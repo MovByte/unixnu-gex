@@ -99,6 +99,8 @@ pub enum LoadError {
         size: u64,
     },
     Malformed(&'static str),
+    /// A Mach-O image that does not parse or cannot be placed.
+    MachO(String),
 }
 
 impl fmt::Display for LoadError {
@@ -135,6 +137,7 @@ impl fmt::Display for LoadError {
                 gex_abi::PIE_BASE
             ),
             LoadError::Malformed(m) => write!(f, "malformed ELF: {m}"),
+            LoadError::MachO(m) => write!(f, "Mach-O: {m}"),
         }
     }
 }
