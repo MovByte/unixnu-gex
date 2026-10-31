@@ -19,6 +19,7 @@ fn call(on: &On<'_>, op: XattrOp<'_>) -> Result<usize, Errno> {
     let fd = match on { On::Fd(fd) => *fd, On::Path(_) => -1 };
     let name_c = |n: &str| CString::new(n).map_err(|_| Errno::EINVAL);
     // SAFETY: every pointer is a live CString or slice for the call's length.
+    #[cfg(not(target_os = "macos"))]
     let r: isize = unsafe {
         match op {
             XattrOp::Get { name, buf } => {
@@ -53,8 +54,56 @@ fn call(on: &On<'_>, op: XattrOp<'_>) -> Result<usize, Errno> {
             }
         }
     };
+    // SAFETY: as above. macOS spells the l* calls as the path calls with
+    // XATTR_NOFOLLOW, and takes a position (resource forks only) and options.
+    #[cfg(target_os = "macos")]
+    let r: isize = unsafe {
+        let nofollow = libc::XATTR_NOFOLLOW;
+        match op {
+            XattrOp::Get { name, buf } => {
+                let n = name_c(name)?;
+                let (b, l) = (buf.as_mut_ptr() as *mut libc::c_void, buf.len());
+                match &path {
+                    Some(p) => libc::getxattr(p.as_ptr(), n.as_ptr(), b, l, 0, nofollow),
+                    None => libc::fgetxattr(fd, n.as_ptr(), b, l, 0, 0),
+                }
+            }
+            XattrOp::Set { name, value, flags } => {
+                let n = name_c(name)?;
+                let (v, l) = (value.as_ptr() as *const libc::c_void, value.len());
+                // Linux's XATTR_CREATE (1) and XATTR_REPLACE (2) are macOS's 2 and 4.
+                let f = ((flags as i32 & 1) << 1) | ((flags as i32 & 2) << 1);
+                (match &path {
+                    Some(p) => libc::setxattr(p.as_ptr(), n.as_ptr(), v, l, 0, f | nofollow),
+                    None => libc::fsetxattr(fd, n.as_ptr(), v, l, 0, f),
+                }) as isize
+            }
+            XattrOp::List { buf } => {
+                let (b, l) = (buf.as_mut_ptr() as *mut libc::c_char, buf.len());
+                match &path {
+                    Some(p) => libc::listxattr(p.as_ptr(), b, l, nofollow),
+                    None => libc::flistxattr(fd, b, l, 0),
+                }
+            }
+            XattrOp::Remove { name } => {
+                let n = name_c(name)?;
+                (match &path {
+                    Some(p) => libc::removexattr(p.as_ptr(), n.as_ptr(), nofollow),
+                    None => libc::fremovexattr(fd, n.as_ptr(), 0),
+                }) as isize
+            }
+        }
+    };
     if r < 0 {
         let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
+        // The guest wants Linux's numbers; the ones that differ on macOS.
+        #[cfg(target_os = "macos")]
+        let e = match e {
+            libc::ENOATTR => 61,  // ENODATA
+            libc::ENOTSUP => 95,  // EOPNOTSUPP
+            libc::ENAMETOOLONG => 36,
+            e => e,
+        };
         return Err(Errno(e as _));
     }
     Ok(r as usize)
