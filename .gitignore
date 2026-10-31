@@ -12,6 +12,7 @@ __pycache__/
 
 # Scratch and build caches
 web/.work/
+tests/darwin/bin/
 # Run output and crash debris
 logs/
 *.core
