@@ -211,6 +211,9 @@ pub struct RunOptions {
     /// The guest memory: wasm32 unless this process needs
     /// more address space.
     pub mem: gex_abi::MemFlavor,
+    /// A Darwin (Mach-O) program: the kernel speaks the Darwin system call
+    /// ABI to it (`gex_kernel::darwin`).
+    pub darwin: bool,
     /// Run ahead-of-time code only (`aot_only`): an ejected Windows
     /// program's runtime, with no tier-1 module and no run-time translator.
     pub aot_only: bool,
@@ -220,6 +223,7 @@ impl Default for RunOptions {
     fn default() -> Self {
         RunOptions {
             mem: gex_abi::MemFlavor::M32,
+            darwin: false,
             args: Vec::new(),
             env: Vec::new(),
             trace: false,
@@ -1107,6 +1111,7 @@ fn run_program_with(
     // translator for every guest process, so a mixed tree is not supported
     // here (the browser has a shim per process).
     kernel.compat = program.compat();
+    kernel.darwin = opts.darwin;
     // Set again by `wasmprog` if this program is native wasm32.
     kernel.wasm32 = false;
     // An ejected project's replacement code has its own region. Recorded for

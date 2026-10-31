@@ -20,6 +20,7 @@ mod pe_info;
 mod units;
 mod host_xattr;
 mod host_walk;
+mod darwin_run;
 
 /// Where the dynamic linker is placed, well above a PIE executable so their
 /// mappings cannot overlap. A closure module for `ld.so` is only correct at the
@@ -671,6 +672,9 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
         }
     }
     let bytes = std::fs::read(&ra.path).with_context(|| format!("reading {}", ra.path))?;
+    if gex_ld::macho::is_macho(&bytes) {
+        return darwin_run::run(ra, &bytes);
+    }
     // Resolved through the guest's namespace (the sysroot when given), so a
     // program links against its own root's libraries, not the host's.
     let sysroot = ra.opts.sysroot.clone();

@@ -10,6 +10,11 @@
 
 use crate::elf::{headers_only, Image, LoadError, Segment, Symbol};
 
+/// Where a position-independent Mach-O executable is placed. Its linked
+/// base, 0x1_0000_0000 past a 4 GiB `__PAGEZERO`, is where a 64-bit gex
+/// memory keeps its dispatch tables, so it moves above them.
+pub const PIE_BASE: u64 = 0x2_0000_0000;
+
 pub const MH_MAGIC_64: u32 = 0xfeed_facf;
 pub const CPU_TYPE_ARM64: u32 = 0x0100_000c;
 
@@ -574,6 +579,12 @@ mod tests {
         let mut m = parse(&f).unwrap();
         m.function_starts = Some((off, 4));
         assert_eq!(m.function_starts(&f), vec![0x1_0000_0400, 0x1_0000_0420]);
+    }
+
+    #[test]
+    fn the_pie_base_clears_the_dispatch_tables() {
+        assert!(PIE_BASE >= gex_abi::HIGH_TABLES_END);
+        assert!(PIE_BASE < gex_abi::LIMIT64);
     }
 
     #[test]
