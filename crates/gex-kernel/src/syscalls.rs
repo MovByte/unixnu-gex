@@ -663,6 +663,10 @@ pub struct Kernel {
     /// ones (see `crate::i386`). Set at exec from the image's class,
     /// inherited across fork.
     pub compat: bool,
+    /// A Darwin (Mach-O) process: it enters with `svc #0x80`, its number
+    /// is in x16, and its errors come back with the carry flag set (see
+    /// `crate::darwin`). Set at exec, inherited across fork.
+    pub darwin: bool,
     /// Set by a syscall that may have made a descriptor readable or
     /// writable for someone else (a write, a read that freed room, a close,
     /// a signal); the host takes it after the call and wakes threads parked
@@ -8748,6 +8752,7 @@ impl Kernel {
             thread_calls: std::collections::HashMap::new(),
             sig_tid: 0,
             compat: false,
+            darwin: false,
             fd_activity: false,
             wasm32: false,
             sigreturn_legacy: false,
@@ -9132,6 +9137,7 @@ impl Kernel {
             thread_calls: std::collections::HashMap::new(),
             sig_tid: 0,
             compat: self.compat,
+            darwin: self.darwin,
             fd_activity: false,
             wasm32: self.wasm32,
             sigreturn_legacy: false,
@@ -9238,7 +9244,13 @@ impl Kernel {
         self.syscall_pc = pc;
         // An i386-ABI process has its number in eax (`x(0)`) in every build:
         // on an AArch64 build that is a native wasm32 program.
-        let nr_slot = if self.compat { ctx::x(0) } else { ctx::SYSCALL_NR };
+        let nr_slot = if self.compat {
+            ctx::x(0)
+        } else if self.darwin {
+            crate::darwin::NR_SLOT
+        } else {
+            ctx::SYSCALL_NR
+        };
         let raw = m
             .read_u64(self.ctx_addr + nr_slot as u64)
             .unwrap_or(!0);
@@ -9258,6 +9270,12 @@ impl Kernel {
                 self.arg(m, 5),
             ]
         };
+        if self.darwin {
+            if let Some(ret) = crate::darwin::direct(m, self.ctx_addr, raw) {
+                let _ = crate::darwin::set_result(m, self.ctx_addr, ret);
+                return SyscallOutcome::Continue;
+            }
+        }
         // The number's register doubles as the result register on x86-64, so
         // keep the raw number where a host can read it after the fact.
         if gex_abi::X86 {
@@ -9278,6 +9296,8 @@ impl Kernel {
             post = p;
             self.sigreturn_legacy = (raw & 0xffff_ffff) == crate::i386::raw::SIGRETURN;
             n
+        } else if self.darwin {
+            crate::darwin::bsd::translate(raw, &mut a)
         } else if gex_abi::X86 {
             crate::x86::translate(
                 raw,
@@ -9531,7 +9551,7 @@ impl Kernel {
         }
         // An x86-64 number with no mapping reaches `dispatch` as `UNKNOWN`;
         // record the guest's own number, which is the one worth looking up.
-        let outcome = if (gex_abi::X86 || self.compat) && n == crate::x86::UNKNOWN {
+        let outcome = if (gex_abi::X86 || self.compat || self.darwin) && n == crate::x86::UNKNOWN {
             let before = self.unimplemented.len();
             let r = self.dispatch(m, n, a);
             if self.unimplemented.len() > before {
@@ -9618,7 +9638,11 @@ impl Kernel {
                 }
             }
         }
-        let _ = set_result(m, self.ctx_addr, ret);
+        let _ = if self.darwin {
+            crate::darwin::set_result(m, self.ctx_addr, ret)
+        } else {
+            set_result(m, self.ctx_addr, ret)
+        };
 
         // A syscall boundary is a safepoint: the context is complete, so a
         // pending signal can be delivered precisely here.
