@@ -257,6 +257,23 @@ impl Kernel {
             // gettid(uidp, gidp): a thread's own credentials, which only
             // settid gives it (settid is not served, so none has them).
             sys::GETTID => neg(Errno::ESRCH),
+            // kill(pid, signum, posix): a process or a group as Linux's
+            // kill reaches them, the signal renumbered. A broadcast is
+            // killpg1's, which includes the caller only when posix is set.
+            sys::KILL => {
+                let (pid, signum, posix) = (a[0] as i32, a[1] as u32, a[2] as i32);
+                if signum >= 32 {
+                    neg(Errno::EINVAL)
+                } else if signum != 0 && signal_to_linux(signum) == 0 {
+                    self.darwin_unimplemented(format!("kill with Darwin signal {signum}, which Linux has no number for"));
+                    neg(Errno::EINVAL)
+                } else if pid == -1 {
+                    self.darwin_unimplemented(format!("a broadcast kill (killpg1, posix {posix})"));
+                    neg(Errno::EINVAL)
+                } else {
+                    res(self.canonical(m, nr::KILL, [pid as i64 as u64, u64::from(signal_to_linux(signum)), 0, 0, 0, 0]))
+                }
+            }
             sys::KQUEUE => res(<Kq as KQueue>::kqueue(self)),
             sys::KQUEUE_WORKLOOP_CTL => {
                 let r = <Kq as KQueue>::workloop_ctl(self, m, a);
