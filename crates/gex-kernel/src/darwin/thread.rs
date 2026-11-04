@@ -316,6 +316,15 @@ impl Kernel {
                 Some(SyscallOutcome::Continue)
             }
             sys::WORKQ_KERNRETURN => Some(self.darwin_workq_kernreturn(m, a)),
+            // sigsuspend_nocancel: the mask (by value) until a signal is
+            // taken, the old one back after; the call ends with EINTR.
+            sys::SIGSUSPEND | sys::SIGSUSPEND_NOCANCEL => {
+                let unblockable = (1u64 << (crate::signal::sig::SIGKILL - 1)) | (1u64 << (crate::signal::sig::SIGSTOP - 1));
+                let restore_mask = self.signals.blocked();
+                self.signals.set_blocked(super::kern::mask_to_linux(a[0] as u32) & !unblockable);
+                self.restore_sigmask = Some(restore_mask);
+                Some(SyscallOutcome::Blocking(crate::syscalls::BlockOp::SigSuspend { restore_mask }))
+            }
             sys::KEVENT => Some(self.darwin_kevent_legacy(m, a, false)),
             sys::KEVENT64 => Some(self.darwin_kevent_legacy(m, a, true)),
             sys::KEVENT_QOS => Some(self.darwin_kevent_qos(m, a)),
