@@ -116,19 +116,28 @@ pub fn const_fold_forwarding(block: &mut Block, forward: bool) {
     // `known[v]` is the constant value of `v`, normalised so that an `I32`
     // value has zero high bits.
     let mut known: Vec<Option<u64>> = vec![None; block.n_values as usize];
-    // With forwarding on: the constant each register was last written in
-    // this block. Anything but a definition, a register write, a store, a
-    // fence or a trap may change guest state the block does not see, and
-    // forgets them all.
-    let mut regs: Vec<(GuestReg, u64)> = Vec::new();
+    // With forwarding on: the known bits, as `(mask, value)`, of what each
+    // register was last written in this block. Anything but a definition, a
+    // register write, a store, a fence or a trap may change guest state the
+    // block does not see, and forgets them all.
+    let mut regs: Vec<(GuestReg, (u64, u64))> = Vec::new();
+    // With forwarding on, also the bits of each value that are known, as
+    // `(mask, value)`: an AND with a constant knows the bits it clears, an
+    // OR the bits it sets, so a run of `movk`s that rewrites every halfword
+    // of a register it never read is a constant.
+    let mut bits: Vec<(u64, u64)> = if forward { vec![(0, 0); block.n_values as usize] } else { Vec::new() };
 
     for stmt in &mut block.stmts {
         if forward {
             match stmt {
                 Stmt::WriteReg { reg, val } => {
                     regs.retain(|(r, _)| r != reg);
-                    if let Some(c) = get(&known, *val) {
-                        regs.push((*reg, c));
+                    let b = match get(&known, *val) {
+                        Some(c) => (u64::MAX, c),
+                        None => bits[val.0 as usize],
+                    };
+                    if b.0 != 0 {
+                        regs.push((*reg, b));
                     }
                 }
                 Stmt::Def { .. } | Stmt::Store { .. } | Stmt::VStore { .. } | Stmt::Fence | Stmt::Trap { .. } => {}
@@ -140,8 +149,21 @@ pub fn const_fold_forwarding(block: &mut Block, forward: bool) {
         };
         if forward {
             if let Expr::ReadReg(r) = expr {
-                if let Some(&(_, c)) = regs.iter().find(|(x, _)| x == r) {
-                    *expr = if expr.ty() == Ty::I32 { Expr::ConstI32(c as u32) } else { Expr::ConstI64(c) };
+                if let Some(&(_, (mask, v))) = regs.iter().find(|(x, _)| x == r) {
+                    let ty = expr.ty();
+                    if mask & ty.mask() == ty.mask() {
+                        *expr = if ty == Ty::I32 { Expr::ConstI32(v as u32) } else { Expr::ConstI64(v & ty.mask()) };
+                    } else {
+                        bits[dst.0 as usize] = (mask & ty.mask(), v & mask & ty.mask());
+                    }
+                }
+            }
+            if let Some(c) = known_bits(expr, &known, &bits) {
+                let i = dst.0 as usize;
+                bits[i] = c;
+                let ty = expr.ty();
+                if ty != Ty::V128 && c.0 & ty.mask() == ty.mask() {
+                    *expr = if ty == Ty::I32 { Expr::ConstI32(c.1 as u32) } else { Expr::ConstI64(c.1 & ty.mask()) };
                 }
             }
         }
@@ -161,6 +183,33 @@ pub fn const_fold_forwarding(block: &mut Block, forward: bool) {
             known[dst.0 as usize] = Some(c);
         }
     }
+}
+
+/// The known bits of an AND or OR with a constant operand, from what is
+/// known of the other.
+fn known_bits(expr: &Expr, known: &[Option<u64>], bits: &[(u64, u64)]) -> Option<(u64, u64)> {
+    let Expr::Bin { op, ty, a, b } = *expr else { return None };
+    let of = |v: Value| match get(known, v) {
+        Some(c) => (u64::MAX, c),
+        None => bits.get(v.0 as usize).copied().unwrap_or((0, 0)),
+    };
+    let ((ma, va), (mb, vb)) = (of(a), of(b));
+    let m = ty.mask();
+    Some(match op {
+        // A bit is known where either side knows it is 0, or both know it.
+        BinOp::And => {
+            let zero = (ma & !va) | (mb & !vb);
+            let both = ma & mb;
+            ((zero | both) & m, va & vb & m)
+        }
+        // Known where either side knows it is 1, or both know it.
+        BinOp::Or => {
+            let one = (ma & va) | (mb & vb);
+            let both = ma & mb;
+            ((one | both) & m, (va | vb) & m)
+        }
+        _ => return None,
+    })
 }
 
 fn get(known: &[Option<u64>], v: Value) -> Option<u64> {
@@ -536,6 +585,30 @@ pub fn stats(block: &Block) -> Stats {
 
 #[cfg(test)]
 mod tests {
+
+    /// Four `movk`s that rewrite every halfword of a register the block
+    /// never read leave a constant, as libsystem's `mach_absolute_time`
+    /// builds its commpage address: each reads the register the last wrote,
+    /// as the lifter has it.
+    #[test]
+    fn a_full_movk_run_is_a_constant() {
+        let mut b = Builder::new(0x1000);
+        for (shift, field) in [(48u32, 0u64), (32, 0xf), (16, 0xffff), (0, 0xc088)] {
+            let old = b.read(GuestReg::X(3));
+            let keep = b.const_i64(!(0xffffu64 << shift));
+            let cleared = b.bin(BinOp::And, Ty::I64, old, keep);
+            let ins = b.const_i64(field << shift);
+            let v = b.bin(BinOp::Or, Ty::I64, cleared, ins);
+            b.write(GuestReg::X(3), v);
+        }
+        let v = b.read(GuestReg::X(3));
+        let mut block = b.finish(Term::Goto { target: 0x1010 });
+        let mut off = block.clone();
+        const_fold_forwarding(&mut block, true);
+        const_fold_forwarding(&mut off, false);
+        assert_eq!(const_value(&block, v), Some(0xf_ffff_c088));
+        assert_eq!(const_value(&off, v), None);
+    }
 
     /// `mov x8, #0xf_ffff_0000; movk x8, #0xc100; ldr w8, [x8]`: with
     /// forwarding the load's address folds to one constant, and a host
