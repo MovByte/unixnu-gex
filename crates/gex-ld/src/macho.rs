@@ -12,8 +12,13 @@ use crate::elf::{headers_only, Image, LoadError, Segment, Symbol};
 
 /// Where a position-independent Mach-O executable is placed. Its linked
 /// base, 0x1_0000_0000 past a 4 GiB `__PAGEZERO`, is where a 64-bit gex
-/// memory keeps its dispatch tables, so it moves above them.
-pub const PIE_BASE: u64 = 0x2_0000_0000;
+/// memory keeps its dispatch tables, and the shared cache follows at
+/// [`SHARED_REGION_BASE`]; iOS 17's runs to 0x2_4c5f_0000. Programs and
+/// dyld go above both.
+pub const PIE_BASE: u64 = 0x2_8000_0000;
+
+/// Where arm64 Darwin maps the shared cache (`SHARED_REGION_BASE_ARM64`).
+pub const SHARED_REGION_BASE: u64 = 0x1_8000_0000;
 
 pub const MH_MAGIC_64: u32 = 0xfeed_facf;
 pub const CPU_TYPE_ARM64: u32 = 0x0100_000c;
@@ -582,8 +587,9 @@ mod tests {
     }
 
     #[test]
-    fn the_pie_base_clears_the_dispatch_tables() {
-        assert!(PIE_BASE >= gex_abi::HIGH_TABLES_END);
+    fn the_layout_clears_the_tables_and_the_shared_region() {
+        assert!(SHARED_REGION_BASE >= gex_abi::HIGH_TABLES_END);
+        assert!(PIE_BASE > SHARED_REGION_BASE + 0xcc5f_0000);
         assert!(PIE_BASE < gex_abi::LIMIT64);
     }
 

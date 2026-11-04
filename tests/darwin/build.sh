@@ -2,15 +2,15 @@
 # Build the Darwin test programs with Xcode's iOS toolchain into bin/.
 #
 # The static programs make raw system calls and need neither dyld nor a
-# shared cache. They are linked above gex's dispatch tables (the default
-# 0x1_0000_0000 base is where gex keeps them in a 64-bit memory) because
-# a static image has no fixups to slide it with.
+# shared cache. They are linked where gex places a position-independent
+# Darwin program (gex_ld::macho::PIE_BASE), above its dispatch tables and
+# the shared region, because a static image has no fixups to slide it with.
 set -eu
 
 HERE=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 OUT=$HERE/bin
 TARGET=${GEX_DARWIN_TARGET:-arm64-apple-ios17.0}
-STATIC_BASE=0x200000000
+STATIC_BASE=0x280000000
 mkdir -p "$OUT"
 
 cc() {
