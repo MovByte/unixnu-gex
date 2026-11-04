@@ -494,6 +494,10 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn as_memfd(self: Arc<Self>) -> Option<Arc<crate::unix::MemFd>> {
         None
     }
+    /// The POSIX shared memory object (`shm_open`) this is a descriptor of.
+    fn as_posix_shm(self: Arc<Self>) -> Option<Arc<crate::darwin::shm::Pshm>> {
+        None
+    }
 
     /// A short description of this handle's state, for a diagnostic: the
     /// buffer behind a descriptor -- empty, full, which way it points -- that

@@ -117,6 +117,7 @@ pub fn translate(raw: u64, a: &mut [u64; 6]) -> u64 {
         sys::PREAD | sys::PREAD_NOCANCEL => nr::PREAD64,
         sys::PWRITE | sys::PWRITE_NOCANCEL => nr::PWRITE64,
         sys::LSEEK => nr::LSEEK,
+        sys::FTRUNCATE => nr::FTRUNCATE,
         sys::OPEN | sys::OPEN_NOCANCEL => {
             *a = [LINUX_AT_FDCWD, a[0], open_flags(a[1]), a[2], 0, 0];
             nr::OPENAT

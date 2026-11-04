@@ -281,6 +281,26 @@ impl Kernel {
                 0
             }
             sys::GETFSSTAT64 => res(self.darwin_getfsstat(m, a[0], a[1])),
+            sys::SHM_OPEN => res(self.darwin_shm_open(m, a)),
+            sys::SHM_UNLINK => res(self.darwin_shm_unlink(m, a)),
+            // An object takes one size and has no read or write; a mapping
+            // of it is checked before it is made.
+            sys::FTRUNCATE if self.darwin_shm_fd(a[0]) => res(self.darwin_shm_ftruncate(a)),
+            sys::READ | sys::READ_NOCANCEL | sys::PREAD | sys::PREAD_NOCANCEL | sys::READV | sys::READV_NOCANCEL | sys::PREADV | sys::PREADV_NOCANCEL
+                if self.darwin_shm_fd(a[0]) =>
+            {
+                neg(self.darwin_shm_io(a[0], false))
+            }
+            sys::WRITE | sys::WRITE_NOCANCEL | sys::PWRITE | sys::PWRITE_NOCANCEL | sys::WRITEV | sys::WRITEV_NOCANCEL | sys::PWRITEV | sys::PWRITEV_NOCANCEL
+                if self.darwin_shm_fd(a[0]) =>
+            {
+                neg(self.darwin_shm_io(a[0], true))
+            }
+            // MAP_ANON is 0x1000: a file mapping has a descriptor to look at.
+            sys::MMAP if a[3] & 0x1000 == 0 && (a[4] as i32) >= 0 => match self.darwin_shm_mmap_check(a) {
+                Ok(()) => return None,
+                Err(e) => neg(e),
+            },
             sys::GETATTRLIST => res(self.darwin_getattrlist(m, a)),
             sys::FGETATTRLIST => res(self.darwin_fgetattrlist(m, a)),
             sys::GETATTRLISTAT => res(self.darwin_getattrlistat(m, a)),
