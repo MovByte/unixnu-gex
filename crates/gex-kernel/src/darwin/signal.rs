@@ -216,6 +216,9 @@ pub struct Sigacts {
     pub nocldstop: bool,
     pub nocldwait: bool,
     pub sigreturn_validation: u32,
+    /// `p->si_pid` and `p->si_uid`: who posted the last signal that was
+    /// caught and not held when posted, until a handler frame takes it.
+    pub si: Option<(i32, u32)>,
 }
 
 impl Default for Sigacts {
@@ -241,6 +244,7 @@ impl Default for Sigacts {
             nocldstop: false,
             nocldwait: false,
             sigreturn_validation: validation::DEFAULT,
+            si: None,
         }
     }
 }
@@ -480,6 +484,7 @@ impl Kernel {
     /// (or is dropped, or would stop it), and a caught one gets a handler
     /// frame, each on top of the one before.
     pub(crate) fn darwin_deliver(&mut self, m: &mut GuestMem<'_>) -> Delivery {
+        self.darwin_assign_signals();
         let mut resume = None;
         loop {
             let ready = self.signals.pending_raw() & !self.signals.blocked();
@@ -519,6 +524,67 @@ impl Kernel {
             }
         }
         resume.map_or(Delivery::None, Delivery::Resume)
+    }
+
+    /// `get_signalthread` for each process-directed signal pending: the
+    /// first thread (a pthread before a workqueue thread) that takes
+    /// signals and does not block it, or else the first thread, gets it on
+    /// its own list (`uu_siglist`). A signal caught and not held there is
+    /// psignal's record of who sent it.
+    pub(crate) fn darwin_assign_signals(&mut self) {
+        let mut bits = self.signals.process().shared();
+        if bits == 0 {
+            return;
+        }
+        let tids = self.thread_signals.tids_in_order();
+        while bits != 0 {
+            let l = bits.trailing_zeros() + 1;
+            bits &= bits - 1;
+            let bit = 1u64 << (l - 1);
+            let willing = |k: &Kernel, t: i32, skip_wq: bool| {
+                let d = k.dtask.threads.map.get(&t);
+                let no_sigmask = d.is_some_and(|d| d.cancel.no_sigmask);
+                let wq = d.is_some_and(|d| d.wq.is_some());
+                let blocked = k.thread_signals.get(t).is_none_or(|s| s.blocked() & bit != 0);
+                !no_sigmask && !blocked && !(skip_wq && wq)
+            };
+            let tid = tids.iter().copied().find(|&t| willing(self, t, true)).or_else(|| tids.iter().copied().find(|&t| willing(self, t, false))).or_else(|| tids.first().copied());
+            let Some(tid) = tid else { continue };
+            let Some(ts) = self.thread_signals.get(tid) else { continue };
+            let Some(source) = self.signals.process().take_shared(l) else { continue };
+            if ts.blocked() & bit == 0 {
+                self.darwin_note_sender(l, source);
+            }
+            ts.raise(l, source);
+        }
+    }
+
+    /// psignal's `si_pid`, `si_uid` for a caught signal (but SIGCHLD): the
+    /// sender, or the process the kernel posted it from (an interval
+    /// timer's SIGALRM, from the kernel's own thread call).
+    pub(crate) fn darwin_note_sender(&mut self, l: u32, source: Option<Source>) {
+        let Some(d) = signal_from_linux(l) else { return };
+        let ps = &self.dtask.sigacts;
+        let caught = ps.handler[d as usize] != SIG_DFL && ps.handler[d as usize] != SIG_IGN && ps.sigignore & sigmask(d) == 0;
+        if !caught || d == dsig::SIGCHLD {
+            return;
+        }
+        let who = match source {
+            Some(src) => (src.pid, src.uid),
+            None if d == dsig::SIGALRM => (0, 0),
+            None => (self.pid, self.creds.uid()),
+        };
+        self.dtask.sigacts.si = Some(who);
+    }
+
+    /// `sigpending(osv)`: the calling thread's own list.
+    pub(crate) fn darwin_sigpending(&mut self, m: &mut GuestMem<'_>, osv: u64) -> Result<u64, Errno> {
+        self.collect_signals();
+        self.darwin_assign_signals();
+        if osv != 0 {
+            m.write_u32(osv, mask_from_linux(self.signals.thread().pending()))?;
+        }
+        Ok(0)
     }
 
     /// A fault the running instruction raised, as `ux_exception` makes it a
@@ -636,26 +702,18 @@ impl Kernel {
                 put32(&mut info, 8, SEGV_ACCERR);
             }
             _ => {
-                // psignal's record of a caught signal: who sent it, a code
-                // of 0 and the signal for its status. The layer keeps the
-                // sender with each pending signal rather than one record for
-                // the process.
-                let (pid, uid) = match source {
-                    Some(Some(src)) => (src.pid as u32, src.uid),
-                    // An interval timer's signal is sent from the kernel's
-                    // own context (realitexpire's thread call).
-                    Some(None) if matches!(d, dsig::SIGALRM | dsig::SIGVTALRM | dsig::SIGPROF) => (0, 0),
-                    _ => {
-                        self.darwin_unimplemented(format!("the sender of Darwin signal {d}, raised by the kernel, for its siginfo"));
-                        (0, 0)
-                    }
-                };
                 if d == dsig::SIGCHLD {
                     self.darwin_unimplemented("SIGCHLD's siginfo (the child's CLD_* code and status)".into());
                 }
-                put32(&mut info, 12, pid);
-                put32(&mut info, 16, uid);
-                put32(&mut info, 20, d);
+                // psignal's record (p->si_*), taken: who sent the last
+                // caught signal, a code of 0 and the signal for its status;
+                // zeros once a frame took it.
+                let _ = source;
+                if let Some((pid, uid)) = self.dtask.sigacts.si.take() {
+                    put32(&mut info, 12, pid as u32);
+                    put32(&mut info, 16, uid);
+                    put32(&mut info, 20, d);
+                }
             }
         }
 

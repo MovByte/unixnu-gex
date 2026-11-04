@@ -10608,6 +10608,11 @@ impl Kernel {
     pub fn signal_pending(&mut self) -> bool {
         self.collect_signals();
         self.check_timers();
+        // A Darwin process's own: each goes to the one thread psignal
+        // would give it, which alone is interrupted.
+        if self.darwin {
+            self.darwin_assign_signals();
+        }
         let ready = self.signals.has_pending();
         if self.trace && !ready && self.signals.pending_raw() != 0 {
             // Arrived but not deliverable. Almost always the blocked mask,

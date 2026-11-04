@@ -214,6 +214,16 @@ impl ProcSig {
         self.defaults.get().map_or_else(|| default_action(signal), |f| f(signal))
     }
 
+    /// Take `signal` off the process-directed pending set, with its sender;
+    /// `None` when it is not there.
+    pub fn take_shared(&self, signal: u32) -> Option<Option<Source>> {
+        let b = bit(signal);
+        if self.shared.fetch_and(!b, Ordering::AcqRel) & b == 0 {
+            return None;
+        }
+        Some(self.shared_sources.lock()[signal as usize].take())
+    }
+
     /// Drop `signal` from the process-directed pending set.
     pub fn discard(&self, signal: u32) {
         self.shared.fetch_and(!bit(signal), Ordering::AcqRel);
@@ -446,6 +456,14 @@ pub struct ThreadSigs(Mutex<std::collections::HashMap<i32, Arc<ThreadSig>>>);
 impl ThreadSigs {
     pub fn get(&self, tid: i32) -> Option<Arc<ThreadSig>> {
         self.0.lock().get(&tid).cloned()
+    }
+
+    /// Every thread's id, in the order the threads were made (thread ids
+    /// only grow).
+    pub fn tids_in_order(&self) -> Vec<i32> {
+        let mut v = self.tids();
+        v.sort_unstable();
+        v
     }
 
     /// Drop `signal` from every thread's own pending set.

@@ -309,11 +309,19 @@ impl Kernel {
                     _ if no_sigmask => neg(Errno::ESRCH),
                     Some(_) if workq_refuses => neg(Errno::EOPNOTSUPP),
                     Some(_) if sig == 0 => 0,
-                    Some(tid) => res(self.canonical(m, nr::TGKILL, [self.pid as u64, tid as u64, u64::from(sig), 0, 0, 0])),
+                    Some(tid) => {
+                        let r = self.canonical(m, nr::TGKILL, [self.pid as u64, tid as u64, u64::from(sig), 0, 0, 0]);
+                        // psignal_uthread's record, for a target that takes it.
+                        if r.is_ok() && self.thread_signals.get(tid).is_some_and(|t| t.blocked() & (1u64 << (sig - 1)) == 0) {
+                            self.darwin_note_sender(sig, Some(crate::signal::Source { code: 0, pid: self.pid, uid: self.creds.uid() }));
+                        }
+                        res(r)
+                    }
                     None => neg(Errno::ESRCH),
                 }
             }
             sys::PIPE => res(self.darwin_pipe(m)),
+            sys::SIGPENDING => res(self.darwin_sigpending(m, a[0])),
             // Process groups and sessions: the same rules as Linux's, but
             // setpgid's target may be any descendant (inferior()), where
             // Linux's must be a child.
