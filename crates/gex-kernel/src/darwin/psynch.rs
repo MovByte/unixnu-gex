@@ -888,7 +888,7 @@ impl Psynch {
 impl Kernel {
     /// The psynch calls; `None` for the rest.
     pub(crate) fn darwin_psynch_call(&mut self, m: &mut GuestMem<'_>, raw: u64, a: &[u64; 6]) -> Option<SyscallOutcome> {
-        let x = |m: &GuestMem<'_>, k: &Kernel, i: u8| m.read_u64(k.ctx_addr + ctx::x(i) as u64).unwrap_or(0);
+        let x = |m: &GuestMem<'_>, k: &Kernel, i: u8| m.read_u64(k.ctx_addr + ctx::x(k.darwin_arg_base + i) as u64).unwrap_or(0);
         let r = match raw {
             sys::PSYNCH_MUTEXWAIT => return Some(self.psynch_mutexwait(m, a[0], a[1] as u32, a[2] as u32, a[3], a[4] as u32)),
             sys::PSYNCH_MUTEXDROP => self.psynch_mutexdrop(m, a[0], a[1] as u32, a[2] as u32, a[4] as u32).map(u64::from),

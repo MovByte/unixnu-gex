@@ -680,6 +680,9 @@ pub struct Kernel {
     pub darwin_dyld_infos: u64,
     /// A Darwin process's threads, waits and IPC.
     pub dtask: crate::darwin::Task,
+    /// The register the current Darwin call's arguments start at: x1 for
+    /// an indirect call, x0 otherwise.
+    pub darwin_arg_base: u8,
     /// The main thread's stack top, as the kernel placed it (XNU's
     /// `p_user_stack`).
     pub darwin_user_stack: u64,
@@ -8804,6 +8807,7 @@ impl Kernel {
             darwin_ports: Default::default(),
             darwin_dyld_infos: 0,
             dtask: Default::default(),
+            darwin_arg_base: 0,
             darwin_user_stack: 0,
             darwin_finish: None,
             fd_activity: false,
@@ -9195,6 +9199,7 @@ impl Kernel {
             darwin_ports: Default::default(),
             darwin_dyld_infos: 0,
             dtask: Default::default(),
+            darwin_arg_base: 0,
             darwin_user_stack: 0,
             darwin_finish: None,
             fd_activity: false,
@@ -9395,6 +9400,30 @@ impl Kernel {
                 let _ = crate::darwin::set_mach_result(m, self.ctx_addr, kr);
                 return SyscallOutcome::Continue;
             }
+            let raw = if raw as u32 as u64 == crate::darwin::PLATFORM {
+                raw
+            } else {
+                match crate::darwin::bsd_call(m, self.ctx_addr, raw) {
+                    crate::darwin::Bsd::Call { nr, first } => {
+                        if first != 0 {
+                            for (i, v) in a.iter_mut().enumerate() {
+                                *v = m.read_u64(self.ctx_addr + ctx::x(first + i as u8) as u64).unwrap_or(0);
+                            }
+                        }
+                        self.darwin_arg_base = first;
+                        nr
+                    }
+                    crate::darwin::Bsd::Enosys => {
+                        let _ = crate::darwin::set_result(m, self.ctx_addr, Errno::ENOSYS.as_return());
+                        return SyscallOutcome::Continue;
+                    }
+                    crate::darwin::Bsd::Nosys => {
+                        let _ = self.canonical(m, nr::TGKILL, [self.pid as u64, self.tid as u64, u64::from(crate::signal::sig::SIGSYS), 0, 0, 0]);
+                        let _ = crate::darwin::set_result(m, self.ctx_addr, Errno::ENOSYS.as_return());
+                        return SyscallOutcome::Continue;
+                    }
+                }
+            };
             if crate::darwin::thread::CANCEL_POINTS.contains(&raw) && self.darwin_testcancel(true) {
                 let _ = crate::darwin::set_result(m, self.ctx_addr, Errno::EINTR.as_return());
                 return SyscallOutcome::Continue;

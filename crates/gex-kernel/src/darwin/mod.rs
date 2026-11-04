@@ -129,6 +129,37 @@ fn neg(e: Errno) -> u64 {
 
 /// Whether x16's number is a Mach trap: negative as the 32-bit value
 /// libsyscall loads (`mov w16, #-n`), the machine-dependent class aside.
+/// What a BSD call number comes to (`unix_syscall`).
+pub enum Bsd {
+    /// Call `nr`; its arguments start at register `first` (x1 for an
+    /// indirect call through call 0, x0 otherwise).
+    Call { nr: u64, first: u8 },
+    /// An `enosys` entry: ENOSYS.
+    Enosys,
+    /// `nosys` (a retired entry, or past the table): SIGSYS, then ENOSYS.
+    Nosys,
+}
+
+/// Resolve x16 as XNU does: zero means the number is in x0 and the
+/// arguments follow it; the number is truncated to 16 bits, and one past
+/// the table is `SYS_invalid`, a `nosys` entry.
+pub fn bsd_call(m: &GuestMem<'_>, ctx_addr: u64, raw: u64) -> Bsd {
+    let (code, first) = if raw != 0 {
+        (raw as u16 as u64, 0)
+    } else {
+        (m.read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(0) as u16 as u64, 1)
+    };
+    if code >= sysno::NSYSENT {
+        Bsd::Nosys
+    } else if sysno::ENOSYS.contains(&code) {
+        Bsd::Enosys
+    } else if sysno::name(code).is_none() {
+        Bsd::Nosys
+    } else {
+        Bsd::Call { nr: code, first }
+    }
+}
+
 pub fn mach_trap_number(raw: u64) -> Option<i32> {
     let t = raw as u32 as i32;
     (t < 0 && raw as u32 as u64 != PLATFORM).then_some(t)

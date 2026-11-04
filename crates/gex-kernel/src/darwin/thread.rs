@@ -153,7 +153,7 @@ impl Cancel {
 /// The BSD calls that are cancellation points: each has a `_nocancel`
 /// twin and starts with `__pthread_testcancel(1)`.
 pub const CANCEL_POINTS: &[u64] = &[
-    sys::READ, sys::WRITE, sys::OPEN, sys::CLOSE, sys::WAIT4, sys::RECVMSG, sys::SENDMSG, sys::RECVFROM, sys::ACCEPT, sys::MSYNC, sys::FCNTL, sys::SELECT, sys::FSYNC, sys::CONNECT, sys::SIGSUSPEND, sys::READV, sys::WRITEV, sys::SENDTO, sys::PREAD, sys::PWRITE, sys::WAITID, sys::POLL, sys::MSGSND, sys::MSGRCV, sys::SEM_WAIT, sys::AIO_SUSPEND, sys::SIGWAIT, sys::OPENAT, sys::PREADV, sys::PWRITEV, sys::PSELECT,
+    sys::READ, sys::WRITE, sys::OPEN, sys::CLOSE, sys::WAIT4, sys::RECVMSG, sys::SENDMSG, sys::RECVFROM, sys::ACCEPT, sys::MSYNC, sys::FCNTL, sys::SELECT, sys::FSYNC, sys::CONNECT, sys::SIGSUSPEND, sys::READV, sys::WRITEV, sys::SENDTO, sys::PREAD, sys::PWRITE, sys::WAITID, sys::POLL, sys::SEM_WAIT, sys::AIO_SUSPEND, sys::SIGWAIT, sys::OPENAT, sys::PREADV, sys::PWRITEV, sys::PSELECT,
 ];
 
 /// A Darwin thread's kernel state.
