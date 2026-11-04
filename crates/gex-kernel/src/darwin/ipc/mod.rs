@@ -7,6 +7,7 @@
 //! XNU, a send right to a port that has died is noticed when the entry is
 //! next used ([`Ipc::right_check`]), which turns it into a dead name.
 
+pub mod msg;
 pub mod port;
 pub mod right;
 pub mod space;
@@ -181,7 +182,11 @@ pub struct Port {
     /// The sets the port is a member of.
     pub psets: Vec<ObjId>,
     /// Queued messages (`ip_messages`).
-    pub messages: VecDeque<u64>,
+    pub messages: VecDeque<Box<msg::Kmsg>>,
+    /// `imq_msgcount`: room reserved, for messages queued or on their way.
+    pub msgcount: u32,
+    /// `ip_fullwaiters`: a sender waits for room.
+    pub fullwaiters: bool,
     /// `ip_reply_context`.
     pub reply_context: u64,
     /// `ip_timestamp`: when the port died.
@@ -221,6 +226,8 @@ impl Port {
             requests: None,
             psets: Vec::new(),
             messages: VecDeque::new(),
+            msgcount: 0,
+            fullwaiters: false,
             reply_context: 0,
             timestamp: 0,
             refs: 1,
@@ -300,6 +307,8 @@ pub struct Ipc {
     pub outbox: Vec<Notify>,
     /// Guard exceptions raised, for the kernel to deliver.
     pub guards: Vec<(u32, Guard, u64)>,
+    /// Message queues' waiters and results.
+    pub queues: msg::Queues,
     /// `ipc_port_timestamp`: a counter dead ports are stamped with.
     timestamp: u32,
 }
@@ -618,10 +627,17 @@ impl Ipc {
             p.active = false;
             p.receiver = Receiver::None;
             p.timestamp = ts;
-            p.messages.clear();
+            let msgs: Vec<_> = p.messages.drain(..).collect();
+            p.msgcount = 0;
+            self.mqueue_changed(port);
+            self.mqueue_senders_restart(port);
+            for k in msgs {
+                self.kmsg_destroy(k, false);
+            }
         } else {
             p.immovable_receive = false;
             p.receiver = Receiver::Transit;
+            self.mqueue_changed(port);
         }
     }
 
@@ -634,6 +650,8 @@ impl Ipc {
             }
         }
         self.pset_mut(pset).active = false;
+        self.mqueue_changed(pset);
+        self.queues.preposts.remove(&pset);
         self.release(pset);
     }
 

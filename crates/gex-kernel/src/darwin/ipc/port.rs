@@ -254,13 +254,15 @@ impl Ipc {
         Ok(names)
     }
 
-    /// `ipc_mqueue_add_locked`: `port` joins `set`.
+    /// `ipc_mqueue_add_locked`: `port` joins `set`; its queued messages go
+    /// to receivers waiting on the set, or are preposted to it.
     fn mqueue_add(&mut self, port: ObjId, set: ObjId) -> u64 {
         if self.port(port).psets.contains(&set) {
             return kr::ALREADY_IN_SET;
         }
         self.port_mut(port).psets.push(set);
         self.pset_mut(set).members.push(port);
+        self.mqueue_link_messages(port, set);
         kr::SUCCESS
     }
 
