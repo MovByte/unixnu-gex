@@ -5,6 +5,8 @@
 #![forbid(unsafe_code)]
 #![no_std]
 
+pub mod crypto;
+
 // ---------------------------------------------------------------------------
 // Guest architecture
 // ---------------------------------------------------------------------------
@@ -927,6 +929,11 @@ pub mod imports {
     /// enough to break musl's `pow`, so this asks the host rather than
     /// approximating.
     pub const FMA: &str = "fma";
+
+    /// A cryptographic-extension instruction ([`crate::crypto`]):
+    /// `(ctx, op, spill)`, its operands at `spill` in guest memory and its
+    /// result written over the first.
+    pub const CRYPTO: &str = "crypto";
 
     /// An x87 operation (`gex_ir::Stmt::X87`) the inline fast path did not
     /// cover, computed exactly (`gex_f80`). Pure: it reads only its
