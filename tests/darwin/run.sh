@@ -1,6 +1,11 @@
 #!/bin/sh
 # Run the Darwin programs under gexc and check what each prints and how it
 # exits. Builds them first when bin/ is missing; GEXC picks the runner.
+# With program names, only those run; without, all of them.
+#
+# A dynamic program needs a Darwin root (GEX_DARWIN_ROOT: dyld and the
+# shared cache, as UniXNU's webroot lays them out) and runs from inside it.
+# Without one it is skipped, or fails when it was asked for by name.
 set -u
 
 HERE=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
@@ -9,10 +14,10 @@ GEXC=${GEXC:-$ROOT/target/release/gexc}
 [ -d "$HERE/bin" ] || "$HERE/build.sh" >/dev/null
 
 fail=0
-check() {
-    name=$1 want_out=$2 want_status=$3
-    out=$("$GEXC" run "$HERE/bin/$name" 2>/dev/null)
-    status=$?
+named=$#
+
+report() {
+    name=$1 out=$2 status=$3 want_out=$4 want_status=$5
     if [ "$out" = "$want_out" ] && [ "$status" -eq "$want_status" ]; then
         echo "PASS $name"
     else
@@ -21,26 +26,58 @@ check() {
     fi
 }
 
-check hello-static "hello from darwin" 0
-check bsd-carry "carry ok" 0
-check commpage "" 0
-check exclusive-pair "" 0
-check aes "" 0
+check() {
+    name=$1 want_out=$2 want_status=$3
+    out=$("$GEXC" run "$HERE/bin/$name" 2>/dev/null)
+    report "$name" "$out" $? "$want_out" "$want_status"
+}
 
-# A dynamic program needs a Darwin root (GEX_DARWIN_ROOT: dyld and the
-# shared cache, as UniXNU's webroot lays them out); it runs from inside it.
-if [ -n "${GEX_DARWIN_ROOT:-}" ]; then
-    mkdir -p "$GEX_DARWIN_ROOT/tmp"
-    cp "$HERE/bin/hello" "$GEX_DARWIN_ROOT/tmp/gex-darwin-hello"
-    out=$("$GEXC" run --sysroot "$GEX_DARWIN_ROOT" "$GEX_DARWIN_ROOT/tmp/gex-darwin-hello" a b 2>/dev/null)
-    status=$?
-    if [ "$out" = "hello from /tmp/gex-darwin-hello with 2 arguments" ] && [ "$status" -eq 0 ]; then
-        echo "PASS hello (dyld, shared cache)"
-    else
-        echo "FAIL hello: status $status, output: $out"
-        fail=1
+# check_root NAME WANT_OUT WANT_STATUS [ARGS...]: a dynamic program, run
+# from the root's /tmp.
+check_root() {
+    name=$1 want_out=$2 want_status=$3
+    shift 3
+    if [ -z "${GEX_DARWIN_ROOT:-}" ]; then
+        if [ "$named" -gt 0 ]; then
+            echo "FAIL $name: no Darwin root (set GEX_DARWIN_ROOT)"
+            fail=1
+        else
+            echo "SKIP $name (set GEX_DARWIN_ROOT)"
+        fi
+        return
     fi
+    mkdir -p "$GEX_DARWIN_ROOT/tmp"
+    cp "$HERE/bin/$name" "$GEX_DARWIN_ROOT/tmp/gex-darwin-$name"
+    out=$("$GEXC" run --sysroot "$GEX_DARWIN_ROOT" "$GEX_DARWIN_ROOT/tmp/gex-darwin-$name" "$@" 2>/dev/null)
+    report "$name" "$out" $? "$want_out" "$want_status"
+}
+
+run() {
+    case $1 in
+    hello-static) check hello-static "hello from darwin" 0 ;;
+    bsd-carry) check bsd-carry "carry ok" 0 ;;
+    commpage) check commpage "" 0 ;;
+    exclusive-pair) check exclusive-pair "" 0 ;;
+    aes) check aes "" 0 ;;
+    hello) check_root hello "hello from /tmp/gex-darwin-hello with 2 arguments" 0 a b ;;
+    pthread) check_root pthread "pthread 4000" 0 ;;
+    dispatch) check_root dispatch "dispatch 55 140" 0 ;;
+    cfrunloop) check_root cfrunloop "cfrunloop 3 1" 0 ;;
+    xpc-anon) check_root xpc-anon "xpc-anon 42" 0 ;;
+    *)
+        echo "FAIL $1: no such program"
+        fail=1
+        ;;
+    esac
+}
+
+if [ "$named" -gt 0 ]; then
+    for p in "$@"; do
+        run "$p"
+    done
 else
-    echo "SKIP hello (set GEX_DARWIN_ROOT)"
+    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch cfrunloop xpc-anon; do
+        run "$p"
+    done
 fi
 exit $fail
