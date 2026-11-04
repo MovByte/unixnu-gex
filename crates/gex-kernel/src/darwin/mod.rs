@@ -16,6 +16,7 @@ use gex_abi::ctx;
 pub mod bsd;
 pub mod commpage;
 pub mod errno;
+pub mod ipc;
 pub mod kern;
 pub mod mach;
 pub mod mig;

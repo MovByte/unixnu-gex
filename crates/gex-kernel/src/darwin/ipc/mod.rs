@@ -1,0 +1,1094 @@
+//! Mach IPC, ported from XNU's `osfmk/ipc` at the tag the profile pins:
+//! ports and port sets, the rights a task's name space holds to them, and
+//! the notifications rights changes send.
+//!
+//! Objects live in one table for the task; an entry in the task's
+//! [`space::Space`] names an object and says which rights it holds. As in
+//! XNU, a send right to a port that has died is noticed when the entry is
+//! next used ([`Ipc::right_check`]), which turns it into a dead name.
+
+pub mod right;
+pub mod space;
+
+use space::{bits, Space};
+use std::collections::{BTreeMap, VecDeque};
+
+/// An object's identity in the task's object table.
+pub type ObjId = u64;
+
+/// `kern_return_t`s the IPC layer answers.
+pub mod kr {
+    pub const SUCCESS: u64 = 0;
+    pub const INVALID_ADDRESS: u64 = 1;
+    pub const NO_SPACE: u64 = 3;
+    pub const INVALID_ARGUMENT: u64 = 4;
+    pub const FAILURE: u64 = 5;
+    pub const RESOURCE_SHORTAGE: u64 = 6;
+    pub const NAME_EXISTS: u64 = 13;
+    pub const ABORTED: u64 = 14;
+    pub const INVALID_NAME: u64 = 15;
+    pub const INVALID_TASK: u64 = 16;
+    pub const INVALID_RIGHT: u64 = 17;
+    pub const INVALID_VALUE: u64 = 18;
+    pub const UREFS_OVERFLOW: u64 = 19;
+    pub const INVALID_CAPABILITY: u64 = 20;
+    pub const RIGHT_EXISTS: u64 = 21;
+    pub const NOT_IN_SET: u64 = 12;
+    pub const OPERATION_TIMED_OUT: u64 = 49;
+    pub const TERMINATED: u64 = 37;
+    pub const NOT_WAITING: u64 = 48;
+}
+
+/// `MACH_PORT_RIGHT_*`.
+pub mod port_right {
+    pub const SEND: u32 = 0;
+    pub const RECEIVE: u32 = 1;
+    pub const SEND_ONCE: u32 = 2;
+    pub const PORT_SET: u32 = 3;
+    pub const DEAD_NAME: u32 = 4;
+    pub const LABELH: u32 = 5;
+    pub const NUMBER: u32 = 6;
+}
+
+/// `MACH_PORT_TYPE_*`.
+pub mod ty {
+    pub const NONE: u32 = 0;
+    pub const SEND: u32 = 1 << 16;
+    pub const RECEIVE: u32 = 1 << 17;
+    pub const SEND_ONCE: u32 = 1 << 18;
+    pub const PORT_SET: u32 = 1 << 19;
+    pub const DEAD_NAME: u32 = 1 << 20;
+    /// `MACH_PORT_TYPE_EX_RECEIVE` (the obsolete LABELH bit, reused).
+    pub const EX_RECEIVE: u32 = 1 << 21;
+    pub const SEND_RECEIVE: u32 = SEND | RECEIVE;
+    pub const SEND_RIGHTS: u32 = SEND | SEND_ONCE;
+    pub const PORT_RIGHTS: u32 = SEND_RIGHTS | RECEIVE;
+    pub const PORT_OR_DEAD: u32 = PORT_RIGHTS | DEAD_NAME;
+    pub const ALL_RIGHTS: u32 = PORT_OR_DEAD | PORT_SET;
+    pub const DNREQUEST: u32 = 0x8000_0000;
+    pub const SPREQUEST: u32 = 0x4000_0000;
+    pub const SPREQUEST_DELAYED: u32 = 0x2000_0000;
+}
+
+/// `MACH_PORT_UREFS_MAX`.
+pub const UREFS_MAX: u32 = 0xffff;
+/// `MACH_PORT_DEAD`.
+pub const PORT_DEAD: u32 = !0;
+/// `MACH_PORT_QLIMIT_*`.
+pub const QLIMIT_DEFAULT: u32 = 5;
+pub const QLIMIT_MAX: u32 = 1024;
+pub const QLIMIT_KERNEL: u32 = 65534;
+
+/// `MACH_PORT_VALID`.
+pub fn name_valid(name: u32) -> bool {
+    name != 0 && name != PORT_DEAD
+}
+
+/// What the kernel side of a port is (`ipc_kobject_type_t`), for a port
+/// the kernel receives on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Kobject {
+    Task,
+    TaskName,
+    Thread(i32),
+    Host,
+    HostPriv,
+    Clock,
+    Semaphore,
+    Timer,
+    Voucher,
+}
+
+/// Where a port's receive right is (`ip_receiver` / `ip_destination`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Receiver {
+    /// In the task's space, under this name.
+    Space(u32),
+    /// The kernel's: a kernel object's port.
+    Kernel,
+    /// In a message, not yet received.
+    Transit,
+    /// The port is dead.
+    None,
+}
+
+/// A request for a notification when a name dies, or sending becomes
+/// possible (`struct ipc_port_request`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Request {
+    /// The name the request is for; 0 on a free slot.
+    pub name: u32,
+    /// The send-once right the notification goes to.
+    pub notify: Option<ObjId>,
+    /// `IPR_SOR_SPREQ_MASK` and `IPR_SOR_SPARM_MASK`.
+    pub spreq: bool,
+    pub sparm: bool,
+    /// The free list's next slot while free.
+    pub next: u32,
+}
+
+/// A port (`struct ipc_port`).
+#[derive(Clone, Debug)]
+pub struct Port {
+    pub active: bool,
+    pub receiver: Receiver,
+    pub kobject: Option<Kobject>,
+    pub mscount: u32,
+    pub srights: u32,
+    pub sorights: u32,
+    pub seqno: u32,
+    pub qlimit: u32,
+    pub context: u64,
+    pub guarded: bool,
+    pub strict_guard: bool,
+    pub immovable_receive: bool,
+    pub immovable_send: bool,
+    pub pinned: bool,
+    pub specialreply: bool,
+    /// A reply port (`ip_is_reply_port`): made by `mach_reply_port` or
+    /// `MPO_REPLY_PORT` in a hardened binary; only a send-once right is
+    /// made from it.
+    pub reply_port: bool,
+    pub tempowner: bool,
+    pub impdonation: bool,
+    pub no_grant: bool,
+    pub service_port: bool,
+    /// `ip_sprequests`: a send-possible request is armed.
+    pub sprequests: bool,
+    /// `ip_nsrequest`: the send-once right a no-senders notification goes
+    /// to, or the kernel's own arming for a kernel object.
+    pub nsrequest: Option<ObjId>,
+    pub nsrequest_kobject: bool,
+    /// `ip_pdrequest`: where the receive right goes when destroyed.
+    pub pdrequest: Option<ObjId>,
+    /// `ip_requests`: the dead-name and send-possible request table, slot
+    /// 0 its free list's head; `None` before the first request.
+    pub requests: Option<Vec<Request>>,
+    /// The sets the port is a member of.
+    pub psets: Vec<ObjId>,
+    /// Queued messages (`ip_messages`).
+    pub messages: VecDeque<u64>,
+    /// `ip_reply_context`.
+    pub reply_context: u64,
+    /// `ip_timestamp`: when the port died.
+    pub timestamp: u32,
+    /// Kernel references (`io_references`).
+    pub refs: u32,
+}
+
+impl Port {
+    fn new(receiver: Receiver) -> Port {
+        Port {
+            active: true,
+            receiver,
+            kobject: None,
+            mscount: 0,
+            srights: 0,
+            sorights: 0,
+            seqno: 0,
+            qlimit: QLIMIT_DEFAULT,
+            context: 0,
+            guarded: false,
+            strict_guard: false,
+            immovable_receive: false,
+            immovable_send: false,
+            pinned: false,
+            specialreply: false,
+            reply_port: false,
+            tempowner: false,
+            impdonation: false,
+            no_grant: false,
+            service_port: false,
+            sprequests: false,
+            nsrequest: None,
+            nsrequest_kobject: false,
+            pdrequest: None,
+            requests: None,
+            psets: Vec::new(),
+            messages: VecDeque::new(),
+            reply_context: 0,
+            timestamp: 0,
+            refs: 1,
+        }
+    }
+}
+
+/// A port set (`struct ipc_pset`).
+#[derive(Clone, Debug, Default)]
+pub struct Pset {
+    pub active: bool,
+    pub name: u32,
+    pub members: Vec<ObjId>,
+    pub refs: u32,
+}
+
+/// An IPC object.
+#[derive(Clone, Debug)]
+pub enum Object {
+    Port(Port),
+    Pset(Pset),
+}
+
+/// A notification a rights change owes, sent as a message by the message
+/// layer (`osfmk/ipc/ipc_notify.c`): to the send-once right `to`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Notify {
+    /// `MACH_NOTIFY_PORT_DELETED` for `name`.
+    PortDeleted { to: ObjId, name: u32 },
+    /// `MACH_NOTIFY_SEND_POSSIBLE` for `name`.
+    SendPossible { to: ObjId, name: u32 },
+    /// `MACH_NOTIFY_PORT_DESTROYED`, carrying the receive right to `port`.
+    PortDestroyed { to: ObjId, port: ObjId },
+    /// `MACH_NOTIFY_NO_SENDERS` with the make-send count.
+    NoSenders { to: ObjId, mscount: u32 },
+    /// A kernel object's port lost its last send right.
+    KobjectNoSenders { port: ObjId, mscount: u32 },
+    /// `MACH_NOTIFY_SEND_ONCE`: a send-once right was destroyed unused.
+    SendOnce { to: ObjId },
+    /// `MACH_NOTIFY_DEAD_NAME` for `name`.
+    DeadName { to: ObjId, name: u32 },
+}
+
+/// `kGUARD_EXC_*`: the guard exceptions IPC misuse raises.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Guard {
+    Destroy = 1,
+    ModRefs = 2,
+    InvalidOptions = 3,
+    SetContext = 4,
+    Unguarded = 1 << 3,
+    IncorrectGuard = 1 << 4,
+    Immovable = 1 << 5,
+    StrictReply = 1 << 6,
+    InvalidRight = 1 << 8,
+    InvalidName = 1 << 9,
+    InvalidValue = 1 << 10,
+    InvalidArgument = 1 << 11,
+    RightExists = 1 << 12,
+    KernNoSpace = 1 << 13,
+    KernFailure = 1 << 14,
+    KernResource = 1 << 15,
+    SendInvalidReply = 1 << 16,
+    SendInvalidVoucher = 1 << 17,
+    SendInvalidRight = 1 << 18,
+    RcvInvalidName = 1 << 19,
+    RequireReplyPortSemantics = 1 << 23,
+}
+
+/// A task's IPC state: its objects and its name space.
+#[derive(Debug, Default)]
+pub struct Ipc {
+    pub objects: BTreeMap<ObjId, Object>,
+    next_id: ObjId,
+    pub space: Space,
+    /// Notifications owed, oldest first.
+    pub outbox: Vec<Notify>,
+    /// Guard exceptions raised, for the kernel to deliver.
+    pub guards: Vec<(u32, Guard, u64)>,
+    /// `ipc_port_timestamp`: a counter dead ports are stamped with.
+    timestamp: u32,
+}
+
+/// `ipc_port_request_table_next_size(2, osize, 16)` in entries (16-byte
+/// requests).
+fn request_table_grow(ocount: usize) -> usize {
+    const REQ_SIZE: u64 = 16;
+    let osize = ocount as u64 * REQ_SIZE;
+    let size = if osize != 0 { osize + REQ_SIZE - 1 } else { 2 * REQ_SIZE - 1 };
+    let size = if size < 16 {
+        16
+    } else if size < 32 {
+        32
+    } else {
+        let scale = 63 - size.leading_zeros();
+        let step = 1u64 << (scale - 1);
+        (size + step) & !(step - 1)
+    };
+    // CONFIG_IPC_TABLE_REQUEST_SIZE_MAX (xsmall): 1 MiB.
+    (size.min(1 << 20) / REQ_SIZE) as usize
+}
+
+impl Ipc {
+    fn new_id(&mut self) -> ObjId {
+        self.next_id += 1;
+        self.next_id
+    }
+
+    pub fn port(&self, id: ObjId) -> &Port {
+        match &self.objects[&id] {
+            Object::Port(p) => p,
+            Object::Pset(_) => panic!("object {id} is a port set"),
+        }
+    }
+
+    pub fn port_mut(&mut self, id: ObjId) -> &mut Port {
+        match self.objects.get_mut(&id) {
+            Some(Object::Port(p)) => p,
+            _ => panic!("object {id} is not a port"),
+        }
+    }
+
+    pub fn pset_mut(&mut self, id: ObjId) -> &mut Pset {
+        match self.objects.get_mut(&id) {
+            Some(Object::Pset(p)) => p,
+            _ => panic!("object {id} is not a port set"),
+        }
+    }
+
+    pub fn is_port(&self, id: ObjId) -> bool {
+        matches!(self.objects.get(&id), Some(Object::Port(_)))
+    }
+
+    /// Take a reference on `id` (`ip_reference`).
+    pub fn reference(&mut self, id: ObjId) {
+        match self.objects.get_mut(&id) {
+            Some(Object::Port(p)) => p.refs += 1,
+            Some(Object::Pset(s)) => s.refs += 1,
+            None => panic!("referencing a freed object"),
+        }
+    }
+
+    /// Drop a reference (`ip_release`); the last frees a dead object.
+    pub fn release(&mut self, id: ObjId) {
+        let gone = match self.objects.get_mut(&id) {
+            Some(Object::Port(p)) => {
+                p.refs -= 1;
+                p.refs == 0
+            }
+            Some(Object::Pset(s)) => {
+                s.refs -= 1;
+                s.refs == 0
+            }
+            None => panic!("releasing a freed object"),
+        };
+        if gone {
+            self.objects.remove(&id);
+        }
+    }
+
+    /// A new port whose receive right is the kernel's (a kernel object).
+    pub fn kobject_port(&mut self, k: Kobject) -> ObjId {
+        let id = self.new_id();
+        let mut p = Port::new(Receiver::Kernel);
+        p.kobject = Some(k);
+        p.qlimit = QLIMIT_KERNEL;
+        self.objects.insert(id, Object::Port(p));
+        id
+    }
+
+    /// `ipc_port_alloc`: a port with its receive right (and a send right,
+    /// with `make_send`) under a new name. `Err` is `KERN_NO_SPACE`.
+    pub fn port_alloc(&mut self, make_send: bool) -> Result<(u32, ObjId), u64> {
+        let id = self.new_id();
+        let name = self.space.alloc(Some(id)).ok_or(kr::NO_SPACE)?;
+        let mut p = Port::new(Receiver::Space(name));
+        let mut t = ty::RECEIVE;
+        if make_send {
+            p.srights = 1;
+            p.mscount = 1;
+            t |= ty::SEND;
+        }
+        self.objects.insert(id, Object::Port(p));
+        let e = self.space.lookup_mut_any(name);
+        e.bits |= t | u32::from(make_send);
+        Ok((name, id))
+    }
+
+    /// `ipc_pset_alloc`: a port set under a new name.
+    pub fn pset_alloc(&mut self) -> Result<(u32, ObjId), u64> {
+        let id = self.new_id();
+        let name = self.space.alloc(Some(id)).ok_or(kr::NO_SPACE)?;
+        self.objects.insert(id, Object::Pset(Pset { active: true, name, members: Vec::new(), refs: 1 }));
+        self.space.lookup_mut_any(name).bits |= ty::PORT_SET;
+        Ok((name, id))
+    }
+
+    /// `ipc_port_request_alloc`, growing the table as `ipc_right_request_alloc`
+    /// does. The slot's index.
+    fn port_request_alloc(&mut self, port: ObjId, name: u32, notify: ObjId, spreq: bool, sparm: bool) -> u32 {
+        let p = self.port_mut(port);
+        loop {
+            if let Some(table) = &mut p.requests {
+                let index = table[0].next;
+                if index != 0 {
+                    let next = table[index as usize].next;
+                    table[0].next = next;
+                    table[index as usize] = Request { name, notify: Some(notify), spreq, sparm, next: 0 };
+                    if spreq && sparm && !p.sprequests {
+                        p.sprequests = true;
+                    }
+                    return index;
+                }
+            }
+            // ipc_port_request_grow
+            let ocount = p.requests.as_ref().map_or(0, |t| t.len());
+            let ncount = request_table_grow(ocount);
+            let table = p.requests.get_or_insert_with(Vec::new);
+            let (start, mut free) = if ocount == 0 { (1, 0) } else { (ocount, table[0].next) };
+            table.resize(ncount, Request::default());
+            for i in start..ncount {
+                table[i].next = free;
+                free = i as u32;
+            }
+            table[0].next = free;
+        }
+    }
+
+    /// `ipc_port_request_cancel`: free slot `index`; the send-once right
+    /// it held.
+    fn port_request_cancel(&mut self, port: ObjId, index: u32) -> Option<ObjId> {
+        let p = self.port_mut(port);
+        let table = p.requests.as_mut().expect("a request table");
+        let request = table[index as usize].notify;
+        let head = table[0].next;
+        table[index as usize] = Request { next: head, ..Default::default() };
+        table[0].next = index;
+        request
+    }
+
+    /// `ipc_port_request_type`: the request bits slot `index` adds to a
+    /// name's type.
+    fn port_request_type(&self, port: ObjId, index: u32) -> u32 {
+        let r = self.port(port).requests.as_ref().expect("a request table")[index as usize];
+        let mut t = 0;
+        if r.notify.is_some() {
+            t |= ty::DNREQUEST;
+            if r.spreq {
+                t |= ty::SPREQUEST;
+                if !r.sparm {
+                    t |= ty::SPREQUEST_DELAYED;
+                }
+            }
+        }
+        t
+    }
+
+    /// `ipc_right_request_cancel_macro`: an entry's request cancelled.
+    pub(crate) fn right_request_cancel_pub(&mut self, port: ObjId, name: u32) -> Option<ObjId> {
+        let req = self.space.lookup(name).map_or(0, |e| e.request);
+        if req == 0 {
+            return None;
+        }
+        let r = self.port_request_cancel(port, req);
+        if let Some(e) = self.space.lookup_mut(name) {
+            e.request = 0;
+        }
+        r
+    }
+
+    /// `ipc_notify_no_senders_prepare`: the no-senders request, taken.
+    pub(crate) fn no_senders_prepare_pub(&mut self, port: ObjId) -> Option<Notify> {
+        let p = self.port_mut(port);
+        if p.nsrequest_kobject {
+            p.nsrequest_kobject = false;
+            return p.active.then_some(Notify::KobjectNoSenders { port, mscount: p.mscount });
+        }
+        let to = p.nsrequest.take()?;
+        Some(Notify::NoSenders { to, mscount: p.mscount })
+    }
+
+    /// `ipc_notify_no_senders_emit`.
+    fn no_senders_emit(&mut self, n: Option<Notify>) {
+        if let Some(n) = n {
+            self.outbox.push(n);
+        }
+    }
+
+    /// `ipc_notify_send_once_and_unlock`: a send-once right to `port`
+    /// destroyed unused.
+    fn send_once_notify(&mut self, port: ObjId) {
+        let p = self.port_mut(port);
+        p.sorights -= 1;
+        if p.active && p.receiver != Receiver::Kernel {
+            self.outbox.push(Notify::SendOnce { to: port });
+        }
+        self.release(port);
+    }
+
+    /// `mach_port_guard_exception`: recorded for the kernel to raise.
+    pub fn guard_exception(&mut self, name: u32, guard: Guard, portguard: u64) {
+        self.guards.push((name, guard, portguard));
+    }
+
+    /// `ipc_right_check`: whether `name`'s port has died, turning the
+    /// entry into a dead name (with an extra user reference for a pending
+    /// dead-name request) if so.
+    pub fn right_check(&mut self, name: u32, allow_dead_send_once: bool) -> bool {
+        let e = *self.space.lookup(name).expect("checked name in use");
+        let port = e.object.expect("a port right names a port");
+        let p = self.port(port);
+        if p.active || (allow_dead_send_once && e.request == 0 && e.bits & ty::SEND_ONCE != 0) {
+            return false;
+        }
+        let mut b = e.bits;
+        if b & ty::SEND != 0 {
+            self.port_mut(port).srights -= 1;
+            self.space.hash_delete(port);
+        } else {
+            self.port_mut(port).sorights -= 1;
+        }
+        b = (b & !bits::TYPE_MASK) | ty::DEAD_NAME;
+        if e.request != 0 {
+            if self.port_request_type(port, e.request) != 0 && b & bits::UREFS_MASK < UREFS_MAX {
+                b += 1;
+            }
+        }
+        let entry = self.space.lookup_mut(name).expect("checked name in use");
+        entry.request = 0;
+        entry.bits = b;
+        entry.object = None;
+        self.release(port);
+        true
+    }
+
+    /// `ipc_port_destroy`: a port's receive right destroyed. Its messages
+    /// go; its receive right goes to its port-destroyed request if any,
+    /// else it dies: dead-name requests fire and a pending no-senders
+    /// request is answered with a send-once notification.
+    pub fn port_destroy(&mut self, port: ObjId) {
+        let p = self.port_mut(port);
+        p.reply_context = 0;
+        let pdrequest = if !p.specialreply { p.pdrequest.take() } else { None };
+        if pdrequest.is_some() {
+            p.tempowner = true;
+        }
+        let should_destroy = pdrequest.is_none();
+        self.clear_receiver_pub(port, should_destroy);
+        if let Some(to) = pdrequest {
+            self.outbox.push(Notify::PortDestroyed { to, port });
+            return;
+        }
+        if let Some(n) = self.no_senders_prepare_pub(port) {
+            match n {
+                Notify::NoSenders { to, .. } => self.send_once_notify(to),
+                Notify::KobjectNoSenders { .. } => self.release(port),
+                _ => unreachable!(),
+            }
+        }
+        // ipc_port_dnnotify
+        if let Some(table) = self.port(port).requests.clone() {
+            for r in table.iter().skip(1) {
+                if name_valid(r.name) {
+                    if let Some(to) = r.notify {
+                        self.outbox.push(Notify::DeadName { to, name: r.name });
+                    }
+                }
+            }
+        }
+        self.release(port);
+    }
+
+    /// `ipc_port_clear_receiver`: out of its sets and its receiver's
+    /// space; with `destroy`, dead and its messages gone.
+    pub(crate) fn clear_receiver_pub(&mut self, port: ObjId, destroy: bool) {
+        let psets = std::mem::take(&mut self.port_mut(port).psets);
+        for s in psets {
+            if let Some(Object::Pset(set)) = self.objects.get_mut(&s) {
+                set.members.retain(|&m| m != port);
+            }
+        }
+        self.timestamp = self.timestamp.wrapping_add(1);
+        let ts = self.timestamp;
+        let p = self.port_mut(port);
+        p.mscount = 0;
+        p.seqno = 0;
+        p.context = 0;
+        p.guarded = false;
+        p.strict_guard = false;
+        if destroy {
+            p.active = false;
+            p.receiver = Receiver::None;
+            p.timestamp = ts;
+            p.messages.clear();
+        } else {
+            p.immovable_receive = false;
+            p.receiver = Receiver::Transit;
+        }
+    }
+
+    /// `ipc_pset_destroy`.
+    pub fn pset_destroy(&mut self, pset: ObjId) {
+        let members = std::mem::take(&mut self.pset_mut(pset).members);
+        for m in members {
+            if let Some(Object::Port(p)) = self.objects.get_mut(&m) {
+                p.psets.retain(|&s| s != pset);
+            }
+        }
+        self.pset_mut(pset).active = false;
+        self.release(pset);
+    }
+
+    /// `ipc_right_destroy`: every right `name` holds, gone. With
+    /// `check_guard`, a guarded receive right needs `guard`.
+    pub fn right_destroy(&mut self, name: u32, check_guard: bool, guard: u64) -> u64 {
+        let e = *self.space.lookup(name).expect("destroyed name in use");
+        let t = e.ty();
+        match t {
+            ty::DEAD_NAME => self.space.dealloc(name),
+            ty::PORT_SET => {
+                let pset = e.object.expect("a set");
+                self.space.dealloc(name);
+                self.pset_destroy(pset);
+            }
+            ty::SEND | ty::RECEIVE | ty::SEND_RECEIVE | ty::SEND_ONCE => {
+                let port = e.object.expect("a port");
+                if t == ty::SEND {
+                    if self.port(port).pinned {
+                        self.guard_exception(name, Guard::ModRefs, 0);
+                        return kr::INVALID_CAPABILITY;
+                    }
+                    self.space.hash_delete(port);
+                }
+                if !self.port(port).active {
+                    self.space.dealloc(name);
+                    self.release(port);
+                    return kr::SUCCESS;
+                }
+                let p = self.port(port);
+                if t & ty::RECEIVE != 0 && check_guard && p.guarded && guard != p.context {
+                    let portguard = p.context;
+                    self.guard_exception(name, Guard::Destroy, portguard);
+                    return kr::INVALID_RIGHT;
+                }
+                let request = self.right_request_cancel_pub(port, name);
+                self.space.dealloc(name);
+                let mut ns = None;
+                if t & ty::SEND != 0 {
+                    let p = self.port_mut(port);
+                    p.srights -= 1;
+                    if p.srights == 0 {
+                        ns = self.no_senders_prepare_pub(port);
+                    }
+                }
+                if t & ty::RECEIVE != 0 {
+                    self.port_destroy(port);
+                } else if t & ty::SEND_ONCE != 0 {
+                    self.port_mut(port).reply_context = 0;
+                    self.send_once_notify(port);
+                } else {
+                    self.release(port);
+                }
+                self.no_senders_emit(ns);
+                if let Some(to) = request {
+                    self.outbox.push(Notify::PortDeleted { to, name });
+                }
+            }
+            _ => panic!("ipc_right_destroy: strange type {t:#x}"),
+        }
+        kr::SUCCESS
+    }
+
+    /// `ipc_right_dealloc`: one user reference of `name`'s right gone.
+    pub fn right_dealloc(&mut self, name: u32) -> u64 {
+        let e = *self.space.lookup(name).expect("deallocated name in use");
+        let mut t = e.ty();
+        if matches!(t, ty::SEND | ty::SEND_ONCE) && self.right_check(name, false) {
+            t = ty::DEAD_NAME;
+        }
+        let e = *self.space.lookup(name).expect("deallocated name in use");
+        match t {
+            ty::PORT_SET => {
+                let pset = e.object.expect("a set");
+                self.space.dealloc(name);
+                self.pset_destroy(pset);
+            }
+            ty::DEAD_NAME => {
+                if e.urefs() == 1 {
+                    self.space.dealloc(name);
+                } else if e.urefs() < UREFS_MAX {
+                    self.space.lookup_mut(name).expect("in use").bits -= 1;
+                }
+            }
+            ty::SEND_ONCE => {
+                let port = e.object.expect("a port");
+                self.port_mut(port).reply_context = 0;
+                let request = self.right_request_cancel_pub(port, name);
+                self.space.dealloc(name);
+                self.send_once_notify(port);
+                if let Some(to) = request {
+                    self.outbox.push(Notify::PortDeleted { to, name });
+                }
+            }
+            ty::SEND => {
+                let port = e.object.expect("a port");
+                let mut ns = None;
+                let mut request = None;
+                if e.urefs() == 1 {
+                    if self.port(port).pinned {
+                        self.guard_exception(name, Guard::ModRefs, 0);
+                        return kr::INVALID_CAPABILITY;
+                    }
+                    let p = self.port_mut(port);
+                    p.srights -= 1;
+                    if p.srights == 0 {
+                        ns = self.no_senders_prepare_pub(port);
+                    }
+                    request = self.right_request_cancel_pub(port, name);
+                    self.space.hash_delete(port);
+                    self.space.dealloc(name);
+                    self.release(port);
+                } else if e.urefs() < UREFS_MAX {
+                    self.space.lookup_mut(name).expect("in use").bits -= 1;
+                }
+                self.no_senders_emit(ns);
+                if let Some(to) = request {
+                    self.outbox.push(Notify::PortDeleted { to, name });
+                }
+            }
+            ty::SEND_RECEIVE => {
+                let port = e.object.expect("a port");
+                let mut ns = None;
+                let entry = self.space.lookup_mut(name).expect("in use");
+                if e.urefs() == 1 {
+                    entry.bits = e.bits & !(bits::UREFS_MASK | ty::SEND);
+                    let p = self.port_mut(port);
+                    p.srights -= 1;
+                    if p.srights == 0 {
+                        ns = self.no_senders_prepare_pub(port);
+                    }
+                } else if e.urefs() < UREFS_MAX {
+                    entry.bits = e.bits - 1;
+                }
+                self.no_senders_emit(ns);
+            }
+            _ => {
+                self.guard_exception(name, Guard::InvalidRight, 0);
+                return kr::INVALID_RIGHT;
+            }
+        }
+        kr::SUCCESS
+    }
+
+    /// `ipc_right_delta`: change `name`'s user references for `right` by
+    /// `delta` (`mach_port_mod_refs`).
+    pub fn right_delta(&mut self, name: u32, right: u32, mut delta: i32) -> u64 {
+        let e = *self.space.lookup(name).expect("modified name in use");
+        let b = e.bits;
+        let invalid_value = |ipc: &mut Ipc| {
+            ipc.guard_exception(name, Guard::InvalidValue, 0);
+            kr::INVALID_VALUE
+        };
+        match right {
+            port_right::PORT_SET => {
+                if b & ty::PORT_SET == 0 {
+                    self.guard_exception(name, Guard::InvalidRight, 0);
+                    return kr::INVALID_RIGHT;
+                }
+                if delta == 0 {
+                    return kr::SUCCESS;
+                }
+                if delta != -1 {
+                    return invalid_value(self);
+                }
+                let pset = e.object.expect("a set");
+                self.space.dealloc(name);
+                self.pset_destroy(pset);
+            }
+            port_right::RECEIVE => {
+                if b & ty::RECEIVE == 0 {
+                    if b & ty::EX_RECEIVE == 0 {
+                        self.guard_exception(name, Guard::InvalidRight, 0);
+                    }
+                    return kr::INVALID_RIGHT;
+                }
+                if delta == 0 {
+                    return kr::SUCCESS;
+                }
+                if delta != -1 {
+                    return invalid_value(self);
+                }
+                let port = e.object.expect("a port");
+                if self.port(port).guarded {
+                    let g = self.port(port).context;
+                    self.guard_exception(name, Guard::ModRefs, g);
+                    return kr::INVALID_RIGHT;
+                }
+                self.receive_right_goes(name, port);
+            }
+            port_right::SEND_ONCE => {
+                if b & ty::SEND_ONCE == 0 {
+                    return kr::INVALID_RIGHT;
+                }
+                let port = e.object.expect("a port");
+                if self.right_check(name, false) {
+                    self.guard_exception(name, Guard::InvalidRight, 0);
+                    return kr::INVALID_RIGHT;
+                }
+                if !(-1..=0).contains(&delta) {
+                    return invalid_value(self);
+                }
+                if delta == 0 {
+                    return kr::SUCCESS;
+                }
+                self.port_mut(port).reply_context = 0;
+                let request = self.right_request_cancel_pub(port, name);
+                self.space.dealloc(name);
+                self.send_once_notify(port);
+                if let Some(to) = request {
+                    self.outbox.push(Notify::PortDeleted { to, name });
+                }
+            }
+            port_right::DEAD_NAME => {
+                let mut b = b;
+                if b & ty::SEND_RIGHTS != 0 {
+                    if !self.right_check(name, false) {
+                        self.guard_exception(name, Guard::InvalidRight, 0);
+                        return kr::INVALID_RIGHT;
+                    }
+                    b = self.space.lookup(name).expect("in use").bits;
+                } else if b & ty::DEAD_NAME == 0 {
+                    self.guard_exception(name, Guard::InvalidRight, 0);
+                    return kr::INVALID_RIGHT;
+                }
+                if delta > UREFS_MAX as i32 || delta < -(UREFS_MAX as i32) {
+                    return invalid_value(self);
+                }
+                let urefs = b & bits::UREFS_MASK;
+                if urefs == UREFS_MAX {
+                    if delta != -(UREFS_MAX as i32) {
+                        delta = 0;
+                    }
+                } else {
+                    if (urefs as i32) + delta < 0 {
+                        return invalid_value(self);
+                    }
+                    if (urefs as i32) + delta > UREFS_MAX as i32 {
+                        delta = (UREFS_MAX - urefs) as i32;
+                    }
+                }
+                if urefs as i32 + delta == 0 {
+                    self.space.dealloc(name);
+                } else if delta != 0 {
+                    self.space.lookup_mut(name).expect("in use").bits = (b as i32 + delta) as u32;
+                }
+            }
+            port_right::SEND => {
+                if b & ty::SEND == 0 {
+                    // A make-send on a receive right with delta 1 is let
+                    // through without a guard (AE_MAKESENDRIGHT_FIXED unset).
+                    if b & ty::DEAD_NAME == 0 && (b & ty::RECEIVE == 0 || delta != 1) {
+                        self.guard_exception(name, Guard::InvalidRight, 0);
+                    }
+                    return kr::INVALID_RIGHT;
+                }
+                let port = e.object.expect("a port");
+                if self.right_check(name, false) {
+                    return kr::INVALID_RIGHT;
+                }
+                if delta > UREFS_MAX as i32 || delta < -(UREFS_MAX as i32) {
+                    return invalid_value(self);
+                }
+                let urefs = b & bits::UREFS_MASK;
+                if urefs == UREFS_MAX {
+                    if delta != -(UREFS_MAX as i32) {
+                        delta = 0;
+                    }
+                } else {
+                    if (urefs as i32) + delta < 0 {
+                        return invalid_value(self);
+                    }
+                    if (urefs as i32) + delta > UREFS_MAX as i32 {
+                        delta = (UREFS_MAX - urefs) as i32;
+                    }
+                }
+                if urefs as i32 + delta == 0 {
+                    if self.port(port).pinned {
+                        self.guard_exception(name, Guard::ModRefs, 0);
+                        return kr::INVALID_CAPABILITY;
+                    }
+                    let p = self.port_mut(port);
+                    p.srights -= 1;
+                    let ns = if p.srights == 0 { self.no_senders_prepare_pub(port) } else { None };
+                    let mut request = None;
+                    if b & ty::RECEIVE != 0 {
+                        self.space.lookup_mut(name).expect("in use").bits = b & !(bits::UREFS_MASK | ty::SEND);
+                    } else {
+                        request = self.right_request_cancel_pub(port, name);
+                        self.space.hash_delete(port);
+                        self.space.dealloc(name);
+                        self.release(port);
+                    }
+                    self.no_senders_emit(ns);
+                    if let Some(to) = request {
+                        self.outbox.push(Notify::PortDeleted { to, name });
+                    }
+                } else if delta != 0 {
+                    self.space.lookup_mut(name).expect("in use").bits = (b as i32 + delta) as u32;
+                }
+            }
+            port_right::LABELH => return kr::INVALID_RIGHT,
+            _ => panic!("ipc_right_delta: strange right {right}"),
+        }
+        kr::SUCCESS
+    }
+
+    /// A receive right's name gives it up (`ipc_right_delta` RECEIVE and
+    /// `ipc_right_destruct`): a remaining send right stays, as a send right
+    /// to a port with a port-destroyed request or else as a dead name; the
+    /// port is destroyed.
+    fn receive_right_goes(&mut self, name: u32, port: ObjId) {
+        let e = *self.space.lookup(name).expect("in use");
+        let mut b = e.bits;
+        let mut request = None;
+        if b & ty::SEND != 0 {
+            if self.port(port).pdrequest.is_some() {
+                b &= !ty::RECEIVE;
+                b |= ty::EX_RECEIVE;
+                self.space.hash_insert(port, name);
+                self.space.lookup_mut(name).expect("in use").bits = b;
+            } else {
+                b &= !bits::TYPE_MASK;
+                b |= ty::DEAD_NAME | ty::EX_RECEIVE;
+                let entry = self.space.lookup_mut(name).expect("in use");
+                if entry.request != 0 {
+                    entry.request = 0;
+                    if b & bits::UREFS_MASK < UREFS_MAX {
+                        b += 1;
+                    }
+                }
+                entry.object = None;
+                entry.bits = b;
+            }
+        } else {
+            request = self.right_request_cancel_pub(port, name);
+            self.space.dealloc(name);
+        }
+        self.port_destroy(port);
+        if let Some(to) = request {
+            self.outbox.push(Notify::PortDeleted { to, name });
+        }
+    }
+
+    /// `ipc_right_destruct`: the receive right (and `srdelta` send
+    /// references) given up, with the guard checked.
+    pub fn right_destruct(&mut self, name: u32, mut srdelta: i32, guard: u64) -> u64 {
+        let e = *self.space.lookup(name).expect("destructed name in use");
+        let b = e.bits;
+        if b & ty::RECEIVE == 0 {
+            if b & ty::EX_RECEIVE == 0 {
+                self.guard_exception(name, Guard::InvalidRight, 0);
+            }
+            return kr::INVALID_RIGHT;
+        }
+        if srdelta != 0 && b & ty::SEND == 0 {
+            self.guard_exception(name, Guard::InvalidRight, 0);
+            return kr::INVALID_RIGHT;
+        }
+        if srdelta > 0 {
+            self.guard_exception(name, Guard::InvalidValue, 0);
+            return kr::INVALID_VALUE;
+        }
+        let port = e.object.expect("a port");
+        let p = self.port(port);
+        if p.guarded && guard != p.context {
+            let g = p.context;
+            self.guard_exception(name, Guard::Destroy, g);
+            return kr::INVALID_ARGUMENT;
+        }
+        let mut ns = None;
+        if srdelta != 0 {
+            let urefs = b & bits::UREFS_MASK;
+            if (urefs as i32) + srdelta < 0 {
+                self.guard_exception(name, Guard::InvalidValue, 0);
+                return kr::INVALID_VALUE;
+            }
+            if urefs == UREFS_MAX && srdelta != -(UREFS_MAX as i32) {
+                srdelta = 0;
+            }
+            let entry = self.space.lookup_mut(name).expect("in use");
+            if urefs as i32 + srdelta == 0 {
+                entry.bits = b & !(bits::UREFS_MASK | ty::SEND);
+                let p = self.port_mut(port);
+                p.srights -= 1;
+                if p.srights == 0 {
+                    ns = self.no_senders_prepare_pub(port);
+                }
+            } else {
+                entry.bits = (b as i32 + srdelta) as u32;
+            }
+        }
+        self.no_senders_emit(ns);
+        self.receive_right_goes(name, port);
+        kr::SUCCESS
+    }
+
+    /// `ipc_right_info`: `name`'s type (with request bits) and user
+    /// references.
+    pub fn right_info(&mut self, name: u32) -> (u32, u32) {
+        let e = *self.space.lookup(name).expect("in use");
+        let mut t = 0;
+        let mut b = e.bits;
+        if b & ty::RECEIVE != 0 {
+            if e.request != 0 {
+                t |= self.port_request_type(e.object.expect("a port"), e.request);
+            }
+        } else if b & ty::SEND_RIGHTS != 0 {
+            let port = e.object.expect("a port");
+            if !self.right_check(name, false) {
+                if e.request != 0 {
+                    t |= self.port_request_type(port, e.request);
+                }
+            } else {
+                b = self.space.lookup(name).expect("in use").bits;
+            }
+        }
+        t |= b & bits::TYPE_MASK;
+        (t, b & bits::UREFS_MASK)
+    }
+
+    /// `ipc_right_request_alloc`: arm (or with no `notify`, cancel)
+    /// `name`'s dead-name request, or a send-possible one. The previous
+    /// request's send-once right, for the caller to return.
+    pub fn right_request_alloc(&mut self, name: u32, spreq: bool, sparm: bool, notify: Option<ObjId>) -> Result<Option<ObjId>, u64> {
+        let e = *self.space.lookup(name).ok_or(kr::INVALID_NAME)?;
+        let prev = e.request;
+        if notify.is_none() && prev == 0 {
+            return Ok(None);
+        }
+        if e.bits & ty::PORT_RIGHTS != 0 {
+            let port = e.object.expect("a port");
+            if !self.right_check(name, false) {
+                let mut previous = None;
+                let Some(n) = notify else {
+                    if prev != 0 {
+                        previous = self.port_request_cancel(port, prev);
+                        self.space.lookup_mut(name).expect("in use").request = 0;
+                    }
+                    return Ok(previous);
+                };
+                let p = self.port(port);
+                let full = p.messages.len() as u32 >= p.qlimit;
+                if spreq && sparm && (e.bits & ty::SEND_ONCE != 0 || p.receiver == Receiver::Kernel || !full) {
+                    if prev != 0 {
+                        previous = self.port_request_cancel(port, prev);
+                        self.space.lookup_mut(name).expect("in use").request = 0;
+                    }
+                    self.outbox.push(Notify::SendPossible { to: n, name });
+                    return Ok(previous);
+                }
+                if prev != 0 {
+                    previous = self.port_request_cancel(port, prev);
+                }
+                let index = self.port_request_alloc(port, name, n, spreq, sparm);
+                self.space.lookup_mut(name).expect("in use").request = index;
+                return Ok(previous);
+            }
+        }
+        let e = *self.space.lookup(name).expect("in use");
+        if (spreq || sparm || notify.is_some()) && notify.is_some() && e.bits & ty::DEAD_NAME != 0 {
+            if e.urefs() < UREFS_MAX {
+                self.space.lookup_mut(name).expect("in use").bits += 1;
+            }
+            self.outbox.push(Notify::DeadName { to: notify.expect("checked"), name });
+            return Ok(None);
+        }
+        Err(if e.bits & ty::PORT_OR_DEAD != 0 { kr::INVALID_ARGUMENT } else { kr::INVALID_RIGHT })
+    }
+}
+
+impl Space {
+    /// An entry just claimed by [`Space::alloc`], before its type is set.
+    pub(crate) fn lookup_mut_any(&mut self, name: u32) -> &mut space::Entry {
+        self.entry_at(space::index(name))
+    }
+}
