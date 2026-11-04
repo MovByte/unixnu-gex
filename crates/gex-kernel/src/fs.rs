@@ -154,6 +154,30 @@ impl Stat {
         self.encode_for(false).to_vec()
     }
 
+    /// Darwin's `struct stat` (the 64-bit-inode one, 144 bytes): a 32-bit
+    /// device, 16-bit mode and link count, then a birth time after the
+    /// three Linux has (reported as the modification time), the size,
+    /// blocks, a 32-bit block size and zeroed flags and generation.
+    pub fn encode_darwin(&self) -> StatBytes {
+        let mut b = StatBytes::zeroed(144);
+        b[0..4].copy_from_slice(&(self.dev as u32).to_le_bytes());
+        b[4..6].copy_from_slice(&(self.mode as u16).to_le_bytes());
+        b[6..8].copy_from_slice(&(self.nlink.min(u16::MAX as u32) as u16).to_le_bytes());
+        b[8..16].copy_from_slice(&self.ino.to_le_bytes());
+        b[16..20].copy_from_slice(&self.uid.to_le_bytes());
+        b[20..24].copy_from_slice(&self.gid.to_le_bytes());
+        b[24..28].copy_from_slice(&(self.rdev as u32).to_le_bytes());
+        let [at, mt, ct] = self.times();
+        for (off, (t, ns)) in [32usize, 48, 64, 80].into_iter().zip([at, mt, ct, mt]) {
+            b[off..off + 8].copy_from_slice(&t.to_le_bytes());
+            b[off + 8..off + 16].copy_from_slice(&(ns as i64).to_le_bytes());
+        }
+        b[96..104].copy_from_slice(&self.size.to_le_bytes());
+        b[104..112].copy_from_slice(&self.blocks.to_le_bytes());
+        b[112..116].copy_from_slice(&self.blksize.to_le_bytes());
+        b
+    }
+
     /// As [`Stat::encode`], or the i386 `struct stat64` (96 bytes, packed to
     /// 4-byte alignment) for a 32-bit process.
     pub fn encode_for(&self, compat: bool) -> StatBytes {

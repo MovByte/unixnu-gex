@@ -1,30 +1,410 @@
-//! Darwin calls that have no Linux counterpart to renumber onto and need
-//! the process's kernel state.
+//! Darwin calls that have no Linux counterpart to renumber onto, or whose
+//! results or structures need the kernel's state to translate.
 
-use super::bsd::sys;
+use super::bsd::{open_flags, open_flags_back, sys};
 use crate::errno::Errno;
-use crate::syscalls::Kernel;
+use crate::syscalls::{nr, Kernel};
 use crate::GuestMem;
 
+fn neg(e: Errno) -> u64 {
+    (-(e.0 as i64)) as u64
+}
+
+fn res(r: Result<u64, Errno>) -> u64 {
+    r.unwrap_or_else(neg)
+}
+
+/// Darwin signal `d` as Linux's number, or 0 where Linux has none (SIGEMT,
+/// SIGINFO).
+pub fn signal_to_linux(d: u32) -> u32 {
+    match d {
+        7 | 29 => 0,
+        10 => 7,
+        12 => 31,
+        16 => 23,
+        17 => 19,
+        18 => 20,
+        19 => 18,
+        20 => 17,
+        23 => 29,
+        30 => 10,
+        31 => 12,
+        s => s,
+    }
+}
+
+/// A Darwin signal mask (`sigset_t`, 32 bits) as a Linux one, and back.
+pub fn mask_to_linux(m: u32) -> u64 {
+    (1..=31u32).filter(|s| m & (1 << (s - 1)) != 0).map(signal_to_linux).filter(|&l| l != 0).fold(0, |acc, l| acc | 1u64 << (l - 1))
+}
+
+pub fn mask_from_linux(m: u64) -> u32 {
+    (1..=31u32).filter(|&d| {
+        let l = signal_to_linux(d);
+        l != 0 && m & (1 << (l - 1)) != 0
+    })
+    .fold(0, |acc, d| acc | 1 << (d - 1))
+}
+
+/// `fcntl` commands Darwin and Linux number differently, and Darwin's own.
+mod f {
+    pub const GETFL: u64 = 3;
+    pub const SETFL: u64 = 4;
+    pub const GETOWN: u64 = 5;
+    pub const SETOWN: u64 = 6;
+    pub const GETLK: u64 = 7;
+    pub const SETLK: u64 = 8;
+    pub const SETLKW: u64 = 9;
+    pub const PREALLOCATE: u64 = 42;
+    pub const RDADVISE: u64 = 44;
+    pub const NOCACHE: u64 = 48;
+    pub const GETPATH: u64 = 50;
+    pub const FULLFSYNC: u64 = 51;
+    pub const ADDSIGS: u64 = 59;
+    pub const ADDFILESIGS: u64 = 61;
+    pub const GETPROTECTIONCLASS: u64 = 63;
+    pub const SETPROTECTIONCLASS: u64 = 64;
+    pub const DUPFD_CLOEXEC: u64 = 67;
+    pub const SETNOSIGPIPE: u64 = 73;
+    pub const GETNOSIGPIPE: u64 = 74;
+    pub const BARRIERFSYNC: u64 = 85;
+    pub const ADDFILESIGS_RETURN: u64 = 97;
+    pub const CHECK_LV: u64 = 98;
+    pub const SPECULATIVE_READ: u64 = 101;
+}
+
+/// `MAXPATHLEN`.
+const MAXPATHLEN: usize = 1024;
+
+/// AMFI's `__mac_syscall` for dyld's policy: every relaxation allowed
+/// (paths, path variables, fallback paths, printing, interposing).
+const AMFI_DYLD_POLICY_SELF: u64 = 90;
+const AMFI_DYLD_OUTPUT_ALL: u64 = 0xff;
+
+/// A mount, as `getfsstat64` reports it.
+pub struct Mount {
+    pub on: &'static str,
+    pub from: &'static str,
+    pub fsid: u64,
+    pub flags: u32,
+}
+
+/// `MNT_RDONLY`, `MNT_ROOTFS`, `MNT_DONTBROWSE`.
+const MNT_RDONLY: u32 = 0x1;
+const MNT_ROOTFS: u32 = 0x4000;
+const MNT_DONTBROWSE: u32 = 0x10_0000;
+
+/// What an iOS 17 system has mounted: the system volume and the SystemOS
+/// cryptex the shared cache is in, by the filesystem id its dynamic data
+/// names.
+pub const MOUNTS: &[Mount] = &[
+    Mount { on: "/", from: "/dev/disk0s1s1", fsid: 0x0100_0002, flags: MNT_RDONLY | MNT_ROOTFS },
+    Mount { on: "/System/Cryptexes/OS", from: "/dev/disk3s1", fsid: super::CACHE_FS_ID, flags: MNT_RDONLY | MNT_DONTBROWSE },
+];
+
+/// `sizeof(struct statfs64)`.
+pub const STATFS64_SIZE: usize = 2168;
+
+/// One `struct statfs64` for `mnt`, as an APFS volume.
+pub fn statfs64(mnt: &Mount) -> Vec<u8> {
+    let mut b = vec![0u8; STATFS64_SIZE];
+    let mut put = |o: usize, v: &[u8]| b[o..o + v.len()].copy_from_slice(v);
+    put(0, &4096u32.to_le_bytes());
+    put(4, &(1u32 << 20).to_le_bytes());
+    put(8, &(8u64 << 20).to_le_bytes());
+    put(16, &(4u64 << 20).to_le_bytes());
+    put(24, &(4u64 << 20).to_le_bytes());
+    put(32, &(1u64 << 24).to_le_bytes());
+    put(40, &(1u64 << 23).to_le_bytes());
+    put(48, &(mnt.fsid as u32).to_le_bytes());
+    put(52, &((mnt.fsid >> 32) as u32).to_le_bytes());
+    put(60, &0x1au32.to_le_bytes());
+    put(64, &mnt.flags.to_le_bytes());
+    put(72, b"apfs");
+    put(88, mnt.on.as_bytes());
+    put(1112, mnt.from.as_bytes());
+    b
+}
+
 impl Kernel {
-    /// Answer a Darwin-only BSD call, or `None` to leave it to the
-    /// renumbering in [`super::bsd::translate`]. The result is in the
-    /// canonical encoding (`-errno` on failure).
+    /// Answer a Darwin call that the renumbering in
+    /// [`super::bsd::translate`] cannot, or `None` to leave it to that.
+    /// The result is in the canonical encoding (`-errno` on failure).
     pub(crate) fn darwin_call(&mut self, m: &mut GuestMem<'_>, raw: u64, a: &[u64; 6]) -> Option<u64> {
-        let neg = |e: Errno| (-(e.0 as i64)) as u64;
         Some(match raw {
             // dyld asks where the shared cache is mapped; the kernel mapped
             // it before the process started.
             sys::SHARED_REGION_CHECK_NP => match self.darwin_region {
                 (0, _) => neg(Errno::EINVAL),
-                (start, _) => match m.write_u64(a[0], start) {
-                    Ok(()) => 0,
-                    Err(e) => neg(e),
-                },
+                (start, _) => res(m.write_u64(a[0], start).map(|_| 0)),
             },
             // No set-id programs here.
             sys::ISSETUGID => 0,
+            sys::GETENTROPY => res(self.canonical(m, nr::GETRANDOM, [a[0], a[1], 0, 0, 0, 0]).map(|_| 0)),
+            sys::FCNTL | sys::FCNTL_NOCANCEL => self.darwin_fcntl(m, a),
+            sys::FSGETPATH => res(self.darwin_fsgetpath(m, a)),
+            sys::GETFSSTAT64 => res(self.darwin_getfsstat(m, a[0], a[1])),
+            sys::STATFS64 => res(self.darwin_statfs(m, Some(a[0]), a[1])),
+            sys::FSTATFS64 => res(self.darwin_statfs(m, None, a[1])),
+            sys::SYSCTL => res(self.darwin_sysctl(m, a)),
+            sys::SYSCTLBYNAME => res(self.darwin_sysctlbyname(m, a)),
+            // dup3 refuses to copy a descriptor onto itself; dup2 checks it
+            // is open and returns it.
+            sys::DUP2 if a[0] == a[1] => match self.canonical(m, nr::FCNTL, [a[0], 1, 0, 0, 0, 0]) {
+                Ok(_) => a[1],
+                Err(e) => neg(e),
+            },
+            sys::DUP2 => res(self.canonical(m, nr::DUP3, [a[0], a[1], 0, 0, 0, 0])),
+            sys::SIGPROCMASK | sys::PTHREAD_SIGMASK => res(self.darwin_sigprocmask(m, a[0], a[1], a[2])),
+            sys::CSOPS | sys::CSOPS_AUDITTOKEN => res(self.darwin_csops(m, a[1], a[2], a[3])),
+            sys::MAC_SYSCALL => res(self.darwin_mac_syscall(m, a[0], a[1], a[2])),
+            // The reason a process aborts: said, then the process ends
+            // through the renumbering (exit status 134).
+            sys::ABORT_WITH_PAYLOAD | sys::TERMINATE_WITH_PAYLOAD => {
+                let (code, text) = if raw == sys::ABORT_WITH_PAYLOAD { (a[1], a[4]) } else { (a[2], a[5]) };
+                let mut buf = [0u8; 1024];
+                let reason = match m.read_cstr_into(text, &mut buf) {
+                    Ok(Some(n)) => String::from_utf8_lossy(&buf[..n]).into_owned(),
+                    _ => String::from("(no reason)"),
+                };
+                eprintln!("[gex:{}] darwin abort (code {code:#x}): {reason}", self.pid);
+                return None;
+            }
             _ => return None,
         })
+    }
+
+    fn darwin_fcntl(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> u64 {
+        let fd = a[0];
+        let canon = |k: &mut Kernel, m: &mut GuestMem<'_>, cmd: u64, arg: u64| res(k.canonical(m, nr::FCNTL, [fd, cmd, arg, 0, 0, 0]));
+        match a[1] {
+            // F_DUPFD, F_GETFD, F_SETFD: the same on both sides.
+            c @ 0..=2 => canon(self, m, c, a[2]),
+            f::GETFL => match self.canonical(m, nr::FCNTL, [fd, 3, 0, 0, 0, 0]) {
+                Ok(l) => open_flags_back(l),
+                Err(e) => neg(e),
+            },
+            f::SETFL => canon(self, m, 4, open_flags(a[2])),
+            f::GETOWN => canon(self, m, 9, 0),
+            f::SETOWN => canon(self, m, 8, a[2]),
+            f::DUPFD_CLOEXEC => canon(self, m, 1030, a[2]),
+            // Record locks: one process's view of its files; granted.
+            f::GETLK | f::SETLK | f::SETLKW => 0,
+            f::GETPATH => {
+                let path = self.fds.list().into_iter().find(|&(n, _)| n as u64 == fd).map(|(_, p)| p);
+                match path {
+                    Some(p) if p.len() < MAXPATHLEN => {
+                        let mut b = p.into_bytes();
+                        b.push(0);
+                        res(m.write(a[2], &b).map(|_| 0))
+                    }
+                    Some(_) => neg(Errno::ENAMETOOLONG),
+                    None => neg(Errno::EBADF),
+                }
+            }
+            // A signature covering the whole file: fs_file_start, the end
+            // of what the signature covers, is the largest offset.
+            f::ADDFILESIGS_RETURN => res(m.write_u64(a[2], i64::MAX as u64).map(|_| 0)),
+            f::ADDSIGS | f::ADDFILESIGS | f::CHECK_LV => 0,
+            f::NOCACHE | f::RDADVISE | f::FULLFSYNC | f::BARRIERFSYNC | f::PREALLOCATE | f::SPECULATIVE_READ => 0,
+            f::SETNOSIGPIPE | f::SETPROTECTIONCLASS => 0,
+            f::GETNOSIGPIPE | f::GETPROTECTIONCLASS => 0,
+            _ => neg(Errno::EINVAL),
+        }
+    }
+
+    /// `fsgetpath(buf, size, fsid, objid)`: the path of a file named by its
+    /// filesystem and object ids. Only the shared cache is named so.
+    fn darwin_fsgetpath(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
+        let fs = u64::from(m.read_u32(a[2])?) | u64::from(m.read_u32(a[2] + 4)?) << 32;
+        if (fs, a[3]) != (super::CACHE_FS_ID, super::CACHE_OBJ_ID) || self.darwin_region.0 == 0 {
+            return Err(Errno::ENOENT);
+        }
+        let mut b = super::CACHE_PATH.as_bytes().to_vec();
+        b.push(0);
+        if (a[1] as usize) < b.len() {
+            return Err(Errno::ENOSPC);
+        }
+        m.write(a[0], &b)?;
+        Ok(b.len() as u64)
+    }
+
+    /// `getfsstat64(buf, bufsize, flags)`: the mounts, or how many there
+    /// are when `buf` is null.
+    fn darwin_getfsstat(&mut self, m: &mut GuestMem<'_>, buf: u64, size: u64) -> Result<u64, Errno> {
+        let mounts = MOUNTS;
+        if buf == 0 {
+            return Ok(mounts.len() as u64);
+        }
+        let n = (size as usize / STATFS64_SIZE).min(mounts.len());
+        for (i, mnt) in mounts.iter().take(n).enumerate() {
+            m.write(buf + (i * STATFS64_SIZE) as u64, &statfs64(mnt))?;
+        }
+        Ok(n as u64)
+    }
+
+    /// `statfs64(path, buf)` or `fstatfs64(fd, buf)`: the mount with the
+    /// longest prefix of the file's path.
+    fn darwin_statfs(&mut self, m: &mut GuestMem<'_>, path: Option<u64>, buf: u64) -> Result<u64, Errno> {
+        let _ = path;
+        let p = match path {
+            Some(at) => {
+                let mut b = [0u8; MAXPATHLEN];
+                let n = m.read_cstr_into(at, &mut b)?.ok_or(Errno::ENAMETOOLONG)?;
+                String::from_utf8_lossy(&b[..n]).into_owned()
+            }
+            None => String::from("/"),
+        };
+        let mnt = MOUNTS
+            .iter()
+            .filter(|mt| p == mt.on || p.starts_with(&format!("{}/", mt.on.trim_end_matches('/'))))
+            .max_by_key(|mt| mt.on.len())
+            .unwrap_or(&MOUNTS[0]);
+        m.write(buf, &statfs64(mnt))?;
+        Ok(0)
+    }
+
+    /// `sysctl(name, namelen, old, oldlenp, new, newlen)`. Nodes are
+    /// read-only, except that a write is accepted and ignored where the
+    /// node exists.
+    fn darwin_sysctl(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
+        use super::sysctl;
+        let n = a[1] as usize;
+        if !(1..=24).contains(&n) {
+            return Err(Errno::EINVAL);
+        }
+        let mut oid = Vec::with_capacity(n);
+        for i in 0..n {
+            oid.push(m.read_u32(a[0] + 4 * i as u64)? as i32);
+        }
+        // {0, 3}: the OID of the name in `new`.
+        let value = if oid == [0, 3] {
+            let mut buf = [0u8; 256];
+            let len = (a[5] as usize).min(buf.len() - 1);
+            let name = m.read(a[4], len)?;
+            buf[..len].copy_from_slice(name);
+            let name = std::str::from_utf8(&buf[..len]).map_err(|_| Errno::EINVAL)?.trim_end_matches('\0');
+            let Some(o) = sysctl::oid(name) else {
+                if self.trace {
+                    eprintln!("[gex:{}] sysctl: no node {name}", self.pid);
+                }
+                return Err(Errno::ENOENT);
+            };
+            o.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()
+        } else {
+            match sysctl::get(&oid) {
+                Some(v) => v.bytes(),
+                None => {
+                    if self.trace {
+                        eprintln!("[gex:{}] sysctl: no node {oid:?}", self.pid);
+                    }
+                    return Err(Errno::ENOENT);
+                }
+            }
+        };
+        self.sysctl_out(m, a[2], a[3], &value)
+    }
+
+    /// `sysctlbyname(name, namelen, old, oldlenp, new, newlen)`.
+    fn darwin_sysctlbyname(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
+        use super::sysctl;
+        let len = (a[1] as usize).min(255);
+        let name = String::from_utf8_lossy(m.read(a[0], len)?).trim_end_matches('\0').to_string();
+        let Some(v) = sysctl::oid(&name).and_then(|o| sysctl::get(&o)) else {
+            if self.trace {
+                eprintln!("[gex:{}] sysctlbyname: no node {name}", self.pid);
+            }
+            return Err(Errno::ENOENT);
+        };
+        self.sysctl_out(m, a[2], a[3], &v.bytes())
+    }
+
+    /// Copy a node's value out: the size alone when `old` is null, ENOMEM
+    /// (with the size) when the buffer is short.
+    fn sysctl_out(&mut self, m: &mut GuestMem<'_>, old: u64, oldlenp: u64, value: &[u8]) -> Result<u64, Errno> {
+        if oldlenp == 0 {
+            return Ok(0);
+        }
+        let room = m.read_u64(oldlenp)? as usize;
+        m.write_u64(oldlenp, value.len() as u64)?;
+        if old == 0 {
+            return Ok(0);
+        }
+        if room < value.len() {
+            return Err(Errno::ENOMEM);
+        }
+        m.write(old, value)?;
+        Ok(0)
+    }
+
+    fn darwin_sigprocmask(&mut self, m: &mut GuestMem<'_>, how: u64, set: u64, old: u64) -> Result<u64, Errno> {
+        let blocked = self.signals.blocked();
+        if old != 0 {
+            m.write_u32(old, mask_from_linux(blocked))?;
+        }
+        if set != 0 {
+            let mask = mask_to_linux(m.read_u32(set)?);
+            let next = match how {
+                1 => blocked | mask,
+                2 => blocked & !mask,
+                3 => mask,
+                _ => return Err(Errno::EINVAL),
+            };
+            let unblockable = (1u64 << (crate::signal::sig::SIGKILL - 1)) | (1u64 << (crate::signal::sig::SIGSTOP - 1));
+            self.signals.set_blocked(next & !unblockable);
+        }
+        Ok(0)
+    }
+
+    /// Code signing status: every program is valid, signed and a platform
+    /// binary, which is what AMFI would have enforced.
+    fn darwin_csops(&mut self, m: &mut GuestMem<'_>, ops: u64, addr: u64, size: u64) -> Result<u64, Errno> {
+        const CS_OPS_STATUS: u64 = 0;
+        const CS_VALID: u32 = 0x1;
+        const CS_SIGNED: u32 = 0x2000_0000;
+        const CS_PLATFORM_BINARY: u32 = 0x400_0000;
+        if addr == 0 {
+            return Ok(0);
+        }
+        m.zero(addr, size.min(4096) as usize)?;
+        if ops == CS_OPS_STATUS && size >= 4 {
+            m.write_u32(addr, CS_VALID | CS_SIGNED | CS_PLATFORM_BINARY)?;
+        }
+        Ok(0)
+    }
+
+    fn darwin_mac_syscall(&mut self, m: &mut GuestMem<'_>, policy: u64, call: u64, arg: u64) -> Result<u64, Errno> {
+        let mut buf = [0u8; 64];
+        let name = match m.read_cstr_into(policy, &mut buf)? {
+            Some(n) => String::from_utf8_lossy(&buf[..n]).into_owned(),
+            None => return Err(Errno::EINVAL),
+        };
+        match (name.as_str(), call) {
+            ("AMFI", AMFI_DYLD_POLICY_SELF) => {
+                let out = m.read_u64(arg + 8)?;
+                m.write_u64(out, AMFI_DYLD_OUTPUT_ALL)?;
+                Ok(0)
+            }
+            _ => {
+                if self.trace {
+                    eprintln!("[gex:{}] __mac_syscall({name}, {call}) is not answered", self.pid);
+                }
+                Err(Errno::ENOSYS)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signal_masks_round_trip() {
+        // SIGUSR1 (30) and SIGCHLD (20) on Darwin are 10 and 17 on Linux.
+        let d = (1 << 29) | (1 << 19);
+        let l = mask_to_linux(d);
+        assert_eq!(l, (1 << 9) | (1 << 16));
+        assert_eq!(mask_from_linux(l), d);
     }
 }

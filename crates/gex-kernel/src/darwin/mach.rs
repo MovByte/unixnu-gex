@@ -26,6 +26,8 @@ pub mod kr {
 
 /// Trap numbers, negated (XNU's `osfmk/kern/syscall_sw.c`).
 pub mod trap {
+    pub const MACH_ABSOLUTE_TIME: i32 = -3;
+    pub const MACH_CONTINUOUS_TIME: i32 = -4;
     pub const MACH_VM_ALLOCATE: i32 = -10;
     pub const MACH_VM_PURGABLE_CONTROL: i32 = -11;
     pub const MACH_VM_DEALLOCATE: i32 = -12;
@@ -117,6 +119,12 @@ impl Space {
     }
 }
 
+/// A monotonic nanosecond count, from the first time it is asked.
+fn monotonic_ns() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+}
+
 /// `MACH_PORT_RIGHT_*`.
 const RIGHT_RECEIVE: u64 = 1;
 const RIGHT_PORT_SET: u64 = 3;
@@ -171,6 +179,10 @@ impl Kernel {
             | trap::MK_TIMER_DESTROY
             | trap::MK_TIMER_CANCEL
             | trap::MK_TIMER_ARM => kr::SUCCESS,
+            // Nanoseconds since the process's first call, as the 1/1
+            // timebase says (libsystem asks the kernel because the
+            // commpage offers no user timebase).
+            trap::MACH_ABSOLUTE_TIME | trap::MACH_CONTINUOUS_TIME => monotonic_ns(),
             trap::MACH_TIMEBASE_INFO => {
                 // mach_absolute_time counts nanoseconds: 1/1.
                 let ok = m.write_u32(a[0], 1).and_then(|_| m.write_u32(a[0] + 4, 1));

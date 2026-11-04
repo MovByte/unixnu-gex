@@ -2904,6 +2904,8 @@ pub struct PathIo<'a> {
     /// The descriptor table, the map and its placement.
     pub map: MapIo<'a>,
     pub compat: bool,
+    /// A Darwin process: its `struct stat` is Darwin's.
+    pub darwin: bool,
     pub pid: i32,
     /// The process's ids, read at each call: the owner a stat reports.
     pub creds: &'a Creds,
@@ -3419,8 +3421,17 @@ impl PathIo<'_> {
 
     pub fn fstat(&self, m: &mut GuestMem<'_>, fd: i32, buf: u64) -> SysResult {
         let md = self.map.fds.get(fd)?.metadata()?;
-        m.write(buf, &self.stat_owned(&md).encode_for(self.compat))?;
+        m.write(buf, &self.encode_stat(&self.stat_owned(&md)))?;
         Ok(0)
+    }
+
+    /// A `struct stat` in this process's layout.
+    fn encode_stat(&self, st: &Stat) -> crate::fs::StatBytes {
+        if self.darwin {
+            st.encode_darwin()
+        } else {
+            st.encode_for(self.compat)
+        }
     }
 
     /// [`Kernel::stat_from`], owned by the process's own ids, as `statx`
@@ -3467,7 +3478,7 @@ impl PathIo<'_> {
         };
         crate::phase::mark(7);
         let md = md?;
-        m.write(buf, &self.stat_owned(&md).encode_for(self.compat))?;
+        m.write(buf, &self.encode_stat(&self.stat_owned(&md)))?;
         crate::phase::mark(9);
         Ok(0)
     }
@@ -9734,6 +9745,7 @@ impl Kernel {
             // for it); outside one, the process's.
             map: self.map_io(),
             compat: self.compat,
+            darwin: self.darwin,
             pid: self.pid,
             creds: &self.creds,
             procs: &self.procs,
