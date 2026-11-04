@@ -45,6 +45,7 @@ pub const PRIVATE: i32 = 0x7f00;
 /// `(name, oid, value)`.
 pub fn table() -> Vec<(&'static str, Vec<i32>, Value)> {
     use Value::*;
+    use super::mig::machine::NCPUS;
     let mut t = vec![
         ("kern.ostype", vec![CTL_KERN, 1], Str("Darwin")),
         ("kern.osrelease", vec![CTL_KERN, 2], Str("23.6.0")),
@@ -65,11 +66,11 @@ pub fn table() -> Vec<(&'static str, Vec<i32>, Value)> {
         ("kern.osversion", vec![CTL_KERN, 65], Str("21H461")),
         ("hw.machine", vec![CTL_HW, 1], Str("iPad7,1")),
         ("hw.model", vec![CTL_HW, 2], Str("J120AP")),
-        ("hw.ncpu", vec![CTL_HW, 3], I32(2)),
+        ("hw.ncpu", vec![CTL_HW, 3], I32(NCPUS as i32)),
         ("hw.byteorder", vec![CTL_HW, 4], I32(1234)),
         ("hw.pagesize", vec![CTL_HW, 7], I32(4096)),
         ("hw.memsize", vec![CTL_HW, 24], I64(4 << 30)),
-        ("hw.availcpu", vec![CTL_HW, 25], I32(2)),
+        ("hw.availcpu", vec![CTL_HW, 25], I32(NCPUS as i32)),
     ];
     let private = [
         ("kern.bootargs", Str("")),
@@ -83,11 +84,11 @@ pub fn table() -> Vec<(&'static str, Vec<i32>, Value)> {
         ("kern.uuid", Str("00000000-0000-0000-0000-000000000000")),
         ("kern.willshutdown", I32(0)),
         ("kern.memorystatus_level", I32(100)),
-        ("hw.activecpu", I32(2)),
-        ("hw.physicalcpu", I32(2)),
-        ("hw.physicalcpu_max", I32(2)),
-        ("hw.logicalcpu", I32(2)),
-        ("hw.logicalcpu_max", I32(2)),
+        ("hw.activecpu", I32(NCPUS as i32)),
+        ("hw.physicalcpu", I32(NCPUS as i32)),
+        ("hw.physicalcpu_max", I32(NCPUS as i32)),
+        ("hw.logicalcpu", I32(NCPUS as i32)),
+        ("hw.logicalcpu_max", I32(NCPUS as i32)),
         ("hw.cputype", I32(0x0100_000c)),
         ("hw.cpusubtype", I32(0)),
         ("hw.cpufamily", I32(0x67ce_ee93u32 as i32)),

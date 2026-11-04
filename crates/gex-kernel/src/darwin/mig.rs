@@ -28,8 +28,16 @@ const MIG_BAD_ARGUMENTS: i32 = -304;
 
 /// The machine the profile describes, as the host routines report it.
 pub mod machine {
-    pub const NCPUS: u32 = 2;
+    /// J120's device tree: `cpu0`..`cpu2` (`#main-cpus` 3).
+    pub const NCPUS: u32 = 3;
+    /// The iPad Pro (12.9-inch, 2nd generation)'s 4 GiB.
     pub const MEMORY: u64 = 4 << 30;
+    /// `task_threadmax` after `scale_setup`: `CONFIG_TASK_MAX` is 512 for
+    /// the xsmall memory tag, and a machine with at least 3 GiB (and under
+    /// 8) doubles it.
+    pub const TASK_THREADMAX: u32 = 1024;
+    /// `CONFIG_THREAD_MAX` for the xsmall memory tag.
+    pub const CONFIG_THREAD_MAX: u32 = 1536;
     pub const CPU_TYPE_ARM64: u32 = 0x0100_000c;
     pub const PAGE_SIZE: u32 = 4096;
 }

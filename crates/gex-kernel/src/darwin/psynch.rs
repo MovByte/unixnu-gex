@@ -931,11 +931,9 @@ impl Kernel {
         Some(SyscallOutcome::Continue)
     }
 
-    /// The most threads a task may have (`get_task_threadmax`, XNU's
-    /// `task_threadmax`).
+    /// The most threads a task may have (`get_task_threadmax`).
     fn darwin_task_threadmax(&self) -> u32 {
-        // `CONFIG_THREAD_MAX` on embedded: 2560 threads per task.
-        2560
+        super::mig::machine::TASK_THREADMAX
     }
 
     /// A psynch object's address and its sharing: process-shared objects

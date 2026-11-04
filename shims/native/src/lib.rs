@@ -4036,7 +4036,7 @@ fn place_image(
     // And its commpage, at the alias its constant addresses are folded to.
     if opts.darwin {
         use gex_kernel::darwin::commpage;
-        let page = commpage::page(2, 4 << 30);
+        let page = commpage::page(gex_kernel::darwin::mig::machine::NCPUS as u8, 4 << 30);
         let data = memory.bytes();
         for at in commpage::placements() {
             data[at as usize..at as usize + page.len()].copy_from_slice(&page);
