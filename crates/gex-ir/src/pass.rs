@@ -73,17 +73,62 @@ pub fn const_fold_with_memory(block: &mut Block, read: &dyn Fn(u64, u32) -> Opti
 // Constant folding
 // ---------------------------------------------------------------------------
 
+static FORWARD_REG_CONSTS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Let [`const_fold`] carry a constant written to a register to the block's
+/// later reads of it, so an address built with `movz`/`movk` and then
+/// loaded through folds to one constant (a Darwin process's commpage
+/// accesses, which the emitter moves only when it sees the constant). In
+/// the module cache key.
+pub fn set_forward_reg_consts(on: bool) {
+    FORWARD_REG_CONSTS.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn forward_reg_consts() -> bool {
+    FORWARD_REG_CONSTS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Replace expressions whose operands are all constants with the constant they
 /// evaluate to.
 pub fn const_fold(block: &mut Block) {
+    const_fold_forwarding(block, forward_reg_consts());
+}
+
+/// [`const_fold`], with register constants forwarded or not regardless of
+/// [`set_forward_reg_consts`].
+pub fn const_fold_forwarding(block: &mut Block, forward: bool) {
     // `known[v]` is the constant value of `v`, normalised so that an `I32`
     // value has zero high bits.
     let mut known: Vec<Option<u64>> = vec![None; block.n_values as usize];
+    // With forwarding on: the constant each register was last written in
+    // this block. Anything but a definition, a register write, a store, a
+    // fence or a trap may change guest state the block does not see, and
+    // forgets them all.
+    let mut regs: Vec<(GuestReg, u64)> = Vec::new();
 
     for stmt in &mut block.stmts {
+        if forward {
+            match stmt {
+                Stmt::WriteReg { reg, val } => {
+                    regs.retain(|(r, _)| r != reg);
+                    if let Some(c) = get(&known, *val) {
+                        regs.push((*reg, c));
+                    }
+                }
+                Stmt::Def { .. } | Stmt::Store { .. } | Stmt::VStore { .. } | Stmt::Fence | Stmt::Trap { .. } => {}
+                _ => regs.clear(),
+            }
+        }
         let Stmt::Def { dst, expr } = stmt else {
             continue;
         };
+        if forward {
+            if let Expr::ReadReg(r) = expr {
+                if let Some(&(_, c)) = regs.iter().find(|(x, _)| x == r) {
+                    *expr = if expr.ty() == Ty::I32 { Expr::ConstI32(c as u32) } else { Expr::ConstI64(c) };
+                }
+            }
+        }
         if let Some(folded) = eval(expr, &known) {
             let ty = expr.ty();
             *expr = match ty {
@@ -475,6 +520,35 @@ pub fn stats(block: &Block) -> Stats {
 
 #[cfg(test)]
 mod tests {
+
+    /// `mov x8, #0xf_ffff_0000; movk x8, #0xc100; ldr w8, [x8]`: with
+    /// forwarding the load's address folds to one constant, and a host
+    /// call in between forgets it.
+    #[test]
+    fn register_constants_forward_to_later_reads() {
+        let build = |call: bool| {
+            let mut b = Builder::new(0x1000);
+            let hi = b.const_i64(0xf_ffff_0000);
+            b.write(GuestReg::X(8), hi);
+            if call {
+                b.stmt(Stmt::Fence);
+                b.stmt(Stmt::MemFill { dst: hi, val: hi, len: hi });
+            }
+            let r = b.read(GuestReg::X(8));
+            let lo = b.const_i64(0xc100);
+            let a = b.bin(BinOp::Or, Ty::I64, r, lo);
+            (b.finish(Term::Goto { target: 0x100c }), a)
+        };
+        let (mut on, a) = build(false);
+        const_fold_forwarding(&mut on, true);
+        let (mut forgot, a2) = build(true);
+        const_fold_forwarding(&mut forgot, true);
+        let (mut off, a3) = build(false);
+        const_fold_forwarding(&mut off, false);
+        assert_eq!(const_value(&on, a), Some(0xf_ffff_c100));
+        assert_eq!(const_value(&forgot, a2), None);
+        assert_eq!(const_value(&off, a3), None);
+    }
 
     /// An x87 operation is pure: deleted with its outputs unused, kept
     /// (with what it reads) when one is used.
