@@ -1157,6 +1157,11 @@ impl<'a> Lifter<'a> {
                 Flow::Next
             }
 
+            Inst::Crypto { op, vd, vn, vm } => {
+                self.crypto(op, vd, vn, vm);
+                Flow::Next
+            }
+
             Inst::StoreExclusivePair { sz, rs, rt, rt2, rn, .. } => {
                 self.store_exclusive_pair(sz, rs, rt, rt2, rn);
                 Flow::Next
@@ -4710,6 +4715,46 @@ impl<'a> Lifter<'a> {
         // The monitor is cleared either way.
         let zero = self.b.const_i64(0);
         self.b.write(GuestReg::MonSize, zero);
+    }
+
+    /// A cryptographic-extension instruction, run by the host
+    /// (`gex_abi::crypto`): the three vector operands spilled below the
+    /// stack pointer, past Apple's 128-byte red zone, where nothing of the
+    /// thread's lives while the host runs; the result read back into `vd`.
+    fn crypto(&mut self, op: gex_isa::CryptoOp, vd: u8, vn: u8, vm: u8) {
+        use gex_abi::crypto::op as c;
+        use gex_isa::CryptoOp::*;
+        let code = match op {
+            Aese => c::AESE,
+            Aesd => c::AESD,
+            Aesmc => c::AESMC,
+            Aesimc => c::AESIMC,
+            Sha1c => c::SHA1C,
+            Sha1p => c::SHA1P,
+            Sha1m => c::SHA1M,
+            Sha1su0 => c::SHA1SU0,
+            Sha256h => c::SHA256H,
+            Sha256h2 => c::SHA256H2,
+            Sha256su1 => c::SHA256SU1,
+            Sha1h => c::SHA1H,
+            Sha1su1 => c::SHA1SU1,
+            Sha256su0 => c::SHA256SU0,
+            Pmull { upper: false, wide: true } => c::PMULL_1Q,
+            Pmull { upper: true, wide: true } => c::PMULL2_1Q,
+            Pmull { upper: false, wide: false } => c::PMULL_8H,
+            Pmull { upper: true, wide: false } => c::PMULL2_8H,
+        };
+        let sp = self.b.read(GuestReg::Sp);
+        let below = self.konst(Ty::I64, (-256i64) as u64);
+        let spill = self.b.bin(BinOp::Add, Ty::I64, sp, below);
+        for (i, r) in [vd, vn, vm].into_iter().enumerate() {
+            let v = self.b.read(GuestReg::V128(r));
+            self.b.stmt(Stmt::VStore { addr: spill, offset: 16 * i as i64, val: v, bytes: 16 });
+        }
+        let opv = self.konst(Ty::I64, code);
+        self.b.stmt(Stmt::HostCall { func: HostFunc::Crypto, args: vec![opv, spill] });
+        let r = self.b.def(Expr::VLoad { addr: spill, offset: 0, bytes: 16 });
+        self.b.write(GuestReg::V128(vd), r);
     }
 
     /// `ldxp`: a W pair is one doubleword, monitored whole; an X pair is

@@ -14823,6 +14823,23 @@ fn write_u64(data: &mut [u8], off: usize, v: u64) {
 /// Fused multiply-add, which wasm cannot express. Rust's `mul_add` is the
 /// hardware instruction where there is one and libm's exact software fallback
 /// where there is not, which is what the guest needs either way.
+/// The cryptographic extension (`gex_abi::crypto`): three 16-byte operands
+/// at `spill` in guest memory, the result written over the first.
+#[no_mangle]
+pub extern "C" fn gex_crypto(_ctx: i32, op: i64, spill: i64) {
+    let mut gm = GuestMem::new(guest_bytes());
+    let at = spill as u64;
+    let mut v = [[0u8; 16]; 3];
+    for (i, r) in v.iter_mut().enumerate() {
+        match gm.read(at + 16 * i as u64, 16) {
+            Ok(b) => r.copy_from_slice(b),
+            Err(_) => return,
+        }
+    }
+    let out = gex_abi::crypto::run(op as u64, v[0], v[1], v[2]);
+    let _ = gm.write(at, &out);
+}
+
 #[no_mangle]
 pub extern "C" fn gex_fma(_ctx: i32, a: i64, b: i64, c: i64, double: i32) -> i64 {
     // Counted: wasm has no FMA, so each of these is a cross-module call in a

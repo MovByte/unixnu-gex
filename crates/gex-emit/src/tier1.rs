@@ -169,6 +169,8 @@ pub struct Context<'a> {
     pub sysreg_read: u32,
     /// Import index of `gex.fma`.
     pub fma: u32,
+    /// Import index of `gex.crypto`.
+    pub crypto: u32,
     /// Import index of `gex.x87`.
     pub x87: u32,
     /// Import index of `gex.mx`.
@@ -4819,6 +4821,7 @@ impl<'a> Emitter<'a> {
             HostFunc::CacheOp => self.cx.cache_op,
             HostFunc::Safepoint => self.cx.safepoint,
             HostFunc::Fma => self.cx.fma,
+            HostFunc::Crypto => self.cx.crypto,
         }
     }
 

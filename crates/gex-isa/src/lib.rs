@@ -1045,6 +1045,9 @@ pub enum Inst {
         rn: RegSel,
         order: Ordering,
     },
+    /// A cryptographic-extension instruction on vector registers: AES,
+    /// SHA-1, SHA-256 or PMULL. `vm` is unused by the two-operand ones.
+    Crypto { op: CryptoOp, vd: u8, vn: u8, vm: u8 },
     /// `ldxp`/`ldaxp` — load-exclusive pair: two registers of `sz` (W or X)
     /// from consecutive words, arming the local monitor for both.
     LoadExclusivePair {
@@ -1082,6 +1085,27 @@ pub enum Inst {
         acquire: bool,
         release: bool,
     },
+}
+
+/// The cryptographic extension's operations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CryptoOp {
+    Aese,
+    Aesd,
+    Aesmc,
+    Aesimc,
+    Sha1c,
+    Sha1p,
+    Sha1m,
+    Sha1su0,
+    Sha256h,
+    Sha256h2,
+    Sha256su1,
+    Sha1h,
+    Sha1su1,
+    Sha256su0,
+    /// `pmull`/`pmull2` on doublewords (`.1q`) or bytes (`.8h`).
+    Pmull { upper: bool, wide: bool },
 }
 
 /// Scalar floating-point precision.

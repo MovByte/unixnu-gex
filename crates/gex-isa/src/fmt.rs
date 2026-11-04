@@ -1540,6 +1540,45 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
             format!("{m} v{}.{w}, v{}.{w}, v{}.{w}", vd.0, vn.0, vm.0)
         }
 
+        Inst::Crypto { op, vd, vn, vm } => {
+            use crate::CryptoOp::*;
+            match op {
+                Aese | Aesd | Aesmc | Aesimc => {
+                    let m = match op {
+                        Aese => "aese",
+                        Aesd => "aesd",
+                        Aesmc => "aesmc",
+                        _ => "aesimc",
+                    };
+                    format!("{m} v{vd}.16b, v{vn}.16b")
+                }
+                Sha1c | Sha1p | Sha1m => {
+                    let m = match op {
+                        Sha1c => "sha1c",
+                        Sha1p => "sha1p",
+                        _ => "sha1m",
+                    };
+                    format!("{m} q{vd}, s{vn}, v{vm}.4s")
+                }
+                Sha256h => format!("sha256h q{vd}, q{vn}, v{vm}.4s"),
+                Sha256h2 => format!("sha256h2 q{vd}, q{vn}, v{vm}.4s"),
+                Sha1su0 => format!("sha1su0 v{vd}.4s, v{vn}.4s, v{vm}.4s"),
+                Sha256su1 => format!("sha256su1 v{vd}.4s, v{vn}.4s, v{vm}.4s"),
+                Sha1h => format!("sha1h s{vd}, s{vn}"),
+                Sha1su1 => format!("sha1su1 v{vd}.4s, v{vn}.4s"),
+                Sha256su0 => format!("sha256su0 v{vd}.4s, v{vn}.4s"),
+                Pmull { upper, wide } => {
+                    let m = if upper { "pmull2" } else { "pmull" };
+                    let (dt, st) = match (wide, upper) {
+                        (true, false) => ("1q", "1d"),
+                        (true, true) => ("1q", "2d"),
+                        (false, false) => ("8h", "8b"),
+                        (false, true) => ("8h", "16b"),
+                    };
+                    format!("{m} v{vd}.{dt}, v{vn}.{st}, v{vm}.{st}")
+                }
+            }
+        }
         Inst::LoadExclusivePair { sz, rt, rt2, rn, order } => {
             let m = if order == Ordering::Acquire { "ldaxp" } else { "ldxp" };
             let rsz = if sz == MemSz::D { Sz::X } else { Sz::W };

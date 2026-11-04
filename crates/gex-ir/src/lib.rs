@@ -955,6 +955,10 @@ pub enum HostFunc {
     Safepoint,
     /// Fused multiply-add, which wasm cannot express.
     Fma,
+    /// A cryptographic-extension instruction: `(op, spill)`, its operands
+    /// spilled to guest memory and its result written back there
+    /// (`gex_abi::crypto`). Writes memory, not guest registers.
+    Crypto,
 }
 
 impl HostFunc {

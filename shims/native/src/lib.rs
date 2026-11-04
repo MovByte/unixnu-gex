@@ -5054,6 +5054,25 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         })()) },
     )?;
 
+    // The cryptographic extension (`gex_abi::crypto`): three 16-byte
+    // operands at `spill`, the result written over the first.
+    linker.func_wrap(
+        m,
+        imports::CRYPTO,
+        |caller: Caller<'_, HostState>, _ctx: i32, op: i64, spill: i64| -> wasmtime::Result<()> {
+            let Some(memory) = caller.data().memory.clone() else { return Ok(()) };
+            let mut gm = GuestMem::new(memory.bytes());
+            let at = spill as u64;
+            let mut v = [[0u8; 16]; 3];
+            for (i, r) in v.iter_mut().enumerate() {
+                r.copy_from_slice(gm.read(at + 16 * i as u64, 16).map_err(|_| wasmtime::Error::msg(format!("crypto operands at {at:#x} are outside guest memory")))?);
+            }
+            let out = gex_abi::crypto::run(op as u64, v[0], v[1], v[2]);
+            gm.write(at, &out).map_err(|_| wasmtime::Error::msg(format!("crypto result at {at:#x} is outside guest memory")))?;
+            Ok(())
+        },
+    )?;
+
     // Fused multiply-add. The host has one; wasm does not, and a multiply
     // followed by an add rounds twice.
     linker.func_wrap(

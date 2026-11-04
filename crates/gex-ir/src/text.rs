@@ -122,7 +122,7 @@ const RMWOPS: [RmwOp; 6] = [
     RmwOp::Xor,
     RmwOp::Xchg,
 ];
-const HOSTS: [HostFunc; 8] = [
+const HOSTS: [HostFunc; 9] = [
     HostFunc::Syscall,
     HostFunc::Illegal,
     HostFunc::Breakpoint,
@@ -131,6 +131,7 @@ const HOSTS: [HostFunc; 8] = [
     HostFunc::CacheOp,
     HostFunc::Safepoint,
     HostFunc::Fma,
+    HostFunc::Crypto,
 ];
 const VBINOPS: [VBinOp; 4] = [VBinOp::And, VBinOp::Or, VBinOp::Xor, VBinOp::AndNot];
 const VUNOPS: [VUnOp; 5] = [

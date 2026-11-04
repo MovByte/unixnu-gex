@@ -29,6 +29,9 @@ fn sext(v: u32, n: u32) -> i64 {
 /// `pc` is needed because PC-relative operands (branches, `adr`, literal
 /// loads) are resolved to absolute guest addresses here.
 pub fn decode(raw: u32, pc: u64) -> Inst {
+    if let Some(i) = decode_crypto(raw) {
+        return i;
+    }
     match bits(raw, 28, 25) {
         0b0000 => decode_reserved(raw),
         0b0001 | 0b0011 => Inst::Unknown { raw },
@@ -41,6 +44,53 @@ pub fn decode(raw: u32, pc: u64) -> Inst {
         0b0111 | 0b1111 => decode_simd_fp(raw),
         _ => Inst::Unknown { raw },
     }
+}
+
+/// The cryptographic extension: AES, SHA-1/SHA-256 (two- and three-register)
+/// and PMULL, whose encodings sit inside the Advanced SIMD space.
+fn decode_crypto(raw: u32) -> Option<Inst> {
+    use CryptoOp::*;
+    let (vd, vn, vm) = (bits(raw, 4, 0) as u8, bits(raw, 9, 5) as u8, bits(raw, 20, 16) as u8);
+    // AESE/AESD/AESMC/AESIMC: 0100 1110 0010 1000 01 op 10 Rn Rd.
+    if raw & 0xffff_cc00 == 0x4e28_4800 {
+        let op = [Aese, Aesd, Aesmc, Aesimc][bits(raw, 13, 12) as usize];
+        return Some(Inst::Crypto { op, vd, vn, vm: 0 });
+    }
+    // Three-register SHA: 0101 1110 000 Rm 0 opcode 00 Rn Rd.
+    if raw & 0xffe0_8c00 == 0x5e00_0000 {
+        let op = match bits(raw, 14, 12) {
+            0 => Sha1c,
+            1 => Sha1p,
+            2 => Sha1m,
+            3 => Sha1su0,
+            4 => Sha256h,
+            5 => Sha256h2,
+            6 => Sha256su1,
+            _ => return None,
+        };
+        return Some(Inst::Crypto { op, vd, vn, vm });
+    }
+    // Two-register SHA: 0101 1110 0010 1000 0 opcode 10 Rn Rd.
+    if raw & 0xfffe_0c00 == 0x5e28_0800 {
+        let op = match bits(raw, 16, 12) {
+            0 => Sha1h,
+            1 => Sha1su1,
+            2 => Sha256su0,
+            _ => return None,
+        };
+        return Some(Inst::Crypto { op, vd, vn, vm: 0 });
+    }
+    // PMULL/PMULL2: 0 Q 0 01110 size 1 Rm 1110 00 Rn Rd, sizes 00 and 11.
+    if raw & 0xbf20_fc00 == 0x0e20_e000 {
+        let wide = match bits(raw, 23, 22) {
+            0b00 => false,
+            0b11 => true,
+            _ => return None,
+        };
+        let upper = bit(raw, 30) == 1;
+        return Some(Inst::Crypto { op: Pmull { upper, wide }, vd, vn, vm });
+    }
+    None
 }
 
 fn decode_reserved(raw: u32) -> Inst {
@@ -2897,6 +2947,27 @@ fn expand_simd_immediate(imm8: u32, cmode: u32, op: bool, q: bool) -> Option<u12
 
 #[cfg(test)]
 mod tests {
+
+    /// The cryptographic extension, as llvm-objdump prints it.
+    #[test]
+    fn crypto_decodes() {
+        for (raw, want) in [
+            (0x4e28_4840u32, "aese v0.16b, v2.16b"),
+            (0x4e28_5820, "aesd v0.16b, v1.16b"),
+            (0x4e28_6800, "aesmc v0.16b, v0.16b"),
+            (0x4e28_7800, "aesimc v0.16b, v0.16b"),
+            (0x5e02_0020, "sha1c q0, s1, v2.4s"),
+            (0x5e02_4020, "sha256h q0, q1, v2.4s"),
+            (0x5e02_5020, "sha256h2 q0, q1, v2.4s"),
+            (0x5e28_0820, "sha1h s0, s1"),
+            (0x5e28_2820, "sha256su0 v0.4s, v1.4s"),
+            (0x0ee2_e020, "pmull v0.1q, v1.1d, v2.1d"),
+            (0x4ee2_e020, "pmull2 v0.1q, v1.2d, v2.2d"),
+            (0x0e22_e020, "pmull v0.8h, v1.8b, v2.8b"),
+        ] {
+            assert_eq!(crate::fmt::disasm(&decode(raw, 0), 0), want, "{raw:#x}");
+        }
+    }
 
     /// The exclusive pairs, as llvm-objdump prints them; `ldxp xzr, x10`
     /// is libsystem's 128-bit atomic load.

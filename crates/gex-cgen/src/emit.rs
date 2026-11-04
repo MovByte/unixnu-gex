@@ -1219,12 +1219,14 @@ impl<'a> Emitter<'a> {
             HostFunc::CacheOp => "gex_cache_op",
             HostFunc::Safepoint => "gex_safepoint",
             HostFunc::Fma => "gex_fma",
+            HostFunc::Crypto => "gex_crypto",
         };
         let want = match func {
             HostFunc::Syscall | HostFunc::Safepoint => 1,
             HostFunc::Illegal | HostFunc::Breakpoint | HostFunc::SysRegRead => 2,
             HostFunc::SysRegWrite | HostFunc::CacheOp => 3,
             HostFunc::Fma => 4,
+            HostFunc::Crypto => 2,
         };
         if args.len() != want {
             bail!("{func:?} with {} arguments, the import takes {want}", args.len());

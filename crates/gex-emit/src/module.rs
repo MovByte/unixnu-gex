@@ -650,6 +650,7 @@ struct Imports {
     cache_op: u32,
     safepoint: u32,
     fma: u32,
+    crypto: u32,
     x87: u32,
     mx: u32,
 }
@@ -736,6 +737,7 @@ impl ModuleBuilder {
             vec![p, ValType::I64, ValType::I64, ValType::I64, ValType::I32],
             vec![ValType::I64],
         ));
+        let t_crypto = m.func_type(FuncType::new(vec![p, ValType::I64, ValType::I64], vec![]));
         let t_x87 = m.func_type(FuncType::new(
             vec![p, ValType::I32, ValType::I64, ValType::I32, ValType::I64, ValType::I32, ValType::I32],
             vec![ValType::I64],
@@ -763,6 +765,7 @@ impl ModuleBuilder {
             cache_op: m.import_func(im, imports::CACHE_OP, t_pc_i32_i64),
             safepoint: m.import_func(im, imports::SAFEPOINT, t_syscall),
             fma: m.import_func(im, imports::FMA, t_fma),
+            crypto: m.import_func(im, imports::CRYPTO, t_crypto),
             x87: m.import_func(im, imports::X87, t_x87),
             mx: t_mx.map_or(u32::MAX, |t| m.import_func(im, imports::MX, t)),
         };
@@ -989,6 +992,7 @@ impl ModuleBuilder {
                 dispatch_miss: self.imports.dispatch_miss,
                 safepoint: self.imports.safepoint,
                 fma: self.imports.fma,
+                crypto: self.imports.crypto,
                 x87: self.imports.x87,
                 mx: self.imports.mx,
                 block_ty: self.block_ty,
