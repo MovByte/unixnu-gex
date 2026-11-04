@@ -79,11 +79,9 @@ impl Rlimits {
     }
 }
 
-/// `round_page_64`: to the kernel's page, 16 KiB on arm64, whatever the
-/// map's own page size.
+/// `round_page_64`: to the kernel's page.
 fn round_page(v: u64) -> Option<u64> {
-    const MASK: u64 = 16 * 1024 - 1;
-    v.checked_add(MASK).map(|r| r & !MASK)
+    v.checked_add(super::mach::PAGE_MASK).map(|r| r & !super::mach::PAGE_MASK)
 }
 
 impl Kernel {
