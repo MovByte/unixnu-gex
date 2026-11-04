@@ -2554,12 +2554,8 @@ impl Kernel {
         if flags & (QOS_FLAG | QOS_OVERRIDE_FLAG) != 0 {
             qos_rv = self.bsdthread_set_self_qos(tid, is_wq, priority, flags & QOS_OVERRIDE_FLAG != 0).err();
         }
-        if flags & VOUCHER_FLAG != 0 {
-            // thread_set_voucher_name: only no voucher can be adopted here.
-            if voucher != 0 {
-                self.darwin_unimplemented("vouchers".into());
-                voucher_rv = Some(Errno::ENOENT);
-            }
+        if flags & VOUCHER_FLAG != 0 && self.thread_set_voucher_name(voucher) != 0 {
+            voucher_rv = Some(Errno::ENOENT);
         }
         if qos_rv.is_none() {
             if flags & (FIXEDPRIORITY_FLAG | TIMESHARE_FLAG) != 0 {

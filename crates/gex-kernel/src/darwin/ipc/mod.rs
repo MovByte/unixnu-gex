@@ -108,7 +108,7 @@ pub enum Kobject {
     Clock,
     Semaphore,
     Timer,
-    Voucher,
+    Voucher(super::voucher::VoucherId),
 }
 
 /// A port's reply semantics (`ip_reply_port_semantics`).

@@ -37,6 +37,7 @@ pub mod sysno;
 pub mod thread;
 pub mod timer;
 pub mod vm;
+pub mod voucher;
 pub mod wait;
 pub mod workq;
 
@@ -78,6 +79,8 @@ pub struct Task {
     pub next_threadreq: u64,
     /// The process's kqueues and knotes.
     pub kevents: kevent::Kevents,
+    /// The process's vouchers and their attribute managers' state.
+    pub vouchers: voucher::Vouchers,
     /// The program's code signature, when it has one.
     pub codesign: Option<codesign::CodeSign>,
     /// `p_workq_allow_sigmask`.

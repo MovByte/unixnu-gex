@@ -236,6 +236,7 @@ impl Kernel {
         let _ = mscount;
         match k {
             Some(Kobject::Semaphore) => self.semaphore_no_senders(port),
+            Some(Kobject::Voucher(v)) => self.ipc_voucher_no_senders(v),
             other => self.darwin_unimplemented(format!("no-senders for kernel object {other:?}")),
         }
     }

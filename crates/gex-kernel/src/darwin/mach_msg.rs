@@ -586,7 +586,7 @@ impl Kernel {
                 return Err(mr::SEND_INVALID_VOUCHER);
             }
             if voucher_name != 0 {
-                let ok = ipc.space.lookup(voucher_name).is_some_and(|e| e.bits & ty::SEND != 0 && e.object.is_some_and(|o| ipc.is_port(o) && ipc.port(o).kobject == Some(super::ipc::Kobject::Voucher)));
+                let ok = ipc.space.lookup(voucher_name).is_some_and(|e| e.bits & ty::SEND != 0 && e.object.is_some_and(|o| ipc.is_port(o) && matches!(ipc.port(o).kobject, Some(super::ipc::Kobject::Voucher(_)))));
                 if !ok {
                     ipc.guard_exception(voucher_name, Guard::SendInvalidVoucher, 0);
                     return Err(mr::SEND_INVALID_VOUCHER);
@@ -876,7 +876,10 @@ impl Kernel {
     /// `ipc_kmsg_send`: to a dead port the message is destroyed and the
     /// send succeeds; to a kernel object, the object's server answers; else
     /// it is queued or handed to a receiver.
-    fn kmsg_send(&mut self, kmsg: Box<Kmsg>, options: u64, timeout_zero: bool) -> Result<(), SendWait> {
+    fn kmsg_send(&mut self, mut kmsg: Box<Kmsg>, options: u64, timeout_zero: bool) -> Result<(), SendWait> {
+        if let Some(vp) = kmsg.voucher {
+            kmsg.voucher = Some(self.ipc_voucher_send_preprocessing(vp));
+        }
         let port = kmsg.dest;
         let ipc = &mut self.dtask.ipc;
         if !ipc.port(port).active {
@@ -1047,7 +1050,15 @@ impl Kernel {
         if r != mr::SUCCESS {
             return (r, msgr);
         }
-        let kmsg = rcv.kmsg.expect("a received message");
+        let mut kmsg = rcv.kmsg.expect("a received message");
+        if options & opt::RCV_VOUCHER != 0 {
+            // ipc_importance_receive, then ipc_voucher_receive_postprocessing.
+            if let Some(vp) = kmsg.voucher {
+                let vp = self.ipc_importance_receive_voucher(Some(vp)).expect("a voucher");
+                kmsg.bits |= msgt::MOVE_SEND << 16;
+                kmsg.voucher = Some(self.ipc_voucher_receive_postprocessing(vp));
+            }
+        }
         let context = self.dtask.ipc.port(kmsg.dest).context;
         let (priority, qos_ovrd) = (kmsg.ppriority, kmsg.qos_override);
         let r = match self.kmsg_copyout(m, *kmsg, options) {

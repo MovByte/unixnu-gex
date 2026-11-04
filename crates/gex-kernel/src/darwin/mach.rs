@@ -507,9 +507,9 @@ impl Kernel {
                     kr::FAILURE
                 }
             }
+            trap::HOST_CREATE_MACH_VOUCHER => self.host_create_mach_voucher_trap(m, w(0), a[1], a[2] as i32, a[3]),
+            trap::MACH_VOUCHER_EXTRACT_ATTR_RECIPE => self.mach_voucher_extract_attr_recipe_trap(m, w(0), w(1), a[2], a[3]),
             trap::CLOCK_SLEEP
-            | trap::HOST_CREATE_MACH_VOUCHER
-            | trap::MACH_VOUCHER_EXTRACT_ATTR_RECIPE
             | trap::TASK_NAME_FOR_PID
             | trap::TASK_FOR_PID
             | trap::DEBUG_CONTROL_PORT_FOR_PID

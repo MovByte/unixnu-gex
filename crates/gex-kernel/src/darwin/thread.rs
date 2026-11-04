@@ -194,6 +194,10 @@ pub struct DThread {
     pub syscall_code: u64,
     /// `AST_KEVENT_*` owed on its way back to user space.
     pub astkevent: u16,
+    /// The voucher it adopted (`ith_voucher`) and the name it gave
+    /// (`ith_voucher_name`).
+    pub voucher: Option<super::voucher::VoucherId>,
+    pub voucher_name: u32,
     /// The kevent override (an owner's or a workqueue kqueue servicer's)
     /// and the servicer override (a workloop's) on its QoS.
     pub kevent_override: u8,
@@ -553,6 +557,9 @@ impl Kernel {
             let _ = self.dtask.ipc.mach_port_deallocate(kport);
         }
         self.darwin_thread_ports_terminate(tid);
+        if let Some(v) = self.dtask.threads.map.get_mut(&tid).and_then(|t| t.voucher.take()) {
+            self.ipc_voucher_release(v);
+        }
         self.darwin_ipc_settle(m);
         self.darwin_workq_thread_terminate(self.tid);
         self.darwin_workq_settle(m);

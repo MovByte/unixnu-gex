@@ -101,6 +101,50 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             (Some(_node), Some(which)) => host_get_special_port(k, obj, req.dest, which),
             _ => bad(),
         },
+        // mach_voucher_extract_attr_content(voucher, key, out content)
+        (Kobject::Voucher(v), 5400) => match (arg(req, 0), arg(req, 1)) {
+            (Some(key), Some(cnt)) => {
+                let n = (cnt as u32).min(4096);
+                voucher_reply(k.with_voucher(*v, |k, v| k.mach_voucher_extract_attr_content(v, key as u32, n)))
+            }
+            _ => bad(),
+        },
+        // mach_voucher_extract_attr_recipe(voucher, key, out recipe)
+        (Kobject::Voucher(v), 5401) => match (arg(req, 0), arg(req, 1)) {
+            (Some(key), Some(cnt)) => {
+                let n = (cnt as u32).min(4096);
+                voucher_reply(k.with_voucher(*v, |k, v| k.mach_voucher_extract_attr_recipe(v, key as u32, n)))
+            }
+            _ => bad(),
+        },
+        // mach_voucher_extract_all_attr_recipes(voucher, out recipes)
+        (Kobject::Voucher(v), 5402) => match arg(req, 0) {
+            Some(cnt) => {
+                let n = (cnt as u32).min(5120);
+                voucher_reply(k.with_voucher(*v, |k, v| k.mach_voucher_extract_all_attr_recipes(v, n)))
+            }
+            None => bad(),
+        },
+        // mach_voucher_attr_command(voucher, key, command, in_content,
+        // out out_content)
+        (Kobject::Voucher(v), 5403) => {
+            let (Some(key), Some(command), Some(in_cnt)) = (arg(req, 0), arg(req, 1), arg(req, 2)) else { return bad() };
+            if in_cnt as u32 > 4096 {
+                return bad();
+            }
+            let at = NDR + 12;
+            let padded = (in_cnt as usize + 3) & !3;
+            let (Some(input), Some(out_cnt)) = (req.body.get(at..at + in_cnt as usize), i32_at(&req.body, at + padded)) else { return bad() };
+            if req.body.len() != at + padded + 4 {
+                return bad();
+            }
+            let input = input.to_vec();
+            let n = (out_cnt as u32).min(4096);
+            voucher_reply(k.with_voucher(*v, |k, v| k.mach_voucher_attr_command(v, key as u32, command as u32, &input, n)))
+        }
+        // mach_voucher_debug_info(task, voucher_name, out recipes): only in
+        // DEVELOPMENT and DEBUG kernels.
+        (Kobject::Task, 5404) => Reply::err(KERN_NOT_SUPPORTED),
         // clock_get_time(clock) -> mach_timespec_t
         (Kobject::Clock, 1000) => {
             let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
@@ -324,6 +368,20 @@ fn task_get_special_port(k: &mut Kernel, which: i32) -> Reply {
             r
         }
         _ => Reply::err(KERN_INVALID_ARGUMENT),
+    }
+}
+
+/// A voucher routine's reply: its inline array (count, bytes, padded to
+/// a word), or its error.
+fn voucher_reply(r: Result<Vec<u8>, u32>) -> Reply {
+    match r {
+        Ok(b) => {
+            let mut o = (b.len() as u32).to_le_bytes().to_vec();
+            o.extend_from_slice(&b);
+            o.resize((o.len() + 3) & !3, 0);
+            Reply::ok(o)
+        }
+        Err(kr) => Reply::err(kr as i32),
     }
 }
 
