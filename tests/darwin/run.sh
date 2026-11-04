@@ -62,6 +62,7 @@ run() {
     hello) check_root hello "hello from /tmp/gex-darwin-hello with 2 arguments" 0 a b ;;
     pthread) check_root pthread "pthread 4000" 0 ;;
     dispatch) check_root dispatch "dispatch 55 140" 0 ;;
+    dispatch-signal) check_root dispatch-signal "dispatch-signal 2" 0 ;;
     sighandler) check_root sighandler "sighandler 3" 0 ;;
     cfrunloop) check_root cfrunloop "cfrunloop 3 1" 0 ;;
     xpc-anon) check_root xpc-anon "xpc-anon 42" 0 ;;
@@ -77,7 +78,7 @@ if [ "$named" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch sighandler cfrunloop xpc-anon; do
+    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler cfrunloop xpc-anon; do
         run "$p"
     done
 fi

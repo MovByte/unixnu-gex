@@ -269,9 +269,13 @@ struct NewAction {
 }
 
 impl Kernel {
-    /// Set the signal layer up for a Darwin process: Darwin's defaults.
+    /// Set the signal layer up for a Darwin process: Darwin's defaults, and
+    /// told of every process-directed signal posted (for its knotes).
     pub fn darwin_signals_init(&mut self) {
         self.signals.process().set_defaults(default_action);
+        self.procs.record_posts(self.pid);
+        let bell = self.darwin_timer_bell();
+        self.signals.process().set_post_hook(Box::new(move || bell.ring()));
     }
 
     fn darwin_sig(&mut self) -> &mut ThreadSig {

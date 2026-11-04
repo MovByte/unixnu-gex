@@ -105,6 +105,9 @@ enum Pressure {
 /// low-swap or process-limit event is posted.
 const MEMORYSTATUS_VM_PRESSURE_LEVEL: Pressure = Pressure::Normal;
 
+/// `NOTE_SIGNAL`, shared with EVFILT_PROC.
+const NOTE_SIGNAL: i64 = 0x0800_0000;
+
 /// `ESTALE`.
 const ESTALE: Errno = Errno(116);
 
@@ -131,6 +134,7 @@ impl Kernel {
             f if f == id(evfilt::WORKLOOP) => self.filt_wlattach(m, n, kev),
             f if f == id(evfilt::MACHPORT) => self.filt_machportattach(n),
             f if f == id(evfilt::MEMORYSTATUS) => self.filt_memorystatusattach(n),
+            f if f == id(evfilt::SIGNAL) => self.filt_sigattach(n),
             f if f == id(evfilt::READ) => self.filt_fileattach(n),
             f if [evfilt::WRITE, evfilt::VNODE, evfilt::SOCK, evfilt::EXCEPT, evfilt::NW_CHANNEL].iter().any(|&e| id(e) == f) => self.filt_fileattach(n),
             // bad_filtops: filt_no_attach.
@@ -141,7 +145,6 @@ impl Kernel {
             f => {
                 let name = match f {
                     f if f == id(evfilt::PROC) => "EVFILT_PROC",
-                    f if f == id(evfilt::SIGNAL) => "EVFILT_SIGNAL",
                     f if f == id(evfilt::FS) => "EVFILT_FS",
                     _ => "an unknown kevent filter",
                 };
@@ -160,6 +163,7 @@ impl Kernel {
             filtid::MACH_PORT | filtid::MACH_PORT_SET => self.filt_machportdetach(n),
             filtid::KQREAD => self.filt_kqdetach(n),
             f if f == id(evfilt::MEMORYSTATUS) => self.dtask.kevents.memorystatus_klist.retain(|&x| x != n),
+            f if f == id(evfilt::SIGNAL) => self.dtask.kevents.sig_klist.retain(|&x| x != n),
             // filt_no_detach
             _ => {}
         }
@@ -176,6 +180,15 @@ impl Kernel {
             filtid::MACH_PORT_SET => filter::ACTIVE,
             filtid::KQREAD => self.filt_kqueue(n),
             f if f == id(evfilt::MEMORYSTATUS) => self.filt_memorystatus(n, hint),
+            f if f == id(evfilt::SIGNAL) => {
+                // filt_signal: a post of the knote's signal counts.
+                assert!(hint & NOTE_SIGNAL != 0, "filt_signal: detected NOTE_EXIT event");
+                let k = self.knote(n);
+                if k.ident == (hint & !NOTE_SIGNAL) as u64 {
+                    k.hook32 += 1;
+                }
+                u32::from(k.hook32 != 0)
+            }
             f => panic!("filt_bad_event[{f}]({n}, {hint})"),
         }
     }
@@ -188,6 +201,7 @@ impl Kernel {
             f if f == id(evfilt::WORKLOOP) => self.filt_wltouch(m, n, kev),
             filtid::MACH_PORT | filtid::MACH_PORT_SET => self.filt_machporttouch(n, kev),
             filtid::KQREAD => self.filt_kqueue(n),
+            f if f == id(evfilt::SIGNAL) => u32::from(self.knote(n).hook32 > 0),
             f if f == id(evfilt::MEMORYSTATUS) => {
                 // filt_memorystatustouch: the knote's interest replaced; on
                 // iOS no per-limit state is kept.
@@ -207,6 +221,16 @@ impl Kernel {
             f if f == id(evfilt::WORKLOOP) => self.filt_wlprocess(n, kev),
             filtid::MACH_PORT | filtid::MACH_PORT_SET => self.filt_machportprocess(m, n, kev, ctx),
             filtid::KQREAD => self.filt_kqprocess(n, kev),
+            f if f == id(evfilt::SIGNAL) => {
+                let k = self.knote(n);
+                if k.hook32 == 0 {
+                    return 0;
+                }
+                let count = k.hook32;
+                *kev = k.fill_kevent(i64::from(count));
+                k.hook32 = 0;
+                1
+            }
             f if f == id(evfilt::MEMORYSTATUS) => {
                 let k = self.knote(n);
                 if k.fflags == 0 {
@@ -1025,6 +1049,29 @@ impl Kernel {
                 self.knote_list(&list, port as i64);
             }
         }
+    }
+
+    // -- EVFILT_SIGNAL ----------------------------------------------------------------------
+
+    /// `filt_sigattach`: on the process's knote list.
+    fn filt_sigattach(&mut self, n: KnId) -> u32 {
+        let k = self.knote(n);
+        k.flags |= ev::CLEAR;
+        k.sdata = 0;
+        self.dtask.kevents.sig_klist.insert(0, n);
+        0
+    }
+
+    /// `proc_knote(p, NOTE_SIGNAL | signum)` for each process-directed
+    /// signal posted since the last time; whether there were any.
+    pub(crate) fn darwin_signal_knotes(&mut self) -> bool {
+        let posted = self.signals.process().take_posted();
+        for &l in &posted {
+            let Some(d) = super::signal::signal_from_linux(l) else { continue };
+            let list = self.dtask.kevents.sig_klist.clone();
+            self.knote_list(&list, NOTE_SIGNAL | i64::from(d));
+        }
+        !posted.is_empty()
     }
 
     // -- EVFILT_MEMORYSTATUS ------------------------------------------------------------------

@@ -170,6 +170,11 @@ pub struct ProcSig {
     /// raise, so a collect that finds the inbox empty because another is
     /// under way waits for that one's signals to be pending.
     collecting: Mutex<()>,
+    /// Each process-directed signal as it is posted, for a kernel that
+    /// tells its knotes of them (Darwin's `proc_knote(NOTE_SIGNAL)`), and
+    /// how it is told; empty and unset for any other.
+    posted: Mutex<Vec<u32>>,
+    post_hook: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// What each signal does with no handler, for a personality whose
     /// defaults are not Linux's ([`default_action`] when unset).
     defaults: std::sync::OnceLock<fn(u32) -> DefaultAction>,
@@ -193,6 +198,8 @@ impl ProcSig {
             timers: Mutex::new([None; 3]),
             collecting: Mutex::new(()),
             timer_next: AtomicU64::new(NO_TIMER),
+            posted: Mutex::new(Vec::new()),
+            post_hook: std::sync::OnceLock::new(),
             defaults: std::sync::OnceLock::new(),
         }
     }
@@ -212,9 +219,32 @@ impl ProcSig {
         self.shared.fetch_and(!bit(signal), Ordering::AcqRel);
     }
 
+    /// Ask to be told of every process-directed signal posted from now on
+    /// ([`ProcSig::take_posted`]); `hook` runs after each is recorded.
+    pub fn set_post_hook(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        let _ = self.post_hook.set(hook);
+    }
+
+    /// The process-directed signals posted since the last take, in order.
+    pub fn take_posted(&self) -> Vec<u32> {
+        std::mem::take(&mut *self.posted.lock())
+    }
+
     /// Mark a process-directed signal pending: whichever thread does not
     /// block it takes it.
     pub fn raise(&self, signal: u32, source: Option<Source>) {
+        if signal > 0 && signal <= sig::MAX {
+            self.raise_quiet(signal, source);
+            if let Some(hook) = self.post_hook.get() {
+                self.posted.lock().push(signal);
+                hook();
+            }
+        }
+    }
+
+    /// [`ProcSig::raise`] without telling the post hook: a signal whose
+    /// posting was recorded where it was sent.
+    fn raise_quiet(&self, signal: u32, source: Option<Source>) {
         if signal > 0 && signal <= sig::MAX {
             self.shared_sources.lock()[signal as usize] = source;
             self.shared.fetch_or(bit(signal), Ordering::AcqRel);
@@ -349,6 +379,9 @@ impl ProcSig {
         if inbox == 0 {
             return 0;
         }
+        // Each post, as the table kept them (one a signal where it keeps
+        // none), for a kernel that is told of posts.
+        let posts = procs.take_posts(pid).unwrap_or_else(|| (1..=64u32).filter(|s| inbox & (1u64 << (s - 1)) != 0).collect());
         // Each signal raised once, with its sender: raised twice, a thread
         // delivering between the two (without the kernel lock) would see it
         // pending again after taking it.
@@ -360,8 +393,12 @@ impl ProcSig {
         }
         for signo in 1..=64u32 {
             if inbox & (1u64 << (signo - 1)) != 0 {
-                self.raise(signo, sources[signo as usize]);
+                self.raise_quiet(signo, sources[signo as usize]);
             }
+        }
+        if let Some(hook) = self.post_hook.get() {
+            self.posted.lock().extend(posts);
+            hook();
         }
         inbox
     }

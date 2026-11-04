@@ -388,6 +388,8 @@ pub struct Kevents {
     /// `ip_klist` / `ips_klist`: the EVFILT_MACHPORT knotes on each port
     /// and set, in the order `filt_machport_link` keeps.
     pub port_klist: HashMap<ObjId, Vec<KnId>>,
+    /// `p_klist`'s EVFILT_SIGNAL knotes.
+    pub sig_klist: Vec<KnId>,
     /// `memorystatus_klist`: the process's EVFILT_MEMORYSTATUS knotes.
     pub memorystatus_klist: Vec<KnId>,
     closed: Arc<Mutex<Vec<KqId>>>,
@@ -2263,6 +2265,7 @@ impl Kernel {
     /// woken.
     pub(crate) fn darwin_kevent_owed(&mut self, m: &mut GuestMem<'_>) {
         self.darwin_machport_knotes();
+        self.darwin_signal_knotes();
         for (t, wr) in std::mem::take(&mut self.kev().wake) {
             self.darwin_wake(m, t, wr);
         }

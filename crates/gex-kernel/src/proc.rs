@@ -189,6 +189,11 @@ struct Proc {
     /// raised), and the pid that sent each. Under the table's lock.
     killed: u64,
     senders: [i32; 64],
+    /// Every signal `kill` posted to it, in order and each time (where
+    /// `pending` keeps one bit a signal), for a process that asked
+    /// ([`ProcTable::record_posts`]): Darwin's knotes count each post.
+    /// Under the table's lock.
+    posts: Option<Vec<u32>>,
     /// Signals `tgkill` sent to one thread of this process from another
     /// process: (tid, signo, sender), in the order sent. Thread ids are the
     /// process's own, so the table cannot check one; a thread that is gone
@@ -299,6 +304,7 @@ impl ProcTable {
                     pending: Arc::new(AtomicU64::new(0)),
                     killed: 0,
                     senders: [0; 64],
+                    posts: None,
                     to_threads: Vec::new(),
                     queue: crate::wait::Queue::new(),
                     info: Vec::new(),
@@ -338,6 +344,7 @@ impl ProcTable {
             pending: Arc::new(AtomicU64::new(0)),
             killed: 0,
             senders: [0; 64],
+            posts: None,
             to_threads: Vec::new(),
             queue: crate::wait::Queue::new(),
             info: Vec::new(),
@@ -745,6 +752,9 @@ impl ProcTable {
                 }
                 p.killed |= bit;
                 p.senders[signo as usize - 1] = caller;
+                if let Some(v) = &mut p.posts {
+                    v.push(signo);
+                }
                 p.pending.fetch_or(bit, Ordering::AcqRel);
             }
             SIGNAL_SEQ.fetch_add(1, Ordering::Release);
@@ -766,19 +776,23 @@ impl ProcTable {
         if signo > 64 {
             return Err(Errno::EINVAL);
         }
-        let t = self.lock();
-        let hits: Vec<&Proc> = t.procs.iter().filter(|p| p.pgid == pgid).collect();
+        let mut t = self.lock();
+        let hits: Vec<usize> = (0..t.procs.len()).filter(|&i| t.procs[i].pgid == pgid).collect();
         if hits.is_empty() {
             return Err(Errno::ESRCH);
         }
         if signo > 0 {
             let bit = 1u64 << (signo - 1);
-            for p in &hits {
+            for &i in &hits {
+                let p = &mut t.procs[i];
+                if let Some(v) = &mut p.posts {
+                    v.push(signo);
+                }
                 p.pending.fetch_or(bit, Ordering::AcqRel);
             }
             SIGNAL_SEQ.fetch_add(1, Ordering::Release);
-            for p in &hits {
-                p.queue.notify();
+            for &i in &hits {
+                t.procs[i].queue.notify();
             }
         }
         Ok(hits.len())
@@ -848,6 +862,26 @@ impl ProcTable {
     }
 
     /// Take everything sent to `pid` since the last call.
+    /// Keep a list of every signal posted to `pid` from now on
+    /// ([`ProcTable::take_posts`]).
+    pub fn record_posts(&self, pid: i32) {
+        if self.remote.is_some() {
+            return;
+        }
+        if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
+            p.posts.get_or_insert_with(Vec::new);
+        }
+    }
+
+    /// The signals posted to `pid` since the last take, in order, if it
+    /// keeps the list; `None` if it does not (a remote table keeps none).
+    pub fn take_posts(&self, pid: i32) -> Option<Vec<u32>> {
+        if self.remote.is_some() {
+            return None;
+        }
+        self.lock().procs.iter_mut().find(|p| p.pid == pid).and_then(|p| p.posts.as_mut().map(std::mem::take))
+    }
+
     pub fn take_signals(&self, pid: i32) -> u64 {
         if let Some(r) = self.remote {
             return (r.take_signals)(pid);
