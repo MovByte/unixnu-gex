@@ -217,6 +217,10 @@ pub struct RunOptions {
     /// A Darwin program's dyld shared cache (its main file; the subcaches
     /// sit beside it), mapped at its shared region before the program runs.
     pub darwin_cache: Option<std::path::PathBuf>,
+    /// Where dyld's `dyld_all_image_infos` is (its `__all_image_info`
+    /// section, slid): the kernel records it at exec, as task_info
+    /// (TASK_DYLD_INFO) reports it.
+    pub darwin_dyld_infos: u64,
     /// Run ahead-of-time code only (`aot_only`): an ejected Windows
     /// program's runtime, with no tier-1 module and no run-time translator.
     pub aot_only: bool,
@@ -228,6 +232,7 @@ impl Default for RunOptions {
             mem: gex_abi::MemFlavor::M32,
             darwin: false,
             darwin_cache: None,
+            darwin_dyld_infos: 0,
             args: Vec::new(),
             env: Vec::new(),
             trace: false,
@@ -1116,6 +1121,7 @@ fn run_program_with(
     // here (the browser has a shim per process).
     kernel.compat = program.compat();
     kernel.darwin = opts.darwin;
+    kernel.darwin_dyld_infos = opts.darwin_dyld_infos;
     // A Darwin program other than launchd is not pid 1: dyld treats pid 1
     // as launchd and boots the system from it. Pid 1 is the kernel's own
     // then, and the program its child, as in the browser's global kernel.

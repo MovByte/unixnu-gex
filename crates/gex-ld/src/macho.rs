@@ -342,6 +342,11 @@ impl MachO {
         (start, end)
     }
 
+    /// A section by segment and name, unslid.
+    pub fn section(&self, seg: &str, sect: &str) -> Option<&Section> {
+        self.segments.iter().flat_map(|s| &s.sections).find(|s| s.segname == seg && s.sectname == sect)
+    }
+
     pub fn is_pie(&self) -> bool {
         self.flags & MH_PIE != 0 || self.filetype != MH_EXECUTE
     }

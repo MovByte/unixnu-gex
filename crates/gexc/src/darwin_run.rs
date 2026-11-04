@@ -35,7 +35,11 @@ pub fn run(mut ra: RunArgs, bytes: &[u8]) -> Result<ExitCode> {
             };
             let host = root.join(dyld.trim_start_matches('/'));
             let dbytes = std::fs::read(&host).with_context(|| format!("reading {}", host.display()))?;
-            let (_, di) = gex_ld::macho::load(&dbytes, dyld_base(&exe)).with_context(|| format!("loading {}", host.display()))?;
+            let (dm, di) = gex_ld::macho::load(&dbytes, dyld_base(&exe)).with_context(|| format!("loading {}", host.display()))?;
+            // dyld's image list, which the kernel names at exec.
+            if let Some(s) = dm.section("__DATA_DIRTY", "__all_image_info").or_else(|| dm.section("__DATA", "__all_image_info")) {
+                ra.opts.darwin_dyld_infos = s.addr.wrapping_add(di.bias);
+            }
             let cache = match std::env::var_os("GEX_DARWIN_CACHE") {
                 Some(p) => PathBuf::from(p),
                 None => root.join(gex_kernel::darwin::CACHE_PATH.trim_start_matches('/')),
