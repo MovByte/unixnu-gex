@@ -154,8 +154,9 @@ impl Space {
     }
 }
 
-/// A monotonic nanosecond count, from the first time it is asked.
-fn monotonic_ns() -> u64 {
+/// A monotonic nanosecond count, from the first time it is asked: what
+/// `mach_absolute_time` returns, with the 1/1 timebase.
+pub(crate) fn monotonic_ns() -> u64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     START.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
 }
@@ -231,8 +232,9 @@ impl Kernel {
                 std::thread::yield_now();
                 kr::SUCCESS
             }
-            trap::MACH_VM_ALLOCATE => self.vm_allocate(m, a[1], a[2], a[3]),
-            trap::MACH_VM_MAP => self.vm_allocate(m, a[1], a[2], a[4]),
+            trap::MACH_VM_ALLOCATE => self.vm_allocate(m, a[1], a[2], 0, a[3]),
+            // _kernelrpc_mach_vm_map_trap(target, address, size, mask, flags, prot)
+            trap::MACH_VM_MAP => self.vm_allocate(m, a[1], a[2], a[3], a[4]),
             trap::MACH_VM_DEALLOCATE => match self.canonical(m, nr::MUNMAP, [a[1], a[2], 0, 0, 0, 0]) {
                 Ok(_) => kr::SUCCESS,
                 Err(_) => kr::INVALID_ADDRESS,
@@ -330,19 +332,34 @@ impl Kernel {
     }
 
     /// `mach_vm_allocate`/`mach_vm_map` of anonymous memory: the address at
-    /// `*addr_p` when the flags fix it, anywhere otherwise.
-    fn vm_allocate(&mut self, m: &mut GuestMem<'_>, addr_p: u64, size: u64, flags: u64) -> u64 {
+    /// `*addr_p` when the flags fix it, anywhere otherwise, aligned to
+    /// `mask + 1` (libmalloc finds a region from a pointer by masking).
+    fn vm_allocate(&mut self, m: &mut GuestMem<'_>, addr_p: u64, size: u64, mask: u64, flags: u64) -> u64 {
         use crate::mem::flags as mf;
         let want = m.read_u64(addr_p).unwrap_or(0);
         let fixed = flags & VM_FLAGS_ANYWHERE == 0;
         let f = mf::PRIVATE | mf::ANONYMOUS | if fixed { mf::FIXED } else { 0 };
         let hint = if fixed { want } else { 0 };
-        match self.canonical(m, nr::MMAP, [hint, size, 3, f, u64::MAX, 0]) {
-            Ok(at) => match m.write_u64(addr_p, at) {
-                Ok(()) => kr::SUCCESS,
-                Err(_) => kr::INVALID_ADDRESS,
-            },
-            Err(_) => kr::NO_SPACE,
+        // Below a page the kernel's own alignment does.
+        let mask = if fixed { 0 } else { mask & !0xfff };
+        let len = size + mask;
+        let at = match self.canonical(m, nr::MMAP, [hint, len, 3, f, u64::MAX, 0]) {
+            Ok(at) => at,
+            Err(_) => return kr::NO_SPACE,
+        };
+        let start = (at + mask) & !mask;
+        // Trim what the alignment left over, before and after.
+        if start > at {
+            let _ = self.canonical(m, nr::MUNMAP, [at, start - at, 0, 0, 0, 0]);
+        }
+        let end = at + len;
+        let page_end = (start + size + 0xfff) & !0xfff;
+        if end > page_end {
+            let _ = self.canonical(m, nr::MUNMAP, [page_end, end - page_end, 0, 0, 0, 0]);
+        }
+        match m.write_u64(addr_p, start) {
+            Ok(()) => kr::SUCCESS,
+            Err(_) => kr::INVALID_ADDRESS,
         }
     }
 

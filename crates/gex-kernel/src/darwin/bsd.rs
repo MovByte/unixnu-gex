@@ -73,6 +73,19 @@ pub fn at_flags(f: u64) -> u64 {
     l
 }
 
+/// A Darwin `RLIMIT_*` as Linux's: they agree to RLIMIT_CORE, then Darwin
+/// has RLIMIT_AS (5), MEMLOCK, NPROC, NOFILE.
+fn rlimit(d: u64) -> Option<u64> {
+    Some(match d {
+        0..=4 => d,
+        5 => 9,
+        6 => 8,
+        7 => 6,
+        8 => 7,
+        _ => return None,
+    })
+}
+
 /// Darwin's `mmap` flags that differ from Linux's.
 mod map {
     pub const ANON: u64 = 0x1000;
@@ -157,6 +170,14 @@ pub fn translate(raw: u64, a: &mut [u64; 6]) -> u64 {
                 a[0] = 10;
             }
             nr::SOCKET
+        }
+        // getrlimit/setrlimit onto prlimit64 for the calling process, the
+        // resource renumbered (_RLIMIT_POSIX_FLAG dropped).
+        sys::GETRLIMIT | sys::SETRLIMIT => {
+            let Some(res) = rlimit(a[0] & 0xfff) else { return UNKNOWN };
+            let (new, old) = if raw == sys::GETRLIMIT { (0, a[1]) } else { (a[1], 0) };
+            *a = [0, res, new, old, 0, 0];
+            nr::PRLIMIT64
         }
         sys::MUNMAP => nr::MUNMAP,
         sys::MPROTECT => nr::MPROTECT,

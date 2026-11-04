@@ -144,6 +144,22 @@ pub fn serve(obj: Object, id: i32, body: &[u8], task: Task<'_>) -> Reply {
                 Reply::err(KERN_INVALID_ARGUMENT)
             }
         }
+        // task_get_special_port(task, which) -> port. The task's own and the
+        // host's are real; the bootstrap port (launchd's) and the rest are
+        // MACH_PORT_NULL until launchd runs.
+        (Object::Task, 3409) => {
+            const TASK_KERNEL_PORT: i32 = 1;
+            const TASK_HOST_PORT: i32 = 2;
+            const TASK_NAME_PORT: i32 = 3;
+            match arg(0) {
+                TASK_KERNEL_PORT | TASK_NAME_PORT => Reply::port(super::mach::TASK_SELF_NAME),
+                TASK_HOST_PORT => Reply::port(super::mach::HOST_SELF_NAME),
+                _ => Reply::port(0),
+            }
+        }
+        // task_set_special_port(task, which, port): nothing reads them back
+        // but task_get_special_port, which answers from its own table.
+        (Object::Task, 3410) => Reply::ok(Vec::new()),
         // task_restartable_ranges_register / _synchronize: code the kernel
         // must restart if it preempts a thread inside. Nothing is
         // preempted mid-block here, so there is nothing to restart.

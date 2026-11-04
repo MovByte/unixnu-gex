@@ -9230,6 +9230,21 @@ impl Kernel {
     }
 
 
+    /// `GEX_STRACE_STACK=N`: the top N stack words of a traced call, which
+    /// in a libc syscall wrapper start with the caller's return address --
+    /// enough to tell who made a call without a debugger.
+    pub(crate) fn strace_stack(&self, m: &GuestMem<'_>) {
+        static STACK_WORDS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let words = *STACK_WORDS.get_or_init(|| std::env::var("GEX_STRACE_STACK").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+        if words == 0 {
+            return;
+        }
+        if let Ok(sp) = m.read_u64(self.ctx_addr + ctx::SP as u64) {
+            let ws: Vec<String> = (0..words).filter_map(|i| m.read_u64(sp + 8 * i).ok()).map(|w| format!("{w:#x}")).collect();
+            eprintln!("[gex:{}]   sp={sp:#x}: {}", self.pid, ws.join(" "));
+        }
+    }
+
     fn arg(&self, m: &GuestMem<'_>, i: u8) -> u64 {
         m.read_u64(self.ctx_addr + ctx::SYSCALL_ARGS[i as usize] as u64)
             .unwrap_or(0)
@@ -9305,6 +9320,7 @@ impl Kernel {
                 let kr = self.mach_trap(m, t, &a);
                 if self.trace {
                     eprintln!("[gex:{}] pc=0x{pc:x} mach {t}({:#x}, {:#x}, {:#x}) = {kr:#x}", self.pid, a[0], a[1], a[2]);
+                    self.strace_stack(m);
                 }
                 let _ = crate::darwin::set_mach_result(m, self.ctx_addr, kr);
                 return SyscallOutcome::Continue;
@@ -9315,7 +9331,8 @@ impl Kernel {
             };
             if let Some(ret) = ret {
                 if self.trace {
-                    eprintln!("[gex:{}] pc=0x{pc:x} darwin {raw:#x}({:#x}, {:#x}, {:#x}) = {}", self.pid, a[0], a[1], a[2], ret as i64);
+                    eprintln!("[gex:{}] pc=0x{pc:x} darwin {}({:#x}, {:#x}, {:#x}) = {}", self.pid, crate::darwin::sysno::name(raw).unwrap_or("?"), a[0], a[1], a[2], ret as i64);
+                    self.strace_stack(m);
                 }
                 let _ = crate::darwin::set_result(m, self.ctx_addr, ret);
                 return SyscallOutcome::Continue;
@@ -9666,22 +9683,7 @@ impl Kernel {
                 traced_path(m, n, a),
                 ret as i64
             );
-            // `GEX_STRACE_STACK=N`: the top N stack words too, which in a
-            // libc syscall wrapper start with the caller's return address --
-            // enough to tell who made a call without a debugger.
-            static STACK_WORDS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-            let words = *STACK_WORDS.get_or_init(|| {
-                std::env::var("GEX_STRACE_STACK").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
-            });
-            if words > 0 {
-                if let Ok(sp) = m.read_u64(self.ctx_addr + ctx::SP as u64) {
-                    let ws: Vec<String> = (0..words)
-                        .filter_map(|i| m.read_u64(sp + 8 * i).ok())
-                        .map(|w| format!("{w:#x}"))
-                        .collect();
-                    eprintln!("[gex:{}]   sp={sp:#x}: {}", self.pid, ws.join(" "));
-                }
-            }
+            self.strace_stack(m);
         }
         let _ = if self.darwin {
             crate::darwin::set_result(m, self.ctx_addr, ret)

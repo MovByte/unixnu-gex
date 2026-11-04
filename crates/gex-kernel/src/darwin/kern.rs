@@ -85,6 +85,9 @@ const MAXPATHLEN: usize = 1024;
 const AMFI_DYLD_POLICY_SELF: u64 = 90;
 const AMFI_DYLD_OUTPUT_ALL: u64 = 0xff;
 
+/// The Sandbox policy's `__mac_syscall` for `sandbox_get_container_expected`.
+const SANDBOX_CONTAINER_EXPECTED: u64 = 67;
+
 /// A mount, as `getfsstat64` reports it.
 pub struct Mount {
     pub on: &'static str,
@@ -130,6 +133,26 @@ pub fn statfs64(mnt: &Mount) -> Vec<u8> {
     b
 }
 
+/// `gettimeofday(tp, tzp, mach_absolute_time)`: a 64-bit `timeval` (seconds,
+/// then 32-bit microseconds), a zero timezone, and the absolute time taken
+/// with it.
+fn darwin_gettimeofday(m: &mut GuestMem<'_>, tp: u64, tzp: u64, abs: u64) -> Result<u64, Errno> {
+    if tp != 0 {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        let mut tv = [0u8; 16];
+        tv[..8].copy_from_slice(&(now.as_secs() as i64).to_le_bytes());
+        tv[8..12].copy_from_slice(&(now.subsec_micros() as i32).to_le_bytes());
+        m.write(tp, &tv)?;
+        if abs != 0 {
+            m.write_u64(abs, super::mach::monotonic_ns())?;
+        }
+    }
+    if tzp != 0 {
+        m.write(tzp, &[0u8; 8])?;
+    }
+    Ok(0)
+}
+
 impl Kernel {
     /// Answer a Darwin call that the renumbering in
     /// [`super::bsd::translate`] cannot, or `None` to leave it to that.
@@ -148,6 +171,7 @@ impl Kernel {
             sys::FCNTL | sys::FCNTL_NOCANCEL => self.darwin_fcntl(m, a),
             sys::FSGETPATH => res(self.darwin_fsgetpath(m, a)),
             sys::PROC_INFO => res(self.darwin_proc_info(m, a)),
+            sys::GETTIMEOFDAY => res(darwin_gettimeofday(m, a[0], a[1], a[2])),
             // No descriptor is a terminal to a Darwin process yet: stdio
             // buffers fully, and termios structures need not be converted.
             sys::IOCTL => neg(Errno::ENOTTY),
@@ -275,15 +299,18 @@ impl Kernel {
             }
             // proc_uniqidentifierinfo: a uuid, the unique id and the
             // parent's, an id version.
+            // The struct has grown over releases; fill what the caller has
+            // room for.
             (CALL_PIDINFO, UNIQIDENTIFIERINFO) if me => {
-                if size < 64 {
+                if size < 32 {
                     return Err(Errno::ENOMEM);
                 }
                 let mut b = [0u8; 64];
                 b[16..24].copy_from_slice(&(self.pid as u64).to_le_bytes());
                 b[24..32].copy_from_slice(&1u64.to_le_bytes());
-                m.write(buf, &b)?;
-                Ok(64)
+                let n = size.min(b.len());
+                m.write(buf, &b[..n])?;
+                Ok(n as u64)
             }
             // proc_pidpath: the program's path.
             (CALL_PIDINFO, PIDPATHINFO) if me => {
@@ -474,6 +501,18 @@ impl Kernel {
             ("AMFI", AMFI_DYLD_POLICY_SELF) => {
                 let out = m.read_u64(arg + 8)?;
                 m.write_u64(out, AMFI_DYLD_OUTPUT_ALL)?;
+                Ok(0)
+            }
+            // sandbox_get_container_expected: two out pointers, a container
+            // expected and the other flag beside it; neither, for a program
+            // that is not a containerised app.
+            ("Sandbox", SANDBOX_CONTAINER_EXPECTED) => {
+                for i in 0..2 {
+                    let out = m.read_u64(arg + 8 * i)?;
+                    if out != 0 {
+                        m.write_u64(out, 0)?;
+                    }
+                }
                 Ok(0)
             }
             _ => {
