@@ -774,6 +774,7 @@ impl Kernel {
 
     /// A Darwin call begins: not a cancellation point unless it says so.
     pub(crate) fn darwin_syscall_enter(&mut self) {
+        super::pipe::set_caller(self.pid);
         self.darwin_me().cancel.notcancelpt = true;
     }
 

@@ -446,8 +446,8 @@ impl Kernel {
             c @ 0..=2 => canon(self, m, c, a[2]),
             f::GETFL => res(self.darwin_getfl(fd as i32)),
             f::SETFL => res(self.darwin_setfl(fd as i32, a[2])),
-            f::GETOWN => canon(self, m, 9, 0),
-            f::SETOWN => canon(self, m, 8, a[2]),
+            f::GETOWN => res(self.fds.get(fd as i32).and_then(|file| self.darwin_getown(&file)).map(|v| v as u32 as u64)),
+            f::SETOWN => res(self.fds.get(fd as i32).and_then(|file| self.darwin_setown(m, &file, a[2] as i32))),
             f::DUPFD_CLOEXEC => canon(self, m, 1030, a[2]),
             f::GETPATH => {
                 let path = self.fds.list().into_iter().find(|&(n, _)| n as u64 == fd).map(|(_, p)| p);

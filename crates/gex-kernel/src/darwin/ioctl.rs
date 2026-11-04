@@ -112,35 +112,12 @@ impl Kernel {
                 self.darwin_fo_ioctl(&file, com, &mut tmp)?;
             }
             cmd::FIOSETOWN => {
-                let mut tmp = int(&data);
-                match self.darwin_file_kind(&file) {
-                    Kind::Socket => {
-                        self.darwin_unimplemented("FIOSETOWN on a socket (so_pgid)".into());
-                        return Err(Errno::EOPNOTSUPP);
-                    }
-                    Kind::Pipe(..) => {}
-                    _ => {
-                        if tmp <= 0 {
-                            tmp = -tmp;
-                        } else {
-                            tmp = self.canonical(m, nr::GETPGID, [tmp as u64, 0, 0, 0, 0, 0])? as i32;
-                        }
-                    }
-                }
-                let mut b = [0u8; 8];
-                put_int(&mut b, tmp);
-                self.darwin_fo_ioctl(&file, cmd::TIOCSPGRP, &mut b)?;
+                self.darwin_setown(m, &file, int(&data))?;
             }
             cmd::FIOGETOWN => {
-                if matches!(self.darwin_file_kind(&file), Kind::Socket) {
-                    self.darwin_unimplemented("FIOGETOWN on a socket (so_pgid)".into());
-                    return Err(Errno::EOPNOTSUPP);
-                }
-                self.darwin_fo_ioctl(&file, cmd::TIOCGPGRP, &mut data)?;
-                let v = -int(&data);
-                put_int(&mut data, v);
+                let v = self.darwin_getown(&file)?;
                 // FIOGETOWN is _IOR: the answer goes out.
-                m.write(udata, &data[..4])?;
+                m.write(udata, &v.to_le_bytes())?;
             }
             _ => {
                 self.darwin_fo_ioctl(&file, com, &mut data)?;
@@ -152,17 +129,55 @@ impl Kernel {
         Ok(0)
     }
 
+    /// FIOSETOWN and F_SETOWN: a pipe's owner as given; another file's as
+    /// a process group (a pid's group, or the group a negative names).
+    pub(crate) fn darwin_setown(&mut self, m: &mut GuestMem<'_>, file: &Arc<OpenFile>, owner: i32) -> Result<u64, Errno> {
+        let mut tmp = owner;
+        match self.darwin_file_kind(file) {
+            Kind::Socket => {
+                self.darwin_unimplemented("setting a socket's owner (so_pgid)".into());
+                return Err(Errno::EOPNOTSUPP);
+            }
+            Kind::Pipe(..) => {}
+            _ => {
+                if tmp <= 0 {
+                    tmp = -tmp;
+                } else {
+                    tmp = self.canonical(m, nr::GETPGID, [tmp as u64, 0, 0, 0, 0, 0])? as i32;
+                }
+            }
+        }
+        let mut b = [0u8; 8];
+        put_int(&mut b, tmp);
+        self.darwin_fo_ioctl(file, cmd::TIOCSPGRP, &mut b)?;
+        Ok(0)
+    }
+
+    /// FIOGETOWN and F_GETOWN: TIOCGPGRP's answer, negated.
+    pub(crate) fn darwin_getown(&mut self, file: &Arc<OpenFile>) -> Result<i32, Errno> {
+        if matches!(self.darwin_file_kind(file), Kind::Socket) {
+            self.darwin_unimplemented("a socket's owner (so_pgid)".into());
+            return Err(Errno::EOPNOTSUPP);
+        }
+        let mut b = [0u8; 8];
+        self.darwin_fo_ioctl(file, cmd::TIOCGPGRP, &mut b)?;
+        Ok(-int(&b))
+    }
+
     /// The file type's `fo_ioctl`.
     pub(crate) fn darwin_fo_ioctl(&mut self, file: &Arc<OpenFile>, com: u64, data: &mut [u8]) -> Result<(), Errno> {
         match self.darwin_file_kind(file) {
             // pipe_ioctl.
             Kind::Pipe(pipe, write) => match com {
                 cmd::FIONBIO => Ok(()),
+                // PIPE_ASYNC: SIGIO to the side's owner at its wakeups, sent
+                // as from the process making the call.
                 cmd::FIOASYNC => {
-                    if int(data) != 0 {
-                        self.darwin_unimplemented("FIOASYNC on a pipe (SIGIO to its process group)".into());
-                        return Err(Errno::EOPNOTSUPP);
-                    }
+                    let procs = Arc::clone(&self.procs);
+                    let send: Arc<dyn Fn(i32) + Send + Sync> = Arc::new(move |owner: i32| {
+                        let _ = procs.kill(super::pipe::caller(), owner, super::kern::signal_to_linux(23));
+                    });
+                    pipe.set_async(write, int(data) != 0, send);
                     Ok(())
                 }
                 cmd::FIONREAD => {

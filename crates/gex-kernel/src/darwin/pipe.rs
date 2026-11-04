@@ -17,6 +17,22 @@ use std::sync::Arc;
 /// `FG_NOSIGPIPE`.
 pub const FG_NOSIGPIPE: u32 = 0x40;
 
+thread_local! {
+    /// The process whose call is running on this thread: what a pipe's
+    /// SIGIO is sent from (`pipeselwakeup` in the caller's context).
+    static CALLER: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
+
+/// Note the process whose call runs on this thread.
+pub fn set_caller(pid: i32) {
+    CALLER.with(|c| c.set(pid));
+}
+
+/// The process whose call runs on this thread.
+pub fn caller() -> i32 {
+    CALLER.with(|c| c.get())
+}
+
 /// `UIO_MAXIOV`.
 const UIO_MAXIOV: u64 = 1024;
 
@@ -90,10 +106,11 @@ impl Kernel {
             return Err(self.darwin_write_error(e, nosigpipe));
         }
         let mut done = 0usize;
-        while done < orig {
-            match pipe.xnu_write_with(orig - done, orig, |dst, from| dst.copy_from_slice(&data[done + from..done + from + dst.len()])) {
-                Ok(n) => done += n as usize,
-                Err(Errno::EAGAIN) => break,
+        // One pass: what fits (pipe_write sleeps when that is not all).
+        if orig > 0 {
+            match pipe.xnu_write_with(orig, orig, |dst, from| dst.copy_from_slice(&data[from..from + dst.len()])) {
+                Ok(n) => done = n as usize,
+                Err(Errno::EAGAIN) => {}
                 Err(e) => return Err(self.darwin_write_error(e, nosigpipe)),
             }
         }

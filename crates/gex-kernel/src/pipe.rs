@@ -85,8 +85,10 @@ struct State {
     /// A Darwin pipe's buffer size (`pipe_buffer.size`, 0 once it is
     /// freed); `None` for a Linux pipe.
     xnu_size: Option<usize>,
-    /// Each side's `pipe_pgid` (read, write), as `TIOCSPGRP` sets it.
+    /// Each side's `pipe_pgid` (read, write), as `TIOCSPGRP` sets it, and
+    /// its `PIPE_ASYNC`.
     pgid: [i32; 2],
+    async_io: [bool; 2],
 }
 
 /// One pipe, shared by both ends.
@@ -96,6 +98,19 @@ pub struct Pipe {
     ready: Condvar,
     /// Who waits on either end (`crate::wait`): notified wherever `ready` is.
     queue: crate::wait::Queue,
+    /// How a Darwin pipe's SIGIO is sent: to a process (a positive owner)
+    /// or a process group (a negative one).
+    sigio: Mutex<Option<Sigio>>,
+}
+
+/// A Darwin pipe's way to send SIGIO to an owner.
+#[derive(Clone)]
+struct Sigio(std::sync::Arc<dyn Fn(i32) + Send + Sync>);
+
+impl std::fmt::Debug for Sigio {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Sigio")
+    }
 }
 
 impl Drop for Pipe {
@@ -129,9 +144,11 @@ impl Pipe {
                 broken: 0,
                 xnu_size: None,
                 pgid: [0; 2],
+                async_io: [false; 2],
             }),
             ready: Condvar::new(),
             queue: crate::wait::Queue::new(),
+            sigio: Mutex::new(None),
         }
     }
 
@@ -151,6 +168,38 @@ impl Pipe {
 
     pub fn set_pgid(&self, write: bool, pgid: i32) {
         self.state.lock().unwrap().pgid[usize::from(write)] = pgid;
+    }
+
+    /// A side's `PIPE_ASYNC`, and how its SIGIO is sent.
+    pub fn set_async(&self, write: bool, on: bool, send: std::sync::Arc<dyn Fn(i32) + Send + Sync>) {
+        self.state.lock().unwrap().async_io[usize::from(write)] = on;
+        *self.sigio.lock().unwrap() = Some(Sigio(send));
+    }
+
+    /// `pipeselwakeup`'s SIGIO, for side `write` of a Darwin pipe: to its
+    /// owner, if it is async and has one. Called with the state unlocked.
+    fn selwakeup(&self, write: bool) {
+        let (on, pgid) = {
+            let s = self.state.lock().unwrap();
+            (s.xnu_size.is_some() && s.async_io[usize::from(write)], s.pgid[usize::from(write)])
+        };
+        if on && pgid != 0 {
+            if let Some(send) = self.sigio.lock().unwrap().clone() {
+                (send.0)(pgid);
+            }
+        }
+    }
+
+    /// After a Darwin read (`pipe_read`'s end): with room left, the write
+    /// side's SIGIO.
+    fn xnu_after_read(&self) {
+        let room = {
+            let s = self.state.lock().unwrap();
+            s.xnu_size.is_some_and(|size| size > s.buf.len())
+        };
+        if room {
+            self.selwakeup(true);
+        }
     }
 
     /// Whether the pipe keeps XNU's rules.
@@ -203,6 +252,11 @@ impl Pipe {
         }
         if space == 0 {
             s.refused += 1;
+            let any = !s.buf.is_empty();
+            drop(s);
+            if any {
+                self.selwakeup(false);
+            }
             return Err(Errno::EAGAIN);
         }
         let n = space.min(left);
@@ -210,6 +264,9 @@ impl Pipe {
         drop(s);
         self.ready.notify_all();
         self.queue.notify();
+        // pipe_write wakes the reader's select and SIGIO before it sleeps
+        // for room, and at its end, with bytes in the buffer.
+        self.selwakeup(false);
         Ok(n as u64)
     }
 
@@ -283,10 +340,17 @@ impl Pipe {
                 }
             }
         }
+        let last = if write { s.writers == 0 } else { s.readers == 0 };
+        drop(s);
         // Waking both sides is what turns the last close into an EOF or an
         // EPIPE rather than a hang.
         self.ready.notify_all();
-                self.queue.notify();
+        self.queue.notify();
+        // pipeclose: the closing side's select and SIGIO, then its peer's.
+        if last {
+            self.selwakeup(write);
+            self.selwakeup(!write);
+        }
     }
 
     /// Read up to `max` bytes, handing what was there to `take` as the
@@ -300,6 +364,12 @@ impl Pipe {
     /// for a full 64 KiB pipe in the page, most of the time a writer blocked
     /// on that pipe waited to be woken.
     pub fn read_with(&self, max: usize, take: impl FnOnce(&[u8], &[u8])) -> Result<usize, Errno> {
+        let r = self.read_with_inner(max, take);
+        self.xnu_after_read();
+        r
+    }
+
+    fn read_with_inner(&self, max: usize, take: impl FnOnce(&[u8], &[u8])) -> Result<usize, Errno> {
         if max == 0 {
             return Ok(0);
         }
@@ -318,6 +388,12 @@ impl Pipe {
     }
 
     pub fn read(&self, buf: &mut [u8]) -> SysResult {
+        let r = self.read_inner(buf);
+        self.xnu_after_read();
+        r
+    }
+
+    fn read_inner(&self, buf: &mut [u8]) -> SysResult {
         if buf.is_empty() {
             return Ok(0);
         }
