@@ -79,7 +79,7 @@ pub fn page(ncpus: u8, memory: u64) -> Vec<u8> {
 }
 
 /// Where each page goes in a Darwin process's memory: the read-only page
-/// and the read-write one, at their aliases below 4 GiB.
+/// and the read-write one, at their aliases at the top of the memory.
 pub fn placements() -> [u64; 2] {
     let alias = |a: u64| gex_abi::DARWIN_COMMPAGE_ALIAS + (a - gex_abi::DARWIN_COMMPAGE_RO);
     [alias(gex_abi::DARWIN_COMMPAGE_RO), alias(gex_abi::DARWIN_COMMPAGE_RW)]
@@ -102,10 +102,10 @@ mod tests {
     }
 
     #[test]
-    fn the_pages_sit_below_4_gib() {
+    fn the_pages_sit_where_their_addresses_wrap() {
         let [ro, rw] = placements();
-        assert_eq!(ro, 0xffff_4000);
-        assert_eq!(rw, 0xffff_c000);
-        assert!(rw + PAGE_LEN as u64 <= 1 << 32);
+        assert_eq!(ro, gex_abi::DARWIN_COMMPAGE_RO & gex_abi::DARWIN_ADDR_MASK);
+        assert_eq!(rw, gex_abi::DARWIN_COMMPAGE_RW & gex_abi::DARWIN_ADDR_MASK);
+        assert_eq!(rw + PAGE_LEN as u64, gex_abi::LIMIT64);
     }
 }

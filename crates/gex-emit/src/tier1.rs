@@ -1536,6 +1536,12 @@ impl<'a> Emitter<'a> {
                 return 0;
             }
             self.push(addr);
+            // A Darwin process: wrapped into the memory, its commpage
+            // landing on the alias (`gex_abi::DARWIN_ADDR_MASK`).
+            if gex_abi::commpage_fold() {
+                self.f.i64_const(gex_abi::DARWIN_ADDR_MASK as i64);
+                self.f.byte(0x83); // i64.and
+            }
             let max_static: i64 = if gex_abi::X86 { 0xffff } else if on { u32::MAX as i64 - gex_abi::NULL_GUARD as i64 } else { u32::MAX as i64 };
             if null_guard {
                 // memory64's effective address does not wrap: (a - G) + G

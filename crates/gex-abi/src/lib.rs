@@ -1190,14 +1190,21 @@ pub const DARWIN_COMMPAGE_RO: u64 = 0xf_ffff_4000;
 pub const DARWIN_COMMPAGE_RW: u64 = 0xf_ffff_c000;
 pub const DARWIN_COMMPAGE_END: u64 = 0x10_0000_0000;
 
-/// Where a Darwin process's commpage is instead: the same offsets from the
-/// top of the low 4 GiB, a range the kernel reserves for it.
-pub const DARWIN_COMMPAGE_ALIAS: u64 = DARWIN_COMMPAGE_RO - 0xf_0000_0000;
+/// What a Darwin process's addresses are wrapped to: every one it computes
+/// at run time is masked with this before the access, so the commpage
+/// address its code builds in one block and dereferences in another lands
+/// at [`DARWIN_COMMPAGE_ALIAS`] as a constant one does.
+pub const DARWIN_ADDR_MASK: u64 = LIMIT64 - 1;
+
+/// Where a Darwin process's commpage is instead: where its address wraps to,
+/// at the top of the 64-bit memory, a range the kernel reserves for it.
+pub const DARWIN_COMMPAGE_ALIAS: u64 = DARWIN_COMMPAGE_RO & DARWIN_ADDR_MASK;
 
 static COMMPAGE_FOLD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// Fold Darwin's commpage addresses in everything translated from now on (a
-/// Darwin process's runner). In the unit key.
+/// Fold Darwin's commpage addresses in everything translated from now on, and
+/// wrap every run-time address with [`DARWIN_ADDR_MASK`] (a Darwin process's
+/// runner). In the unit key.
 pub fn set_commpage_fold(on: bool) {
     COMMPAGE_FOLD.store(on, core::sync::atomic::Ordering::Relaxed);
 }
