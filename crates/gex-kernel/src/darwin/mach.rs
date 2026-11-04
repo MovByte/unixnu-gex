@@ -116,7 +116,7 @@ impl Space {
     }
 
     /// The name for this thread's own port, made on first use.
-    fn thread(&mut self, tid: i32) -> u32 {
+    pub fn thread(&mut self, tid: i32) -> u32 {
         if let Some((&n, _)) = self.names.iter().find(|(_, p)| **p == Port::Thread(tid)) {
             return n;
         }
@@ -263,7 +263,7 @@ impl Kernel {
         }
     }
 
-    fn semaphore_signal(&mut self, name: u32) -> u64 {
+    pub(crate) fn semaphore_signal(&mut self, name: u32) -> u64 {
         match self.darwin_ports.get_mut(name) {
             Some(Port::Semaphore(v)) => {
                 *v += 1;

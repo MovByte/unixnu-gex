@@ -101,6 +101,11 @@ pub fn translate(raw: u64, a: &mut [u64; 6]) -> u64 {
         // Darwin's exit ends the process, every thread with it; so do the
         // payload aborts once [`super::kern`] has said why.
         sys::EXIT => nr::EXIT_GROUP,
+        // One thread's end, its stack and semaphore already seen to.
+        sys::BSDTHREAD_TERMINATE => {
+            a[0] = 0;
+            nr::EXIT
+        }
         sys::ABORT_WITH_PAYLOAD | sys::TERMINATE_WITH_PAYLOAD => {
             a[0] = 128 + 6;
             nr::EXIT_GROUP

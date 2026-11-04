@@ -21,6 +21,7 @@ pub mod mach;
 pub mod mig;
 pub mod sysctl;
 pub mod sysno;
+pub mod thread;
 
 /// Where iOS 17 keeps the shared cache, inside the SystemOS cryptex.
 pub const CACHE_PATH: &str = "/System/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64";

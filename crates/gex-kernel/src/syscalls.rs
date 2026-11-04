@@ -532,9 +532,12 @@ impl BlockOp {
 pub mod clone_flags {
     pub const VM: u64 = 0x0000_0100;
     pub const FS: u64 = 0x0000_0200;
+    pub const FILES: u64 = 0x0000_0400;
+    pub const SIGHAND: u64 = 0x0000_0800;
     pub const PIDFD: u64 = 0x0000_1000;
     pub const VFORK: u64 = 0x0000_4000;
     pub const THREAD: u64 = 0x0001_0000;
+    pub const SYSVSEM: u64 = 0x0004_0000;
     pub const SETTLS: u64 = 0x0008_0000;
     pub const PARENT_SETTID: u64 = 0x0010_0000;
     pub const CHILD_CLEARTID: u64 = 0x0020_0000;
@@ -678,6 +681,12 @@ pub struct Kernel {
     /// libpthread's thread and workqueue thread entry points, as
     /// `bsdthread_register` gave them.
     pub darwin_thread_entry: (u64, u64),
+    /// Where libpthread keeps a thread's TSD inside its pthread, and its
+    /// own port inside the TSD (`bsdthread_register`'s registration data).
+    pub darwin_tsd_offset: u64,
+    pub darwin_port_offset: u64,
+    /// How the Darwin call that blocked writes its result back.
+    pub darwin_finish: Option<crate::darwin::thread::Finish>,
     /// Set by a syscall that may have made a descriptor readable or
     /// writable for someone else (a write, a read that freed room, a close,
     /// a signal); the host takes it after the call and wakes threads parked
@@ -7338,6 +7347,21 @@ pub fn futex_block(cx: &FutexCx<'_>, m: &GuestMem<'_>, a: [u64; 6]) -> Option<Bl
     })
 }
 
+/// A wait on the word at `uaddr` while it holds `val`, for at most
+/// `deadline` (a Darwin `ulock`): `None` when the word is outside the map or
+/// already differs. The queue place is taken before the word is read, as
+/// [`futex_block`] does.
+pub fn futex_wait_op(cx: &FutexCx<'_>, m: &GuestMem<'_>, uaddr: u64, val: u32, deadline: Option<std::time::Duration>) -> Option<BlockOp> {
+    if !cx.mapped(uaddr) {
+        return None;
+    }
+    let parked = cx.table.park(uaddr);
+    if m.read_u32(uaddr).ok()? != val {
+        return None;
+    }
+    Some(BlockOp::FutexWait { table: Arc::clone(cx.table), uaddr, val, deadline, parked: Some(parked) })
+}
+
 /// The park for a `FUTEX_LOCK_PI` that found the lock held ([`futex_call`]
 /// set the waiters bit and answered `EAGAIN`).
 pub fn futex_pi_park(cx: &FutexCx<'_>, m: &GuestMem<'_>, a: [u64; 6]) -> Option<BlockOp> {
@@ -8566,6 +8590,7 @@ pub struct PendingCall {
     /// ([`Kernel::finish_blocking`]).
     pub block_restart: crate::signal::Restart,
     pub block_pc: u64,
+    pub darwin_finish: Option<crate::darwin::thread::Finish>,
 }
 
 /// A thread the kernel has prepared and the host must start.
@@ -8625,6 +8650,7 @@ impl Kernel {
             retry_sigwait: self.retry_sigwait.take(),
             block_restart: std::mem::take(&mut self.block_restart),
             block_pc: std::mem::take(&mut self.block_pc),
+            darwin_finish: self.darwin_finish.take(),
         };
         if call != PendingCall::default() {
             self.thread_calls.insert(self.sig_tid, call);
@@ -8638,6 +8664,7 @@ impl Kernel {
         self.retry_sigwait = call.retry_sigwait;
         self.block_restart = call.block_restart;
         self.block_pc = call.block_pc;
+        self.darwin_finish = call.darwin_finish;
         let blocked = self.signals.blocked();
         let next = self
             .thread_signals
@@ -8779,6 +8806,9 @@ impl Kernel {
             darwin_ports: Default::default(),
             darwin_dyld_infos: 0,
             darwin_thread_entry: (0, 0),
+            darwin_tsd_offset: 0,
+            darwin_port_offset: 0,
+            darwin_finish: None,
             fd_activity: false,
             wasm32: false,
             sigreturn_legacy: false,
@@ -9168,6 +9198,9 @@ impl Kernel {
             darwin_ports: Default::default(),
             darwin_dyld_infos: 0,
             darwin_thread_entry: (0, 0),
+            darwin_tsd_offset: 0,
+            darwin_port_offset: 0,
+            darwin_finish: None,
             fd_activity: false,
             wasm32: self.wasm32,
             sigreturn_legacy: false,
@@ -9208,6 +9241,11 @@ impl Kernel {
     ///
     /// A `clone` without `CLONE_THREAD` never reaches here; the new-process
     /// case is handled in `syscall`.
+    /// A Darwin thread, made as `clone` makes one.
+    pub(crate) fn darwin_clone(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> Result<SpawnRequest, Errno> {
+        self.sys_clone(m, a)
+    }
+
     fn sys_clone(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> Result<SpawnRequest, Errno> {
         let fs = self.fs_of(self.ctx_addr);
         self.thread_maker(&fs).make(m, self.ctx_addr, a)
@@ -9324,6 +9362,12 @@ impl Kernel {
                 }
                 let _ = crate::darwin::set_mach_result(m, self.ctx_addr, kr);
                 return SyscallOutcome::Continue;
+            }
+            if let Some(out) = self.darwin_thread_call(m, raw, &a) {
+                if self.trace {
+                    eprintln!("[gex:{}] pc=0x{pc:x} darwin {}({:#x}, {:#x}, {:#x}) -> {}", self.pid, crate::darwin::sysno::name(raw).unwrap_or("?"), a[0], a[1], a[2], if matches!(out, SyscallOutcome::Blocking(_)) { "blocks" } else { "done" });
+                }
+                return out;
             }
             let ret = match crate::darwin::direct(m, self.ctx_addr, raw) {
                 Some(ret) => Some(ret),
@@ -9953,8 +9997,14 @@ impl Kernel {
                 crate::signal::Source { code: crate::signal::SI_USER, pid: self.pid, uid: self.creds.uid() },
             );
         }
-        let ret = encode(r);
-        let _ = set_result(m, self.ctx_addr, ret);
+        if !(self.darwin && self.darwin_finish_blocking(m, r)) {
+            let ret = encode(r);
+            let _ = if self.darwin {
+                crate::darwin::set_result(m, self.ctx_addr, ret)
+            } else {
+                set_result(m, self.ctx_addr, ret)
+            };
+        }
         if let Some(mask) = suspended {
             self.signals.set_suspend_restore(Some(mask));
         }
@@ -10147,7 +10197,7 @@ impl Kernel {
 
     /// What this process's futex calls need ([`FutexCx`]), for the calling
     /// thread, with the map asked directly (`mapped`): this kernel owns it.
-    fn futex_cx<'a>(&'a self, mapped: &'a dyn Fn(u64, u64) -> bool) -> FutexCx<'a> {
+    pub(crate) fn futex_cx<'a>(&'a self, mapped: &'a dyn Fn(u64, u64) -> bool) -> FutexCx<'a> {
         FutexCx { table: &self.futexes, map: None, mapped_by: Some(mapped), tid: self.tid as u32, clock: self.clock }
     }
 

@@ -176,22 +176,37 @@ impl Kernel {
             // buffers fully, and termios structures need not be converted.
             sys::IOCTL => neg(Errno::ENOTTY),
             // libpthread's entry points for new threads and workqueue
-            // threads, kept for when threads are created; the features are
-            // what this kernel does (no kevent or workloop support yet).
+            // threads, and from its registration data (`struct
+            // _pthread_registration_data`, packed) where a pthread keeps its
+            // TSD and its own port. Back goes the default mutex policy:
+            // first-fit on ulocks, so mutexes and their condition variables
+            // wait on `ulock` rather than psynch's sequence words. The
+            // features are what this kernel does.
             sys::BSDTHREAD_REGISTER => {
+                const POLICY_FIRSTFIT: u32 = 3;
+                const USE_ULOCK: u32 = 0x100;
                 self.darwin_thread_entry = (a[0], a[1]);
+                if a[3] != 0 && a[4] >= 36 {
+                    self.darwin_tsd_offset = m.read_u32(a[3] + 24).map_or(0, u64::from);
+                    self.darwin_port_offset = m.read_u32(a[3] + 32).map_or(0, u64::from);
+                }
+                if a[3] != 0 && a[4] >= 48 {
+                    let _ = m.write_u32(a[3] + 44, POLICY_FIRSTFIT | USE_ULOCK);
+                }
                 PTHREAD_FEATURES
             }
             // QoS overrides and the like: no scheduler classes to apply.
             sys::BSDTHREAD_CTL => 0,
-            // A signal to a thread by its Mach port: this one, the only
-            // thread a Darwin process has yet.
+            // A signal to a thread by its Mach port; signal 0 only asks
+            // whether the thread is there.
             sys::PTHREAD_KILL => {
                 let sig = signal_to_linux(a[1] as u32);
-                if sig == 0 {
-                    0
-                } else {
-                    res(self.canonical(m, nr::TGKILL, [self.pid as u64, self.tid as u64, u64::from(sig), 0, 0, 0]))
+                match self.darwin_ports.get(a[0] as u32) {
+                    Some(super::mach::Port::Thread(_)) if sig == 0 => 0,
+                    Some(&super::mach::Port::Thread(tid)) => {
+                        res(self.canonical(m, nr::TGKILL, [self.pid as u64, tid as u64, u64::from(sig), 0, 0, 0]))
+                    }
+                    _ => neg(Errno::ESRCH),
                 }
             }
             // Handlers are not delivered in Darwin's frame format yet: a
