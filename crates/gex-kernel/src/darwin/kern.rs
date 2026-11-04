@@ -180,6 +180,9 @@ impl Kernel {
     /// [`super::bsd::translate`] cannot, or `None` to leave it to that.
     /// The result is in the canonical encoding (`-errno` on failure).
     pub(crate) fn darwin_call(&mut self, m: &mut GuestMem<'_>, raw: u64, a: &[u64; 6]) -> Option<u64> {
+        if let Some(r) = self.darwin_fs_call(m, raw, a) {
+            return Some(res(r));
+        }
         Some(match raw {
             // dyld asks where the shared cache is mapped; the kernel mapped
             // it before the process started.

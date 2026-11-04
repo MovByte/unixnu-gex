@@ -3936,13 +3936,19 @@ impl PathIo<'_> {
             }
             (v[0], v[1])
         };
+        self.set_times_at(m, dirfd, path, atime, mtime, flags & AT_SYMLINK_NOFOLLOW == 0)
+    }
+
+    /// Set the access and modification times (`None`: leave it) of `path`
+    /// under `dirfd`, or of the open descriptor `dirfd` itself when `path`
+    /// is 0.
+    pub fn set_times_at(&self, m: &GuestMem<'_>, dirfd: i32, path: u64, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>, follow: bool) -> SysResult {
         if path == 0 {
             // futimens: the "path" is really the open descriptor in `dirfd`.
             self.map.fds.get(dirfd)?.handle.set_times(atime, mtime)?;
             return Ok(0);
         }
         let p = self.at_path(m, dirfd, path)?;
-        let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
         if atime.is_some() || mtime.is_some() {
             // Which says `ENOENT` itself.
             self.ns.set_times(&p, atime, mtime, follow)?;
