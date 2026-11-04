@@ -2313,6 +2313,8 @@ fn decode_simd_across(raw: u32, q: bool, u: u32) -> Inst {
         (0b11010, 0) => VAcrossOp::SMin,
         (0b11010, _) => VAcrossOp::UMin,
         (0b11011, 0) => VAcrossOp::Add,
+        (0b00011, 0) => VAcrossOp::SAddL,
+        (0b00011, _) => VAcrossOp::UAddL,
         _ => return Inst::Unknown { raw },
     };
     let lane_bytes = match bits(raw, 23, 22) {
@@ -2947,6 +2949,19 @@ fn expand_simd_immediate(imm8: u32, cmode: u32, op: bool, q: bool) -> Option<u12
 
 #[cfg(test)]
 mod tests {
+
+    /// The widening sums across lanes, as llvm-objdump prints them.
+    #[test]
+    fn widening_sums_across_lanes_decode() {
+        for (raw, want) in [
+            (0x2e30_3800u32, "uaddlv h0, v0.8b"),
+            (0x6e70_3820, "uaddlv s0, v1.8h"),
+            (0x4eb0_3800, "saddlv d0, v0.4s"),
+            (0x0e30_3800, "saddlv h0, v0.8b"),
+        ] {
+            assert_eq!(crate::fmt::disasm(&decode(raw, 0), 0), want, "{raw:#x}");
+        }
+    }
 
     /// The cryptographic extension, as llvm-objdump prints it.
     #[test]

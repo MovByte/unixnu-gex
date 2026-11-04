@@ -1412,6 +1412,9 @@ pub enum VAcrossOp {
     /// `fmaxnmv`/`fmaxnmp`: a NaN loses to a number, rather than propagating.
     FMaxNm,
     FMinNm,
+    /// `saddlv`/`uaddlv`: the sum, widened to twice the lane size.
+    SAddL,
+    UAddL,
 }
 
 /// The three-operand bitwise selects.

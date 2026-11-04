@@ -2208,6 +2208,25 @@ impl<'a> Lifter<'a> {
                 Flow::Next
             }
 
+            Inst::VAcross { op: op @ (VAcrossOp::SAddL | VAcrossOp::UAddL), arr, vd, vn } => {
+                // The widening sums: every lane extended and added as a
+                // scalar, the total in a lane twice the size.
+                let signed = op == VAcrossOp::SAddL;
+                let lb = arr.lane_bytes;
+                let wide = if lb == 4 { Ty::I64 } else { Ty::I32 };
+                let src = self.b.read(GuestReg::V128(vn.0));
+                let mut sum = self.konst(wide, 0);
+                for l in 0..arr.lanes() {
+                    let v = self.b.def(Expr::VExtract { a: src, lane: l, lane_bytes: lb, signed, ty: Ty::I32 });
+                    let v = if wide == Ty::I64 { self.b.def(Expr::Extend { a: v, signed }) } else { v };
+                    sum = self.b.bin(BinOp::Add, wide, sum, v);
+                }
+                let zero = self.b.def(Expr::VConst(Box::new([0u8; 16])));
+                let out = self.b.def(Expr::VReplace { a: zero, lane: 0, lane_bytes: lb * 2, val: sum });
+                self.b.write(GuestReg::V128(vd.0), out);
+                Flow::Next
+            }
+
             Inst::VAcross { op, arr, vd, vn } => {
                 // Wasm has no horizontal reduction, so fold the vector in
                 // half repeatedly: log2(lanes) shuffles and lane-wise ops
@@ -2223,6 +2242,7 @@ impl<'a> Lifter<'a> {
                     VAcrossOp::SMin | VAcrossOp::FMin | VAcrossOp::FMinNm => VLaneBinOp::MinS,
                     VAcrossOp::UMax => VLaneBinOp::MaxU,
                     VAcrossOp::UMin => VLaneBinOp::MinU,
+                    VAcrossOp::SAddL | VAcrossOp::UAddL => unreachable!("the widening sums are lifted above"),
                 };
                 let mut acc = self.b.read(GuestReg::V128(vn.0));
                 let lb = arr.lane_bytes;

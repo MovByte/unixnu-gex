@@ -1069,14 +1069,18 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                 (VAcrossOp::FMaxNm, true) => "fmaxnmp",
                 (VAcrossOp::FMinNm, false) => "fminnmv",
                 (VAcrossOp::FMinNm, true) => "fminnmp",
+                (VAcrossOp::SAddL, _) => "saddlv",
+                (VAcrossOp::UAddL, _) => "uaddlv",
             };
             let src = VArr {
                 scalar: false,
                 ..arr
             };
+            // The widening sums write a lane twice the size.
+            let dest = if matches!(op, VAcrossOp::SAddL | VAcrossOp::UAddL) { arr.lane_bytes * 2 } else { arr.lane_bytes };
             format!(
                 "{m} {}{}, v{}.{}",
-                lane_letter(arr.lane_bytes),
+                lane_letter(dest),
                 vd.0,
                 vn.0,
                 src.suffix()
