@@ -9313,6 +9313,9 @@ impl Kernel {
     /// Handle one system call (`svc #0`, or `syscall`).
     pub fn syscall(&mut self, m: &mut GuestMem<'_>, pc: u64) -> SyscallOutcome {
         let out = self.syscall_cwd(m, pc);
+        if self.darwin && !matches!(out, SyscallOutcome::Blocking(_)) {
+            self.darwin_syscall_exit();
+        }
         if self.darwin {
             if let Some(what) = self.darwin_strict_stop() {
                 eprintln!("[gex:{}] GEX_DARWIN_STRICT: stopping at pc {pc:#x}: {what}", self.pid);
@@ -9382,6 +9385,7 @@ impl Kernel {
             ]
         };
         if self.darwin {
+            self.darwin_syscall_enter();
             if let Some(t) = crate::darwin::mach_trap_number(raw) {
                 let kr = self.mach_trap(m, t, &a);
                 if self.trace {
@@ -9390,6 +9394,16 @@ impl Kernel {
                 }
                 let _ = crate::darwin::set_mach_result(m, self.ctx_addr, kr);
                 return SyscallOutcome::Continue;
+            }
+            if crate::darwin::thread::CANCEL_POINTS.contains(&raw) && self.darwin_testcancel(true) {
+                let _ = crate::darwin::set_result(m, self.ctx_addr, Errno::EINTR.as_return());
+                return SyscallOutcome::Continue;
+            }
+            if let Some(out) = self.darwin_psynch_call(m, raw, &a) {
+                if self.trace {
+                    eprintln!("[gex:{}] pc=0x{pc:x} darwin {}({:#x}, {:#x}, {:#x}) -> {}", self.pid, crate::darwin::sysno::name(raw).unwrap_or("?"), a[0], a[1], a[2], if matches!(out, SyscallOutcome::Blocking(_)) { "blocks" } else { "done" });
+                }
+                return out;
             }
             if let Some(out) = self.darwin_thread_call(m, raw, &a) {
                 if self.trace {
@@ -9983,6 +9997,7 @@ impl Kernel {
                     self.block_restart = crate::signal::Restart::Never;
                     self.block_pc = 0;
                     self.darwin_wait_done(m, wait, res);
+                    self.darwin_syscall_exit();
                     return match self.deliver_pending(m) {
                         Delivery::None => SyscallOutcome::Continue,
                         Delivery::Resume(_) if self.wasm32 => SyscallOutcome::Continue,
@@ -10049,6 +10064,7 @@ impl Kernel {
         }
         let ret = encode(r);
         let _ = if self.darwin {
+            self.darwin_syscall_exit();
             crate::darwin::set_result(m, self.ctx_addr, ret)
         } else {
             set_result(m, self.ctx_addr, ret)

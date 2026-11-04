@@ -172,13 +172,29 @@ impl Kernel {
             // buffers fully, and termios structures need not be converted.
             sys::IOCTL => neg(Errno::ENOTTY),
             sys::BSDTHREAD_REGISTER => res(self.darwin_bsdthread_register(m, a)),
+            sys::PTHREAD_MARKCANCEL => res(self.darwin_markcancel(m, a[0] as u32)),
+            sys::PTHREAD_CANCELED => res(self.darwin_canceled(a[0])),
+            // A thread on its way out takes no more signals or cancels.
+            sys::DISABLE_THREADSIGNAL => {
+                let c = &mut self.dtask.threads.map.entry(self.tid).or_default().cancel;
+                c.no_sigmask = true;
+                c.disable = true;
+                0
+            }
             // QoS overrides and the like: no scheduler classes to apply.
             sys::BSDTHREAD_CTL => 0,
             // A signal to a thread by its Mach port; signal 0 only asks
             // whether the thread is there.
             sys::PTHREAD_KILL => {
                 let sig = signal_to_linux(a[1] as u32);
+                let target = match self.darwin_ports.get(a[0] as u32) {
+                    Some(&super::mach::Port::Thread(tid)) => Some(tid),
+                    _ => None,
+                };
+                let no_sigmask = target.is_some_and(|t| self.dtask.threads.map.get(&t).is_some_and(|d| d.cancel.no_sigmask));
                 match self.darwin_ports.get(a[0] as u32) {
+                    _ if (a[1] as u32) >= 32 && target.is_some() => neg(Errno::EINVAL),
+                    _ if no_sigmask => neg(Errno::ESRCH),
                     Some(super::mach::Port::Thread(_)) if sig == 0 => 0,
                     Some(&super::mach::Port::Thread(tid)) => {
                         res(self.canonical(m, nr::TGKILL, [self.pid as u64, tid as u64, u64::from(sig), 0, 0, 0]))

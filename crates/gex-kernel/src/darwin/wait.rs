@@ -114,6 +114,14 @@ impl Kernel {
         let slot = self.dtask.waits.slots.get_mut(&tid).expect("slot made above");
         slot.waiting = true;
         slot.result = None;
+        // An abort the thread did not wait for ends this wait at once.
+        let me = self.dtask.threads.map.entry(tid).or_default();
+        if me.cancel.abort_safely {
+            me.cancel.abort_safely = false;
+            self.dtask.waits.slots.get_mut(&tid).expect("slot made above").waiting = false;
+            self.darwin_wait_done(m, wait, WaitResult::Interrupted);
+            return SyscallOutcome::Continue;
+        }
         self.darwin_sleep(m, word, wait)
     }
 

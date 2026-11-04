@@ -124,10 +124,43 @@ pub struct Policy {
     pub importance: Option<i32>,
 }
 
+/// A thread's cancellation state: XNU's `UT_CANCEL*` bits of `uu_flag`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Cancel {
+    /// `UT_CANCEL`: a cancel is pending.
+    pub cancel: bool,
+    /// `UT_CANCELED`: the thread has acted on it.
+    pub canceled: bool,
+    /// `UT_CANCELDISABLE`.
+    pub disable: bool,
+    /// `UT_NOTCANCELPT`: in a call that is not a cancellation point (set
+    /// on entry, cleared by one that is and on return).
+    pub notcancelpt: bool,
+    /// `UT_NO_SIGMASK`: `__pthread_kill` no longer reaches it.
+    pub no_sigmask: bool,
+    /// An abort (`thread_abort_safely`) that found the thread not waiting:
+    /// its next wait in this call ends at once, interrupted.
+    pub abort_safely: bool,
+}
+
+impl Cancel {
+    /// `uthread_is_cancelled`: a cancel pending and acted on when it can be.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel && !self.canceled && !self.disable
+    }
+}
+
+/// The BSD calls that are cancellation points: each has a `_nocancel`
+/// twin and starts with `__pthread_testcancel(1)`.
+pub const CANCEL_POINTS: &[u64] = &[
+    sys::READ, sys::WRITE, sys::OPEN, sys::CLOSE, sys::WAIT4, sys::RECVMSG, sys::SENDMSG, sys::RECVFROM, sys::ACCEPT, sys::MSYNC, sys::FCNTL, sys::SELECT, sys::FSYNC, sys::CONNECT, sys::SIGSUSPEND, sys::READV, sys::WRITEV, sys::SENDTO, sys::PREAD, sys::PWRITE, sys::WAITID, sys::POLL, sys::MSGSND, sys::MSGRCV, sys::SEM_WAIT, sys::AIO_SUSPEND, sys::SIGWAIT, sys::OPENAT, sys::PREADV, sys::PWRITEV, sys::PSELECT,
+];
+
 /// A Darwin thread's kernel state.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DThread {
     pub policy: Policy,
+    pub cancel: Cancel,
     /// `thread_suspend` count. A thread made with `PTHREAD_START_SUSPENDED`
     /// starts at 1, not yet run.
     pub suspend: u32,
@@ -187,6 +220,8 @@ pub struct Ulocks {
 pub enum Finish {
     /// `ulock_wait`.
     Ulock { addr: u64, no_errno: bool },
+    /// A psynch wait.
+    Psynch(super::psynch::Cont),
 }
 
 /// `wait_result_to_return_code` (`sys_ulock.c`).
@@ -452,6 +487,9 @@ impl Kernel {
             bsd_result(m, k.ctx_addr, r, no_errno);
             SyscallOutcome::Continue
         };
+        if flags & ul::WAIT_CANCEL_POINT != 0 && self.darwin_testcancel(true) {
+            return done(self, m, Err(Errno::EINTR));
+        }
         if flags & ul::WAIT_MASK != flags {
             return done(self, m, Err(Errno::EINVAL));
         }
@@ -589,6 +627,7 @@ impl Kernel {
     /// A blocked thread call's wait has ended: its result, written back.
     pub(crate) fn darwin_thread_wait_done(&mut self, m: &mut GuestMem<'_>, f: Finish, res: WaitResult) {
         match f {
+            Finish::Psynch(c) => self.darwin_psynch_wait_done(m, c, res),
             Finish::Ulock { addr, no_errno } => {
                 // A waiter that was not woken is still on the queue.
                 if res != WaitResult::Awakened {
@@ -602,6 +641,107 @@ impl Kernel {
                     Some(e) => Err(e),
                 };
                 bsd_result(m, self.ctx_addr, r, no_errno);
+            }
+        }
+    }
+}
+
+impl Kernel {
+    /// The calling thread's Darwin state, made on first use.
+    fn darwin_me(&mut self) -> &mut DThread {
+        self.dtask.threads.map.entry(self.tid).or_default()
+    }
+
+    /// A Darwin call begins: not a cancellation point unless it says so.
+    pub(crate) fn darwin_syscall_enter(&mut self) {
+        self.darwin_me().cancel.notcancelpt = true;
+    }
+
+    /// A Darwin call has returned to the program: an abort it did not wait
+    /// for is spent.
+    pub(crate) fn darwin_syscall_exit(&mut self) {
+        let c = &mut self.darwin_me().cancel;
+        c.notcancelpt = false;
+        c.abort_safely = false;
+    }
+
+    /// `__pthread_testcancel(presyscall)`: this call is a cancellation
+    /// point. With a cancel pending, one about to start (`presyscall`)
+    /// fails with EINTR (true); one in progress has its next wait aborted.
+    pub(crate) fn darwin_testcancel(&mut self, presyscall: bool) -> bool {
+        let me = self.tid;
+        let c = &mut self.darwin_me().cancel;
+        c.notcancelpt = false;
+        if c.is_cancelled() {
+            if presyscall {
+                return true;
+            }
+            self.darwin_abort_safely(me);
+        }
+        false
+    }
+
+    /// `__pthread_testcancel(0)`, for a call that waits after it.
+    pub(crate) fn darwin_testcancel_abort(&mut self) {
+        self.darwin_testcancel(false);
+    }
+
+    /// `thread_abort_safely`: end `tid`'s abort-safe wait, interrupted; one
+    /// not waiting has its next wait in its current or next call end so.
+    fn darwin_abort_safely(&mut self, tid: i32) {
+        if self.dtask.waits.waiting(tid) {
+            return;
+        }
+        let blocked_in_bsd = self.thread_calls.get(&tid).is_some_and(|c| c.block_pc != 0) || (tid == self.tid && self.block_pc != 0);
+        if blocked_in_bsd {
+            self.darwin_unimplemented("cancelling a thread blocked in a BSD call".into());
+        }
+        self.dtask.threads.map.entry(tid).or_default().cancel.abort_safely = true;
+    }
+
+    /// `__pthread_markcancel(thread_port)`.
+    pub(crate) fn darwin_markcancel(&mut self, m: &mut GuestMem<'_>, port: u32) -> Result<u64, Errno> {
+        let tid = match self.darwin_ports.get(port) {
+            Some(super::mach::Port::Thread(t)) => *t,
+            _ => return Err(Errno::ESRCH),
+        };
+        let c = &mut self.dtask.threads.map.entry(tid).or_default().cancel;
+        if !c.cancel && !c.canceled {
+            c.cancel = true;
+            c.no_sigmask = true;
+            if !c.notcancelpt && !c.disable {
+                if self.dtask.waits.waiting(tid) {
+                    self.darwin_wake(m, tid, WaitResult::Interrupted);
+                } else {
+                    self.darwin_abort_safely(tid);
+                }
+            }
+        }
+        Ok(0)
+    }
+
+    /// `__pthread_canceled(action)`: 1 enables cancellation, 2 disables it,
+    /// 0 acts on a pending cancel (EINVAL with none).
+    pub(crate) fn darwin_canceled(&mut self, action: u64) -> Result<u64, Errno> {
+        let c = &mut self.darwin_me().cancel;
+        match action as i32 {
+            1 => {
+                c.disable = false;
+                Ok(0)
+            }
+            2 => {
+                c.disable = true;
+                Ok(0)
+            }
+            _ => {
+                if c.is_cancelled() {
+                    c.cancel = false;
+                    c.canceled = true;
+                    c.no_sigmask = true;
+                    Ok(0)
+                } else {
+                    Err(Errno::EINVAL)
+                }
             }
         }
     }

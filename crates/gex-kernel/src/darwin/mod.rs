@@ -19,6 +19,7 @@ pub mod errno;
 pub mod kern;
 pub mod mach;
 pub mod mig;
+pub mod psynch;
 pub mod sysctl;
 pub mod sysno;
 pub mod thread;
@@ -33,6 +34,7 @@ pub struct Task {
     pub threads: thread::Threads,
     pub waits: wait::Waits,
     pub ulocks: thread::Ulocks,
+    pub psynch: psynch::Psynch,
     pub timers: timer::Timers,
     /// Threads made by a call (resumed, or the workqueue's) for the host to
     /// start after it ([`crate::syscalls::Kernel::take_spawns`]).
