@@ -37,7 +37,14 @@ pub mod hdr {
     pub const IMAGES_OFFSET: usize = 0x1c0;
     pub const IMAGES_COUNT: usize = 0x1c4;
     pub const CACHE_SUBTYPE: usize = 0x1c8;
+    pub const DYNAMIC_DATA_OFFSET: usize = 0x1f0;
+    pub const DYNAMIC_DATA_MAX_SIZE: usize = 0x1f8;
 }
+
+/// The magic of the page the first process to map a cache fills in for the
+/// rest (`dyld_cache_dynamic_data_header`), followed by the cache file's
+/// filesystem id and object id.
+pub const DYNAMIC_DATA_MAGIC: &[u8; 16] = b"dyld_data    v0\0";
 
 /// `VM_PROT_*`, as mappings carry them.
 pub const PROT_READ: u32 = 1;
@@ -89,6 +96,8 @@ pub struct Header {
     pub images: Vec<DylibEntry>,
     pub subcaches: Vec<SubCache>,
     pub symbol_file_uuid: Option<[u8; 16]>,
+    /// The dynamic data page, as `(offset from the cache's base, size)`.
+    pub dynamic_data: Option<(u64, u64)>,
 }
 
 impl Header {
@@ -233,7 +242,20 @@ pub fn parse_header(d: &[u8]) -> Result<Header, LoadError> {
         images,
         subcaches,
         symbol_file_uuid,
+        dynamic_data: match (f64_(hdr::DYNAMIC_DATA_OFFSET), f64_(hdr::DYNAMIC_DATA_MAX_SIZE)) {
+            (0, _) | (_, 0) => None,
+            (o, n) => Some((o, n)),
+        },
     })
+}
+
+/// The dynamic data header: magic, filesystem id, object id.
+pub fn dynamic_data_header(fs_id: u64, obj_id: u64) -> [u8; 32] {
+    let mut b = [0u8; 32];
+    b[..16].copy_from_slice(DYNAMIC_DATA_MAGIC);
+    b[16..24].copy_from_slice(&fs_id.to_le_bytes());
+    b[24..32].copy_from_slice(&obj_id.to_le_bytes());
+    b
 }
 
 /// Rebase one mapping's bytes in place by its slide info, for a cache

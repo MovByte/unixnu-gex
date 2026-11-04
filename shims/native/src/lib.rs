@@ -1116,6 +1116,15 @@ fn run_program_with(
     // here (the browser has a shim per process).
     kernel.compat = program.compat();
     kernel.darwin = opts.darwin;
+    // A Darwin program other than launchd is not pid 1: dyld treats pid 1
+    // as launchd and boots the system from it. Pid 1 is the kernel's own
+    // then, and the program its child, as in the browser's global kernel.
+    if opts.darwin && fresh && opts.exe.as_deref() != Some("/sbin/launchd") && kernel.pid == gex_kernel::proc::INIT_PID {
+        kernel.procs.set_virtual_init(true);
+        let pid = kernel.procs.spawn(gex_kernel::proc::INIT_PID);
+        kernel.pid = pid;
+        kernel.tid = pid;
+    }
     // Set again by `wasmprog` if this program is native wasm32.
     kernel.wasm32 = false;
     // An ejected project's replacement code has its own region. Recorded for
@@ -4108,6 +4117,19 @@ fn map_shared_cache(store: &mut Store<HostState>, memory: &gex_mem::GuestMemory,
             }
             store.data_mut().with_kernel(|k| k.mem.lock().insert(m.address, m.address + m.size, pr, "[shared-cache]"));
         }
+    }
+    // The page the first process to map the cache (launchd's dyld) fills in
+    // for every later one: which file the cache is.
+    if let Some((off, size)) = h.dynamic_data {
+        let at = h.mappings.first().map_or(h.shared_region_start, |m| m.address) + off;
+        let (start, end) = (at as usize, (at + size) as usize);
+        if end > data.len() {
+            bail!("the shared cache's dynamic data at {at:#x} does not fit in guest memory");
+        }
+        data[start..end].fill(0);
+        let hdr = dsc::dynamic_data_header(gex_kernel::darwin::CACHE_FS_ID, gex_kernel::darwin::CACHE_OBJ_ID);
+        data[start..start + hdr.len()].copy_from_slice(&hdr);
+        store.data_mut().with_kernel(|k| k.mem.lock().insert(at, at + size, prot::READ | prot::WRITE, "[shared-cache-data]"));
     }
     Ok((h.shared_region_start, h.shared_region_size))
 }

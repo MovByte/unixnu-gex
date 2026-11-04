@@ -11,8 +11,6 @@ use gex_ld::Program;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-/// Where iOS 17 keeps the shared cache, inside the SystemOS cryptex.
-const CACHE_IN_ROOT: &str = "System/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64";
 
 /// dyld goes above the program, on a 16 MiB boundary.
 fn dyld_base(exe: &gex_ld::Image) -> u64 {
@@ -40,7 +38,7 @@ pub fn run(mut ra: RunArgs, bytes: &[u8]) -> Result<ExitCode> {
             let (_, di) = gex_ld::macho::load(&dbytes, dyld_base(&exe)).with_context(|| format!("loading {}", host.display()))?;
             let cache = match std::env::var_os("GEX_DARWIN_CACHE") {
                 Some(p) => PathBuf::from(p),
-                None => root.join(CACHE_IN_ROOT),
+                None => root.join(gex_kernel::darwin::CACHE_PATH.trim_start_matches('/')),
             };
             if !cache.exists() {
                 bail!("no shared cache at {} (set GEX_DARWIN_CACHE)", cache.display());
