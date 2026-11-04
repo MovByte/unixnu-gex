@@ -24,4 +24,5 @@ check() {
 check hello-static "hello from darwin" 0
 check bsd-carry "carry ok" 0
 check commpage "" 0
+check exclusive-pair "" 0
 exit $fail

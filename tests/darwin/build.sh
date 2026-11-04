@@ -17,7 +17,7 @@ cc() {
     xcrun -sdk iphoneos clang -target "$TARGET" "$@"
 }
 
-for p in hello-static bsd-carry commpage; do
+for p in hello-static bsd-carry commpage exclusive-pair; do
     cc -O2 -ffreestanding -fno-stack-protector -nostdlib -static \
         -Wl,-e,_start -Wl,-image_base,$STATIC_BASE \
         -o "$OUT/$p" "$HERE/src/$p.c"

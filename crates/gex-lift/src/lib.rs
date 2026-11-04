@@ -1152,6 +1152,16 @@ impl<'a> Lifter<'a> {
                 Flow::Next
             }
 
+            Inst::LoadExclusivePair { sz, rt, rt2, rn, order } => {
+                self.load_exclusive_pair(sz, rt, rt2, rn, order);
+                Flow::Next
+            }
+
+            Inst::StoreExclusivePair { sz, rs, rt, rt2, rn, .. } => {
+                self.store_exclusive_pair(sz, rs, rt, rt2, rn);
+                Flow::Next
+            }
+
             Inst::CompareSwap { sz, rs, rt, rn, .. } => {
                 let ty = if sz == MemSz::D { Ty::I64 } else { Ty::I32 };
                 let width = if sz == MemSz::D { Sz::X } else { Sz::W };
@@ -4698,6 +4708,75 @@ impl<'a> Lifter<'a> {
         self.wr_gp(rs, Sz::W, status);
 
         // The monitor is cleared either way.
+        let zero = self.b.const_i64(0);
+        self.b.write(GuestReg::MonSize, zero);
+    }
+
+    /// `ldxp`: a W pair is one doubleword, monitored whole; an X pair is
+    /// two, of which the monitor keeps the first (see
+    /// [`Self::store_exclusive_pair`]).
+    fn load_exclusive_pair(&mut self, sz: MemSz, rt: RegSel, rt2: RegSel, rn: RegSel, order: IsaOrder) {
+        let addr = self.rd_addr(rn);
+        let lo = self.b.def(Expr::Load { addr, offset: 0, sz: gex_ir::MemSz::B8, signed: false, ty: Ty::I64, order: order_of(order) });
+        self.b.write(GuestReg::MonAddr, addr);
+        self.b.write(GuestReg::MonValue, lo);
+        if sz == MemSz::D {
+            let hi = self.b.def(Expr::Load { addr, offset: 8, sz: gex_ir::MemSz::B8, signed: false, ty: Ty::I64, order: order_of(order) });
+            let size = self.b.const_i64(16);
+            self.b.write(GuestReg::MonSize, size);
+            self.wr_gp(rt, Sz::X, lo);
+            self.wr_gp(rt2, Sz::X, hi);
+        } else {
+            let size = self.b.const_i64(8);
+            self.b.write(GuestReg::MonSize, size);
+            let first = self.b.wrap(lo);
+            let thirty_two = self.b.const_i64(32);
+            let top = self.b.bin(BinOp::ShrU, Ty::I64, lo, thirty_two);
+            let second = self.b.wrap(top);
+            self.wr_gp(rt, Sz::W, first);
+            self.wr_gp(rt2, Sz::W, second);
+        }
+    }
+
+    /// `stxp`. A W pair is one doubleword, compared and swapped as `stxr`'s
+    /// is. An X pair compares and swaps its first doubleword against the
+    /// monitor and then stores the second: wasm has no 128-bit
+    /// compare-and-swap, so the pair is atomic against another exclusive
+    /// pair only while one thread runs.
+    fn store_exclusive_pair(&mut self, sz: MemSz, rs: RegSel, rt: RegSel, rt2: RegSel, rn: RegSel) {
+        let addr = self.rd_addr(rn);
+        let width = if sz == MemSz::D { 16 } else { 8 };
+        let (lo, hi) = if sz == MemSz::D {
+            (self.rd_gp(rt, Sz::X), Some(self.rd_gp(rt2, Sz::X)))
+        } else {
+            let a = self.rd_gp(rt, Sz::W);
+            let b = self.rd_gp(rt2, Sz::W);
+            let a64 = self.b.extend(a, false);
+            let b64 = self.b.extend(b, false);
+            let thirty_two = self.b.const_i64(32);
+            let top = self.b.bin(BinOp::Shl, Ty::I64, b64, thirty_two);
+            (self.b.bin(BinOp::Or, Ty::I64, top, a64), None)
+        };
+        let mon_addr = self.b.read(GuestReg::MonAddr);
+        let mon_size = self.b.read(GuestReg::MonSize);
+        let want_size = self.b.const_i64(width);
+        let addr_ok = self.b.cmp(CmpOp::Eq, Ty::I64, mon_addr, addr);
+        let size_ok = self.b.cmp(CmpOp::Eq, Ty::I64, mon_size, want_size);
+        let armed = self.b.bin(BinOp::And, Ty::I32, addr_ok, size_ok);
+        let scratch = self.b.const_i64(gex_abi::EXCLUSIVE_SCRATCH);
+        let eff_addr = self.b.select(armed, addr, scratch, Ty::I64);
+        let expected = self.b.read(GuestReg::MonValue);
+        let old = self.b.def(Expr::CmpXchg { addr: eff_addr, expected, replacement: lo, sz: gex_ir::MemSz::B8, ty: Ty::I64 });
+        let swapped = self.b.cmp(CmpOp::Eq, Ty::I64, old, expected);
+        let success = self.b.bin(BinOp::And, Ty::I32, armed, swapped);
+        if let Some(hi) = hi {
+            // The second doubleword lands only with the first.
+            let at = self.b.select(success, addr, scratch, Ty::I64);
+            self.b.stmt(Stmt::Store { addr: at, offset: 8, val: hi, sz: gex_ir::MemSz::B8, order: Order::Relaxed });
+        }
+        let one = self.b.const_i32(1);
+        let status = self.b.bin(BinOp::Xor, Ty::I32, success, one);
+        self.wr_gp(rs, Sz::W, status);
         let zero = self.b.const_i64(0);
         self.b.write(GuestReg::MonSize, zero);
     }

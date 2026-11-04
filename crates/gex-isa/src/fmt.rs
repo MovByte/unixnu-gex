@@ -1540,6 +1540,16 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
             format!("{m} v{}.{w}, v{}.{w}, v{}.{w}", vd.0, vn.0, vm.0)
         }
 
+        Inst::LoadExclusivePair { sz, rt, rt2, rn, order } => {
+            let m = if order == Ordering::Acquire { "ldaxp" } else { "ldxp" };
+            let rsz = if sz == MemSz::D { Sz::X } else { Sz::W };
+            format!("{m} {}, {}, [{}]", reg(rt, rsz), reg(rt2, rsz), reg(rn, Sz::X))
+        }
+        Inst::StoreExclusivePair { sz, rs, rt, rt2, rn, order } => {
+            let m = if order == Ordering::Release { "stlxp" } else { "stxp" };
+            let rsz = if sz == MemSz::D { Sz::X } else { Sz::W };
+            format!("{m} {}, {}, {}, [{}]", reg(rs, Sz::W), reg(rt, rsz), reg(rt2, rsz), reg(rn, Sz::X))
+        }
         Inst::LoadExclusive { sz, rt, rn, order } => {
             let acq = order == Ordering::Acquire;
             let m = match (sz, acq) {

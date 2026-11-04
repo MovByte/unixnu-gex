@@ -1045,6 +1045,24 @@ pub enum Inst {
         rn: RegSel,
         order: Ordering,
     },
+    /// `ldxp`/`ldaxp` — load-exclusive pair: two registers of `sz` (W or X)
+    /// from consecutive words, arming the local monitor for both.
+    LoadExclusivePair {
+        sz: MemSz,
+        rt: RegSel,
+        rt2: RegSel,
+        rn: RegSel,
+        order: Ordering,
+    },
+    /// `stxp`/`stlxp` — store-exclusive pair; `rs` receives 0 on success.
+    StoreExclusivePair {
+        sz: MemSz,
+        rs: RegSel,
+        rt: RegSel,
+        rt2: RegSel,
+        rn: RegSel,
+        order: Ordering,
+    },
     /// `cas`/`casa`/`casl`/`casal` — compare and swap (FEAT_LSE).
     CompareSwap {
         sz: MemSz,

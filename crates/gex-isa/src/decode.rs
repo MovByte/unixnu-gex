@@ -1232,8 +1232,22 @@ fn decode_ldst_exclusive(raw: u32) -> Inst {
                 }
             }
         }
-        // Exclusive pair (LDXP/STXP) and CASP — deferred to the threading
-        // milestone; nothing in T0/T1 userspace emits them.
+        // Exclusive pair (LDXP/LDAXP/STXP/STLXP), sizes 10 (W) and 11 (X).
+        // Sizes 00 and 01 are CASP, not decoded yet.
+        (0, 1) if size >= 0b10 => {
+            let order = match (o0, l) {
+                (1, 1) => Ordering::Acquire,
+                (1, _) => Ordering::Release,
+                _ => Ordering::None,
+            };
+            let sz = if size == 0b11 { MemSz::D } else { MemSz::W };
+            let rt2 = RegSel::gp(bits(raw, 14, 10));
+            if l == 1 {
+                Inst::LoadExclusivePair { sz, rt: RegSel::gp(rt), rt2, rn: RegSel::sp(rn), order }
+            } else {
+                Inst::StoreExclusivePair { sz, rs: RegSel::gp(rs), rt: RegSel::gp(rt), rt2, rn: RegSel::sp(rn), order }
+            }
+        }
         (0, 1) => Inst::Unknown { raw },
         // Load-acquire / store-release register — ordered but not exclusive.
         // Covers LDAR/STLR (o0=1) and LDLAR/STLLR (o0=0, FEAT_LOR); treating
@@ -2883,6 +2897,22 @@ fn expand_simd_immediate(imm8: u32, cmode: u32, op: bool, q: bool) -> Option<u12
 
 #[cfg(test)]
 mod tests {
+
+    /// The exclusive pairs, as llvm-objdump prints them; `ldxp xzr, x10`
+    /// is libsystem's 128-bit atomic load.
+    #[test]
+    fn exclusive_pairs_decode() {
+        for (raw, want) in [
+            (0xc87f_a928u32, "ldaxp x8, x10, [x9]"),
+            (0xc82b_a928, "stlxp w11, x8, x10, [x9]"),
+            (0x887f_2d0a, "ldxp w10, w11, [x8]"),
+            (0x882c_2d0a, "stxp w12, w10, w11, [x8]"),
+            (0xc87f_293f, "ldxp xzr, x10, [x9]"),
+        ] {
+            assert_eq!(crate::fmt::disasm(&decode(raw, 0), 0), want, "{raw:#x}");
+        }
+    }
+
     use super::*;
 
     fn d(raw: u32) -> Inst {
