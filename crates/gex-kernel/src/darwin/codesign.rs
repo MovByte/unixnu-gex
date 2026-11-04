@@ -110,6 +110,40 @@ fn blobs() -> &'static std::sync::Mutex<std::collections::HashMap<(u64, u64), Ve
     B.get_or_init(Default::default)
 }
 
+/// `ubc_cs_blob_add` of a validated blob for the slice at `file_start`:
+/// kept on the vnode, or the one already there for that slice found. The
+/// end of the range it covers (`csb_end_offset`).
+pub fn register_blob(vnode: (u64, u64), file_start: i64, b: &[u8]) -> Result<u64, crate::errno::Errno> {
+    let mut all = blobs().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, _, end)) = all.get(&vnode).and_then(|v| v.iter().find(|&&(base, start, end)| file_start >= base + start as i64 && file_start < base + end as i64)) {
+        return Ok(end);
+    }
+    let (cd_at, cd_len) = validate_csblob(b)?;
+    let cd = &b[cd_at..cd_at + cd_len];
+    let end = end_offset(cd);
+    // csb_start_offset: the first scattered page, if scattered.
+    let scatter = be32(cd, 44).unwrap_or(0) as usize;
+    let start = if be32(cd, 8).unwrap_or(0) >= CS_SUPPORTSSCATTER && scatter != 0 { u64::from(be32(cd, scatter + 4).unwrap_or(0)) << cd[39] } else { 0 };
+    all.entry(vnode).or_default().push((file_start, start, end));
+    Ok(end)
+}
+
+/// `ubc_cs_is_range_codesigned`: one blob on the vnode covers the whole
+/// of `[start, start + size)`, the one whose range holds `start`.
+pub fn range_codesigned(vnode: (u64, u64), start: u64, size: u64) -> bool {
+    if size == 0 || start.checked_add(size).is_none() {
+        return false;
+    }
+    let all = blobs().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(&(base, bstart, bend)) = all.get(&vnode).and_then(|v| {
+        v.iter().find(|&&(base, s, e)| start as i64 >= base + s as i64 && (start as i64) < base + e as i64)
+    }) else {
+        return false;
+    };
+    let (lo, hi) = ((base + bstart as i64) as u64, (base + bend as i64) as u64);
+    lo <= start && start + size <= hi
+}
+
 /// `CS_MAX_BLOB_SIZE`.
 const CS_MAX_BLOB_SIZE: u64 = 40 * 1024 * 1024;
 
@@ -152,14 +186,7 @@ impl Kernel {
                         got += n;
                     }
                 }
-                let (cd_at, cd_len) = validate_csblob(&b)?;
-                let cd = &b[cd_at..cd_at + cd_len];
-                let end = end_offset(cd);
-                // csb_start_offset: the first scattered page, if scattered.
-                let scatter = be32(cd, 44).unwrap_or(0) as usize;
-                let start = if be32(cd, 8).unwrap_or(0) >= CS_SUPPORTSSCATTER && scatter != 0 { u64::from(be32(cd, scatter + 4).unwrap_or(0)) << cd[39] } else { 0 };
-                blobs().lock().unwrap_or_else(|e| e.into_inner()).entry(vnode).or_default().push((file_start, start, end));
-                end
+                register_blob(vnode, file_start, &b)?
             }
         };
         if cmd == F_ADDFILESIGS_RETURN {
@@ -181,7 +208,7 @@ impl Kernel {
 
     /// An open file's vnode (its mount and inode), or `None` for what is
     /// not a vnode.
-    fn darwin_vnode_of(&mut self, file: &std::sync::Arc<crate::file::OpenFile>) -> Option<(u64, u64)> {
+    pub(crate) fn darwin_vnode_of(&mut self, file: &std::sync::Arc<crate::file::OpenFile>) -> Option<(u64, u64)> {
         if file.handle.pipe_end().is_some() || std::sync::Arc::clone(&file.handle).as_kqueue().is_some() || std::sync::Arc::clone(&file.handle).as_posix_shm().is_some() {
             return None;
         }

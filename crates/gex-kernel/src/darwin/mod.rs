@@ -31,6 +31,7 @@ pub mod mach;
 pub mod mach_msg;
 pub mod mig;
 pub mod mk_timer;
+pub mod mwl;
 pub mod pipe;
 pub mod psynch;
 pub mod rlimit;
@@ -99,6 +100,9 @@ pub struct Task {
     pub rlimits: rlimit::Rlimits,
     /// `P_LCUSTOM_STACK`: the main stack's size came from `LC_MAIN`.
     pub custom_stack: bool,
+    /// `p_disallow_map_with_linking`: dyld said it is done mapping with
+    /// linking.
+    pub disallow_mwl: bool,
     /// `p_workq_allow_sigmask`.
     pub workq_allow_sigmask: u32,
     /// `p_dispatchqueue_serialno_offset`, `p_dispatchqueue_label_offset`.

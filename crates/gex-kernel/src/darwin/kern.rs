@@ -191,10 +191,22 @@ impl Kernel {
         Some(match raw {
             // dyld asks where the shared cache is mapped; the kernel mapped
             // it before the process started.
+            // DYLD_VM_END_MWL ends map_with_linking_np for the process; a
+            // null address takes the shared region out of the task.
+            sys::SHARED_REGION_CHECK_NP if a[0] == super::mwl::DYLD_VM_END_MWL => {
+                self.dtask.disallow_mwl = true;
+                0
+            }
             sys::SHARED_REGION_CHECK_NP => match self.darwin_region {
                 (0, _) => neg(Errno::EINVAL),
+                (start, size) if a[0] == 0 => {
+                    self.darwin_vm_deallocate(m, start, size);
+                    self.darwin_region = (0, 0);
+                    0
+                }
                 (start, _) => res(m.write_u64(a[0], start).map(|_| 0)),
             },
+            sys::MAP_WITH_LINKING_NP => res(self.darwin_map_with_linking(m, a)),
             // No set-id programs here.
             sys::ISSETUGID => 0,
             sys::GETENTROPY => res(self.canonical(m, nr::GETRANDOM, [a[0], a[1], 0, 0, 0, 0]).map(|_| 0)),
