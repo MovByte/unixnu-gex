@@ -163,6 +163,11 @@ impl Kernel {
             filtid::MACH_PORT | filtid::MACH_PORT_SET => self.filt_machportdetach(n),
             filtid::KQREAD => self.filt_kqdetach(n),
             filtid::PIPE_N | filtid::PIPE_R | filtid::PIPE_W => self.filt_pipedetach(n),
+            filtid::VN => {
+                if let Some(id) = self.knote(n).vnote.take() {
+                    crate::vnote::unlisten(id);
+                }
+            }
             f if f == id(evfilt::MEMORYSTATUS) => self.dtask.kevents.memorystatus_klist.retain(|&x| x != n),
             f if f == id(evfilt::SIGNAL) => self.dtask.kevents.sig_klist.retain(|&x| x != n),
             // filt_no_detach
@@ -183,7 +188,7 @@ impl Kernel {
             filtid::PIPE_N => self.filt_pipe_draincommon(n),
             filtid::PIPE_R => self.filt_piperead_common(n, None),
             filtid::PIPE_W => self.filt_pipewrite_common(n, None),
-            filtid::VN => self.filt_vnode_common(n, None),
+            filtid::VN => self.filt_vnode_common(n, hint as u32, None),
             f if f == id(evfilt::MEMORYSTATUS) => self.filt_memorystatus(n, hint),
             f if f == id(evfilt::SIGNAL) => {
                 // filt_signal: a post of the knote's signal counts.
@@ -219,7 +224,7 @@ impl Kernel {
             }
             filtid::VN => {
                 self.knote(n).sfflags = kev.fflags;
-                self.filt_vnode_common(n, None)
+                self.filt_vnode_common(n, 0, None)
             }
             f if f == id(evfilt::SIGNAL) => u32::from(self.knote(n).hook32 > 0),
             f if f == id(evfilt::MEMORYSTATUS) => {
@@ -250,7 +255,7 @@ impl Kernel {
             }
             filtid::PIPE_R => self.filt_piperead_common(n, Some(kev)),
             filtid::PIPE_W => self.filt_pipewrite_common(n, Some(kev)),
-            filtid::VN => self.filt_vnode_common(n, Some(kev)),
+            filtid::VN => self.filt_vnode_common(n, 0, Some(kev)),
             f if f == id(evfilt::SIGNAL) => {
                 let k = self.knote(n);
                 if k.hook32 == 0 {
@@ -1300,6 +1305,29 @@ impl Kernel {
         told
     }
 
+    /// The vnode notes the process's knotes were sent: each knote told
+    /// (`KNOTE(&vp->v_knotes, hint)`); whether any was.
+    pub(crate) fn darwin_vnode_knotes(&mut self) -> bool {
+        let notes = std::mem::take(&mut *self.dtask.kevents.vnote_inbox.lock().unwrap_or_else(|e| e.into_inner()));
+        for &(n, hint) in &notes {
+            if self.knote_exists(n) {
+                self.knote_list(&[n], i64::from(hint));
+            }
+        }
+        !notes.is_empty()
+    }
+
+    /// The vnode an open file is on, as the filesystems name it for their
+    /// notes.
+    pub(crate) fn darwin_vnote_key(&mut self, fp: &std::sync::Arc<crate::file::OpenFile>) -> Option<crate::inotify::Key> {
+        if let Some(k) = fp.darwin_vnote_key.get() {
+            return Some(*k);
+        }
+        let (fs, rel) = self.vfs.watch_target(&fp.path, true).ok()?;
+        let key = fs.watch_key(&rel).ok()?.0?;
+        Some(*fp.darwin_vnote_key.get_or_init(|| key))
+    }
+
     /// The count of pipe knotes, for a host thread that says when pipes
     /// may have changed.
     pub fn darwin_pipe_watch(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
@@ -1315,43 +1343,60 @@ impl Kernel {
                 self.knote(n).set_error(Errno::EINVAL);
                 return 0;
             }
-            evfilt::VNODE => {
-                self.darwin_unimplemented(format!("kevent EVFILT_VNODE on {} (vnode events)", fp.path));
-                self.knote(n).set_error(Errno::EOPNOTSUPP);
-                return 0;
-            }
+            evfilt::VNODE => {}
             _ => {
                 self.knote(n).set_error(Errno::EINVAL);
                 return 0;
             }
         }
-        self.knote(n).filtid = filtid::VN;
-        self.filt_vnode_common(n, None)
+        // On the vnode's list: its notes come to the process to tell.
+        let Some(key) = self.darwin_vnote_key(fp) else {
+            self.darwin_unimplemented(format!("kevent on {}, whose filesystem names no vnode", fp.path));
+            self.knote(n).set_error(Errno::EOPNOTSUPP);
+            return 0;
+        };
+        let inbox = std::sync::Arc::clone(&self.dtask.kevents.vnote_inbox);
+        let bell = self.darwin_timer_bell();
+        let id = crate::vnote::listen(
+            key,
+            std::sync::Arc::new(move |notes: u32| {
+                inbox.lock().unwrap_or_else(|e| e.into_inner()).push((n, notes));
+                bell.ring();
+            }),
+        );
+        let k = self.knote(n);
+        k.filtid = filtid::VN;
+        k.vnote = Some(id);
+        self.filt_vnode_common(n, 0, None)
     }
 
-    /// `filt_vnode_common` for a regular file: readable while the file
-    /// goes past the descriptor's offset (the data is how far), always
-    /// writable (data 1).
-    fn filt_vnode_common(&mut self, n: KnId, kev: Option<&mut Kev>) -> u32 {
+    /// `filt_vnode_common`: EVFILT_READ readable while the file goes past
+    /// the descriptor's offset (the data is how far), EVFILT_WRITE always
+    /// writable (data 1), both looked at whatever the note; EVFILT_VNODE
+    /// collects the notes (all of `hint`, if any is asked for).
+    fn filt_vnode_common(&mut self, n: KnId, hint: u32, kev: Option<&mut Kev>) -> u32 {
         const EV_POLL: u16 = 0x1000;
         let fp = self.knote(n).fp.clone().expect("a vnode knote's file");
         let k = self.knote(n);
-        let data = if k.filter == evfilt::READ {
-            if k.flags & EV_POLL != 0 {
-                1
-            } else {
-                let size = fp.handle.metadata().map_or(0, |md| md.size);
-                (size as i128 - fp.offset() as i128).clamp(i64::MIN as i128, i64::MAX as i128) as i64
+        let (data, activate) = match k.filter {
+            evfilt::READ => {
+                let data = if k.flags & EV_POLL != 0 {
+                    1
+                } else {
+                    let size = fp.handle.metadata().map_or(0, |md| md.size);
+                    (size as i128 - fp.offset() as i128).clamp(i64::MIN as i128, i64::MAX as i128) as i64
+                };
+                (data, data != 0)
             }
-        } else {
-            1
+            evfilt::WRITE => (1, true),
+            _ => {
+                if k.sfflags & hint != 0 {
+                    k.fflags |= hint;
+                }
+                (0, k.fflags != 0)
+            }
         };
-        let activate = u32::from(data != 0);
-        if activate == 0 {
-            // The knote waits for the file to grow, which XNU says with
-            // KNOTE(&vp->v_knotes) from the filesystem's writes.
-            self.darwin_unimplemented(format!("kevent EVFILT_READ waiting on {} (vnode events)", fp.path));
-        }
+        let activate = u32::from(activate);
         if activate != 0 {
             if let Some(kev) = kev {
                 *kev = self.knote(n).fill_kevent(data);

@@ -40,6 +40,8 @@ pub struct OpenFile {
     /// The vnode its Darwin advisory locks are kept on, once one is taken
     /// through it (`crate::darwin::lockf`).
     pub darwin_lock_key: OnceLock<(u64, u64)>,
+    /// Its vnode as the filesystems name it for vnode notes.
+    pub darwin_vnote_key: OnceLock<crate::inotify::Key>,
     /// A path to unlink when the last descriptor to this file closes. Set for
     /// `O_TMPFILE`: Linux makes such a file nameless at once, but gex keeps it
     /// named (`.gex-tmpfile-*`) so the `linkat("/proc/self/fd/N", target,
@@ -141,6 +143,7 @@ impl OpenFile {
             ino: OnceLock::new(),
             darwin_lflags: std::sync::atomic::AtomicU32::new(0),
             darwin_lock_key: OnceLock::new(),
+            darwin_vnote_key: OnceLock::new(),
         })
     }
 
@@ -169,6 +172,7 @@ impl OpenFile {
             writable,
             darwin_lflags: std::sync::atomic::AtomicU32::new(0),
             darwin_lock_key: OnceLock::new(),
+            darwin_vnote_key: OnceLock::new(),
         })
     }
 

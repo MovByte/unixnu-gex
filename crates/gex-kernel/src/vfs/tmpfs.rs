@@ -74,10 +74,26 @@ fn note(inner: &Inner, fs: usize, path: &str, own: Option<(u64, bool)>, ev: u32,
     entry_event(Key { fs, ino: TmpFs::ino_of(inner, dir) }, name, own.map(|(ino, _)| Key { fs, ino }), ev, cookie, isdir);
 }
 
-/// [`note`] of what `path` names now.
+/// [`note`] of what `path` names now; an attribute change is also its
+/// vnode's NOTE_ATTRIB (VNOP_SETATTR, VNOP_SETXATTR).
 fn note_path(inner: &Inner, fs: usize, path: &str, ev: u32) {
     if crate::inotify::any() {
         note(inner, fs, path, node_ino(inner, path), ev, 0);
+    }
+    if ev == crate::inotify::mask::ATTRIB && crate::vnote::any() && inner.nodes.contains_key(path) {
+        vnote(fs, TmpFs::ino_of(inner, path), crate::vnote::note::ATTRIB);
+    }
+}
+
+/// A vnode note to inode `ino`.
+fn vnote(fs: usize, ino: u64, notes: u32) {
+    crate::vnote::post(crate::inotify::Key { fs, ino }, notes);
+}
+
+/// A vnode note to the directory `path` is in.
+fn vnote_parent(inner: &Inner, fs: usize, path: &str, notes: u32) {
+    if crate::vnote::any() {
+        vnote(fs, TmpFs::ino_of(inner, split_name(path).0), notes);
     }
 }
 
@@ -87,6 +103,13 @@ fn note_path(inner: &Inner, fs: usize, path: &str, ev: u32) {
 /// `IN_DELETE_SELF` to the inode, as Linux orders them.
 fn note_removed(inner: &Inner, fs: usize, path: &str, own: (u64, bool)) {
     use crate::inotify::{event, mask, Key};
+    // VNOP_REMOVE and VNOP_RMDIR: the vnode NOTE_DELETE|NOTE_LINK, its
+    // directory NOTE_WRITE, and NOTE_LINK too for a directory removed.
+    if crate::vnote::any() {
+        use crate::vnote::note;
+        vnote(fs, own.0, note::DELETE | note::LINK);
+        vnote_parent(inner, fs, path, if own.1 { note::LINK | note::WRITE } else { note::WRITE });
+    }
     if !crate::inotify::any() {
         return;
     }
@@ -804,6 +827,30 @@ impl TmpFs {
                 *inner.moves.entry(i).or_insert(0) += 1;
             }
         }
+        // VNOP_RENAME's notes: NOTE_WRITE to both directories (NOTE_LINK
+        // too for a directory moved to another without overwriting, or
+        // kept in one and overwriting), NOTE_DELETE to what it replaced,
+        // NOTE_RENAME to it.
+        if crate::vnote::any() {
+            use crate::vnote::note;
+            let fs = fs_key(&self.inner);
+            let (fdir, tdir) = (split_name(from).0, split_name(to).0);
+            let (fdvp, tdvp) = (TmpFs::ino_of(&inner, fdir), TmpFs::ino_of(&inner, tdir));
+            let mut dirs = note::WRITE;
+            if is_dir && ((fdvp != tdvp && replaced.is_none()) || (fdvp == tdvp && replaced.is_some())) {
+                dirs |= note::LINK;
+            }
+            vnote(fs, fdvp, dirs);
+            if fdvp != tdvp {
+                vnote(fs, tdvp, dirs);
+            }
+            if let Some((ino, _)) = replaced {
+                vnote(fs, ino, note::DELETE);
+            }
+            if let Some((ino, _)) = own {
+                vnote(fs, ino, note::RENAME);
+            }
+        }
         if crate::inotify::any() {
             use crate::inotify::{event, mask, Key};
             let fs = fs_key(&self.inner);
@@ -1207,6 +1254,19 @@ impl Drop for TmpHandle {
 }
 
 impl TmpHandle {
+    /// A vnode note to this handle's node.
+    fn vnote_here(&self, notes: u32) {
+        if !crate::vnote::any() {
+            return;
+        }
+        let ino = match (&self.file, self.dir) {
+            (Some(f), _) => f.ino,
+            (None, Some(d)) => d,
+            _ => return,
+        };
+        vnote(fs_key(&self.inner), ino, notes);
+    }
+
     /// `ev` about this handle's node, by the name it has now (to its own
     /// watches only, once it has none).
     fn note_here(&self, ev: u32) {
@@ -1311,6 +1371,7 @@ impl FileHandle for TmpHandle {
         file.touch();
         self.note_write();
         self.note_here(crate::inotify::mask::MODIFY);
+        self.vnote_here(crate::vnote::note::WRITE);
         Ok(buf.len() as u64)
     }
 
@@ -1434,6 +1495,7 @@ impl FileHandle for TmpHandle {
             Some(f) => {
                 f.set_times(atime, mtime, now);
                 self.note_here(crate::inotify::mask::ATTRIB);
+                self.vnote_here(crate::vnote::note::ATTRIB);
                 Ok(())
             }
             None => {
@@ -1459,6 +1521,8 @@ impl FileHandle for TmpHandle {
         }
         file.touch();
         self.note_here(crate::inotify::mask::MODIFY);
+        // A size set is VNOP_SETATTR's.
+        self.vnote_here(crate::vnote::note::ATTRIB);
         Ok(())
     }
 
@@ -1497,6 +1561,7 @@ impl FileHandle for TmpHandle {
         if changes && r.is_ok() {
             drop(inner);
             self.note_here(crate::inotify::mask::ATTRIB);
+            self.vnote_here(crate::vnote::note::ATTRIB);
         }
         Some(r)
     }
@@ -1606,6 +1671,15 @@ impl FileSystem for TmpFs {
                 h.note_here(mask::MODIFY);
             }
             h.note_here(mask::OPEN);
+        }
+        // VNOP_CREATE's NOTE_WRITE to the directory; O_TRUNC's size set,
+        // VNOP_SETATTR's NOTE_ATTRIB.
+        if crate::vnote::any() {
+            if created {
+                vnote_parent(&self.inner.read().unwrap(), fs_key(&self.inner), &h.path, crate::vnote::note::WRITE);
+            } else if wrote {
+                h.vnote_here(crate::vnote::note::ATTRIB);
+            }
         }
         Ok(Arc::new(h))
     }
@@ -1760,6 +1834,8 @@ impl FileSystem for TmpFs {
         inner.set_ino(path.to_string(), ino);
         inner.nodes.insert(path.to_string(), Node::Dir);
         note(&inner, fs_key(&self.inner), path, Some((ino, true)), crate::inotify::mask::CREATE, 0);
+        // VNOP_MKDIR: the directory NOTE_LINK|NOTE_WRITE.
+        vnote_parent(&inner, fs_key(&self.inner), path, crate::vnote::note::LINK | crate::vnote::note::WRITE);
         Ok(())
     }
 
@@ -1839,6 +1915,11 @@ impl FileSystem for TmpFs {
             crate::inotify::event(crate::inotify::Key { fs, ino }, crate::inotify::mask::ATTRIB, 0, None, false);
             note(&inner, fs, to, None, crate::inotify::mask::CREATE, 0);
         }
+        // VNOP_LINK: the vnode NOTE_LINK, the new name's directory NOTE_WRITE.
+        if crate::vnote::any() {
+            vnote(fs_key(&self.inner), ino, crate::vnote::note::LINK);
+            vnote_parent(&inner, fs_key(&self.inner), to, crate::vnote::note::WRITE);
+        }
         Ok(())
     }
 
@@ -1856,6 +1937,9 @@ impl FileSystem for TmpFs {
         inner.set_ino(path.to_string(), ino);
         inner.nodes.insert(path.to_string(), Node::Socket);
         note(&inner, fs_key(&self.inner), path, Some((ino, false)), crate::inotify::mask::CREATE, 0);
+        // VNOP_CREATE (a socket's name) and VNOP_SYMLINK: the directory
+        // NOTE_WRITE.
+        vnote_parent(&inner, fs_key(&self.inner), path, crate::vnote::note::WRITE);
         Ok(())
     }
 
@@ -1872,6 +1956,9 @@ impl FileSystem for TmpFs {
             .nodes
             .insert(path.to_string(), Node::Symlink(target.to_string()));
         note(&inner, fs_key(&self.inner), path, Some((ino, false)), crate::inotify::mask::CREATE, 0);
+        // VNOP_CREATE (a socket's name) and VNOP_SYMLINK: the directory
+        // NOTE_WRITE.
+        vnote_parent(&inner, fs_key(&self.inner), path, crate::vnote::note::WRITE);
         Ok(())
     }
 }

@@ -683,9 +683,18 @@ pub fn last_close(file: &OpenFile) {
     let fg = file as *const OpenFile as usize;
     if flags & FWASLOCKED != 0 {
         unlock_all(v, Id::Flock(fg), lf::F_FLOCK);
+        funlock(file);
     }
     if flags & FG_HAS_OFDLOCK != 0 {
         unlock_all(v, Id::Ofd(fg), lf::F_OFD_LOCK);
+        funlock(file);
+    }
+}
+
+/// VNOP_ADVLOCK's NOTE_FUNLOCK for a flock or OFD unlock.
+fn funlock(file: &OpenFile) {
+    if let Some(&key) = file.darwin_vnote_key.get() {
+        crate::vnote::post(key, crate::vnote::note::FUNLOCK);
     }
 }
 
@@ -723,6 +732,8 @@ impl Kernel {
             crate::vfs::FileType::Socket => Target::NotVnode,
             crate::vfs::FileType::Regular | crate::vfs::FileType::Directory => {
                 let key = *file.darwin_lock_key.get_or_init(|| (self.vfs.mount_id_of(&file.path), md.ino));
+                // For the NOTE_FUNLOCK its unlocks post.
+                let _ = self.darwin_vnote_key(file);
                 Target::Lockf(key)
             }
             _ => Target::NoAdvlock,
@@ -835,6 +846,9 @@ impl Kernel {
                 match advlock(v, id, op, &mut fl, flags, owner, waker, size) {
                     Step::Done(r) => {
                         r?;
+                        if op == Op::Unlck && ofd {
+                            funlock(&file);
+                        }
                         if op == Op::SetLk && mark != 0 {
                             file.darwin_lflags.fetch_or(mark, std::sync::atomic::Ordering::AcqRel);
                         }
@@ -880,6 +894,7 @@ impl Kernel {
             if let Step::Done(r) = advlock(v, Id::Flock(fg), Op::Unlck, &mut fl, lf::F_FLOCK, None, None, || Ok(0)) {
                 r?;
             }
+            funlock(file);
             return Ok(None);
         }
         let waker = Some(self.darwin_waker());

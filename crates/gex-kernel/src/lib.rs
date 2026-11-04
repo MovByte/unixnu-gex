@@ -37,6 +37,7 @@ pub mod darwin;
 pub mod errno;
 pub mod eventfd;
 pub mod inotify;
+pub mod vnote;
 pub mod netlink;
 pub mod file;
 pub mod fs;

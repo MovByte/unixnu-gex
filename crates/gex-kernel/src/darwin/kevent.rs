@@ -261,6 +261,9 @@ pub struct Knote {
     /// A pipe knote: its pipe's wakeup count when last told
     /// ([`crate::vfs::FileHandle::wakes`]).
     pub seen: Option<u64>,
+    /// A vnode knote's place on its vnode's list (`v_knotes`,
+    /// [`crate::vnote::listen`]).
+    pub vnote: Option<u64>,
     /// `kn_thcall`, while armed.
     pub thcall: Option<(Instant, u64)>,
 }
@@ -404,6 +407,8 @@ pub struct Kevents {
     /// changed.
     pub pipe_klist: Vec<KnId>,
     pub pipe_watch: Arc<std::sync::atomic::AtomicUsize>,
+    /// The vnode notes posted to the process's vnode knotes, to tell them.
+    pub vnote_inbox: Arc<Mutex<Vec<(KnId, u32)>>>,
     closed: Arc<Mutex<Vec<KqId>>>,
     /// Threads to wake when the call settles.
     wake: Vec<(i32, WaitResult)>,

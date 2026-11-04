@@ -180,6 +180,28 @@ fn host_ino(p: &Path) -> Option<(u64, bool)> {
 /// `ev` about host path `p` (whose inode is `own`, when known), to its
 /// directory's watches by name and to its own.
 fn hnote(fs: usize, p: &Path, own: Option<(u64, bool)>, ev: u32, cookie: u32) {
+    use crate::inotify::Key;
+    // The vnode notes: a name made is its directory's NOTE_WRITE (and
+    // NOTE_LINK for a directory, VNOP_MKDIR), an attribute changed the
+    // vnode's NOTE_ATTRIB.
+    if crate::vnote::any() {
+        use crate::vnote::note;
+        if ev & crate::inotify::mask::CREATE != 0 {
+            let dir = own.is_some_and(|(_, d)| d);
+            hvnote_parent(fs, p, if dir { note::LINK | note::WRITE } else { note::WRITE });
+        }
+        if ev == crate::inotify::mask::ATTRIB {
+            if let Some((ino, _)) = own {
+                crate::vnote::post(Key { fs, ino }, note::ATTRIB);
+            }
+        }
+    }
+    hnote_entry(fs, p, own, ev, cookie);
+}
+
+/// [`hnote`]'s inotify half alone: what a handle says of itself, whose
+/// vnode notes it posts on its own.
+fn hnote_entry(fs: usize, p: &Path, own: Option<(u64, bool)>, ev: u32, cookie: u32) {
     use crate::inotify::{entry_event, Key};
     if !crate::inotify::any() {
         return;
@@ -190,9 +212,21 @@ fn hnote(fs: usize, p: &Path, own: Option<(u64, bool)>, ev: u32, cookie: u32) {
     entry_event(Key { fs, ino: dino }, &name.to_string_lossy(), own.map(|(ino, _)| Key { fs, ino }), ev, cookie, isdir);
 }
 
+/// A vnode note to the directory host path `p` is in.
+fn hvnote_parent(fs: usize, p: &Path, notes: u32) {
+    if let Some((dino, _)) = p.parent().and_then(host_ino) {
+        crate::vnote::post(crate::inotify::Key { fs, ino: dino }, notes);
+    }
+}
+
 /// A name removed whose inode was `own`: as tmpfs says it.
 fn hnote_removed(fs: usize, p: &Path, own: (u64, bool), links_left: u64) {
     use crate::inotify::{event, mask, Key};
+    if crate::vnote::any() {
+        use crate::vnote::note;
+        crate::vnote::post(Key { fs, ino: own.0 }, note::DELETE | note::LINK);
+        hvnote_parent(fs, p, if own.1 { note::LINK | note::WRITE } else { note::WRITE });
+    }
     if !crate::inotify::any() {
         return;
     }
@@ -207,10 +241,19 @@ fn hnote_removed(fs: usize, p: &Path, own: (u64, bool), links_left: u64) {
 }
 
 impl HostHandle {
+    /// A vnode note to the file this handle is open on.
+    fn vnote(&self, notes: u32) {
+        if crate::vnote::any() {
+            if let Some(ino) = self.file.lock().ok().and_then(|f| f.metadata().ok()).map(|m| m.ino()) {
+                crate::vnote::post(crate::inotify::Key { fs: self.at.0, ino }, notes);
+            }
+        }
+    }
+
     fn note(&self, ev: u32) {
         if crate::inotify::any() {
             let own = self.file.lock().ok().and_then(|f| f.metadata().ok()).map(|m| (m.ino(), m.is_dir()));
-            hnote(self.at.0, &self.at.1, own, ev, 0);
+            hnote_entry(self.at.0, &self.at.1, own, ev, 0);
         }
     }
 }
@@ -246,12 +289,19 @@ impl FileHandle for HostHandle {
     fn xattr(&self, op: super::XattrOp<'_>) -> Option<Result<usize, Errno>> {
         use std::os::unix::io::AsRawFd;
         let f = self.file.lock().unwrap_or_else(|e| e.into_inner());
-        Some(host_xattr::call(host_xattr::On::Fd(f.as_raw_fd()), op))
+        let changes = !matches!(op, super::XattrOp::Get { .. } | super::XattrOp::List { .. });
+        let r = host_xattr::call(host_xattr::On::Fd(f.as_raw_fd()), op);
+        drop(f);
+        if changes && r.is_ok() {
+            self.vnote(crate::vnote::note::ATTRIB);
+        }
+        Some(r)
     }
 
     fn set_times(&self, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>) -> Result<(), Errno> {
         self.file.lock().unwrap().set_times(file_times(atime, mtime)).map_err(|e| Errno::from_io(&e))?;
         self.note(crate::inotify::mask::ATTRIB);
+        self.vnote(crate::vnote::note::ATTRIB);
         Ok(())
     }
 
@@ -264,6 +314,8 @@ impl FileHandle for HostHandle {
             .set_len(len)
             .map_err(|e| Errno::from_io(&e))?;
         self.note(crate::inotify::mask::MODIFY);
+        // A size set is VNOP_SETATTR's.
+        self.vnote(crate::vnote::note::ATTRIB);
         Ok(())
     }
 
@@ -287,6 +339,7 @@ impl FileHandle for HostHandle {
         let n = f.write(buf).map(|n| n as u64).map_err(|e| Errno::from_io(&e))?;
         drop(f);
         self.note(crate::inotify::mask::MODIFY);
+        self.vnote(crate::vnote::note::WRITE);
         Ok(n)
     }
 
@@ -316,13 +369,20 @@ struct HostDir {
     /// ([`FileHandle::moved`]).
     held: Option<(File, String, PathBuf)>,
     gate: Arc<super::RenameGate>,
+    /// The mount's half of its vnode key.
+    fs: usize,
 }
 
 impl FileHandle for HostDir {
     fn xattr(&self, op: super::XattrOp<'_>) -> Option<Result<usize, Errno>> {
         use std::os::unix::io::AsRawFd;
         let (f, _, _) = self.held.as_ref()?;
-        Some(host_xattr::call(host_xattr::On::Fd(f.as_raw_fd()), op))
+        let changes = !matches!(op, super::XattrOp::Get { .. } | super::XattrOp::List { .. });
+        let r = host_xattr::call(host_xattr::On::Fd(f.as_raw_fd()), op);
+        if changes && r.is_ok() {
+            crate::vnote::post(crate::inotify::Key { fs: self.fs, ino: self.md.ino }, crate::vnote::note::ATTRIB);
+        }
+        Some(r)
     }
 
     fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> SysResult {
@@ -448,6 +508,7 @@ impl FileSystem for HostFs {
                     md: convert(md),
                     held,
                     gate: Arc::clone(&self.gate),
+                    fs: self.watch_fs(),
                 }));
             }
         }
@@ -515,6 +576,14 @@ impl FileSystem for HostFs {
                 h.note(mask::MODIFY);
             }
             h.note(mask::OPEN);
+        }
+        // VNOP_CREATE's NOTE_WRITE to the directory; O_TRUNC's NOTE_ATTRIB.
+        if crate::vnote::any() {
+            if md.is_err() {
+                hvnote_parent(h.at.0, &h.at.1, crate::vnote::note::WRITE);
+            } else if flags & oflags::O_TRUNC != 0 {
+                h.vnote(crate::vnote::note::ATTRIB);
+            }
         }
         Ok(Arc::new(h))
     }
@@ -604,11 +673,35 @@ impl FileSystem for HostFs {
         }
         let (from, to) = (self.host_path(from)?, self.host_path(to)?);
         let dir = std::fs::symlink_metadata(&from).is_ok_and(|m| m.is_dir());
-        let watched = crate::inotify::any();
+        let watched = crate::inotify::any() || crate::vnote::any();
         let own = if watched { host_ino(&from) } else { None };
+        let (fdvp, tdvp) = if watched { (from.parent().and_then(host_ino), to.parent().and_then(host_ino)) } else { (None, None) };
         let replaced = if watched { std::fs::symlink_metadata(&to).ok().map(|m| ((m.ino(), m.is_dir()), m.nlink())) } else { None };
         self.gate.rename(super::own_holds(), dir, || std::fs::rename(&from, &to).map_err(|e| Errno::from_io(&e)))?;
-        if watched {
+        // VNOP_RENAME's notes, as tmpfs posts them.
+        if crate::vnote::any() {
+            use crate::vnote::note;
+            let fs = self.watch_fs();
+            let key = |ino| crate::inotify::Key { fs, ino };
+            let replaced_ino = replaced.map(|((i, _), _)| i).filter(|&i| Some(i) != own.map(|o| o.0));
+            if let (Some((fd, _)), Some((td, _))) = (fdvp, tdvp) {
+                let mut dirs = note::WRITE;
+                if dir && ((fd != td && replaced_ino.is_none()) || (fd == td && replaced_ino.is_some())) {
+                    dirs |= note::LINK;
+                }
+                crate::vnote::post(key(fd), dirs);
+                if fd != td {
+                    crate::vnote::post(key(td), dirs);
+                }
+            }
+            if let Some(i) = replaced_ino {
+                crate::vnote::post(key(i), note::DELETE);
+            }
+            if let Some((i, _)) = own {
+                crate::vnote::post(key(i), note::RENAME);
+            }
+        }
+        if watched && crate::inotify::any() {
             use crate::inotify::{event, mask, Key};
             let fs = self.watch_fs();
             let cookie = crate::inotify::cookie();
@@ -710,6 +803,9 @@ impl FileSystem for HostFs {
         std::fs::hard_link(self.host_path(from)?, &to).map_err(|e| Errno::from_io(&e))?;
         if let Some((ino, d)) = host_ino(&to) {
             crate::inotify::event(crate::inotify::Key { fs: self.watch_fs(), ino }, crate::inotify::mask::ATTRIB, 0, None, d);
+            // VNOP_LINK: the vnode NOTE_LINK (the directory's NOTE_WRITE
+            // is the new name's, below).
+            crate::vnote::post(crate::inotify::Key { fs: self.watch_fs(), ino }, crate::vnote::note::LINK);
         }
         hnote(self.watch_fs(), &to, None, crate::inotify::mask::CREATE, 0);
         Ok(())

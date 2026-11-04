@@ -117,15 +117,26 @@ impl Kernel {
             sys::UTIMES => self.darwin_utimes(m, cwd as i32, a[0], a[1]),
             sys::FUTIMES => self.darwin_utimes(m, a[0] as i32, 0, a[1]),
             sys::GETDIRENTRIES64 => self.darwin_getdirentries64(m, a[0] as i32, a[1], a[2], a[3]),
-            // A directory's offset is where its next entry is read from.
+            // A directory's offset is where its next entry is read from;
+            // a vnode's lseek is its knotes' NOTE_NONE (what it may read
+            // changed).
             sys::LSEEK => {
                 let Ok(file) = self.fds.get(a[0] as i32) else { return None };
-                if file.handle.metadata().map(|md| md.file_type) != Ok(crate::vfs::FileType::Directory) {
+                let ty = file.handle.metadata().map(|md| md.file_type);
+                let dir = ty == Ok(crate::vfs::FileType::Directory);
+                if !dir && (ty != Ok(crate::vfs::FileType::Regular) || a[2] > 2) {
                     return None;
                 }
                 let r = file.seek(a[1] as i64, a[2] as u32);
                 if let Ok(pos) = r {
-                    file.set_dir_cursor(pos as usize);
+                    if dir {
+                        file.set_dir_cursor(pos as usize);
+                    }
+                    if crate::vnote::any() {
+                        if let Some(key) = self.darwin_vnote_key(&file) {
+                            crate::vnote::post(key, crate::vnote::note::NONE);
+                        }
+                    }
                 }
                 r
             }
