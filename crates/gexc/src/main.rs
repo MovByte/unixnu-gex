@@ -21,6 +21,7 @@ mod units;
 mod host_xattr;
 mod host_walk;
 mod darwin_run;
+mod dsc_info;
 
 /// Where the dynamic linker is placed, well above a PIE executable so their
 /// mappings cannot overlap. A closure module for `ld.so` is only correct at the
@@ -88,6 +89,7 @@ fn real_main() -> Result<ExitCode> {
         "seed" => cmd_seed(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "closure" => cmd_closure(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "pe-info" => pe_info::cmd_pe_info(&argv[2..]).map(|_| ExitCode::SUCCESS),
+        "dsc-info" => dsc_info::cmd(&argv[2..]),
         "units" => units::cmd_units(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "profile" => cmd_profile(&argv[2..]).map(|_| ExitCode::SUCCESS),
         // `eject run` runs the guest, as `run` does: on a thread with a
