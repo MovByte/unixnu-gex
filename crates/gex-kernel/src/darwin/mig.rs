@@ -96,6 +96,11 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             Some(_) => Reply::err(KERN_INVALID_ARGUMENT),
             None => bad(),
         },
+        // host_get_special_port(host_priv, node, which) -> port
+        (Kobject::Host | Kobject::HostPriv, 412) => match (arg(req, 0), arg(req, 1)) {
+            (Some(_node), Some(which)) => host_get_special_port(k, obj, req.dest, which),
+            _ => bad(),
+        },
         // clock_get_time(clock) -> mach_timespec_t
         (Kobject::Clock, 1000) => {
             let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
@@ -287,7 +292,7 @@ fn task_get_special_port(k: &mut Kernel, which: i32) -> Reply {
             Reply::port(Carried::Port(p))
         }
         TASK_HOST_PORT => {
-            let p = k.darwin_host_port();
+            let p = k.darwin_itk_host();
             k.dtask.ipc.copy_send(p);
             Reply::port(Carried::Port(p))
         }
@@ -320,6 +325,36 @@ fn task_get_special_port(k: &mut Kernel, which: i32) -> Reply {
         }
         _ => Reply::err(KERN_INVALID_ARGUMENT),
     }
+}
+
+/// `host_get_special_port_from_user`: `convert_port_to_host_priv` takes
+/// only the task's own host port, and only when it is the privilege port.
+fn host_get_special_port(k: &mut Kernel, obj: &Kobject, port: super::ipc::ObjId, id: i32) -> Reply {
+    const HOST_SECURITY_PORT: i32 = 0;
+    const HOST_PORT: i32 = 1;
+    const HOST_PRIV_PORT: i32 = 2;
+    const HOST_IO_MAIN_PORT: i32 = 3;
+    const HOST_MAX_SPECIAL_PORT: i32 = 7 + 27;
+    let host_priv = matches!(obj, Kobject::HostPriv) && port == k.darwin_itk_host();
+    if !host_priv || id == HOST_SECURITY_PORT || !(HOST_SECURITY_PORT..=HOST_MAX_SPECIAL_PORT).contains(&id) {
+        return Reply::err(KERN_INVALID_ARGUMENT);
+    }
+    let p = match id {
+        HOST_PORT => k.darwin_host_port(),
+        HOST_PRIV_PORT => k.darwin_host_priv_port(),
+        HOST_IO_MAIN_PORT => {
+            let mut r = Reply::err(KERN_INVALID_ARGUMENT);
+            r.unimplemented = Some("the IOKit main port (HOST_IO_MAIN_PORT)".into());
+            return r;
+        }
+        _ => {
+            // realhost.special: launchd's ports, which no task here has
+            // set (host_set_special_port).
+            return Reply::ok(Vec::new()).with_null_port(0);
+        }
+    };
+    k.dtask.ipc.copy_send(p);
+    Reply::port(Carried::Port(p))
 }
 
 /// `task_set_special_port`: KERNEL and HOST are refused (no CSR on iOS);

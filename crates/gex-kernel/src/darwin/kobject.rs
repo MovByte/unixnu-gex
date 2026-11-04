@@ -79,6 +79,19 @@ impl Kernel {
         self.kport(|k| &mut k.host, Kobject::Host)
     }
 
+    /// The host privilege port.
+    pub(crate) fn darwin_host_priv_port(&mut self) -> ObjId {
+        self.kport(|k| &mut k.host_priv, Kobject::HostPriv)
+    }
+
+    /// The task's host port (`itk_host`), as `set_security_token` sets it
+    /// with each change of identity: the host privilege port for root,
+    /// the host port for anyone else. No MAC policy here takes it from
+    /// root (`mac_system_check_host_priv`).
+    pub(crate) fn darwin_itk_host(&mut self) -> ObjId {
+        if self.creds.uid() == 0 { self.darwin_host_priv_port() } else { self.darwin_host_port() }
+    }
+
     /// The system clock's port.
     pub(crate) fn darwin_clock_port(&mut self) -> ObjId {
         self.kport(|k| &mut k.clock, Kobject::Clock)

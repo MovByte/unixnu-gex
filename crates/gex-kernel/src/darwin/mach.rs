@@ -445,7 +445,7 @@ impl Kernel {
                 u64::from(self.darwin_copyout_send(p))
             }
             trap::HOST_SELF => {
-                let p = self.darwin_host_port();
+                let p = self.darwin_itk_host();
                 self.dtask.ipc.make_send(p);
                 u64::from(self.darwin_copyout_send(p))
             }
