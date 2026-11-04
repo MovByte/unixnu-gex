@@ -7,6 +7,7 @@
 //! XNU, a send right to a port that has died is noticed when the entry is
 //! next used ([`Ipc::right_check`]), which turns it into a dead name.
 
+pub mod port;
 pub mod right;
 pub mod space;
 
@@ -37,7 +38,17 @@ pub mod kr {
     pub const OPERATION_TIMED_OUT: u64 = 49;
     pub const TERMINATED: u64 = 37;
     pub const NOT_WAITING: u64 = 48;
+    pub const ALREADY_IN_SET: u64 = 11;
+    pub const DENIED: u64 = 53;
+    /// Service and connection ports (`MPO_SERVICE_PORT`,
+    /// `MPO_CONNECTION_PORT`) need launchd's service labels, which are not
+    /// here yet: the kernel reports it and answers `KERN_FAILURE`.
+    pub const UNIMPLEMENTED_SERVICE_PORT: u64 = 0x1_0000_0005;
 }
+
+/// `IPR_SOR_*_MASK`: a request's send-possible bits.
+pub const IPR_SOR_SPARM_MASK: u32 = 0x01;
+pub const IPR_SOR_SPREQ_MASK: u32 = 0x02;
 
 /// `MACH_PORT_RIGHT_*`.
 pub mod port_right {
@@ -149,6 +160,9 @@ pub struct Port {
     /// `MPO_REPLY_PORT` in a hardened binary; only a send-once right is
     /// made from it.
     pub reply_port: bool,
+    /// `MPO_ENFORCE_REPLY_PORT_SEMANTICS`: a message to this port must name
+    /// a reply port as its reply.
+    pub enforce_reply_port_semantics: bool,
     pub tempowner: bool,
     pub impdonation: bool,
     pub no_grant: bool,
@@ -177,7 +191,7 @@ pub struct Port {
 }
 
 impl Port {
-    fn new(receiver: Receiver) -> Port {
+    pub(crate) fn new(receiver: Receiver) -> Port {
         Port {
             active: true,
             receiver,
@@ -195,6 +209,7 @@ impl Port {
             pinned: false,
             specialreply: false,
             reply_port: false,
+            enforce_reply_port_semantics: false,
             tempowner: false,
             impdonation: false,
             no_grant: false,
@@ -309,6 +324,10 @@ fn request_table_grow(ocount: usize) -> usize {
 }
 
 impl Ipc {
+    pub(crate) fn new_id_pub(&mut self) -> ObjId {
+        self.new_id()
+    }
+
     fn new_id(&mut self) -> ObjId {
         self.next_id += 1;
         self.next_id
@@ -1039,7 +1058,9 @@ impl Ipc {
     /// `ipc_right_request_alloc`: arm (or with no `notify`, cancel)
     /// `name`'s dead-name request, or a send-possible one. The previous
     /// request's send-once right, for the caller to return.
-    pub fn right_request_alloc(&mut self, name: u32, spreq: bool, sparm: bool, notify: Option<ObjId>) -> Result<Option<ObjId>, u64> {
+    pub fn right_request_alloc(&mut self, name: u32, opts: u32, notify: Option<ObjId>) -> Result<Option<ObjId>, u64> {
+        let spreq = opts & IPR_SOR_SPREQ_MASK != 0;
+        let sparm = opts & IPR_SOR_SPARM_MASK != 0;
         let e = *self.space.lookup(name).ok_or(kr::INVALID_NAME)?;
         let prev = e.request;
         if notify.is_none() && prev == 0 {
@@ -1075,7 +1096,7 @@ impl Ipc {
             }
         }
         let e = *self.space.lookup(name).expect("in use");
-        if (spreq || sparm || notify.is_some()) && notify.is_some() && e.bits & ty::DEAD_NAME != 0 {
+        if opts != 0 && notify.is_some() && e.bits & ty::DEAD_NAME != 0 {
             if e.urefs() < UREFS_MAX {
                 self.space.lookup_mut(name).expect("in use").bits += 1;
             }
