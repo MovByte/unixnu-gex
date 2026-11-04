@@ -751,6 +751,12 @@ impl FileHandle for PipeEnd {
         Some(self.pipe.wakes())
     }
 
+    fn pipe_state(&self) -> Option<crate::vfs::PipeState> {
+        let (readers, writers) = self.pipe.ends();
+        let xnu = self.pipe.xnu_sizes().map(|(size, max, _)| (size as u64, max as u64));
+        Some(crate::vfs::PipeState { buffered: self.pipe.buffered() as u64, closed: readers == 0 || writers == 0, xnu })
+    }
+
     fn pipe_end(&self) -> Option<(Arc<Pipe>, bool)> {
         Some((Arc::clone(&self.pipe), self.write))
     }

@@ -38,7 +38,7 @@ impl Bell {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).0
     }
 
-    pub(crate) fn ring(&self) {
+    pub fn ring(&self) {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).0 += 1;
         self.cv.notify_all();
     }
@@ -114,8 +114,9 @@ impl Timers {
 impl Kernel {
     /// Fire every thread call that is due; the next deadline.
     pub fn darwin_thread_calls(&mut self, m: &mut GuestMem<'_>) -> Option<Instant> {
-        // Signals posted from outside a call: their knotes are told.
-        if self.darwin_signal_knotes() {
+        // Signals posted, and pipes changed, from outside a call: their
+        // knotes are told.
+        if self.darwin_signal_knotes() | self.darwin_pipe_knotes() {
             self.darwin_kevent_settle(m);
         }
         loop {

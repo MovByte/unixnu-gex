@@ -64,6 +64,7 @@ run() {
     dispatch) check_root dispatch "dispatch 55 140" 0 ;;
     dispatch-signal) check_root dispatch-signal "dispatch-signal 2" 0 ;;
     sighandler) check_root sighandler "sighandler 3" 0 ;;
+    kq-pipe) check_root kq-pipe "kq-pipe 7" 0 ;;
     pipe) check_root pipe "pipe ok" 0 ;;
     cfrunloop) check_root cfrunloop "cfrunloop 3 1" 0 ;;
     xpc-anon) check_root xpc-anon "xpc-anon 42" 0 ;;
@@ -79,7 +80,7 @@ if [ "$named" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler pipe cfrunloop xpc-anon; do
+    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe cfrunloop xpc-anon; do
         run "$p"
     done
 fi

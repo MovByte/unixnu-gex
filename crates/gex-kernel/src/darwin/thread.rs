@@ -767,6 +767,9 @@ impl Kernel {
         c.notcancelpt = false;
         c.abort_safely = false;
         self.darwin_knote_fdcheck();
+        if self.darwin_pipe_knotes() {
+            self.darwin_kevent_settle(m);
+        }
         self.darwin_kevent_ast(m);
     }
 

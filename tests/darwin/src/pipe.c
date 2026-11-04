@@ -1,6 +1,6 @@
 // Darwin pipes, by sys_pipe.c's rules: fstat's size and block size as the
 // buffer grows (512 bytes, then a pipesize_blocks size a write needs),
-// partial non-blocking writes, atomic
+// EVFILT_WRITE's room in MAX_PIPESIZE, partial non-blocking writes, atomic
 // writes of up to PIPE_BUF, and EPIPE with SIGPIPE unless F_SETNOSIGPIPE.
 
 #include <errno.h>
@@ -10,6 +10,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/event.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -40,6 +41,14 @@ static void *reader(void *arg) {
     return NULL;
 }
 
+static long room(int kq, int fd) {
+    struct kevent ev, out;
+    struct timespec zero = {0, 0};
+    EV_SET(&ev, fd, EVFILT_WRITE, EV_ADD | EV_ONESHOT, 0, 0, NULL);
+    kevent(kq, &ev, 1, NULL, 0, NULL);
+    return kevent(kq, NULL, 0, &out, 1, &zero) == 1 ? (long)out.data : -1;
+}
+
 int main(void) {
     int p[2];
     struct stat st;
@@ -47,11 +56,16 @@ int main(void) {
     if (fstat(p[0], &st) || !S_ISFIFO(st.st_mode) || st.st_blksize != 16384 || st.st_size != 0 || st.st_nlink != 0) return bad("fstat of a new pipe", st.st_blksize);
     write(p[1], "abc", 3);
     if (fstat(p[1], &st) || st.st_size != 3 || st.st_blksize != 16384) return bad("fstat of the write end", st.st_size);
+    int kq = kqueue();
+    long r = room(kq, p[1]);
+    if (r != 16384 - 3) return bad("EVFILT_WRITE's room", r);
 
     fcntl(p[1], F_SETFL, O_NONBLOCK);
     ssize_t n = write(p[1], big, 20000);
     if (n != 20000) return bad("a write that grows the buffer", n);
     if (fstat(p[0], &st) || st.st_blksize != 65536 || st.st_size != 20003) return bad("fstat after growing", st.st_blksize);
+    r = room(kq, p[1]);
+    if (r != 65536 - 20003) return bad("room after growing", r);
     n = write(p[1], big, sizeof big);
     if (n != 65536 - 20003) return bad("a partial non-blocking write", n);
     n = write(p[1], big, 100);

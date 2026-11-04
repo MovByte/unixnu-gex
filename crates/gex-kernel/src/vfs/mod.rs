@@ -29,6 +29,19 @@ pub use procfs::{ProcFs, ProcSource, SysCpuFs};
 pub use remote::RemoteFs;
 pub use tmpfs::TmpFs;
 
+/// What a kqueue's pipe filters read of an anonymous pipe end
+/// ([`FileHandle::pipe_state`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PipeState {
+    /// Bytes waiting to be read.
+    pub buffered: u64,
+    /// Every descriptor for one of the two ends has closed.
+    pub closed: bool,
+    /// A Darwin pipe's buffer size and `MAX_PIPESIZE`; `None` for a Linux
+    /// pipe.
+    pub xnu: Option<(u64, u64)>,
+}
+
 /// What kind of thing a directory entry names.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum FileType {
@@ -399,6 +412,12 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     /// asked for, as Linux does; a server learns that a client died this way.
     fn poll_hup(&self) -> bool {
         false
+    }
+
+    /// An anonymous pipe end's state, for a kqueue's pipe filters; `None`
+    /// for anything else.
+    fn pipe_state(&self) -> Option<PipeState> {
+        None
     }
 
     /// The pipe an anonymous pipe end is on, and whether it is the write

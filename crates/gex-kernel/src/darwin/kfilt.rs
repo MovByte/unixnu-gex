@@ -162,6 +162,7 @@ impl Kernel {
             f if f == id(evfilt::WORKLOOP) => self.filt_wldetach(n),
             filtid::MACH_PORT | filtid::MACH_PORT_SET => self.filt_machportdetach(n),
             filtid::KQREAD => self.filt_kqdetach(n),
+            filtid::PIPE_N | filtid::PIPE_R | filtid::PIPE_W => self.filt_pipedetach(n),
             f if f == id(evfilt::MEMORYSTATUS) => self.dtask.kevents.memorystatus_klist.retain(|&x| x != n),
             f if f == id(evfilt::SIGNAL) => self.dtask.kevents.sig_klist.retain(|&x| x != n),
             // filt_no_detach
@@ -179,6 +180,10 @@ impl Kernel {
             }
             filtid::MACH_PORT_SET => filter::ACTIVE,
             filtid::KQREAD => self.filt_kqueue(n),
+            filtid::PIPE_N => self.filt_pipe_draincommon(n),
+            filtid::PIPE_R => self.filt_piperead_common(n, None),
+            filtid::PIPE_W => self.filt_pipewrite_common(n, None),
+            filtid::VN => self.filt_vnode_common(n, None),
             f if f == id(evfilt::MEMORYSTATUS) => self.filt_memorystatus(n, hint),
             f if f == id(evfilt::SIGNAL) => {
                 // filt_signal: a post of the knote's signal counts.
@@ -201,6 +206,21 @@ impl Kernel {
             f if f == id(evfilt::WORKLOOP) => self.filt_wltouch(m, n, kev),
             filtid::MACH_PORT | filtid::MACH_PORT_SET => self.filt_machporttouch(n, kev),
             filtid::KQREAD => self.filt_kqueue(n),
+            filtid::PIPE_N | filtid::PIPE_R | filtid::PIPE_W => {
+                // The low water mark and its flag are the new ones.
+                let k = self.knote(n);
+                k.sdata = kev.data;
+                k.sfflags = kev.fflags;
+                match k.filtid {
+                    filtid::PIPE_N => self.filt_pipe_draincommon(n),
+                    filtid::PIPE_R => self.filt_piperead_common(n, None),
+                    _ => self.filt_pipewrite_common(n, None),
+                }
+            }
+            filtid::VN => {
+                self.knote(n).sfflags = kev.fflags;
+                self.filt_vnode_common(n, None)
+            }
             f if f == id(evfilt::SIGNAL) => u32::from(self.knote(n).hook32 > 0),
             f if f == id(evfilt::MEMORYSTATUS) => {
                 // filt_memorystatustouch: the knote's interest replaced; on
@@ -221,6 +241,16 @@ impl Kernel {
             f if f == id(evfilt::WORKLOOP) => self.filt_wlprocess(n, kev),
             filtid::MACH_PORT | filtid::MACH_PORT_SET => self.filt_machportprocess(m, n, kev, ctx),
             filtid::KQREAD => self.filt_kqprocess(n, kev),
+            filtid::PIPE_N => {
+                let r = self.filt_pipe_draincommon(n);
+                if r != 0 {
+                    *kev = self.knote(n).fill_kevent(0);
+                }
+                r
+            }
+            filtid::PIPE_R => self.filt_piperead_common(n, Some(kev)),
+            filtid::PIPE_W => self.filt_pipewrite_common(n, Some(kev)),
+            filtid::VN => self.filt_vnode_common(n, Some(kev)),
             f if f == id(evfilt::SIGNAL) => {
                 let k = self.knote(n);
                 if k.hook32 == 0 {
@@ -1117,6 +1147,14 @@ impl Kernel {
         if let Some(h) = std::sync::Arc::clone(&fp.handle).as_kqueue() {
             return self.kqueue_kqfilter(n, h.id());
         }
+        // An anonymous pipe (DTYPE_PIPE); a named one is a fifofs vnode.
+        if fp.path.starts_with("pipe:[") && fp.handle.pipe_state().is_some() {
+            return self.pipe_kqfilter(n, &fp);
+        }
+        let file_type = fp.handle.metadata().map(|md| md.file_type);
+        if matches!(file_type, Ok(crate::vfs::FileType::Regular | crate::vfs::FileType::Directory | crate::vfs::FileType::Symlink)) {
+            return self.vn_kqfilter(n, &fp, file_type.unwrap());
+        }
         let name = match self.knote(n).filter {
             evfilt::READ => "EVFILT_READ",
             evfilt::WRITE => "EVFILT_WRITE",
@@ -1128,6 +1166,198 @@ impl Kernel {
         self.darwin_unimplemented(format!("kevent {name} on {}", fp.path));
         self.knote(n).set_error(Errno::EOPNOTSUPP);
         0
+    }
+
+    /// `pipe_kqfilter`: a knote on either end of a pipe, on its read
+    /// side's list. The wrong filter for an end is neutered: it fires only
+    /// when the pipe dies.
+    fn pipe_kqfilter(&mut self, n: KnId, fp: &std::sync::Arc<crate::file::OpenFile>) -> u32 {
+        let fid = match self.knote(n).filter {
+            evfilt::READ if fp.readable => filtid::PIPE_R,
+            evfilt::WRITE if fp.writable && fp.handle.pipe_state().is_some_and(|st| st.xnu.is_some()) => filtid::PIPE_W,
+            evfilt::WRITE if fp.writable => {
+                // A Linux pipe has none of the buffer sizes filt_pipewrite
+                // reports from.
+                self.darwin_unimplemented(format!("kevent EVFILT_WRITE on {}, a pipe without XNU's rules", fp.path));
+                self.knote(n).set_error(Errno::EOPNOTSUPP);
+                return 0;
+            }
+            evfilt::READ | evfilt::WRITE => filtid::PIPE_N,
+            _ => {
+                self.knote(n).set_error(Errno::EINVAL);
+                return 0;
+            }
+        };
+        let k = self.knote(n);
+        k.filtid = fid;
+        k.seen = fp.handle.wakes();
+        self.dtask.kevents.pipe_klist.push(n);
+        self.dtask.kevents.pipe_watch.fetch_add(1, std::sync::atomic::Ordering::Release);
+        match fid {
+            filtid::PIPE_N => self.filt_pipe_draincommon(n),
+            filtid::PIPE_R => self.filt_piperead_common(n, None),
+            _ => self.filt_pipewrite_common(n, None),
+        }
+    }
+
+    fn filt_pipedetach(&mut self, n: KnId) {
+        let list = &mut self.dtask.kevents.pipe_klist;
+        if let Some(i) = list.iter().position(|&x| x == n) {
+            list.remove(i);
+            self.dtask.kevents.pipe_watch.fetch_sub(1, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    fn knote_pipe(&mut self, n: KnId) -> crate::vfs::PipeState {
+        let fp = self.knote(n).fp.clone().expect("a pipe knote's file");
+        fp.handle.pipe_state().expect("a pipe knote's pipe")
+    }
+
+    /// `filt_pipe_draincommon`: either end gone is EOF.
+    fn filt_pipe_draincommon(&mut self, n: KnId) -> u32 {
+        if self.knote_pipe(n).closed {
+            self.knote(n).flags |= ev::EOF;
+            return 1;
+        }
+        0
+    }
+
+    /// `filt_pipelowwat`: NOTE_LOWAT's mark, bounded by `MAX_PIPESIZE`
+    /// while the buffer is there, or `def`.
+    fn filt_pipelowwat(&mut self, n: KnId, def: i64) -> i64 {
+        const NOTE_LOWAT: u32 = 0x1;
+        let st = self.knote_pipe(n);
+        let k = self.knote(n);
+        if k.sfflags & NOTE_LOWAT == 0 {
+            return def;
+        }
+        let sdata = k.sdata;
+        match st.xnu {
+            Some((size, max)) if size != 0 && sdata > max as i64 => max as i64,
+            Some(_) => sdata.max(def),
+            None => {
+                self.darwin_unimplemented("kevent NOTE_LOWAT on a pipe without XNU's rules".into());
+                sdata.max(def)
+            }
+        }
+    }
+
+    /// `filt_piperead_common`: readable at the low water mark (one byte, or
+    /// NOTE_LOWAT's) or at EOF; the data is what is buffered.
+    fn filt_piperead_common(&mut self, n: KnId, kev: Option<&mut Kev>) -> u32 {
+        let data = self.knote_pipe(n).buffered as i64;
+        let res = if self.filt_pipe_draincommon(n) != 0 {
+            1
+        } else {
+            let lowwat = self.filt_pipelowwat(n, 1);
+            u32::from(data >= lowwat)
+        };
+        if res != 0 {
+            if let Some(kev) = kev {
+                *kev = self.knote(n).fill_kevent(data);
+            }
+        }
+        res
+    }
+
+    /// `filt_pipewrite_common`: writable with `PIPE_BUF` (or NOTE_LOWAT's
+    /// mark) free of `MAX_PIPESIZE`, or at EOF; the data is the room.
+    fn filt_pipewrite_common(&mut self, n: KnId, kev: Option<&mut Kev>) -> u32 {
+        let mut data = 0;
+        let res = if self.filt_pipe_draincommon(n) != 0 {
+            1
+        } else {
+            let st = self.knote_pipe(n);
+            let (_, max) = st.xnu.expect("a Darwin pipe");
+            data = max as i64 - st.buffered as i64;
+            let lowwat = self.filt_pipelowwat(n, crate::pipe::xnu::PIPE_BUF as i64);
+            u32::from(data >= lowwat)
+        };
+        if res != 0 {
+            if let Some(kev) = kev {
+                *kev = self.knote(n).fill_kevent(data);
+            }
+        }
+        res
+    }
+
+    /// Tell each pipe knote whose pipe has been woken since it was last
+    /// told (the pipe's `KNOTE(&rpipe->pipe_sel.si_note)`); whether any was.
+    pub(crate) fn darwin_pipe_knotes(&mut self) -> bool {
+        let mut told = false;
+        for n in self.dtask.kevents.pipe_klist.clone() {
+            if !self.knote_exists(n) {
+                continue;
+            }
+            let fp = self.knote(n).fp.clone().expect("a pipe knote's file");
+            let now = fp.handle.wakes();
+            if now != self.knote(n).seen {
+                self.knote(n).seen = now;
+                self.knote_list(&[n], 0);
+                told = true;
+            }
+        }
+        told
+    }
+
+    /// The count of pipe knotes, for a host thread that says when pipes
+    /// may have changed.
+    pub fn darwin_pipe_watch(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        std::sync::Arc::clone(&self.dtask.kevents.pipe_watch)
+    }
+
+    /// `vn_kqfilter`: EVFILT_READ and EVFILT_WRITE on a regular file;
+    /// another kind of vnode refuses them.
+    fn vn_kqfilter(&mut self, n: KnId, fp: &std::sync::Arc<crate::file::OpenFile>, ty: crate::vfs::FileType) -> u32 {
+        match self.knote(n).filter {
+            evfilt::READ | evfilt::WRITE if ty == crate::vfs::FileType::Regular => {}
+            evfilt::READ | evfilt::WRITE => {
+                self.knote(n).set_error(Errno::EINVAL);
+                return 0;
+            }
+            evfilt::VNODE => {
+                self.darwin_unimplemented(format!("kevent EVFILT_VNODE on {} (vnode events)", fp.path));
+                self.knote(n).set_error(Errno::EOPNOTSUPP);
+                return 0;
+            }
+            _ => {
+                self.knote(n).set_error(Errno::EINVAL);
+                return 0;
+            }
+        }
+        self.knote(n).filtid = filtid::VN;
+        self.filt_vnode_common(n, None)
+    }
+
+    /// `filt_vnode_common` for a regular file: readable while the file
+    /// goes past the descriptor's offset (the data is how far), always
+    /// writable (data 1).
+    fn filt_vnode_common(&mut self, n: KnId, kev: Option<&mut Kev>) -> u32 {
+        const EV_POLL: u16 = 0x1000;
+        let fp = self.knote(n).fp.clone().expect("a vnode knote's file");
+        let k = self.knote(n);
+        let data = if k.filter == evfilt::READ {
+            if k.flags & EV_POLL != 0 {
+                1
+            } else {
+                let size = fp.handle.metadata().map_or(0, |md| md.size);
+                (size as i128 - fp.offset() as i128).clamp(i64::MIN as i128, i64::MAX as i128) as i64
+            }
+        } else {
+            1
+        };
+        let activate = u32::from(data != 0);
+        if activate == 0 {
+            // The knote waits for the file to grow, which XNU says with
+            // KNOTE(&vp->v_knotes) from the filesystem's writes.
+            self.darwin_unimplemented(format!("kevent EVFILT_READ waiting on {} (vnode events)", fp.path));
+        }
+        if activate != 0 {
+            if let Some(kev) = kev {
+                *kev = self.knote(n).fill_kevent(data);
+            }
+        }
+        activate
     }
 
     /// `kqueue_kqfilter`: a knote on a file kqueue's descriptor, readable

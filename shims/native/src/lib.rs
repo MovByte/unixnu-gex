@@ -2426,8 +2426,27 @@ fn give_runner() {
 /// process.
 fn start_darwin_thread_calls(kernel: std::sync::Weak<Mutex<Kernel>>, memory: gex_mem::GuestMemory) {
     let Some(k) = kernel.upgrade() else { return };
-    let bell = k.lock().unwrap_or_else(|e| e.into_inner()).darwin_timer_bell();
+    let (bell, pipes) = {
+        let k = k.lock().unwrap_or_else(|e| e.into_inner());
+        (k.darwin_timer_bell(), k.darwin_pipe_watch())
+    };
     drop(k);
+    // A pipe another process writes changes without a call of this one:
+    // whenever descriptors may have changed (`ready::notify`), the thread
+    // calls look at the pipes that have knotes on them.
+    {
+        let (kernel, bell) = (kernel.clone(), std::sync::Arc::clone(&bell));
+        let _ = std::thread::Builder::new().name("gex-darwin-pipes".into()).spawn(move || loop {
+            let seen = crate::ready::seq();
+            if kernel.strong_count() == 0 {
+                return;
+            }
+            crate::ready::wait(seen, std::time::Duration::from_secs(60));
+            if pipes.load(std::sync::atomic::Ordering::Acquire) > 0 && crate::ready::seq() != seen {
+                bell.ring();
+            }
+        });
+    }
     let _ = std::thread::Builder::new().name("gex-darwin-thread-call".into()).spawn(move || loop {
         let seen = bell.generation();
         let next = {

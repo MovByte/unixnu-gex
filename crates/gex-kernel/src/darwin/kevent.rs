@@ -54,6 +54,10 @@ pub mod evfilt {
 /// `EVFILTID_*` a filter moves a knote to.
 pub mod filtid {
     pub const KQREAD: u8 = 18;
+    pub const PIPE_N: u8 = 19;
+    pub const PIPE_R: u8 = 20;
+    pub const PIPE_W: u8 = 21;
+    pub const VN: u8 = 34;
     pub const MACH_PORT: u8 = 37;
     pub const MACH_PORT_SET: u8 = 38;
     pub const DETACHED: u8 = 39;
@@ -254,6 +258,9 @@ pub struct Knote {
     pub ipc: Option<ObjId>,
     /// A file kqueue a kqread knote watches.
     pub kqread: Option<KqId>,
+    /// A pipe knote: its pipe's wakeup count when last told
+    /// ([`crate::vfs::FileHandle::wakes`]).
+    pub seen: Option<u64>,
     /// `kn_thcall`, while armed.
     pub thcall: Option<(Instant, u64)>,
 }
@@ -392,6 +399,11 @@ pub struct Kevents {
     pub sig_klist: Vec<KnId>,
     /// `memorystatus_klist`: the process's EVFILT_MEMORYSTATUS knotes.
     pub memorystatus_klist: Vec<KnId>,
+    /// The knotes on pipes (each pipe's `pipe_sel.si_note`), and how many
+    /// there are, for a host thread that says when descriptors may have
+    /// changed.
+    pub pipe_klist: Vec<KnId>,
+    pub pipe_watch: Arc<std::sync::atomic::AtomicUsize>,
     closed: Arc<Mutex<Vec<KqId>>>,
     /// Threads to wake when the call settles.
     wake: Vec<(i32, WaitResult)>,
