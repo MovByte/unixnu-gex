@@ -88,6 +88,22 @@ pub fn forward_reg_consts() -> bool {
     FORWARD_REG_CONSTS.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+static FOLD_THROUGH_MEMORY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// Whether translation may fold a load from a constant address to what
+/// memory holds when the block is translated ([`const_fold_with_memory`]).
+/// Sound only where that memory is final before code runs: a Linux process,
+/// whose GOTs gex's own loader fills. A Darwin process's dyld rebases and
+/// binds its data after its code is translated, so its runner turns this
+/// off. In the module cache key.
+pub fn set_fold_through_memory(on: bool) {
+    FOLD_THROUGH_MEMORY.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn fold_through_memory() -> bool {
+    FOLD_THROUGH_MEMORY.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Replace expressions whose operands are all constants with the constant they
 /// evaluate to.
 pub fn const_fold(block: &mut Block) {

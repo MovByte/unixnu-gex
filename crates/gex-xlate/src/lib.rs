@@ -1584,8 +1584,10 @@ fn lift_one(
     if !gex_abi::X86 {
         // A64: folded through memory before the ordinary passes, so a PLT's
         // GOT load becomes a constant and its `br` becomes a target discovery
-        // can follow.
-        pass::const_fold_with_memory(&mut block, &read);
+        // can follow (where memory is final by then: `fold_through_memory`).
+        if pass::fold_through_memory() {
+            pass::const_fold_with_memory(&mut block, &read);
+        }
         pass::optimize(&mut block);
         let folded = match block.term {
             Term::Indirect { target, .. } => pass::const_value(&block, target),

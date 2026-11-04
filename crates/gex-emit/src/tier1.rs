@@ -260,6 +260,7 @@ pub fn knobs() -> u8 {
         | (gex_ir::mxcsr_exact() as u8) << 4
         | (gex_abi::commpage_fold() as u8) << 5
         | (gex_ir::pass::forward_reg_consts() as u8) << 6
+        | (!gex_ir::pass::fold_through_memory() as u8) << 7
 }
 
 /// Whether the translators put the null guard (`gex_abi::NULL_GUARD`) on
