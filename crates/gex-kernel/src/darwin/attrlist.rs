@@ -1273,7 +1273,7 @@ pub fn getvolattrlist(al: &AttrList, buffer_size: usize, options: u64, vi: &VolI
     let bsize = u64::from(vi.bsize);
     let bused = vi.blocks.saturating_sub(vi.bfree);
     let v = alp.vol;
-    let mut put = |ab: &mut AttrBuf, bit: u32, f: &dyn Fn(&mut AttrBuf)| {
+    let put = |ab: &mut AttrBuf, bit: u32, f: &dyn Fn(&mut AttrBuf)| {
         if v & bit != 0 {
             f(ab);
             ab.actual.vol |= bit;
