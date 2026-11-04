@@ -170,12 +170,51 @@ pub fn translate(raw: u64, a: &mut [u64; 6]) -> u64 {
             a[3] = l;
             nr::MMAP
         }
-        sys::SOCKET => {
-            // AF_UNIX and AF_INET agree; Darwin's AF_INET6 is 30.
-            if a[0] == 30 {
-                a[0] = 10;
+        // AF_UNIX and AF_INET agree; Darwin's AF_INET6 is 30. A family with
+        // no Linux counterpart never gets here ([`super::kern`] refuses it).
+        sys::SOCKET | sys::SOCKETPAIR => {
+            a[0] = super::sockaddr::family_to_linux(a[0]).unwrap_or(u64::MAX);
+            if raw == sys::SOCKET {
+                nr::SOCKET
+            } else {
+                nr::SOCKETPAIR
             }
-            nr::SOCKET
+        }
+        // The address structures are read and written in Darwin's layout by
+        // the socket code itself (`FdIo::darwin`); what is renumbered here is
+        // the message flags and the options.
+        sys::BIND => nr::BIND,
+        sys::LISTEN => nr::LISTEN,
+        sys::CONNECT | sys::CONNECT_NOCANCEL => nr::CONNECT,
+        sys::ACCEPT | sys::ACCEPT_NOCANCEL => nr::ACCEPT,
+        sys::GETSOCKNAME => nr::GETSOCKNAME,
+        sys::GETPEERNAME => nr::GETPEERNAME,
+        sys::SHUTDOWN => nr::SHUTDOWN,
+        sys::SENDTO | sys::SENDTO_NOCANCEL => {
+            a[3] = super::sockaddr::msg_flags_to_linux(a[3]);
+            nr::SENDTO
+        }
+        sys::RECVFROM | sys::RECVFROM_NOCANCEL => {
+            a[3] = super::sockaddr::msg_flags_to_linux(a[3]);
+            nr::RECVFROM
+        }
+        sys::SENDMSG | sys::SENDMSG_NOCANCEL => {
+            a[2] = super::sockaddr::msg_flags_to_linux(a[2]);
+            nr::SENDMSG
+        }
+        sys::RECVMSG | sys::RECVMSG_NOCANCEL => {
+            a[2] = super::sockaddr::msg_flags_to_linux(a[2]);
+            nr::RECVMSG
+        }
+        sys::SETSOCKOPT | sys::GETSOCKOPT => {
+            let Ok((level, name)) = super::sockaddr::sockopt_to_linux(a[1], a[2]) else { return UNKNOWN };
+            a[1] = level;
+            a[2] = name;
+            if raw == sys::SETSOCKOPT {
+                nr::SETSOCKOPT
+            } else {
+                nr::GETSOCKOPT
+            }
         }
         // getrlimit/setrlimit onto prlimit64 for the calling process, the
         // resource renumbered (_RLIMIT_POSIX_FLAG dropped).

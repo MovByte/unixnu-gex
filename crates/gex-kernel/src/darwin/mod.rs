@@ -28,6 +28,7 @@ pub mod mk_timer;
 pub mod psynch;
 pub mod sema;
 pub mod shm;
+pub mod sockaddr;
 pub mod sysctl;
 pub mod sysno;
 pub mod thread;

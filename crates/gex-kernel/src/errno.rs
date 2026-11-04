@@ -60,6 +60,7 @@ impl Errno {
     pub const EPROTONOSUPPORT: Errno = Errno(93);
     pub const ENETUNREACH: Errno = Errno(101);
     pub const ENOTSOCK: Errno = Errno(88);
+    pub const EDESTADDRREQ: Errno = Errno(89);
     pub const EMSGSIZE: Errno = Errno(90);
     pub const EPROTOTYPE: Errno = Errno(91);
     pub const ENOPROTOOPT: Errno = Errno(92);

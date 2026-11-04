@@ -11,6 +11,7 @@
 
 use crate::errno::{encode, Errno, SysResult};
 use crate::file::{FdTable, OpenFile, PipeEnd};
+use crate::darwin::sockaddr::Rule;
 use crate::fs::{oflags, Stat};
 use crate::futex::{self, FutexTable};
 use crate::mem::{flags as mflags, MemoryMap};
@@ -1251,6 +1252,9 @@ pub fn clock_call(
 pub struct FdIo<'a> {
     pub fds: &'a FdTable,
     pub compat: bool,
+    /// A Darwin process: its socket addresses and message structures are
+    /// Darwin's.
+    pub darwin: bool,
     /// The process's namespace, for a descriptor rebuilt from its name
     /// (`SCM_RIGHTS` from another process), and its pid.
     pub ns: &'a crate::vfs::Namespace,
@@ -1879,10 +1883,85 @@ impl FdIo<'_> {
     /// or 12 for an i386 process. `msghdr`, `iovec` and `mmsghdr` are
     /// pointer-sized fields too ([`Self::msg_word`]).
     pub(crate) fn cmsg_hdr(&self) -> u64 {
-        if self.compat {
+        if self.cmsg32() {
             12
         } else {
             16
+        }
+    }
+
+    /// Whether a `cmsghdr` has a 32-bit length: i386's, and Darwin's
+    /// (`socklen_t`, aligned to 4).
+    pub(crate) fn cmsg32(&self) -> bool {
+        self.compat || self.darwin
+    }
+
+    /// `cmsg_len` of the header at `at`.
+    fn cmsg_len_rd(&self, m: &GuestMem<'_>, at: u64) -> Result<u64, Errno> {
+        if self.cmsg32() {
+            Ok(m.read_u32(at)? as u64)
+        } else {
+            m.read_u64(at)
+        }
+    }
+
+    fn cmsg_len_wr(&self, m: &mut GuestMem<'_>, at: u64, v: u64) -> Result<(), Errno> {
+        if self.cmsg32() {
+            m.write_u32(at, v as u32)
+        } else {
+            m.write_u64(at, v)
+        }
+    }
+
+    /// `SOL_SOCKET` as a `cmsg_level`.
+    fn sol_socket(&self) -> u32 {
+        if self.darwin {
+            0xffff
+        } else {
+            1
+        }
+    }
+
+    /// The `i`th field of a `struct msghdr` at `at`: the name, its length,
+    /// the vector, its length, the control data, its length. Darwin's
+    /// lengths are 32 bits and its flags follow them at 44.
+    pub(crate) fn hdr_rd(&self, m: &GuestMem<'_>, at: u64, i: u64) -> Result<u64, Errno> {
+        if self.darwin {
+            match i {
+                0 | 2 | 4 => m.read_u64(at + 8 * i),
+                1 => Ok(m.read_u32(at + 8)? as u64),
+                3 => Ok(m.read_u32(at + 24)? as u64),
+                _ => Ok(m.read_u32(at + 40)? as u64),
+            }
+        } else {
+            self.msg_rd(m, at, i)
+        }
+    }
+
+    pub(crate) fn hdr_wr(&self, m: &mut GuestMem<'_>, at: u64, i: u64, v: u64) -> Result<(), Errno> {
+        if self.darwin && matches!(i, 1 | 3 | 5) {
+            m.write_u32(at + [0, 8, 0, 24, 0, 40][i as usize], v as u32)
+        } else {
+            self.msg_wr(m, at, i, v)
+        }
+    }
+
+    /// Where `msg_flags` is, and a Linux flag word in this process's terms.
+    pub(crate) fn msg_flags_at(&self) -> u64 {
+        if self.compat {
+            24
+        } else if self.darwin {
+            44
+        } else {
+            48
+        }
+    }
+
+    pub(crate) fn flags_out(&self, linux: u32) -> u32 {
+        if self.darwin {
+            crate::darwin::sockaddr::msg_flags_from_linux(linux)
+        } else {
+            linux
         }
     }
 
@@ -1893,7 +1972,7 @@ impl FdIo<'_> {
 
     /// The pointer and `size_t` width of the message structures.
     pub(crate) fn msg_word(&self) -> u64 {
-        if self.compat {
+        if self.cmsg32() {
             4
         } else {
             8
@@ -1928,19 +2007,19 @@ impl FdIo<'_> {
         control: u64,
         len: u64,
     ) -> Result<Vec<Arc<OpenFile>>, Errno> {
-        const SOL_SOCKET: u32 = 1;
         const SCM_RIGHTS: u32 = 1;
+        let sol_socket = self.sol_socket();
         let (hdr, w) = (self.cmsg_hdr(), self.msg_word());
         let mut out = Vec::new();
         let mut at = 0u64;
         while at + hdr <= len {
-            let cmsg_len = self.msg_rd(m, control + at, 0)?;
+            let cmsg_len = self.cmsg_len_rd(m, control + at)?;
             if cmsg_len < hdr || at + cmsg_len > len {
                 break;
             }
             let level = m.read_u32(control + at + w)?;
             let ty = m.read_u32(control + at + w + 4)?;
-            if level == SOL_SOCKET && ty == SCM_RIGHTS {
+            if level == sol_socket && ty == SCM_RIGHTS {
                 let n = (cmsg_len - hdr) / 4;
                 for i in 0..n.min(253) {
                     let fd = m.read_u32(control + at + hdr + i * 4)? as i32;
@@ -1964,8 +2043,8 @@ impl FdIo<'_> {
         len: u64,
         files: Vec<Arc<OpenFile>>,
     ) -> Result<u64, Errno> {
-        const SOL_SOCKET: u32 = 1;
         const SCM_RIGHTS: u32 = 1;
+        let sol_socket = self.sol_socket();
         if files.is_empty() || control == 0 {
             return Ok(0);
         }
@@ -1975,8 +2054,8 @@ impl FdIo<'_> {
         if cmsg_len > len {
             return Ok(0);
         }
-        self.msg_wr(m, control, 0, cmsg_len)?;
-        m.write_u32(control + w, SOL_SOCKET)?;
+        self.cmsg_len_wr(m, control, cmsg_len)?;
+        m.write_u32(control + w, sol_socket)?;
         m.write_u32(control + w + 4, SCM_RIGHTS)?;
         for (i, f) in files.into_iter().enumerate() {
             let fd = self.fds.insert(f, false)?;
@@ -1990,20 +2069,20 @@ impl FdIo<'_> {
     pub fn sendmsg(&self, m: &GuestMem<'_>, fd: i32, msg: u64) -> SysResult {
         // `msg_name` is where this one goes, and a reply has to be reported
         // as having come from there or a resolver drops it as spoofed.
-        let name = self.msg_rd(m, msg, 0)?;
+        let name = self.hdr_rd(m, msg, 0)?;
         if let Ok(d) = self.dgram_of(fd) {
             // A datagram, to `msg_name` when there is one (resolved as the
             // socket's own names are: an abstract name, or a path from `/`;
             // a relative one is taken from `/`), else to the connected peer.
             let namelen = m.read_u32(msg + if self.compat { 4 } else { 8 })? as u64;
             let to = if name != 0 {
-                let p = Kernel::sockaddr_un(m, name, namelen)?;
+                let p = self.unix_path(m, name, namelen)?;
                 Some(if p.starts_with('\0') { p } else { crate::vfs::normalize(&p, "/") })
             } else {
                 None
             };
-            let iov = self.msg_rd(m, msg, 2)?;
-            let iovlen = self.msg_rd(m, msg, 3)?;
+            let iov = self.hdr_rd(m, msg, 2)?;
+            let iovlen = self.hdr_rd(m, msg, 3)?;
             let mut data = Vec::new();
             for i in 0..iovlen.min(1024) {
                 let base = self.msg_rd(m, iov, 2 * i)?;
@@ -2016,14 +2095,14 @@ impl FdIo<'_> {
         }
         if name != 0 {
             if let Ok(sock) = self.socket_of(fd) {
-                let bytes = m.read(name, 16)?.to_vec();
-                if let Ok((ip, port)) = net::parse_sockaddr(&bytes) {
+                let namelen = m.read_u32(msg + if self.compat { 4 } else { 8 })? as u64;
+                if let Ok((ip, port)) = self.inet_addr(m, name, namelen) {
                     sock.set_peer(ip, port);
                 }
             }
         }
-        let iov = self.msg_rd(m, msg, 2)?;
-        let iovlen = self.msg_rd(m, msg, 3)?;
+        let iov = self.hdr_rd(m, msg, 2)?;
+        let iovlen = self.hdr_rd(m, msg, 3)?;
         let mut data = Vec::new();
         for i in 0..iovlen.min(1024) {
             let base = self.msg_rd(m, iov, 2 * i)?;
@@ -2035,8 +2114,8 @@ impl FdIo<'_> {
         // Ancillary data, which for a unix socket may be descriptors. Staged
         // on the socket rather than passed down, so the send attaches them to
         // the first byte it writes and a send that fails attaches nothing.
-        let control = self.msg_rd(m, msg, 4)?;
-        let controllen = self.msg_rd(m, msg, 5)?;
+        let control = self.hdr_rd(m, msg, 4)?;
+        let controllen = self.hdr_rd(m, msg, 5)?;
         if control != 0 && controllen >= self.cmsg_hdr() {
             if let Ok(sock) = self.unix_of(fd) {
                 let files = self.read_scm_rights(m, control, controllen)?;
@@ -2092,19 +2171,19 @@ impl FdIo<'_> {
             m.write(base, &tmp[at..at + take])?;
             at += take;
         }
-        let name = self.msg_rd(m, msg, 0)?;
+        let name = self.hdr_rd(m, msg, 0)?;
         let namelen_at = msg + if self.compat { 4 } else { 8 };
         if name != 0 {
             match from {
-                Some(p) => Kernel::write_sockaddr_un(m, name, namelen_at, &p)?,
+                Some(p) => self.put_unix(m, name, namelen_at, &p, Rule::Recv)?,
                 None => {
-                    Kernel::write_sockaddr_unnamed(m, name, namelen_at)?;
+                    self.put_unnamed(m, name, namelen_at, Rule::Recv)?;
                 }
             }
         }
-        self.msg_wr(m, msg, 5, 0)?;
+        self.hdr_wr(m, msg, 5, 0)?;
         const MSG_TRUNC: u32 = 0x20;
-        m.write_u32(msg + if self.compat { 24 } else { 48 }, if whole > n { MSG_TRUNC } else { 0 })?;
+        m.write_u32(msg + self.msg_flags_at(), self.flags_out(if whole > n { MSG_TRUNC } else { 0 }))?;
         Ok(n as u64)
     }
 
@@ -2153,13 +2232,13 @@ impl FdIo<'_> {
                 files.push(f);
             }
         }
-        let name = self.msg_rd(m, msg, 0)?;
+        let name = self.hdr_rd(m, msg, 0)?;
         if name != 0 {
             m.write_u32(msg + if self.compat { 4 } else { 8 }, 0)?;
         }
         let written = self.write_scm_rights(m, control, controllen, files)?;
-        self.msg_wr(m, msg, 5, written)?;
-        m.write_u32(msg + if self.compat { 24 } else { 48 }, 0)?;
+        self.hdr_wr(m, msg, 5, written)?;
+        m.write_u32(msg + self.msg_flags_at(), 0)?;
         Ok(n)
     }
 
@@ -2179,10 +2258,10 @@ impl FdIo<'_> {
 
     pub fn recvmsg(&self, m: &mut GuestMem<'_>, fd: i32, msg: u64, flags: u64) -> SysResult {
         let peek = flags & Kernel::MSG_PEEK != 0;
-        let iov = self.msg_rd(m, msg, 2)?;
-        let iovlen = self.msg_rd(m, msg, 3)?;
-        let control = self.msg_rd(m, msg, 4)?;
-        let controllen = self.msg_rd(m, msg, 5)?;
+        let iov = self.hdr_rd(m, msg, 2)?;
+        let iovlen = self.hdr_rd(m, msg, 3)?;
+        let control = self.hdr_rd(m, msg, 4)?;
+        let controllen = self.hdr_rd(m, msg, 5)?;
         // How many descriptors the caller left room for: the rest of a
         // write's are closed (`MSG_CTRUNC`).
         let room = if control != 0 && controllen >= self.cmsg_hdr() {
@@ -2201,7 +2280,7 @@ impl FdIo<'_> {
         }
         // The read and the sender address it set, as one (`recv_turn`).
         // Only when it asks who sent it.
-        let inet = if unix_sock.is_none() && self.msg_rd(m, msg, 0)? != 0 { self.socket_of(fd).ok() } else { None };
+        let inet = if unix_sock.is_none() && self.hdr_rd(m, msg, 0)? != 0 { self.socket_of(fd).ok() } else { None };
         let _turn = inet.as_ref().map(|s| s.recv_turn());
         // One read for the whole vector, then scattered over it, as the
         // remote path does. Reading each iovec in turn lost data: a first
@@ -2256,7 +2335,7 @@ impl FdIo<'_> {
         };
         // Who sent it, as recvfrom says: musl's resolver drops a reply whose
         // msg_name is not one of its nameservers. A unix peer has no name.
-        let name = self.msg_rd(m, msg, 0)?;
+        let name = self.hdr_rd(m, msg, 0)?;
         let namelen_at = msg + if self.compat { 4 } else { 8 };
         if name != 0 {
             if unix_sock.is_some() {
@@ -2264,18 +2343,65 @@ impl FdIo<'_> {
             } else {
                 let peer = self.socket_of(fd).ok().and_then(|s| s.last_from().or_else(|| s.peer()));
                 let (ip, port) = peer.unwrap_or((0, 0));
-                self.write_sockaddr(m, ip, port, name, namelen_at)?;
+                self.put_inet(m, ip, port, name, namelen_at, Rule::Recv)?;
             }
         }
         let given = !received.is_empty();
         let written = self.write_scm_rights(m, control, controllen, received)?;
-        self.msg_wr(m, msg, 5, written)?;
+        self.hdr_wr(m, msg, 5, written)?;
         // msg_flags (int): MSG_CTRUNC when descriptors were closed for want
         // of room.
         const MSG_CTRUNC: u32 = 0x8;
         let flags = if cut || (given && written == 0) { MSG_CTRUNC } else { 0 };
-        m.write_u32(msg + if self.compat { 24 } else { 48 }, flags)?;
+        m.write_u32(msg + self.msg_flags_at(), self.flags_out(flags))?;
         Ok(total)
+    }
+
+    /// An unix socket's name copied out to a caller, in this process's
+    /// layout.
+    pub(crate) fn put_unix(&self, m: &mut GuestMem<'_>, addr: u64, lenp: u64, path: &str, rule: Rule) -> Result<(), Errno> {
+        if self.darwin {
+            crate::darwin::sockaddr::put(m, addr, lenp, &crate::darwin::sockaddr::out_unix(path), rule)
+        } else {
+            Kernel::write_sockaddr_un(m, addr, lenp, path)
+        }
+    }
+
+    /// The address of a unix socket that has none.
+    pub(crate) fn put_unnamed(&self, m: &mut GuestMem<'_>, addr: u64, lenp: u64, rule: Rule) -> SysResult {
+        if self.darwin {
+            crate::darwin::sockaddr::put(m, addr, lenp, &crate::darwin::sockaddr::out_unnamed(), rule).map(|_| 0)
+        } else {
+            Kernel::write_sockaddr_unnamed(m, addr, lenp)
+        }
+    }
+
+    /// An internet address copied out to a caller.
+    pub(crate) fn put_inet(&self, m: &mut GuestMem<'_>, ip: u32, port: u16, addr: u64, lenp: u64, rule: Rule) -> SysResult {
+        if self.darwin {
+            crate::darwin::sockaddr::put(m, addr, lenp, &crate::darwin::sockaddr::out_inet(ip, port), rule).map(|_| 0)
+        } else {
+            self.write_sockaddr(m, ip, port, addr, lenp)
+        }
+    }
+
+    /// The path of a unix address a caller gave.
+    pub(crate) fn unix_path(&self, m: &GuestMem<'_>, addr: u64, len: u64) -> Result<String, Errno> {
+        if self.darwin {
+            crate::darwin::sockaddr::unix_path(&crate::darwin::sockaddr::get(m, addr, len, false)?)
+        } else {
+            Kernel::sockaddr_un(m, addr, len)
+        }
+    }
+
+    /// The address and port of an internet address a caller gave.
+    pub(crate) fn inet_addr(&self, m: &GuestMem<'_>, addr: u64, len: u64) -> Result<(u32, u16), Errno> {
+        if self.darwin {
+            crate::darwin::sockaddr::inet(&crate::darwin::sockaddr::get(m, addr, len, true)?)
+        } else {
+            let bytes = m.read(addr, (len as usize).min(128))?.to_vec();
+            net::parse_sockaddr(&bytes)
+        }
     }
 
     fn write_sockaddr(
@@ -4629,8 +4755,8 @@ impl NetIo<'_> {
             nr::SENDMMSG => sendmmsg(io, m, fd, a[1], a[2]),
             nr::RECVMMSG => recvmmsg(io, m, fd, a[1], a[2], a[3]),
             nr::GETPEERNAME if io.dgram_of(fd).is_ok() => match io.dgram_of(fd)?.peer_name()? {
-                Some(p) => Kernel::write_sockaddr_un(m, a[1], a[2], &p).map(|_| 0),
-                None => Kernel::write_sockaddr_unnamed(m, a[1], a[2]),
+                Some(p) => io.put_unix(m, a[1], a[2], &p, Rule::Name).map(|_| 0),
+                None => io.put_unnamed(m, a[1], a[2], Rule::Name),
             },
             // A unix stream socket: the name it connected to (an accepted
             // end's peer is unnamed: the family alone).
@@ -4646,13 +4772,13 @@ impl NetIo<'_> {
                     }
                 };
                 match peer {
-                    Some(p) => Kernel::write_sockaddr_un(m, a[1], a[2], &p).map(|_| 0),
-                    None => Kernel::write_sockaddr_unnamed(m, a[1], a[2]),
+                    Some(p) => io.put_unix(m, a[1], a[2], &p, Rule::Name).map(|_| 0),
+                    None => io.put_unnamed(m, a[1], a[2], Rule::Name),
                 }
             }
             nr::GETPEERNAME => {
                 let (ip, port) = io.socket_of(fd)?.peer().ok_or(Errno::ENOTCONN)?;
-                io.write_sockaddr(m, ip, port, a[1], a[2])
+                io.put_inet(m, ip, port, a[1], a[2], Rule::Name)
             }
             // An unbound, unconnected socket is at 0.0.0.0; a connected one
             // not bound to an address is on the interface its peer is
@@ -4666,7 +4792,7 @@ impl NetIo<'_> {
             nr::GETSOCKNAME => match socket_family_type(io, fd) {
                 // A bound datagram socket has its name.
                 Ok((1, 2)) if io.dgram_of(fd)?.name().is_some() => {
-                    Kernel::write_sockaddr_un(m, a[1], a[2], &io.dgram_of(fd)?.name().unwrap()).map(|_| 0)
+                    io.put_unix(m, a[1], a[2], &io.dgram_of(fd)?.name().unwrap(), Rule::Name).map(|_| 0)
                 }
                 // A unix stream socket: its name (bound, listening, or its
                 // listener's when accepted), else unnamed. A listener in the
@@ -4677,8 +4803,8 @@ impl NetIo<'_> {
                         Err(_) => io.remote_unix_of(fd).ok().filter(|r| r.listening).and_then(|r| r.peer.clone()),
                     };
                     match name {
-                        Some(p) => Kernel::write_sockaddr_un(m, a[1], a[2], &p).map(|_| 0),
-                        None => Kernel::write_sockaddr_unnamed(m, a[1], a[2]),
+                        Some(p) => io.put_unix(m, a[1], a[2], &p, Rule::Name).map(|_| 0),
+                        None => io.put_unnamed(m, a[1], a[2], Rule::Name),
                     }
                 }
                 _ => {
@@ -4689,7 +4815,7 @@ impl NetIo<'_> {
                             (local, _) => local,
                         })
                         .unwrap_or((0, 0));
-                    io.write_sockaddr(m, ip, port, a[1], a[2])
+                    io.put_inet(m, ip, port, a[1], a[2], Rule::Name)
                 }
             },
             // Nothing here has an option worth setting -- no timeouts, no
@@ -4716,14 +4842,12 @@ impl NetIo<'_> {
             // A local address means nothing when there is one interface and
             // it is a proxy, but a resolver binds its socket before it sends
             // and gives up if that fails.
+            nr::BIND if io.darwin && a[1] == 0 => Err(Errno::EDESTADDRREQ),
             nr::BIND => match self.unix_bind(io, m, fd, a[1], a[2], cwd) {
                 Err(Errno::ENOTSOCK) => match io.socket_of(fd) {
                     // An internet socket remembers where it is (`listen`,
                     // `getsockname`).
-                    Ok(sock) => m
-                        .read(a[1], (a[2] as usize).min(128))
-                        .and_then(|b| net::parse_sockaddr(b))
-                        .and_then(|(ip, port)| sock.bind(ip, port).map(|_| 0)),
+                    Ok(sock) => io.inet_addr(m, a[1], a[2]).and_then(|(ip, port)| sock.bind(ip, port).map(|_| 0)),
                     Err(_) => io.fds.get(fd).map(|_| 0),
                 },
                 other => other,
@@ -4758,8 +4882,7 @@ impl NetIo<'_> {
         let file = io.fds.get(a[0] as i32).ok()?;
         match n {
             nr::CONNECT => {
-                let bytes = m.read(a[1], (a[2] as usize).min(128)).ok()?.to_vec();
-                let (ip, port) = net::parse_sockaddr(&bytes).ok()?;
+                let (ip, port) = io.inet_addr(m, a[1], a[2]).ok()?;
                 let socket = io.socket_of(a[0] as i32).ok()?;
                 let started = socket.connect(ip, port);
                 let waits = file.would_block() && started == Err(Errno::EINPROGRESS);
@@ -4916,7 +5039,7 @@ impl NetIo<'_> {
 
     pub fn unix_bind(&self, io: &FdIo<'_>, m: &GuestMem<'_>, fd: i32, addr: u64, len: u64, cwd: &str) -> SysResult {
         if let Ok(d) = io.dgram_of(fd) {
-            let path = Kernel::sockaddr_un(m, addr, len)?;
+            let path = io.unix_path(m, addr, len)?;
             let path = if path.starts_with('\0') { path } else { crate::vfs::normalize(&path, cwd) };
             d.bind(&path)?;
             if !path.starts_with('\0') {
@@ -4925,7 +5048,7 @@ impl NetIo<'_> {
             return Ok(0);
         }
         let sock = io.unix_of(fd)?;
-        let path = Kernel::sockaddr_un(m, addr, len)?;
+        let path = io.unix_path(m, addr, len)?;
         // A filesystem socket resolves against the guest's root the way any
         // other path does; an abstract one has no filesystem existence.
         let path = if path.starts_with('\0') { path } else { crate::vfs::normalize(&path, cwd) };
@@ -4971,12 +5094,12 @@ impl NetIo<'_> {
 
     pub fn unix_connect(&self, io: &FdIo<'_>, m: &GuestMem<'_>, fd: i32, addr: u64, len: u64, cwd: &str) -> SysResult {
         if let Ok(d) = io.dgram_of(fd) {
-            let path = Kernel::sockaddr_un(m, addr, len)?;
+            let path = io.unix_path(m, addr, len)?;
             let path = if path.starts_with('\0') { path } else { crate::vfs::normalize(&path, cwd) };
             return d.connect(&path);
         }
         let sock = io.unix_of(fd)?;
-        let path = Kernel::sockaddr_un(m, addr, len)?;
+        let path = io.unix_path(m, addr, len)?;
         let path = if path.starts_with('\0') { path } else { crate::vfs::normalize(&path, cwd) };
         // The global kernel first, because that is where a name another
         // process bound will be. A host-bound name -- the virtio-gpu socket --
@@ -4999,7 +5122,26 @@ impl NetIo<'_> {
         if let Ok(r) = self.host_names.connect(&sock, &path) {
             return Ok(r);
         }
-        self.socket_names.connect(&sock, &path)
+        let r = self.socket_names.connect(&sock, &path);
+        if io.darwin && r == Err(Errno::ECONNREFUSED) {
+            return Err(Self::unix_connect_lookup(io, &path));
+        }
+        r
+    }
+
+    /// Why XNU's `unp_connect` refuses a name nothing is bound to: it looks
+    /// the path up first, so a path that is not there is `ENOENT` and one
+    /// that is not a socket `ENOTSOCK`; only a socket file with no listener
+    /// is `ECONNREFUSED`.
+    fn unix_connect_lookup(io: &FdIo<'_>, path: &str) -> Errno {
+        if path.starts_with('\0') {
+            return Errno::ENOENT;
+        }
+        match io.ns.metadata(path) {
+            Err(e) => e,
+            Ok(md) if md.file_type != FileType::Socket => Errno::ENOTSOCK,
+            Ok(_) => Errno::ECONNREFUSED,
+        }
     }
 }
 
@@ -5032,8 +5174,7 @@ fn insert_remote_unix(io: &FdIo<'_>, sock: Arc<unix::RemoteUnix>, flags: u64, cl
 }
 
 fn inet_connect(io: &FdIo<'_>, m: &GuestMem<'_>, fd: i32, addr: u64, len: u64) -> SysResult {
-    let bytes = m.read(addr, (len as usize).min(128))?.to_vec();
-    let (ip, port) = net::parse_sockaddr(&bytes)?;
+    let (ip, port) = io.inet_addr(m, addr, len)?;
     io.socket_of(fd)?.connect(ip, port).map(|_| 0)
 }
 
@@ -5055,7 +5196,7 @@ fn inet_accept(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, addr: u64, len_out:
     let handle: Arc<dyn crate::vfs::FileHandle> = sock.clone();
     let file = OpenFile::new(handle, "socket".to_string(), oflag, true, true);
     let new_fd = io.fds.insert(file, flags & SOCK_CLOEXEC != 0)?;
-    io.write_sockaddr(m, ip, port, addr, len_out)?;
+    io.put_inet(m, ip, port, addr, len_out, Rule::Name)?;
     Ok(new_fd)
 }
 
@@ -5066,7 +5207,7 @@ fn unix_accept(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, addr: u64, len_out:
         let session = listener.accept()?;
         // The peer's address: a client that never bound has an unnamed one,
         // as Linux reports it (the family alone), not the listener's path.
-        Kernel::write_sockaddr_unnamed(m, addr, len_out)?;
+        io.put_unnamed(m, addr, len_out, Rule::Name)?;
         let nonblock = flags & SOCK_NONBLOCK != 0;
         session.set_nonblocking(nonblock);
         let oflag = if nonblock { oflags::O_NONBLOCK } else { 0 };
@@ -5076,7 +5217,7 @@ fn unix_accept(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, addr: u64, len_out:
     }
     let listener = io.unix_of(fd)?;
     let session = listener.accept()?;
-    Kernel::write_sockaddr_unnamed(m, addr, len_out)?;
+    io.put_unnamed(m, addr, len_out, Rule::Name)?;
     let nonblock = flags & SOCK_NONBLOCK != 0;
     session.set_nonblocking(nonblock);
     let oflag = if nonblock { oflags::O_NONBLOCK } else { 0 };
@@ -5088,7 +5229,7 @@ fn sendto(io: &FdIo<'_>, m: &GuestMem<'_>, fd: i32, buf: u64, len: u64, dest: u6
     if let Ok(d) = io.dgram_of(fd) {
         let data = m.read(buf, (len as usize).min(1 << 22))?.to_vec();
         let to = if dest != 0 {
-            let path = Kernel::sockaddr_un(m, dest, dest_len)?;
+            let path = io.unix_path(m, dest, dest_len)?;
             Some(if path.starts_with('\0') { path } else { crate::vfs::normalize(&path, cwd) })
         } else {
             None
@@ -5097,8 +5238,7 @@ fn sendto(io: &FdIo<'_>, m: &GuestMem<'_>, fd: i32, buf: u64, len: u64, dest: u6
     }
     if dest != 0 {
         if let Ok(sock) = io.socket_of(fd) {
-            let bytes = m.read(dest, 16)?.to_vec();
-            if let Ok((ip, port)) = net::parse_sockaddr(&bytes) {
+            if let Ok((ip, port)) = io.inet_addr(m, dest, dest_len) {
                 sock.set_peer(ip, port);
             }
         }
@@ -5116,9 +5256,9 @@ fn recvfrom(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64, fl
         m.write(buf, &tmp[..n])?;
         if addr != 0 {
             match from {
-                Some(p) => Kernel::write_sockaddr_un(m, addr, addrlen, &p)?,
+                Some(p) => io.put_unix(m, addr, addrlen, &p, Rule::Recv)?,
                 None => {
-                    Kernel::write_sockaddr_unnamed(m, addr, addrlen)?;
+                    io.put_unnamed(m, addr, addrlen, Rule::Recv)?;
                 }
             }
         }
@@ -5138,7 +5278,7 @@ fn recvfrom(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64, fl
         // else the connected peer.
         let peer = io.socket_of(fd).ok().and_then(|s| s.last_from().or_else(|| s.peer()));
         let (ip, port) = peer.unwrap_or((0, 0));
-        io.write_sockaddr(m, ip, port, addr, addrlen)?;
+        io.put_inet(m, ip, port, addr, addrlen, Rule::Recv)?;
     }
     Ok(n)
 }
@@ -9844,6 +9984,7 @@ impl Kernel {
         FdIo {
             fds: &self.fds,
             compat: self.compat,
+            darwin: self.darwin,
             ns: &self.vfs,
             pid: self.pid,
             creds: &self.creds,
@@ -9937,8 +10078,7 @@ impl Kernel {
                 Some(op)
             }
             nr::CONNECT => {
-                let bytes = m.read(a[1], (a[2] as usize).min(128)).ok()?.to_vec();
-                let (ip, port) = net::parse_sockaddr(&bytes).ok()?;
+                let (ip, port) = self.fd_io().inet_addr(m, a[1], a[2]).ok()?;
                 let file = self.fds.get(a[0] as i32).ok()?;
                 let socket = self.socket_of(a[0] as i32).ok()?;
                 // Start it here, whichever way this goes: the non-blocking
@@ -11381,7 +11521,7 @@ impl Kernel {
     /// usually bind -- is kept as a distinct name by prefixing it, so an
     /// abstract socket and a filesystem one of the same spelling do not
     /// collide.
-    fn sockaddr_un(m: &GuestMem<'_>, addr: u64, len: u64) -> Result<String, Errno> {
+    pub(crate) fn sockaddr_un(m: &GuestMem<'_>, addr: u64, len: u64) -> Result<String, Errno> {
         if addr == 0 || len < 2 {
             return Err(Errno::EINVAL);
         }
@@ -11399,7 +11539,7 @@ impl Kernel {
     /// Write a `struct sockaddr_un` back, for `getsockname`, `recvfrom` and
     /// `recvmsg`: at most the caller's `*len_out` bytes of it (a
     /// `struct sockaddr` of 16 is a common buffer), its whole length reported.
-    fn write_sockaddr_un(
+    pub(crate) fn write_sockaddr_un(
         m: &mut GuestMem<'_>,
         addr: u64,
         len_out: u64,
@@ -11483,7 +11623,7 @@ impl Kernel {
 
     /// `getsockopt`. The only one anybody asks: has the connection come up?
     /// An unnamed `sockaddr_un`: the family alone, two bytes long.
-    fn write_sockaddr_unnamed(m: &mut GuestMem<'_>, addr: u64, addrlen: u64) -> SysResult {
+    pub(crate) fn write_sockaddr_unnamed(m: &mut GuestMem<'_>, addr: u64, addrlen: u64) -> SysResult {
         if addr != 0 {
             let room = if addrlen != 0 { m.read_u32(addrlen)? } else { 2 };
             if room >= 2 {
@@ -15003,6 +15143,44 @@ mod tests {
         set_args(&mut m, k.ctx_addr, nr::RECVMSG, &[a, 0x21000, MSG_DONTWAIT]);
         k.syscall(&mut m, 0);
         assert_eq!(ret(&m, k.ctx_addr), -(Errno::EAGAIN.0 as i64));
+    }
+
+    /// A Darwin process's `msghdr` has 32-bit lengths and keeps its flags at
+    /// 44, its `cmsghdr` a 32-bit length and `SOL_SOCKET` as 0xffff, and a
+    /// received flag word is Darwin's.
+    #[test]
+    fn darwin_message_structures() {
+        let (mut buf, mut k) = setup();
+        let mut m = GuestMem::new(&mut buf);
+        set_args(&mut m, k.ctx_addr, nr::SOCKETPAIR, &[1, 1, 0, 0x20000]);
+        k.syscall(&mut m, 0);
+        let a = m.read_u32(0x20000).unwrap() as i32;
+        k.darwin = true;
+        let io = k.fd_io();
+        // name, namelen, iov, iovlen, control, controllen, flags: the
+        // padding after each length holds whatever the caller left there
+        m.write_u64(0x21000, 0x30000).unwrap();
+        m.write_u64(0x21008, 0xdead_beef_0000_0010).unwrap();
+        m.write_u64(0x21010, 0x31000).unwrap();
+        m.write_u64(0x21018, 0xdead_beef_0000_0002).unwrap();
+        m.write_u64(0x21020, 0x32000).unwrap();
+        m.write_u64(0x21028, 0xdead_beef_0000_0020).unwrap();
+        assert_eq!(io.hdr_rd(&m, 0x21000, 0).unwrap(), 0x30000);
+        assert_eq!(io.hdr_rd(&m, 0x21000, 1).unwrap(), 0x10);
+        assert_eq!(io.hdr_rd(&m, 0x21000, 3).unwrap(), 2);
+        assert_eq!(io.hdr_rd(&m, 0x21000, 5).unwrap(), 0x20);
+        io.hdr_wr(&mut m, 0x21000, 5, 12).unwrap();
+        assert_eq!(m.read_u32(0x21028).unwrap(), 12);
+        assert_eq!(io.msg_flags_at(), 44);
+        // MSG_CTRUNC and MSG_TRUNC swap their Linux values for Darwin's
+        assert_eq!(io.flags_out(0x8 | 0x20), 0x20 | 0x10);
+        // one descriptor in a control buffer: 12 header bytes and the fd
+        let file = io.fds.get(a).unwrap();
+        assert_eq!(io.write_scm_rights(&mut m, 0x32000, 0x20, vec![file]).unwrap(), 16);
+        assert_eq!(m.read_u32(0x32000).unwrap(), 16);
+        assert_eq!((m.read_u32(0x32004).unwrap(), m.read_u32(0x32008).unwrap()), (0xffff, 1));
+        let sent = io.read_scm_rights(&m, 0x32000, 16).unwrap();
+        assert_eq!(sent.len(), 1);
     }
 
     /// A vector whose first iovec the waiting bytes fill exactly: the call

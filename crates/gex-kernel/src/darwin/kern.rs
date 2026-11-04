@@ -301,6 +301,21 @@ impl Kernel {
                 Ok(()) => return None,
                 Err(e) => neg(e),
             },
+            // A family or an option this kernel has no Linux counterpart for
+            // is refused where the caller is told, and said.
+            sys::SOCKET | sys::SOCKETPAIR if !matches!(a[0], 0..=2) => {
+                if super::sockaddr::family_exists(a[0]) {
+                    self.darwin_unimplemented(format!("socket domain {} (AF_* of Darwin's bsd/sys/socket.h)", a[0]));
+                }
+                neg(Errno::EAFNOSUPPORT)
+            }
+            sys::SETSOCKOPT | sys::GETSOCKOPT => match super::sockaddr::sockopt_to_linux(a[1], a[2]) {
+                Ok(_) => return None,
+                Err(what) => {
+                    self.darwin_unimplemented(format!("{} {what}", if raw == sys::SETSOCKOPT { "setsockopt" } else { "getsockopt" }));
+                    neg(Errno::ENOPROTOOPT)
+                }
+            },
             sys::GETATTRLIST => res(self.darwin_getattrlist(m, a)),
             sys::FGETATTRLIST => res(self.darwin_fgetattrlist(m, a)),
             sys::GETATTRLISTAT => res(self.darwin_getattrlistat(m, a)),
