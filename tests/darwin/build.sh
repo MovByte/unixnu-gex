@@ -23,6 +23,9 @@ for p in hello-static bsd-carry commpage exclusive-pair aes; do
         -o "$OUT/$p" "$HERE/src/$p.c"
 done
 
-cc -O2 -o "$OUT/hello" "$HERE/src/hello.c"
+for p in hello pthread dispatch xpc-anon; do
+    cc -O2 -o "$OUT/$p" "$HERE/src/$p.c"
+done
+cc -O2 -framework CoreFoundation -o "$OUT/cfrunloop" "$HERE/src/cfrunloop.c"
 
 echo "built: $(cd "$OUT" && ls | tr '\n' ' ')"
