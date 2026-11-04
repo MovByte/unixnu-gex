@@ -202,6 +202,8 @@ impl Kernel {
             sys::FSGETPATH => res(self.darwin_fsgetpath(m, a)),
             sys::PROC_INFO => res(self.darwin_proc_info(m, a)),
             sys::GETTIMEOFDAY => res(darwin_gettimeofday(m, a[0], a[1], a[2])),
+            sys::GETRLIMIT => res(self.darwin_getrlimit(m, a[0], a[1])),
+            sys::SETRLIMIT => res(self.darwin_setrlimit(m, a[0], a[1])),
             // A new mapping's entries have the default maximum protection.
             // MAP_ANON is 0x1000: a file mapping has a descriptor to look at
             // (a POSIX shared memory object's checks).

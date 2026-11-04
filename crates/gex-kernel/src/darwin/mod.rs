@@ -33,6 +33,7 @@ pub mod mig;
 pub mod mk_timer;
 pub mod pipe;
 pub mod psynch;
+pub mod rlimit;
 pub mod sema;
 pub mod shm;
 pub mod signal;
@@ -94,6 +95,10 @@ pub struct Task {
     pub lock_wakes: std::sync::Arc<std::sync::Mutex<Vec<i32>>>,
     /// `p_sigacts` and `p_sigignore`.
     pub sigacts: signal::Sigacts,
+    /// `p_limit`.
+    pub rlimits: rlimit::Rlimits,
+    /// `P_LCUSTOM_STACK`: the main stack's size came from `LC_MAIN`.
+    pub custom_stack: bool,
     /// `p_workq_allow_sigmask`.
     pub workq_allow_sigmask: u32,
     /// `p_dispatchqueue_serialno_offset`, `p_dispatchqueue_label_offset`.

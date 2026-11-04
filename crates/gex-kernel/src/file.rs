@@ -489,6 +489,12 @@ impl FdTable {
         self.limit.store(limit.min(NOFILE_HARD), Ordering::Relaxed);
     }
 
+    /// A limit the process's own rules have already clamped (a Darwin
+    /// process's `maxfilesperproc`), past Linux's table size.
+    pub fn set_limit_exact(&self, limit: usize) {
+        self.limit.store(limit, Ordering::Relaxed);
+    }
+
     pub fn limit(&self) -> usize {
         self.limit.load(Ordering::Relaxed)
     }

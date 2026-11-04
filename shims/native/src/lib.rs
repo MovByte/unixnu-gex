@@ -1150,6 +1150,7 @@ fn run_program_with(
     }
     if opts.darwin {
         kernel.darwin_signals_init();
+        kernel.darwin_nofile_sync();
     }
     // Set again by `wasmprog` if this program is native wasm32.
     kernel.wasm32 = false;
