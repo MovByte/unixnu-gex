@@ -17,6 +17,7 @@ pub mod bsd;
 pub mod commpage;
 pub mod errno;
 mod kern;
+pub mod mach;
 
 /// Where a Darwin thread puts its system call number.
 pub const NR_SLOT: usize = ctx::x(16);
@@ -67,6 +68,18 @@ pub fn apple_strings(exe_path: &str) -> Vec<String> {
 
 fn neg(e: Errno) -> u64 {
     (-(e.0 as i64)) as u64
+}
+
+/// Whether x16's number is a Mach trap: negative as the 32-bit value
+/// libsyscall loads (`mov w16, #-n`), the machine-dependent class aside.
+pub fn mach_trap_number(raw: u64) -> Option<i32> {
+    let t = raw as u32 as i32;
+    (t < 0 && raw as u32 as u64 != PLATFORM).then_some(t)
+}
+
+/// Write a Mach trap's result: x0 only.
+pub fn set_mach_result(m: &mut GuestMem<'_>, ctx_addr: u64, kr: u64) -> Result<(), Errno> {
+    m.write_u64(ctx_addr + ctx::x(0) as u64, kr)
 }
 
 /// Write a result in the canonical encoding (a value, or `-errno` with a

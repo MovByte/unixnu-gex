@@ -63,6 +63,9 @@ pub fn run(mut ra: RunArgs, bytes: &[u8]) -> Result<ExitCode> {
     // constants they are.
     gex_abi::set_commpage_fold(true);
     gex_ir::pass::set_forward_reg_consts(true);
+    // dyld rebases and binds its data after its code is translated: no
+    // load may be folded to what memory held at translation.
+    gex_ir::pass::set_fold_through_memory(false);
     ra.opts.jit = ra.jit;
     // Darwin images live above 4 GiB: always a 64-bit memory.
     if ra.mem64 == Some(false) {

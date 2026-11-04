@@ -670,6 +670,8 @@ pub struct Kernel {
     /// A Darwin process's shared region, `(start, size)`, which the host
     /// mapped the shared cache into: `(0, 0)` when there is none.
     pub darwin_region: (u64, u64),
+    /// A Darwin process's Mach port names.
+    pub darwin_ports: crate::darwin::mach::Space,
     /// Set by a syscall that may have made a descriptor readable or
     /// writable for someone else (a write, a read that freed room, a close,
     /// a signal); the host takes it after the call and wakes threads parked
@@ -8757,6 +8759,7 @@ impl Kernel {
             compat: false,
             darwin: false,
             darwin_region: (0, 0),
+            darwin_ports: Default::default(),
             fd_activity: false,
             wasm32: false,
             sigreturn_legacy: false,
@@ -9143,6 +9146,7 @@ impl Kernel {
             compat: self.compat,
             darwin: self.darwin,
             darwin_region: self.darwin_region,
+            darwin_ports: Default::default(),
             fd_activity: false,
             wasm32: self.wasm32,
             sigreturn_legacy: false,
@@ -9276,6 +9280,14 @@ impl Kernel {
             ]
         };
         if self.darwin {
+            if let Some(t) = crate::darwin::mach_trap_number(raw) {
+                let kr = self.mach_trap(m, t, &a);
+                if self.trace {
+                    eprintln!("[gex:{}] pc=0x{pc:x} mach {t}({:#x}, {:#x}, {:#x}) = {kr:#x}", self.pid, a[0], a[1], a[2]);
+                }
+                let _ = crate::darwin::set_mach_result(m, self.ctx_addr, kr);
+                return SyscallOutcome::Continue;
+            }
             let ret = match crate::darwin::direct(m, self.ctx_addr, raw) {
                 Some(ret) => Some(ret),
                 None => self.darwin_call(m, raw, &a),
@@ -9946,7 +9958,7 @@ impl Kernel {
     }
 
     /// The dispatch table. `Err(code)` means the process is exiting.
-    fn dispatch(&mut self, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> Result<SysResult, i32> {
+    pub(crate) fn dispatch(&mut self, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> Result<SysResult, i32> {
         let r: SysResult = match n {
             nr::EXIT | nr::EXIT_GROUP => {
                 self.map_io().flush_all_shared(m);
