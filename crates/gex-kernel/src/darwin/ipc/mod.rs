@@ -111,6 +111,26 @@ pub enum Kobject {
     Voucher,
 }
 
+/// A port's reply semantics (`ip_reply_port_semantics`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReplySemantics {
+    #[default]
+    None,
+    /// `PORT_MARK_REPLY_PORT`: a reply port, of a hardened task; only a
+    /// send-once right is made from it.
+    ReplyPort,
+    /// `PORT_ENFORCE_REPLY_PORT_SEMANTICS`: a message to it must name a
+    /// reply port, or a provisional one, as its reply.
+    Enforce,
+    /// `PORT_MARK_PROVISIONAL_REPLY_PORT`: what would be a reply port, in
+    /// a task that is not hardened.
+    Provisional,
+    /// `PORT_ENFORCE_RIGID_REPLY_PORT_SEMANTICS`.
+    EnforceRigid,
+    /// `PORT_ID_PROTECTED_OPT_OUT`.
+    IdProtOptOut,
+}
+
 /// Where a port's receive right is (`ip_receiver` / `ip_destination`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Receiver {
@@ -157,13 +177,8 @@ pub struct Port {
     pub immovable_send: bool,
     pub pinned: bool,
     pub specialreply: bool,
-    /// A reply port (`ip_is_reply_port`): made by `mach_reply_port` or
-    /// `MPO_REPLY_PORT` in a hardened binary; only a send-once right is
-    /// made from it.
-    pub reply_port: bool,
-    /// `MPO_ENFORCE_REPLY_PORT_SEMANTICS`: a message to this port must name
-    /// a reply port as its reply.
-    pub enforce_reply_port_semantics: bool,
+    /// `ip_reply_port_semantics`, set when the port is made.
+    pub reply_semantics: ReplySemantics,
     pub tempowner: bool,
     pub impdonation: bool,
     pub no_grant: bool,
@@ -224,8 +239,7 @@ impl Port {
             immovable_send: false,
             pinned: false,
             specialreply: false,
-            reply_port: false,
-            enforce_reply_port_semantics: false,
+            reply_semantics: ReplySemantics::None,
             tempowner: false,
             impdonation: false,
             no_grant: false,

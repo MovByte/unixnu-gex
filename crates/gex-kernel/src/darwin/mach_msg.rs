@@ -752,13 +752,17 @@ impl Kernel {
         }
         if let Some(rp) = re.object.filter(|&o| ipc.is_port(o)) {
             if ipc.port(rp).active {
-                if ipc.port(rp).reply_port && reply_type != msgt::MAKE_SEND_ONCE {
+                use super::ipc::ReplySemantics as Rs;
+                let rs = ipc.port(rp).reply_semantics;
+                if rs == Rs::ReplyPort && reply_type != msgt::MAKE_SEND_ONCE {
                     return false;
                 }
                 // ip_violates_reply_port_semantics: a destination that
-                // enforces them takes only a reply port as the reply.
+                // enforces them takes a reply port, or a provisional one,
+                // as the reply (reply_port_semantics is on). A rigid
+                // destination's violations are only counted.
                 if let Some(dp) = de.and_then(|d| d.object).filter(|&o| ipc.is_port(o)) {
-                    if ipc.port(dp).active && ipc.port(dp).enforce_reply_port_semantics && !ipc.port(rp).reply_port {
+                    if ipc.port(dp).active && ipc.port(dp).reply_semantics == Rs::Enforce && rs != Rs::ReplyPort && rs != Rs::Provisional {
                         ipc.guard_exception(reply_name, Guard::RequireReplyPortSemantics, 0);
                         return false;
                     }
@@ -1266,7 +1270,7 @@ impl Kernel {
         let reply_name = match k.reply {
             None => 0,
             Some(Carried::Dead) => super::ipc::PORT_DEAD,
-            Some(Carried::Port(p)) if self.dtask.ipc.port(p).reply_port => {
+            Some(Carried::Port(p)) if self.dtask.ipc.port(p).reply_semantics == super::ipc::ReplySemantics::ReplyPort => {
                 // ipc_kmsg_copyout_reply_object: the send-once right goes;
                 // the receive right's name stands for it.
                 let ipc = &mut self.dtask.ipc;

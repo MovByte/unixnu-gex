@@ -427,7 +427,17 @@ impl Kernel {
                 self.dtask.kports.special_reply.remove(&tid);
                 match self.dtask.ipc.port_alloc(true) {
                     Ok((name, port)) => {
-                        self.dtask.ipc.port_mut(port).specialreply = true;
+                        // IPC_PORT_INIT_SPECIAL_REPLY: a reply port in a
+                        // hardened task, else a provisional one.
+                        let hardened = self.darwin_hardened();
+                        let p = self.dtask.ipc.port_mut(port);
+                        p.specialreply = true;
+                        if hardened {
+                            p.immovable_receive = true;
+                            p.reply_semantics = super::ipc::ReplySemantics::ReplyPort;
+                        } else {
+                            p.reply_semantics = super::ipc::ReplySemantics::Provisional;
+                        }
                         self.dtask.kports.special_reply.insert(tid, port);
                         u64::from(name)
                     }

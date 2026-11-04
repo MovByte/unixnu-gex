@@ -361,7 +361,7 @@ impl Ipc {
                 }
                 let port = self.translate_receive(name)?;
                 let p = self.port(port);
-                if p.kobject.is_some() || p.specialreply || p.reply_port {
+                if p.kobject.is_some() || p.specialreply || p.reply_semantics == super::ReplySemantics::ReplyPort {
                     self.guard_exception(name, Guard::InvalidRight, 0);
                     return Err(kr::INVALID_RIGHT);
                 }
@@ -377,7 +377,7 @@ impl Ipc {
                     return Err(kr::INVALID_RIGHT);
                 }
                 let port = self.translate_receive(name)?;
-                if self.port(port).reply_port {
+                if self.port(port).reply_semantics == super::ReplySemantics::ReplyPort {
                     self.guard_exception(name, Guard::InvalidRight, 0);
                     return Err(kr::INVALID_RIGHT);
                 }
@@ -670,18 +670,28 @@ impl Ipc {
         }
         let (name, port) = self.port_alloc(flags & mpo::INSERT_SEND_RIGHT != 0)?;
         let p = self.port_mut(port);
-        // ipc_port_init's reply-port marking (`IPC_PORT_INIT_REPLY`, and
-        // MPO_PROVISIONAL_REPLY_PORT while not enforced): a reply port in a
-        // hardened task, else a provisional one.
-        if flags & mpo::REPLY_PORT != 0 && hardened {
-            p.immovable_receive = true;
-            p.reply_port = true;
-        }
-        if flags & mpo::PROVISIONAL_ID_PROT_OPTOUT != 0 {
-            p.immovable_receive = true;
+        // ipc_port_init's reply semantics: IPC_PORT_INIT_REPLY marks a
+        // reply port in a hardened task, else a provisional one; the
+        // enforcing flags, MPO_PROVISIONAL_REPLY_PORT (not enforced, so
+        // IPC_PORT_INIT_PROVISIONAL_REPLY) and the opt-out set it after.
+        use super::ReplySemantics as Rs;
+        if flags & mpo::REPLY_PORT != 0 {
+            if hardened {
+                p.immovable_receive = true;
+                p.reply_semantics = Rs::ReplyPort;
+            } else {
+                p.reply_semantics = Rs::Provisional;
+            }
         }
         if flags & mpo::ENFORCE_REPLY_PORT_SEMANTICS != 0 {
-            p.enforce_reply_port_semantics = true;
+            p.reply_semantics = Rs::Enforce;
+        }
+        if flags & mpo::PROVISIONAL_REPLY_PORT != 0 {
+            p.reply_semantics = Rs::Provisional;
+        }
+        if flags & mpo::PROVISIONAL_ID_PROT_OPTOUT != 0 {
+            p.reply_semantics = Rs::IdProtOptOut;
+            p.immovable_receive = true;
         }
         if flags & mpo::QLIMIT != 0 {
             p.qlimit = qlimit;

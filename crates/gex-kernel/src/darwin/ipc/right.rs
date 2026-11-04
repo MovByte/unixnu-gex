@@ -140,7 +140,7 @@ impl Ipc {
 
     /// Whether `port` is a reply port (`ip_is_reply_port`).
     fn is_reply_port(&self, port: ObjId) -> bool {
-        self.port(port).reply_port
+        self.port(port).reply_semantics == super::ReplySemantics::ReplyPort
     }
 
     /// `ipc_right_copyin`: take `msgt` out of `name`. The carried right,
@@ -195,7 +195,7 @@ impl Ipc {
                 } else {
                     false
                 };
-                if (!allow_imm_recv && p.immovable_receive) || p.reply_port || p.specialreply {
+                if (!allow_imm_recv && p.immovable_receive) || p.reply_semantics == super::ReplySemantics::ReplyPort || p.specialreply {
                     self.guard_exception(name, Guard::Immovable, 0);
                     return Err(kr::INVALID_CAPABILITY);
                 }
