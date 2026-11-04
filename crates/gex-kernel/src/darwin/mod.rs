@@ -61,6 +61,8 @@ pub struct Task {
     pub kports: kobject::Kports,
     pub semas: sema::Semas,
     pub mk_timers: mk_timer::MkTimers,
+    /// `p_idversion`, from the system's `nextpidversion` at exec.
+    pub pidversion: i32,
     /// Maximum protections lowered from `VM_PROT_ALL`.
     pub maxprot: vm::MaxProt,
     /// Threads a semaphore operation woke, and how.
@@ -76,6 +78,13 @@ pub struct Task {
     /// Under strict mode, the unimplemented thing that stops the process
     /// when the call returns.
     stop: Option<String>,
+}
+
+impl Task {
+    /// A new process's task: it takes the next pidversion.
+    pub fn new_process() -> Task {
+        Task { pidversion: next_pidversion(), ..Default::default() }
+    }
 }
 
 impl crate::syscalls::Kernel {
@@ -96,12 +105,30 @@ impl crate::syscalls::Kernel {
         self.dtask.stop.take()
     }
 
+    /// The task's audit token (`proc_calc_audit_token`): auid, euid, egid,
+    /// ruid, rgid, pid, asid, pidversion. A process launchd has put in no
+    /// session has the default one (`AU_DEFAUDITID`, `AU_DEFAUDITSID`); gex
+    /// keeps one identity, so the real ids are the effective ones.
+    pub(crate) fn darwin_audit_token(&self) -> [u32; 8] {
+        const AU_DEFAUDITID: u32 = u32::MAX;
+        const AU_DEFAUDITSID: u32 = 0;
+        let (uid, gid) = (self.creds.uid(), self.creds.gid());
+        [AU_DEFAUDITID, uid, gid, uid, gid, self.pid as u32, AU_DEFAUDITSID, self.dtask.pidversion as u32]
+    }
+
     /// A fatal Mach port guard exception was raised: with no exception
     /// handler the task exits as `exit_with_mach_exception` makes it, killed
     /// by SIGKILL.
     pub(crate) fn darwin_guard_kill(&mut self) -> Option<crate::syscalls::SyscallOutcome> {
         std::mem::take(&mut self.dtask.guard_kill).then_some(crate::syscalls::SyscallOutcome::Killed { signal: crate::signal::sig::SIGKILL as u32, core: false })
     }
+}
+
+/// `nextpidversion`: one counter for the system, taken at each exec
+/// (`OSIncrementAtomic` returns the value before).
+pub fn next_pidversion() -> i32 {
+    static NEXT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Where iOS 17 keeps the shared cache, inside the SystemOS cryptex.

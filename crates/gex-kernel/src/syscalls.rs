@@ -8943,7 +8943,8 @@ impl Kernel {
             darwin: false,
             darwin_region: (0, 0),
             darwin_dyld_infos: 0,
-            dtask: Default::default(),
+            // A new process takes the next pidversion (`forkproc`).
+            dtask: crate::darwin::Task::new_process(),
             darwin_arg_base: 0,
             darwin_user_stack: 0,
             darwin_finish: None,
@@ -9334,7 +9335,8 @@ impl Kernel {
             darwin: self.darwin,
             darwin_region: self.darwin_region,
             darwin_dyld_infos: 0,
-            dtask: Default::default(),
+            // A new process takes the next pidversion (`forkproc`).
+            dtask: crate::darwin::Task::new_process(),
             darwin_arg_base: 0,
             darwin_user_stack: 0,
             darwin_finish: None,

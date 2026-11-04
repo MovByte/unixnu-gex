@@ -1131,6 +1131,10 @@ fn run_program_with(
     kernel.darwin_dyld_infos = opts.darwin_dyld_infos;
     kernel.dtask.strict = opts.darwin_strict;
     kernel.dtask.platform = opts.darwin_platform;
+    // An exec takes the next pidversion (`proc_setpidversion`).
+    if opts.darwin {
+        kernel.dtask.pidversion = gex_kernel::darwin::next_pidversion();
+    }
     // A Darwin program other than launchd is not pid 1: dyld treats pid 1
     // as launchd and boots the system from it. Pid 1 is the kernel's own
     // then, and the program its child, as in the browser's global kernel.

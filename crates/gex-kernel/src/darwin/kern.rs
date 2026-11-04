@@ -246,6 +246,9 @@ impl Kernel {
             // No descriptor is a terminal to a Darwin process yet: stdio
             // buffers fully, and termios structures need not be converted.
             sys::IOCTL => neg(Errno::ENOTTY),
+            // gettid(uidp, gidp): a thread's own credentials, which only
+            // settid gives it (settid is not served, so none has them).
+            sys::GETTID => neg(Errno::ESRCH),
             sys::BSDTHREAD_REGISTER => res(self.darwin_bsdthread_register(m, a)),
             sys::PTHREAD_MARKCANCEL => res(self.darwin_markcancel(m, a[0] as u32)),
             sys::PTHREAD_CANCELED => res(self.darwin_canceled(a[0])),

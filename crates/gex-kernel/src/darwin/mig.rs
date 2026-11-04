@@ -97,7 +97,7 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         }
         // task_info(task, flavor, out, &count)
         (Kobject::Task, 3405) => match (arg(req, 0), arg(req, 1)) {
-            (Some(flavor), Some(count)) => task_info(flavor, count as u32, k.darwin_dyld_infos),
+            (Some(flavor), Some(count)) => task_info(flavor, count as u32, k.darwin_dyld_infos, k.darwin_audit_token()),
             _ => bad(),
         },
         // task_get_special_port(task, which) -> port
@@ -224,7 +224,9 @@ fn host_info(flavor: i32, count: u32) -> Reply {
 }
 
 /// `task_info`, with the caller's count checked as XNU checks it.
-fn task_info(flavor: i32, count: u32, dyld_infos: u64) -> Reply {
+fn task_info(flavor: i32, count: u32, dyld_infos: u64, audit: [u32; 8]) -> Reply {
+    const TASK_AUDIT_TOKEN: i32 = 15;
+    const TASK_AUDIT_TOKEN_COUNT: u32 = 8;
     const TASK_DYLD_INFO: i32 = 17;
     const TASK_DYLD_INFO_COUNT: u32 = 5;
     const TASK_LEGACY_DYLD_INFO_COUNT: u32 = 4;
@@ -244,6 +246,12 @@ fn task_info(flavor: i32, count: u32, dyld_infos: u64) -> Reply {
                 w.push(1);
             }
             Reply::ok(words(&w))
+        }
+        TASK_AUDIT_TOKEN => {
+            if count < TASK_AUDIT_TOKEN_COUNT {
+                return Reply::err(KERN_INVALID_ARGUMENT);
+            }
+            Reply::ok(words(&audit))
         }
         _ => {
             let mut r = Reply::err(KERN_INVALID_ARGUMENT);

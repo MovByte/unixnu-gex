@@ -488,8 +488,7 @@ impl Kernel {
     /// The sending task's tokens (`task_get_sec_token`,
     /// `task_get_audit_token`).
     fn darwin_sender(&self) -> Sender {
-        let (euid, egid) = (self.creds.uid(), self.creds.gid());
-        Sender { sec: [euid, egid], audit: [u32::MAX, euid, egid, euid, egid, self.pid as u32, 0, 0] }
+        Sender { sec: [self.creds.uid(), self.creds.gid()], audit: self.darwin_audit_token() }
     }
 
     /// Undo a header copyin (`ipc_kmsg_clean_header`).
