@@ -12,6 +12,9 @@ impl Errno {
     pub const ENOENT: Errno = Errno(2);
     pub const ESRCH: Errno = Errno(3);
     pub const EINTR: Errno = Errno(4);
+    pub const EDOM: Errno = Errno(33);
+    pub const EALREADY: Errno = Errno(114);
+    pub const EOWNERDEAD: Errno = Errno(130);
     pub const EIO: Errno = Errno(5);
     pub const ENXIO: Errno = Errno(6);
     pub const E2BIG: Errno = Errno(7);

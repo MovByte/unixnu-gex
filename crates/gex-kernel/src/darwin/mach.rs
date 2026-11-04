@@ -252,12 +252,15 @@ impl Kernel {
                 e => e,
             },
             trap::MACH_MSG2 => self.mach_msg2(m, a),
-            trap::MACH_MSG | trap::MACH_MSG_OVERWRITE => kr::SEND_INVALID_DEST,
+            trap::MACH_MSG | trap::MACH_MSG_OVERWRITE => {
+                self.darwin_unimplemented("mach_msg (trap -31/-32)".into());
+                kr::SEND_INVALID_DEST
+            }
             _ => {
-                if self.trace || !self.unimplemented.contains(&(t as i64 as u64)) {
-                    eprintln!("[gex:{}] unimplemented Mach trap {t}", self.pid);
+                if !self.unimplemented.contains(&(t as i64 as u64)) {
                     self.unimplemented.push(t as i64 as u64);
                 }
+                self.darwin_unimplemented(format!("Mach trap {t}"));
                 kr::FAILURE
             }
         }
@@ -307,9 +310,7 @@ impl Kernel {
             _ => None,
         };
         let (Some(obj), true) = (obj, opts & (SEND | RCV) == SEND | RCV) else {
-            if self.trace {
-                eprintln!("[gex:{}] mach_msg2 options {opts:#x} id {id} to {remote:#x}: not delivered", self.pid);
-            }
+            self.darwin_unimplemented(format!("mach_msg2 delivery (options {opts:#x}, id {id})"));
             return kr::SEND_INVALID_DEST;
         };
         let header = super::mig::HEADER;
@@ -317,9 +318,21 @@ impl Kernel {
             Ok(b) => b.to_vec(),
             Err(_) => return kr::INVALID_ADDRESS,
         };
-        let reply = super::mig::serve(obj, id, &body, super::mig::Task { dyld_infos: self.darwin_dyld_infos, ports: &mut self.darwin_ports });
-        if self.trace || reply.ret == super::mig::MIG_BAD_ID {
+        let task = super::mig::Task {
+            dyld_infos: self.darwin_dyld_infos,
+            ports: &mut self.darwin_ports,
+            threads: &mut self.dtask.threads,
+            spawns: &mut self.dtask.spawns,
+        };
+        let reply = super::mig::serve(obj, id, &body, task);
+        if self.trace {
             eprintln!("[gex:{}] mig {obj:?} id {id} -> {}", self.pid, reply.ret);
+        }
+        if reply.ret == super::mig::MIG_BAD_ID {
+            self.darwin_unimplemented(format!("MIG routine {id} on {obj:?}"));
+        }
+        if let Some(what) = &reply.unimplemented {
+            self.darwin_unimplemented(what.clone());
         }
         let msg = reply.message(id, local);
         if msg.len() > rcv_size {

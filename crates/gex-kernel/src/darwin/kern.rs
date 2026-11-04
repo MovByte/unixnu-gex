@@ -73,10 +73,6 @@ mod f {
     pub const SPECULATIVE_READ: u64 = 101;
 }
 
-/// What `bsdthread_register` reports: dispatch function, fine priority,
-/// bsdthread_ctl, set-self, the maintenance and default QoS classes.
-const PTHREAD_FEATURES: u64 = 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x4000_0000;
-
 /// `MAXPATHLEN`.
 const MAXPATHLEN: usize = 1024;
 
@@ -175,26 +171,7 @@ impl Kernel {
             // No descriptor is a terminal to a Darwin process yet: stdio
             // buffers fully, and termios structures need not be converted.
             sys::IOCTL => neg(Errno::ENOTTY),
-            // libpthread's entry points for new threads and workqueue
-            // threads, and from its registration data (`struct
-            // _pthread_registration_data`, packed) where a pthread keeps its
-            // TSD and its own port. Back goes the default mutex policy:
-            // first-fit on ulocks, so mutexes and their condition variables
-            // wait on `ulock` rather than psynch's sequence words. The
-            // features are what this kernel does.
-            sys::BSDTHREAD_REGISTER => {
-                const POLICY_FIRSTFIT: u32 = 3;
-                const USE_ULOCK: u32 = 0x100;
-                self.darwin_thread_entry = (a[0], a[1]);
-                if a[3] != 0 && a[4] >= 36 {
-                    self.darwin_tsd_offset = m.read_u32(a[3] + 24).map_or(0, u64::from);
-                    self.darwin_port_offset = m.read_u32(a[3] + 32).map_or(0, u64::from);
-                }
-                if a[3] != 0 && a[4] >= 48 {
-                    let _ = m.write_u32(a[3] + 44, POLICY_FIRSTFIT | USE_ULOCK);
-                }
-                PTHREAD_FEATURES
-            }
+            sys::BSDTHREAD_REGISTER => res(self.darwin_bsdthread_register(m, a)),
             // QoS overrides and the like: no scheduler classes to apply.
             sys::BSDTHREAD_CTL => 0,
             // A signal to a thread by its Mach port; signal 0 only asks

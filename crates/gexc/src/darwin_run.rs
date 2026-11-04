@@ -66,6 +66,7 @@ pub fn run(mut ra: RunArgs, bytes: &[u8]) -> Result<ExitCode> {
         ra.opts.env.push("MallocNanoZone=0".into());
     }
     ra.opts.darwin = true;
+    ra.opts.darwin_strict = std::env::var("GEX_DARWIN_STRICT").is_ok_and(|v| v == "1");
     // Its commpage is folded below 4 GiB in everything translated for it,
     // which needs the addresses its code builds in registers seen as the
     // constants they are.

@@ -221,6 +221,9 @@ pub struct RunOptions {
     /// section, slid): the kernel records it at exec, as task_info
     /// (TASK_DYLD_INFO) reports it.
     pub darwin_dyld_infos: u64,
+    /// `GEX_DARWIN_STRICT=1`: stop at the first thing the Darwin kernel
+    /// does not do.
+    pub darwin_strict: bool,
     /// Run ahead-of-time code only (`aot_only`): an ejected Windows
     /// program's runtime, with no tier-1 module and no run-time translator.
     pub aot_only: bool,
@@ -233,6 +236,7 @@ impl Default for RunOptions {
             darwin: false,
             darwin_cache: None,
             darwin_dyld_infos: 0,
+            darwin_strict: false,
             args: Vec::new(),
             env: Vec::new(),
             trace: false,
@@ -1122,6 +1126,7 @@ fn run_program_with(
     kernel.compat = program.compat();
     kernel.darwin = opts.darwin;
     kernel.darwin_dyld_infos = opts.darwin_dyld_infos;
+    kernel.dtask.strict = opts.darwin_strict;
     // A Darwin program other than launchd is not pid 1: dyld treats pid 1
     // as launchd and boots the system from it. Pid 1 is the kernel's own
     // then, and the program its child, as in the browser's global kernel.
@@ -3994,6 +3999,9 @@ fn place_image(
         let region = map_shared_cache(store, &memory, cache)?;
         store.data_mut().with_kernel(|k| k.darwin_region = region);
     }
+    if opts.darwin {
+        store.data_mut().with_kernel(|k| k.darwin_user_stack = gex_abi::STACK_TOP);
+    }
     // And its commpage, at the alias its constant addresses are folded to.
     if opts.darwin {
         use gex_kernel::darwin::commpage;
@@ -4324,8 +4332,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 stall::decoded(sys_nr);
             }
             // A blocking syscall is run here, with the kernel unlocked, and
-            // then finished under the lock again.
-            let outcome = if let SyscallOutcome::Blocking(op) = outcome {
+            // then finished under the lock again. Finishing may block again
+            // (a Darwin wait woken for another reason sleeps on).
+            let mut outcome = outcome;
+            while let SyscallOutcome::Blocking(op) = outcome {
                 // `GEX_STALL_BT=1`: where in the guest each blocking call was
                 // made, for a stall dump to say what a stuck thread waits in.
                 if stall_on && stall::want_bt() {
@@ -4379,12 +4389,19 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     g.enter();
                 }
                 let mut gm = GuestMem::new(memory.bytes());
-                caller
+                outcome = caller
                     .data_mut()
-                    .with_kernel(|k| k.finish_blocking(&mut gm, r))
-            } else {
-                outcome
-            };
+                    .with_kernel(|k| k.finish_blocking(&mut gm, r));
+            }
+            // Threads the call made for after it (a Darwin thread resumed,
+            // the workqueue's).
+            let later = caller.data_mut().with_kernel(|k| k.take_spawns());
+            if !later.is_empty() {
+                let cx = caller.data().spawn.clone().ok_or_else(|| anyhow!("thread start with no spawn context"))?;
+                for req in later {
+                    start_guest_thread(Arc::clone(&cx), ThreadState { ctx_addr: req.ctx_addr, tid: req.tid })?;
+                }
+            }
             // Wake threads parked on descriptors if this call may have made
             // one ready (`ready`).
             if caller.data_mut().with_kernel(|k| k.take_fd_activity()) {

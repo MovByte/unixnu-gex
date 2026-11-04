@@ -678,15 +678,13 @@ pub struct Kernel {
     /// Where a Darwin process's dyld keeps its image list
     /// (`dyld_all_image_infos`), once it has said: 0 before.
     pub darwin_dyld_infos: u64,
-    /// libpthread's thread and workqueue thread entry points, as
-    /// `bsdthread_register` gave them.
-    pub darwin_thread_entry: (u64, u64),
-    /// Where libpthread keeps a thread's TSD inside its pthread, and its
-    /// own port inside the TSD (`bsdthread_register`'s registration data).
-    pub darwin_tsd_offset: u64,
-    pub darwin_port_offset: u64,
+    /// A Darwin process's threads, waits and IPC.
+    pub dtask: crate::darwin::Task,
+    /// The main thread's stack top, as the kernel placed it (XNU's
+    /// `p_user_stack`).
+    pub darwin_user_stack: u64,
     /// How the Darwin call that blocked writes its result back.
-    pub darwin_finish: Option<crate::darwin::thread::Finish>,
+    pub darwin_finish: Option<crate::darwin::wait::Wait>,
     /// Set by a syscall that may have made a descriptor readable or
     /// writable for someone else (a write, a read that freed room, a close,
     /// a signal); the host takes it after the call and wakes threads parked
@@ -8590,7 +8588,7 @@ pub struct PendingCall {
     /// ([`Kernel::finish_blocking`]).
     pub block_restart: crate::signal::Restart,
     pub block_pc: u64,
-    pub darwin_finish: Option<crate::darwin::thread::Finish>,
+    pub darwin_finish: Option<crate::darwin::wait::Wait>,
 }
 
 /// A thread the kernel has prepared and the host must start.
@@ -8805,9 +8803,8 @@ impl Kernel {
             darwin_region: (0, 0),
             darwin_ports: Default::default(),
             darwin_dyld_infos: 0,
-            darwin_thread_entry: (0, 0),
-            darwin_tsd_offset: 0,
-            darwin_port_offset: 0,
+            dtask: Default::default(),
+            darwin_user_stack: 0,
             darwin_finish: None,
             fd_activity: false,
             wasm32: false,
@@ -9197,9 +9194,8 @@ impl Kernel {
             darwin_region: self.darwin_region,
             darwin_ports: Default::default(),
             darwin_dyld_infos: 0,
-            darwin_thread_entry: (0, 0),
-            darwin_tsd_offset: 0,
-            darwin_port_offset: 0,
+            dtask: Default::default(),
+            darwin_user_stack: 0,
             darwin_finish: None,
             fd_activity: false,
             wasm32: self.wasm32,
@@ -9244,6 +9240,32 @@ impl Kernel {
     /// A Darwin thread, made as `clone` makes one.
     pub(crate) fn darwin_clone(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> Result<SpawnRequest, Errno> {
         self.sys_clone(m, a)
+    }
+
+    /// End a thread made by [`Self::darwin_clone`] that never ran: what
+    /// its exit would have ended, and the host thread promised for it.
+    pub(crate) fn darwin_discard_thread(&mut self, m: &mut GuestMem<'_>, req: SpawnRequest) {
+        if let Some(sig) = self.thread_signals.get(req.tid) {
+            let end = ThreadEnd {
+                thread: &sig,
+                threads: &self.thread_signals,
+                thread_fs: &self.thread_fs,
+                futexes: &self.futexes,
+                procs: &self.procs,
+            };
+            end.end(m, req.ctx_addr, req.tid);
+        }
+        self.live_threads.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        if let Some(r) = THREAD_RUNNERS.get() {
+            (r.give)();
+        }
+    }
+
+    /// Threads a call made for the host to start once it returns: a Darwin
+    /// thread resumed after being made suspended, the workqueue's. The host
+    /// takes them after every call.
+    pub fn take_spawns(&mut self) -> Vec<SpawnRequest> {
+        std::mem::take(&mut self.dtask.spawns)
     }
 
     fn sys_clone(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> Result<SpawnRequest, Errno> {
@@ -9291,6 +9313,12 @@ impl Kernel {
     /// Handle one system call (`svc #0`, or `syscall`).
     pub fn syscall(&mut self, m: &mut GuestMem<'_>, pc: u64) -> SyscallOutcome {
         let out = self.syscall_cwd(m, pc);
+        if self.darwin {
+            if let Some(what) = self.darwin_strict_stop() {
+                eprintln!("[gex:{}] GEX_DARWIN_STRICT: stopping at pc {pc:#x}: {what}", self.pid);
+                return SyscallOutcome::Killed { signal: crate::signal::sig::SIGSYS as u32, core: false };
+            }
+        }
         // What a signal that ends the wait makes of it ([`Self::finish_blocking`]).
         if let SyscallOutcome::Blocking(op) = &out {
             self.block_restart = op.restart();
@@ -9666,6 +9694,10 @@ impl Kernel {
                     self.unimplemented.push(raw);
                 }
             }
+            if self.darwin {
+                let name = crate::darwin::sysno::name(raw).unwrap_or("?");
+                self.darwin_unimplemented(format!("BSD call {raw} ({name})"));
+            }
             r
         } else {
             self.dispatch(m, n, a)
@@ -9942,6 +9974,24 @@ impl Kernel {
     }
 
     pub fn finish_blocking(&mut self, m: &mut GuestMem<'_>, r: SysResult) -> SyscallOutcome {
+        // A Darwin wait: its own call writes the result, or it sleeps again.
+        if self.darwin {
+            match self.darwin_wait_end(m, r) {
+                crate::darwin::wait::End::NotDarwin => {}
+                crate::darwin::wait::End::Again => return self.darwin_sleep_again(m),
+                crate::darwin::wait::End::Done(wait, res) => {
+                    self.block_restart = crate::signal::Restart::Never;
+                    self.block_pc = 0;
+                    self.darwin_wait_done(m, wait, res);
+                    return match self.deliver_pending(m) {
+                        Delivery::None => SyscallOutcome::Continue,
+                        Delivery::Resume(_) if self.wasm32 => SyscallOutcome::Continue,
+                        Delivery::Resume(pc) => SyscallOutcome::Resume(pc),
+                        Delivery::Terminate { signal, core } => SyscallOutcome::Killed { signal, core },
+                    };
+                }
+            }
+        }
         // An `accept` that waited does its real work here, now that the
         // kernel is locked again and there is a descriptor table to put the
         // new socket in.
@@ -9997,14 +10047,12 @@ impl Kernel {
                 crate::signal::Source { code: crate::signal::SI_USER, pid: self.pid, uid: self.creds.uid() },
             );
         }
-        if !(self.darwin && self.darwin_finish_blocking(m, r)) {
-            let ret = encode(r);
-            let _ = if self.darwin {
-                crate::darwin::set_result(m, self.ctx_addr, ret)
-            } else {
-                set_result(m, self.ctx_addr, ret)
-            };
-        }
+        let ret = encode(r);
+        let _ = if self.darwin {
+            crate::darwin::set_result(m, self.ctx_addr, ret)
+        } else {
+            set_result(m, self.ctx_addr, ret)
+        };
         if let Some(mask) = suspended {
             self.signals.set_suspend_restore(Some(mask));
         }

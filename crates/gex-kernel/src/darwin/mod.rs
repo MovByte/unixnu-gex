@@ -22,6 +22,49 @@ pub mod mig;
 pub mod sysctl;
 pub mod sysno;
 pub mod thread;
+pub mod timer;
+pub mod wait;
+
+/// A Darwin process's kernel state beyond the BSD side's: its threads and
+/// what they wait on.
+#[derive(Debug, Default)]
+pub struct Task {
+    pub pthread: thread::Registration,
+    pub threads: thread::Threads,
+    pub waits: wait::Waits,
+    pub ulocks: thread::Ulocks,
+    pub timers: timer::Timers,
+    /// Threads made by a call (resumed, or the workqueue's) for the host to
+    /// start after it ([`crate::syscalls::Kernel::take_spawns`]).
+    pub spawns: Vec<crate::syscalls::SpawnRequest>,
+    /// `GEX_DARWIN_STRICT=1`: stop the process at the first thing it asks
+    /// for that this kernel does not do.
+    pub strict: bool,
+    /// What has been reported as not done, so each is said once.
+    said: std::collections::HashSet<String>,
+    /// Under strict mode, the unimplemented thing that stops the process
+    /// when the call returns.
+    stop: Option<String>,
+}
+
+impl crate::syscalls::Kernel {
+    /// Something a Darwin program asked for that this kernel does not do.
+    /// It is said once per kind; under strict mode the process stops with
+    /// SIGSYS when the call returns ([`Self::darwin_strict_stop`]).
+    pub(crate) fn darwin_unimplemented(&mut self, what: String) {
+        if self.dtask.said.insert(what.clone()) || self.trace {
+            eprintln!("[gex:{}] Darwin: not implemented: {what}", self.pid);
+        }
+        if self.dtask.strict && self.dtask.stop.is_none() {
+            self.dtask.stop = Some(what);
+        }
+    }
+
+    /// The strict-mode stop a call left, taken.
+    pub(crate) fn darwin_strict_stop(&mut self) -> Option<String> {
+        self.dtask.stop.take()
+    }
+}
 
 /// Where iOS 17 keeps the shared cache, inside the SystemOS cryptex.
 pub const CACHE_PATH: &str = "/System/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64";

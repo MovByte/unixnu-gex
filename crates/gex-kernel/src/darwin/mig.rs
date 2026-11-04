@@ -27,6 +27,7 @@ pub const MIG_BAD_ID: i32 = -303;
 /// `kern_return_t`s routines return.
 pub const KERN_SUCCESS: i32 = 0;
 pub const KERN_INVALID_ARGUMENT: i32 = 4;
+pub const KERN_FAILURE: i32 = 5;
 
 /// The kernel object a request was sent to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,19 +44,22 @@ pub struct Reply {
     pub ret: i32,
     pub out: Vec<u8>,
     pub ports: Vec<u32>,
+    /// What the routine was asked that it does not do, for the kernel to
+    /// report ([`crate::syscalls::Kernel::darwin_unimplemented`]).
+    pub unimplemented: Option<String>,
 }
 
 impl Reply {
     fn ok(out: Vec<u8>) -> Reply {
-        Reply { ret: KERN_SUCCESS, out, ports: Vec::new() }
+        Reply { ret: KERN_SUCCESS, out, ports: Vec::new(), unimplemented: None }
     }
 
     fn err(ret: i32) -> Reply {
-        Reply { ret, out: Vec::new(), ports: Vec::new() }
+        Reply { ret, out: Vec::new(), ports: Vec::new(), unimplemented: None }
     }
 
     fn port(name: u32) -> Reply {
-        Reply { ret: KERN_SUCCESS, out: Vec::new(), ports: vec![name] }
+        Reply { ret: KERN_SUCCESS, out: Vec::new(), ports: vec![name], unimplemented: None }
     }
 
     /// The whole reply message, to the request's reply port `local`. A
@@ -119,6 +123,9 @@ pub struct Task<'a> {
     /// dyld's `dyld_all_image_infos`, once registered.
     pub dyld_infos: u64,
     pub ports: &'a mut super::mach::Space,
+    pub threads: &'a mut super::thread::Threads,
+    /// Threads a routine started, for the host to run.
+    pub spawns: &'a mut Vec<crate::syscalls::SpawnRequest>,
 }
 
 /// Answer request `id` with body `body` (after the header) sent to `obj`.
@@ -164,6 +171,34 @@ pub fn serve(obj: Object, id: i32, body: &[u8], task: Task<'_>) -> Reply {
         // must restart if it preempts a thread inside. Nothing is
         // preempted mid-block here, so there is nothing to restart.
         (Object::Task, 8000) | (Object::Task, 8001) => Reply::ok(Vec::new()),
+        // thread_suspend(thread) (`thread_act.defs`): one more user stop.
+        // A thread made suspended has not run, so there is nothing to wait
+        // for; one that runs would have to be stopped where it is.
+        (Object::Thread(t), 3605) => {
+            let th = task.threads.map.entry(t).or_default();
+            if th.unstarted.is_none() {
+                let mut r = Reply::err(KERN_FAILURE);
+                r.unimplemented = Some("thread_suspend of a running thread".into());
+                return r;
+            }
+            th.suspend += 1;
+            Reply::ok(Vec::new())
+        }
+        // thread_resume(thread): one user stop fewer; at none, a thread
+        // that has never run starts.
+        (Object::Thread(t), 3606) => {
+            let th = task.threads.map.entry(t).or_default();
+            if th.suspend == 0 {
+                return Reply::err(KERN_FAILURE);
+            }
+            th.suspend -= 1;
+            if th.suspend == 0 {
+                if let Some(req) = th.unstarted.take() {
+                    task.spawns.push(req);
+                }
+            }
+            Reply::ok(Vec::new())
+        }
         // host_get_clock_service(host, clock_id) -> clock_serv_t
         (Object::Host, 206) => Reply::port(task.ports.clock()),
         // clock_get_time(clock) -> mach_timespec_t
@@ -237,7 +272,7 @@ mod tests {
         body.extend_from_slice(&1i32.to_le_bytes());
         body.extend_from_slice(&12u32.to_le_bytes());
         let mut sp = super::super::mach::Space::default();
-        let r = serve(Object::Host, 200, &body, Task { dyld_infos: 0, ports: &mut sp });
+        let r = serve(Object::Host, 200, &body, Task { dyld_infos: 0, ports: &mut sp, threads: &mut Default::default(), spawns: &mut Vec::new() });
         assert_eq!(r.ret, KERN_SUCCESS);
         let m = r.message(200, 0x703);
         assert_eq!(i32_at(&m, 20), 300, "id + 100");
@@ -251,7 +286,7 @@ mod tests {
     #[test]
     fn an_unknown_routine_is_mig_bad_id() {
         let mut sp = super::super::mach::Space::default();
-        let r = serve(Object::Task, 9999, &NDR_RECORD, Task { dyld_infos: 0, ports: &mut sp });
+        let r = serve(Object::Task, 9999, &NDR_RECORD, Task { dyld_infos: 0, ports: &mut sp, threads: &mut Default::default(), spawns: &mut Vec::new() });
         assert_eq!(r.ret, MIG_BAD_ID);
         assert_eq!(r.message(9999, 1).len(), HEADER + NDR + 4);
     }
@@ -259,7 +294,7 @@ mod tests {
     #[test]
     fn a_returned_right_makes_a_complex_reply() {
         let mut sp = super::super::mach::Space::default();
-        let r = serve(Object::Host, 206, &NDR_RECORD, Task { dyld_infos: 0, ports: &mut sp });
+        let r = serve(Object::Host, 206, &NDR_RECORD, Task { dyld_infos: 0, ports: &mut sp, threads: &mut Default::default(), spawns: &mut Vec::new() });
         let m = r.message(206, 0x703);
         assert_eq!(m.len(), 40);
         assert_eq!(i32_at(&m, 0) as u32 & COMPLEX, COMPLEX);
