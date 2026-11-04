@@ -12,6 +12,128 @@ pub mod port;
 pub mod right;
 pub mod space;
 
+use crate::errno::Errno;
+use crate::syscalls::{Kernel, SyscallOutcome};
+use crate::GuestMem;
+
+/// Mach messaging as the system calls reach it: the traps, a blocked
+/// message's continuation, and what an operation owes when it is done.
+///
+/// This, [`KQueue`] and [`WorkQueue`] are where the Darwin system calls
+/// meet the IPC, kqueue and workqueue they use. [`Native`] is the port of
+/// XNU's code here; a build of XNU's own `osfmk/ipc` and `bsd/kern` can
+/// take its place by implementing them and being named in [`Mach`],
+/// [`Kq`] and [`Wq`].
+pub trait MachIpc {
+    /// `mach_msg2_trap`.
+    fn mach_msg2(k: &mut Kernel, m: &mut GuestMem<'_>, a: &[u64; 6]) -> SyscallOutcome;
+    /// `mach_msg_trap` and `mach_msg_overwrite_trap`.
+    fn mach_msg_trap(k: &mut Kernel, m: &mut GuestMem<'_>, a: &[u64; 6], overwrite: bool) -> SyscallOutcome;
+    /// A blocked send or receive has woken.
+    fn wait_done(k: &mut Kernel, m: &mut GuestMem<'_>, c: crate::darwin::mach_msg::Cont, res: crate::darwin::wait::WaitResult) -> Option<SyscallOutcome>;
+    /// What an IPC operation owes: notifications sent, threads woken.
+    fn settle(k: &mut Kernel, m: &mut GuestMem<'_>);
+}
+
+/// The kqueue calls (`bsd/kern/kern_event.c`).
+pub trait KQueue {
+    /// `kqueue()`.
+    fn kqueue(k: &mut Kernel) -> Result<u64, Errno>;
+    /// `kevent` (`kev64` false) and `kevent64`.
+    fn kevent_legacy(k: &mut Kernel, m: &mut GuestMem<'_>, a: &[u64; 6], kev64: bool) -> SyscallOutcome;
+    fn kevent_qos(k: &mut Kernel, m: &mut GuestMem<'_>, a: &[u64; 6]) -> SyscallOutcome;
+    fn kevent_id(k: &mut Kernel, m: &mut GuestMem<'_>, a: &[u64; 6]) -> SyscallOutcome;
+    fn workloop_ctl(k: &mut Kernel, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno>;
+    /// A blocked kevent call has woken.
+    fn wait_done(k: &mut Kernel, m: &mut GuestMem<'_>, c: crate::darwin::kevent::Cont, res: crate::darwin::wait::WaitResult) -> Option<SyscallOutcome>;
+    /// What kevent owes after a call.
+    fn settle(k: &mut Kernel, m: &mut GuestMem<'_>);
+}
+
+/// The workqueue (`bsd/pthread/pthread_workqueue.c`).
+pub trait WorkQueue {
+    fn open(k: &mut Kernel) -> Result<u64, Errno>;
+    fn kernreturn(k: &mut Kernel, m: &mut GuestMem<'_>, a: &[u64; 6]) -> SyscallOutcome;
+    fn bsdthread_ctl(k: &mut Kernel, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno>;
+    /// A parked workqueue thread has woken.
+    fn wait_done(k: &mut Kernel, m: &mut GuestMem<'_>, res: crate::darwin::wait::WaitResult) -> Option<SyscallOutcome>;
+    /// A new thread's first entry, when it is the kernel's.
+    fn thread_entry(k: &mut Kernel, m: &mut GuestMem<'_>) -> Option<SyscallOutcome>;
+}
+
+/// The IPC, kqueue and workqueue ported here.
+pub struct Native;
+
+/// The implementations the system calls use.
+pub type Mach = Native;
+pub type Kq = Native;
+pub type Wq = Native;
+
+impl MachIpc for Native {
+    fn mach_msg2(k: &mut Kernel, m: &mut GuestMem<'_>, a: &[u64; 6]) -> SyscallOutcome {
+        k.darwin_mach_msg2(m, a)
+    }
+    fn mach_msg_trap(k: &mut Kernel, m: &mut GuestMem<'_>, a: &[u64; 6], overwrite: bool) -> SyscallOutcome {
+        k.darwin_mach_msg_trap(m, a, overwrite)
+    }
+    fn wait_done(k: &mut Kernel, m: &mut GuestMem<'_>, c: crate::darwin::mach_msg::Cont, res: crate::darwin::wait::WaitResult) -> Option<SyscallOutcome> {
+        k.darwin_mach_msg_wait_done(m, c, res)
+    }
+    fn settle(k: &mut Kernel, m: &mut GuestMem<'_>) {
+        k.darwin_ipc_settle(m)
+    }
+}
+
+impl KQueue for Native {
+    fn kqueue(k: &mut Kernel) -> Result<u64, Errno> {
+        k.darwin_kqueue()
+    }
+    fn kevent_legacy(k: &mut Kernel, m: &mut GuestMem<'_>, a: &[u64; 6], kev64: bool) -> SyscallOutcome {
+        k.darwin_kevent_legacy(m, a, kev64)
+    }
+    fn kevent_qos(k: &mut Kernel, m: &mut GuestMem<'_>, a: &[u64; 6]) -> SyscallOutcome {
+        k.darwin_kevent_qos(m, a)
+    }
+    fn kevent_id(k: &mut Kernel, m: &mut GuestMem<'_>, a: &[u64; 6]) -> SyscallOutcome {
+        k.darwin_kevent_id(m, a)
+    }
+    fn workloop_ctl(k: &mut Kernel, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
+        k.darwin_kqueue_workloop_ctl(m, a)
+    }
+    fn wait_done(k: &mut Kernel, m: &mut GuestMem<'_>, c: crate::darwin::kevent::Cont, res: crate::darwin::wait::WaitResult) -> Option<SyscallOutcome> {
+        k.darwin_kevent_wait_done(m, c, res)
+    }
+    fn settle(k: &mut Kernel, m: &mut GuestMem<'_>) {
+        k.darwin_kevent_settle(m)
+    }
+}
+
+impl WorkQueue for Native {
+    fn open(k: &mut Kernel) -> Result<u64, Errno> {
+        k.darwin_workq_open()
+    }
+    fn kernreturn(k: &mut Kernel, m: &mut GuestMem<'_>, a: &[u64; 6]) -> SyscallOutcome {
+        k.darwin_workq_kernreturn(m, a)
+    }
+    fn bsdthread_ctl(k: &mut Kernel, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
+        k.darwin_bsdthread_ctl(m, a)
+    }
+    fn wait_done(k: &mut Kernel, m: &mut GuestMem<'_>, res: crate::darwin::wait::WaitResult) -> Option<SyscallOutcome> {
+        k.darwin_workq_wait_done(m, res)
+    }
+    fn thread_entry(k: &mut Kernel, m: &mut GuestMem<'_>) -> Option<SyscallOutcome> {
+        k.workq_thread_entry(m)
+    }
+}
+
+impl Kernel {
+    /// The first entry of a new Darwin thread: the kernel's, for a new
+    /// workqueue thread ([`WorkQueue::thread_entry`]).
+    pub fn darwin_thread_entry(&mut self, m: &mut GuestMem<'_>) -> Option<SyscallOutcome> {
+        <Wq as WorkQueue>::thread_entry(self, m)
+    }
+}
+
 use space::{bits, Space};
 use std::collections::{BTreeMap, VecDeque};
 

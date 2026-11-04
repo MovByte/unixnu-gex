@@ -2062,7 +2062,7 @@ impl Kernel {
 
     /// The first entry of a thread whose first act is the kernel's: a new
     /// workqueue thread runs `workq_unpark_continue`.
-    pub fn darwin_thread_entry(&mut self, m: &mut GuestMem<'_>) -> Option<SyscallOutcome> {
+    pub(crate) fn workq_thread_entry(&mut self, m: &mut GuestMem<'_>) -> Option<SyscallOutcome> {
         let tid = self.tid;
         if !self.darwin_is_wq_thread(tid) || !self.wqt(tid).enter_kernel {
             return None;

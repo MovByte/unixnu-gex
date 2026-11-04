@@ -7,6 +7,7 @@
 //! `osfmk/ipc/mach_kernelrpc.c`'s.
 
 use super::ipc::kr;
+use super::ipc::{MachIpc, Mach};
 use super::wait::{Wait, WaitResult};
 use crate::errno::Errno;
 use crate::syscalls::{nr, Kernel, SyscallOutcome};
@@ -208,9 +209,9 @@ impl Kernel {
     /// Run Mach trap `t` (negative), writing its result.
     pub(crate) fn mach_trap(&mut self, m: &mut GuestMem<'_>, t: i32, a: &[u64; 6]) -> SyscallOutcome {
         let r = match t {
-            trap::MACH_MSG2 => return self.darwin_mach_msg2(m, a),
-            trap::MACH_MSG => return self.darwin_mach_msg_trap(m, a, false),
-            trap::MACH_MSG_OVERWRITE => return self.darwin_mach_msg_trap(m, a, true),
+            trap::MACH_MSG2 => return <Mach as MachIpc>::mach_msg2(self, m, a),
+            trap::MACH_MSG => return <Mach as MachIpc>::mach_msg_trap(self, m, a, false),
+            trap::MACH_MSG_OVERWRITE => return <Mach as MachIpc>::mach_msg_trap(self, m, a, true),
             trap::MACH_WAIT_UNTIL => return self.mach_wait_until(m, a[0]),
             trap::THREAD_SWITCH => return self.thread_switch(m, a[0] as u32, a[1] as u32 as u64, a[2] as u32),
             _ => {

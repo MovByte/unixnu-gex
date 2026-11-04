@@ -3,6 +3,7 @@
 
 use super::bsd::{open_flags, open_flags_back, sys};
 use crate::errno::Errno;
+use super::ipc::{KQueue, Kq, WorkQueue, Wq};
 use crate::syscalls::{nr, Kernel};
 use crate::GuestMem;
 
@@ -256,10 +257,10 @@ impl Kernel {
             // gettid(uidp, gidp): a thread's own credentials, which only
             // settid gives it (settid is not served, so none has them).
             sys::GETTID => neg(Errno::ESRCH),
-            sys::KQUEUE => res(self.darwin_kqueue()),
+            sys::KQUEUE => res(<Kq as KQueue>::kqueue(self)),
             sys::KQUEUE_WORKLOOP_CTL => {
-                let r = self.darwin_kqueue_workloop_ctl(m, a);
-                self.darwin_kevent_settle(m);
+                let r = <Kq as KQueue>::workloop_ctl(self, m, a);
+                <Kq as KQueue>::settle(self, m);
                 res(r)
             }
             sys::BSDTHREAD_REGISTER => res(self.darwin_bsdthread_register(m, a)),
@@ -273,7 +274,7 @@ impl Kernel {
                 0
             }
             // QoS overrides and the like: no scheduler classes to apply.
-            sys::BSDTHREAD_CTL => res(self.darwin_bsdthread_ctl(m, a)),
+            sys::BSDTHREAD_CTL => res(<Wq as WorkQueue>::bsdthread_ctl(self, m, a)),
             // A signal to a thread by its Mach port; signal 0 only asks
             // whether the thread is there.
             sys::PTHREAD_KILL => {

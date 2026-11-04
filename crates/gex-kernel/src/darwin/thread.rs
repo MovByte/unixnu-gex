@@ -4,6 +4,7 @@
 //! the wait and wake under `os_unfair_lock` and joins.
 
 use super::bsd::sys;
+use super::ipc::{KQueue, Kq, MachIpc, Mach, WorkQueue, Wq};
 use super::wait::{Wait, WaitResult};
 use crate::errno::Errno;
 use crate::syscalls::{Kernel, SpawnRequest, SyscallOutcome};
@@ -315,11 +316,11 @@ impl Kernel {
             sys::ULOCK_WAIT2 => Some(self.darwin_ulock_wait(m, a)),
             sys::SEMWAIT_SIGNAL => Some(self.darwin_semwait_signal(m, a, true)),
             sys::WORKQ_OPEN => {
-                let r = self.darwin_workq_open();
+                let r = <Wq as WorkQueue>::open(self);
                 bsd_result(m, self.ctx_addr, r, false);
                 Some(SyscallOutcome::Continue)
             }
-            sys::WORKQ_KERNRETURN => Some(self.darwin_workq_kernreturn(m, a)),
+            sys::WORKQ_KERNRETURN => Some(<Wq as WorkQueue>::kernreturn(self, m, a)),
             // sigsuspend_nocancel: the mask (by value) until a signal is
             // taken, the old one back after; the call ends with EINTR.
             sys::SIGSUSPEND | sys::SIGSUSPEND_NOCANCEL => {
@@ -329,10 +330,10 @@ impl Kernel {
                 self.restore_sigmask = Some(restore_mask);
                 Some(SyscallOutcome::Blocking(crate::syscalls::BlockOp::SigSuspend { restore_mask }))
             }
-            sys::KEVENT => Some(self.darwin_kevent_legacy(m, a, false)),
-            sys::KEVENT64 => Some(self.darwin_kevent_legacy(m, a, true)),
-            sys::KEVENT_QOS => Some(self.darwin_kevent_qos(m, a)),
-            sys::KEVENT_ID => Some(self.darwin_kevent_id(m, a)),
+            sys::KEVENT => Some(<Kq as KQueue>::kevent_legacy(self, m, a, false)),
+            sys::KEVENT64 => Some(<Kq as KQueue>::kevent_legacy(self, m, a, true)),
+            sys::KEVENT_QOS => Some(<Kq as KQueue>::kevent_qos(self, m, a)),
+            sys::KEVENT_ID => Some(<Kq as KQueue>::kevent_id(self, m, a)),
             sys::SEMWAIT_SIGNAL_NOCANCEL => Some(self.darwin_semwait_signal(m, a, false)),
             sys::ULOCK_WAKE => {
                 let no_errno = a[0] & ul::NO_ERRNO != 0;
@@ -718,11 +719,11 @@ impl Kernel {
     /// A blocked thread call's wait has ended: its result, written back.
     pub(crate) fn darwin_thread_wait_done(&mut self, m: &mut GuestMem<'_>, f: Finish, res: WaitResult) -> Option<SyscallOutcome> {
         match f {
-            Finish::MachMsg(c) => return self.darwin_mach_msg_wait_done(m, c, res),
+            Finish::MachMsg(c) => return <Mach as MachIpc>::wait_done(self, m, c, res),
             Finish::Sema(c) => self.darwin_sema_wait_done(m, c, res),
             Finish::Sleep(s) => self.darwin_sleep_done(m, s, res),
-            Finish::WorkqPark => return self.darwin_workq_wait_done(m, res),
-            Finish::Kevent(c) => return self.darwin_kevent_wait_done(m, c, res),
+            Finish::WorkqPark => return <Wq as WorkQueue>::wait_done(self, m, res),
+            Finish::Kevent(c) => return <Kq as KQueue>::wait_done(self, m, c, res),
             Finish::Psynch(c) => self.darwin_psynch_wait_done(m, c, res),
             Finish::Ulock { addr, no_errno } => {
                 // A waiter that was not woken is still on the queue.
