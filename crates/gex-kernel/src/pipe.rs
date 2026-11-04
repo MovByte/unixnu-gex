@@ -85,6 +85,8 @@ struct State {
     /// A Darwin pipe's buffer size (`pipe_buffer.size`, 0 once it is
     /// freed); `None` for a Linux pipe.
     xnu_size: Option<usize>,
+    /// Each side's `pipe_pgid` (read, write), as `TIOCSPGRP` sets it.
+    pgid: [i32; 2],
 }
 
 /// One pipe, shared by both ends.
@@ -126,6 +128,7 @@ impl Pipe {
                 last: Vec::new(),
                 broken: 0,
                 xnu_size: None,
+                pgid: [0; 2],
             }),
             ready: Condvar::new(),
             queue: crate::wait::Queue::new(),
@@ -139,6 +142,15 @@ impl Pipe {
         xnu::add(size as i64);
         p.state.lock().unwrap().xnu_size = Some(size);
         p
+    }
+
+    /// The `pipe_pgid` of the write side or the read side.
+    pub fn pgid(&self, write: bool) -> i32 {
+        self.state.lock().unwrap().pgid[usize::from(write)]
+    }
+
+    pub fn set_pgid(&self, write: bool, pgid: i32) {
+        self.state.lock().unwrap().pgid[usize::from(write)] = pgid;
     }
 
     /// Whether the pipe keeps XNU's rules.

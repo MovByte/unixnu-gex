@@ -1,7 +1,7 @@
 //! Darwin calls that have no Linux counterpart to renumber onto, or whose
 //! results or structures need the kernel's state to translate.
 
-use super::bsd::{open_flags, open_flags_back, sys};
+use super::bsd::sys;
 use crate::errno::Errno;
 use super::ipc::{KQueue, Kq, WorkQueue, Wq};
 use crate::syscalls::{nr, Kernel};
@@ -253,7 +253,7 @@ impl Kernel {
             }
             // No descriptor is a terminal to a Darwin process yet: stdio
             // buffers fully, and termios structures need not be converted.
-            sys::IOCTL => neg(Errno::ENOTTY),
+            sys::IOCTL => res(self.darwin_ioctl(m, a)),
             // gettid(uidp, gidp): a thread's own credentials, which only
             // settid gives it (settid is not served, so none has them).
             sys::GETTID => neg(Errno::ESRCH),
@@ -423,11 +423,8 @@ impl Kernel {
         match a[1] {
             // F_DUPFD, F_GETFD, F_SETFD: the same on both sides.
             c @ 0..=2 => canon(self, m, c, a[2]),
-            f::GETFL => match self.canonical(m, nr::FCNTL, [fd, 3, 0, 0, 0, 0]) {
-                Ok(l) => open_flags_back(l),
-                Err(e) => neg(e),
-            },
-            f::SETFL => canon(self, m, 4, open_flags(a[2])),
+            f::GETFL => res(self.darwin_getfl(fd as i32)),
+            f::SETFL => res(self.darwin_setfl(fd as i32, a[2])),
             f::GETOWN => canon(self, m, 9, 0),
             f::SETOWN => canon(self, m, 8, a[2]),
             f::DUPFD_CLOEXEC => canon(self, m, 1030, a[2]),

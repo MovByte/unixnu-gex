@@ -19,6 +19,7 @@ pub mod bsd;
 pub mod codesign;
 pub mod commpage;
 pub mod errno;
+pub mod ioctl;
 pub mod ipc;
 pub mod kern;
 pub mod kevent;

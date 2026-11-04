@@ -27,8 +27,9 @@ pub fn dirfd(fd: u64) -> u64 {
 /// Darwin `open` flags, as the canonical (AArch64 Linux) ones.
 pub fn open_flags(f: u64) -> u64 {
     // (Darwin bit, Linux bit): O_NONBLOCK, O_APPEND, O_CREAT, O_TRUNC,
-    // O_EXCL, O_NOFOLLOW, O_NOCTTY, O_DIRECTORY, O_CLOEXEC, O_DSYNC, O_SYNC.
-    const MAP: [(u64, u64); 11] = [
+    // O_EXCL, O_NOFOLLOW, O_NOCTTY, O_DIRECTORY, O_CLOEXEC, O_DSYNC, O_SYNC,
+    // O_ASYNC.
+    const MAP: [(u64, u64); 12] = [
         (0x4, 0x800),
         (0x8, 0x400),
         (0x200, 0x40),
@@ -40,6 +41,7 @@ pub fn open_flags(f: u64) -> u64 {
         (0x100_0000, 0x8_0000),
         (0x40_0000, 0x1000),
         (0x80, 0x10_1000),
+        (0x40, 0x2000),
     ];
     let mut l = f & 3;
     for (d, x) in MAP {
@@ -50,13 +52,21 @@ pub fn open_flags(f: u64) -> u64 {
     l
 }
 
-/// Linux `open` status flags back in Darwin's terms (`F_GETFL`).
+/// Linux `open` status flags back in Darwin's terms (`F_GETFL`): the
+/// access mode and the `FCNTLFLAGS` (O_NONBLOCK, O_APPEND, O_ASYNC,
+/// O_SYNC, O_DSYNC), as `OFLAGS(f_flag)` has them.
 pub fn open_flags_back(l: u64) -> u64 {
     let mut d = l & 3;
-    for (dbit, lbit) in [(0x4u64, 0x800u64), (0x8, 0x400)] {
+    for (dbit, lbit) in [(0x4u64, 0x800u64), (0x8, 0x400), (0x40, 0x2000)] {
         if l & lbit != 0 {
             d |= dbit;
         }
+    }
+    // Linux's O_SYNC is its O_DSYNC with one more bit.
+    if l & 0x10_1000 == 0x10_1000 {
+        d |= 0x80;
+    } else if l & 0x1000 != 0 {
+        d |= 0x40_0000;
     }
     d
 }
