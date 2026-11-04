@@ -2166,6 +2166,13 @@ impl Kernel {
         r
     }
 
+    /// Whether `__pthread_kill` refuses thread `tid`: a workqueue thread
+    /// that has not allowed it, in a process that allowed no signals.
+    pub(crate) fn darwin_workq_refuses_kill(&self, tid: i32) -> bool {
+        let allowed = self.dtask.threads.map.get(&tid).and_then(|t| t.wq.as_ref()).map(|t| t.kill_allowed);
+        matches!(allowed, Some(false)) && self.dtask.workq_allow_sigmask == 0
+    }
+
     /// `bsdthread_add_explicit_override`.
     fn bsdthread_add_explicit_override(&mut self, kport: u32, pp_: u64, resource: u64) -> Result<u64, Errno> {
         let q = pp::qos(pp_);

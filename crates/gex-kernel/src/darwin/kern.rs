@@ -274,9 +274,13 @@ impl Kernel {
                 let sig = signal_to_linux(a[1] as u32);
                 let target = self.darwin_name_to_thread(a[0] as u32);
                 let no_sigmask = target.is_some_and(|t| self.dtask.threads.map.get(&t).is_some_and(|d| d.cancel.no_sigmask));
+                // A workqueue thread takes signals only if it allowed it, or
+                // the process allowed some (BSDTHREAD_CTL_WORKQ_ALLOW_*).
+                let workq_refuses = target.is_some_and(|t| self.darwin_workq_refuses_kill(t));
                 match target {
                     Some(_) if (a[1] as u32) >= 32 => neg(Errno::EINVAL),
                     _ if no_sigmask => neg(Errno::ESRCH),
+                    Some(_) if workq_refuses => neg(Errno::EOPNOTSUPP),
                     Some(_) if sig == 0 => 0,
                     Some(tid) => res(self.canonical(m, nr::TGKILL, [self.pid as u64, tid as u64, u64::from(sig), 0, 0, 0])),
                     None => neg(Errno::ESRCH),

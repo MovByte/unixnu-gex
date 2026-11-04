@@ -181,6 +181,14 @@ pub enum Sleep {
     Switch,
 }
 
+/// Darwin's errno values the BSD-side traps return in x0 as they are
+/// (`bsd/sys/errno.h`).
+mod derrno {
+    pub const EPERM: u64 = 1;
+    pub const EFAULT: u64 = 14;
+    pub const ENOTSUP: u64 = 45;
+}
+
 /// `MACH_ACTIVITY_ID_COUNT_MAX`.
 const ACTIVITY_ID_COUNT_MAX: u32 = 16;
 
@@ -454,7 +462,7 @@ impl Kernel {
                 }
                 let id = ACTIVITY_ID.fetch_add(u64::from(count), std::sync::atomic::Ordering::Relaxed);
                 // A copyout's failure is its errno.
-                if m.write_u64(a[2], id).is_ok() { kr::SUCCESS } else { Errno::EFAULT.0 as u64 }
+                if m.write_u64(a[2], id).is_ok() { kr::SUCCESS } else { derrno::EFAULT }
             }
             trap::MK_TIMER_CREATE => u64::from(self.mk_timer_create()),
             trap::MK_TIMER_DESTROY => self.mk_timer_destroy(w(0)),
@@ -471,14 +479,14 @@ impl Kernel {
             // CONFIG_EXCLAVES is not in the iPhoneOS kernel configuration.
             trap::EXCLAVES_CTL => kr2::NOT_SUPPORTED,
             // dp_backing_file.c: no swap on iOS.
-            trap::MACX_SWAPON | trap::MACX_SWAPOFF | trap::MACX_BACKING_STORE_SUSPEND | trap::MACX_BACKING_STORE_RECOVERY => Errno::EOPNOTSUPP.0 as u64,
+            trap::MACX_SWAPON | trap::MACX_SWAPOFF | trap::MACX_BACKING_STORE_SUSPEND | trap::MACX_BACKING_STORE_RECOVERY => derrno::ENOTSUP,
             trap::MACX_TRIGGERS => {
                 const SWAP_COMPACT_DISABLE: u32 = 0x1;
                 const SWAP_COMPACT_ENABLE: u32 = 0x2;
                 if w(0) & (SWAP_COMPACT_DISABLE | SWAP_COMPACT_ENABLE) == 0 {
-                    Errno::EOPNOTSUPP.0 as u64
+                    derrno::ENOTSUP
                 } else if self.creds.uid() != 0 {
-                    Errno::EPERM.0 as u64
+                    derrno::EPERM
                 } else {
                     self.darwin_unimplemented("macx_triggers swap compaction".into());
                     kr::FAILURE
