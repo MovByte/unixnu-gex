@@ -1181,6 +1181,36 @@ pub fn fold_kuser(ea: u64) -> Option<u64> {
     (kuser_fold() && (KUSER_WINDOWS..kuser_fold_end()).contains(&ea)).then(|| ea - KUSER_WINDOWS + WINE32_KUSER)
 }
 
+/// Darwin's commpage, the kernel's per-boot data at a fixed address in every
+/// process: the read-only page (`_COMM_PAGE64_RO_ADDRESS`) through the
+/// read-write one (`_COMM_PAGE64_BASE_ADDRESS`) and its end. Above any gex
+/// memory, so a Darwin process's constant accesses there are folded to
+/// [`DARWIN_COMMPAGE_ALIAS`] ([`fold_commpage`]).
+pub const DARWIN_COMMPAGE_RO: u64 = 0xf_ffff_4000;
+pub const DARWIN_COMMPAGE_RW: u64 = 0xf_ffff_c000;
+pub const DARWIN_COMMPAGE_END: u64 = 0x10_0000_0000;
+
+/// Where a Darwin process's commpage is instead: the same offsets from the
+/// top of the low 4 GiB, a range the kernel reserves for it.
+pub const DARWIN_COMMPAGE_ALIAS: u64 = DARWIN_COMMPAGE_RO - 0xf_0000_0000;
+
+static COMMPAGE_FOLD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Fold Darwin's commpage addresses in everything translated from now on (a
+/// Darwin process's runner). In the unit key.
+pub fn set_commpage_fold(on: bool) {
+    COMMPAGE_FOLD.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn commpage_fold() -> bool {
+    COMMPAGE_FOLD.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// A constant effective address in Darwin's commpage, moved to its alias.
+pub fn fold_commpage(ea: u64) -> Option<u64> {
+    (commpage_fold() && (DARWIN_COMMPAGE_RO..DARWIN_COMMPAGE_END).contains(&ea)).then(|| ea - DARWIN_COMMPAGE_RO + DARWIN_COMMPAGE_ALIAS)
+}
+
 /// With folding on, the bounds guard's limit (tier-1 and gex-cgen): an
 /// access at or above it is one the translator did not fold -- a pointer
 /// into the old page computed at run time -- and becomes

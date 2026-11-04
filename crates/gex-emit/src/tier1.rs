@@ -258,6 +258,8 @@ fn t1_fold() -> bool {
 pub fn knobs() -> u8 {
     inline_dispatch() as u8 | (t1_fold() as u8) << 1 | (gex_abi::kuser_fold() as u8) << 2 | (null_guard_on() as u8) << 3
         | (gex_ir::mxcsr_exact() as u8) << 4
+        | (gex_abi::commpage_fold() as u8) << 5
+        | (gex_ir::pass::forward_reg_consts() as u8) << 6
 }
 
 /// Whether the translators put the null guard (`gex_abi::NULL_GUARD`) on
@@ -1525,6 +1527,8 @@ impl<'a> Emitter<'a> {
         if gex_abi::mem64() {
             if let Some(c) = self.value_const.get(addr.0 as usize).copied().flatten() {
                 let ea = c.wrapping_add(offset as u64);
+                // A Darwin process: its commpage is at its alias.
+                let ea = gex_abi::fold_commpage(ea).unwrap_or(ea);
                 // Below the null guard: an address past every memory's end.
                 let ea = if null_guard && ea < gex_abi::NULL_GUARD { u64::MAX - 15 } else { ea };
                 self.f.i64_const(ea as i64);

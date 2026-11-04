@@ -214,6 +214,9 @@ pub struct RunOptions {
     /// A Darwin (Mach-O) program: the kernel speaks the Darwin system call
     /// ABI to it (`gex_kernel::darwin`).
     pub darwin: bool,
+    /// A Darwin program's dyld shared cache (its main file; the subcaches
+    /// sit beside it), mapped at its shared region before the program runs.
+    pub darwin_cache: Option<std::path::PathBuf>,
     /// Run ahead-of-time code only (`aot_only`): an ejected Windows
     /// program's runtime, with no tier-1 module and no run-time translator.
     pub aot_only: bool,
@@ -224,6 +227,7 @@ impl Default for RunOptions {
         RunOptions {
             mem: gex_abi::MemFlavor::M32,
             darwin: false,
+            darwin_cache: None,
             args: Vec::new(),
             env: Vec::new(),
             trace: false,
@@ -3970,16 +3974,46 @@ fn place_image(
         });
     }
 
+    // A Darwin program's shared cache, where the kernel maps it.
+    if let Some(cache) = opts.darwin_cache.as_deref().filter(|_| opts.darwin) {
+        let region = map_shared_cache(store, &memory, cache)?;
+        store.data_mut().with_kernel(|k| k.darwin_region = region);
+    }
+    // And its commpage, at the alias its constant addresses are folded to.
+    if opts.darwin {
+        use gex_kernel::darwin::commpage;
+        let page = commpage::page(2, 4 << 30);
+        let data = memory.bytes();
+        for at in commpage::placements() {
+            data[at as usize..at as usize + page.len()].copy_from_slice(&page);
+        }
+        let (lo, hi) = (gex_abi::DARWIN_COMMPAGE_ALIAS, gex_abi::DARWIN_COMMPAGE_ALIAS + (gex_abi::DARWIN_COMMPAGE_END - gex_abi::DARWIN_COMMPAGE_RO));
+        store.data_mut().with_kernel(|k| k.mem.lock().insert(lo, hi, prot::READ, "[commpage]"));
+    }
+
     // Then the stack. Determinism by default means a fixed
     // AT_RANDOM unless the caller asks otherwise.
-    let layout = build_initial_stack(
-        image,
-        gex_abi::STACK_TOP,
-        &opts.args,
-        &opts.env,
-        *b"gexdeterministic",
-        id,
-    );
+    let layout = if opts.darwin {
+        // dyld finds the program by the header address on top of its stack.
+        let header = image.segments.iter().map(|s| s.vaddr).min().unwrap_or(0);
+        let path = opts.exe.clone().or_else(|| opts.args.first().cloned()).unwrap_or_default();
+        gex_ld::macho::build_stack(
+            gex_abi::STACK_TOP,
+            program.interp.as_ref().map(|_| header),
+            &opts.args,
+            &opts.env,
+            &gex_kernel::darwin::apple_strings(&path),
+        )
+    } else {
+        build_initial_stack(
+            image,
+            gex_abi::STACK_TOP,
+            &opts.args,
+            &opts.env,
+            *b"gexdeterministic",
+            id,
+        )
+    };
     let data = memory.bytes();
     let start = layout.low as usize;
     let end = start + layout.bytes.len();
@@ -4019,6 +4053,63 @@ fn place_image(
         data[ctx_addr + ctx::MXCSR..ctx_addr + ctx::MXCSR + 4].copy_from_slice(&0x1f80u32.to_le_bytes());
     }
     Ok(())
+}
+
+/// Map a dyld shared cache, its main file and every subcache it names, at
+/// the addresses it was linked for, rebased by its slide info at a zero
+/// slide, and record each mapping as the kernel would. Returns the shared
+/// region as `(start, size)`.
+fn map_shared_cache(store: &mut Store<HostState>, memory: &gex_mem::GuestMemory, main: &std::path::Path) -> Result<(u64, u64)> {
+    use gex_ld::dsc;
+    use std::io::{Read, Seek, SeekFrom};
+    let head = |p: &std::path::Path, len: usize| -> Result<Vec<u8>> {
+        let mut f = std::fs::File::open(p).with_context(|| format!("opening {}", p.display()))?;
+        let mut b = vec![0u8; len];
+        let n = f.read(&mut b)?;
+        b.truncate(n);
+        Ok(b)
+    };
+    let h = dsc::parse_header(&head(main, 8 << 20)?).with_context(|| format!("reading {}", main.display()))?;
+    let mut files = vec![(main.to_path_buf(), h.clone())];
+    for sc in &h.subcaches {
+        let p = std::path::PathBuf::from(format!("{}{}", main.display(), sc.suffix));
+        let sh = dsc::parse_header(&head(&p, 1 << 20)?).with_context(|| format!("reading {}", p.display()))?;
+        if sh.uuid != sc.uuid {
+            bail!("{} is not the subcache {} names", p.display(), main.display());
+        }
+        files.push((p, sh));
+    }
+    let data = memory.bytes();
+    for (p, fh) in &files {
+        let mut f = std::fs::File::open(p).with_context(|| format!("opening {}", p.display()))?;
+        for m in &fh.mappings {
+            let (start, end) = (m.address as usize, (m.address + m.size) as usize);
+            if end > data.len() {
+                bail!("shared cache mapping {:#x}..{:#x} does not fit in guest memory", m.address, m.address + m.size);
+            }
+            gex_kernel::big_op("shared cache", end - start);
+            f.seek(SeekFrom::Start(m.file_offset))?;
+            f.read_exact(&mut data[start..end]).with_context(|| format!("reading {}", p.display()))?;
+            if let Some((off, size)) = m.slide_info {
+                let mut info = vec![0u8; size as usize];
+                f.seek(SeekFrom::Start(off))?;
+                f.read_exact(&mut info)?;
+                dsc::apply_slide(&mut data[start..end], &info, 0).with_context(|| format!("sliding {}", p.display()))?;
+            }
+            let mut pr = 0;
+            if m.init_prot & dsc::PROT_READ != 0 {
+                pr |= prot::READ;
+            }
+            if m.init_prot & dsc::PROT_WRITE != 0 {
+                pr |= prot::WRITE;
+            }
+            if m.init_prot & dsc::PROT_EXEC != 0 {
+                pr |= prot::EXEC;
+            }
+            store.data_mut().with_kernel(|k| k.mem.lock().insert(m.address, m.address + m.size, pr, "[shared-cache]"));
+        }
+    }
+    Ok((h.shared_region_start, h.shared_region_size))
 }
 
 fn write_u64(data: &mut [u8], off: usize, v: u64) {

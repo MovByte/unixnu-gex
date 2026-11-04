@@ -14,7 +14,9 @@ use crate::GuestMem;
 use gex_abi::ctx;
 
 pub mod bsd;
+pub mod commpage;
 pub mod errno;
+mod kern;
 
 /// Where a Darwin thread puts its system call number.
 pub const NR_SLOT: usize = ctx::x(16);
@@ -49,6 +51,18 @@ pub fn direct(m: &mut GuestMem<'_>, ctx_addr: u64, raw: u64) -> Option<u64> {
         }
         _ => neg(Errno::ENOSYS),
     })
+}
+
+/// The `apple[]` strings exec passes a Darwin program: its path first,
+/// then the per-process values libSystem and dyld read. Fixed, as the
+/// Linux side's AT_RANDOM is, so runs are reproducible.
+pub fn apple_strings(exe_path: &str) -> Vec<String> {
+    vec![
+        format!("executable_path={exe_path}"),
+        "stack_guard=0x6a5b4c3d2e1f0f00".into(),
+        "malloc_entropy=0x7a6b5c4d3e2f1001,0x1122334455667788".into(),
+        "ptr_munge=0x1".into(),
+    ]
 }
 
 fn neg(e: Errno) -> u64 {

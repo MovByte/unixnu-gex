@@ -20,6 +20,8 @@ pub mod sys {
     pub const GETPPID: u64 = 39;
     pub const GETEGID: u64 = 43;
     pub const GETGID: u64 = 47;
+    pub const SHARED_REGION_CHECK_NP: u64 = 294;
+    pub const ISSETUGID: u64 = 327;
 }
 
 /// The canonical number for BSD call `raw`, with `a` rewritten where the

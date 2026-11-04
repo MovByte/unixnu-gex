@@ -667,6 +667,9 @@ pub struct Kernel {
     /// is in x16, and its errors come back with the carry flag set (see
     /// `crate::darwin`). Set at exec, inherited across fork.
     pub darwin: bool,
+    /// A Darwin process's shared region, `(start, size)`, which the host
+    /// mapped the shared cache into: `(0, 0)` when there is none.
+    pub darwin_region: (u64, u64),
     /// Set by a syscall that may have made a descriptor readable or
     /// writable for someone else (a write, a read that freed room, a close,
     /// a signal); the host takes it after the call and wakes threads parked
@@ -8753,6 +8756,7 @@ impl Kernel {
             sig_tid: 0,
             compat: false,
             darwin: false,
+            darwin_region: (0, 0),
             fd_activity: false,
             wasm32: false,
             sigreturn_legacy: false,
@@ -9138,6 +9142,7 @@ impl Kernel {
             sig_tid: 0,
             compat: self.compat,
             darwin: self.darwin,
+            darwin_region: self.darwin_region,
             fd_activity: false,
             wasm32: self.wasm32,
             sigreturn_legacy: false,
@@ -9271,7 +9276,14 @@ impl Kernel {
             ]
         };
         if self.darwin {
-            if let Some(ret) = crate::darwin::direct(m, self.ctx_addr, raw) {
+            let ret = match crate::darwin::direct(m, self.ctx_addr, raw) {
+                Some(ret) => Some(ret),
+                None => self.darwin_call(m, raw, &a),
+            };
+            if let Some(ret) = ret {
+                if self.trace {
+                    eprintln!("[gex:{}] pc=0x{pc:x} darwin {raw:#x}({:#x}, {:#x}, {:#x}) = {}", self.pid, a[0], a[1], a[2], ret as i64);
+                }
                 let _ = crate::darwin::set_result(m, self.ctx_addr, ret);
                 return SyscallOutcome::Continue;
             }
