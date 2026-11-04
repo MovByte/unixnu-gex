@@ -9,9 +9,22 @@ pub fn from_darwin(darwin: i32) -> i32 {
     (1..=133).find(|&l| to_darwin(l) == darwin && (l == 22 || darwin != 22)).unwrap_or(22)
 }
 
+/// Where a Darwin errno with no Linux number is carried: this plus the
+/// Darwin number, inside the range a call's return reads as an error.
+pub const NATIVE: i32 = 3000;
+
+/// A Darwin errno with no Linux number (EBADEXEC, EBADARCH, EAUTH...).
+pub const fn native(darwin: i32) -> crate::errno::Errno {
+    crate::errno::Errno(NATIVE + darwin)
+}
+
+/// `EBADEXEC`.
+pub const EBADEXEC: crate::errno::Errno = native(85);
+
 /// Darwin's number for a Linux errno.
 pub fn to_darwin(linux: i32) -> i32 {
     match linux {
+        l if (NATIVE + 1..NATIVE + 1000).contains(&l) => l - NATIVE,
         11 => 35,  // EAGAIN
         35 => 11,  // EDEADLK
         1..=34 => linux,

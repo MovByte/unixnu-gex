@@ -72,6 +72,7 @@ run() {
     sigthread) check_root sigthread "sigthread ok" 0 ;;
     sigio) check_root sigio "sigio ok" 0 ;;
     vnode) check_root vnode "vnode ok" 0 ;;
+    codesig) check_root codesig "codesig ok" 0 ;;
     cfrunloop) check_root cfrunloop "cfrunloop 3 1" 0 ;;
     xpc-anon) check_root xpc-anon "xpc-anon 42" 0 ;;
     *)
@@ -86,7 +87,7 @@ if [ "$named" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode cfrunloop xpc-anon; do
+    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig cfrunloop xpc-anon; do
         run "$p"
     done
 fi

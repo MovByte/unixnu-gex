@@ -7,6 +7,7 @@
 //! binary, and the entitlements (an XML property list).
 
 use crate::syscalls::Kernel;
+use crate::GuestMem;
 
 /// `CSMAGIC_*`, `CSSLOT_*`.
 const CSMAGIC_EMBEDDED_SIGNATURE: u32 = 0xfade_0cc0;
@@ -102,7 +103,95 @@ impl CodeSign {
     }
 }
 
+/// The signatures added to each vnode (`ubc_cs_blob_add`): where each
+/// slice starts in the file, and the range its signature covers.
+fn blobs() -> &'static std::sync::Mutex<std::collections::HashMap<(u64, u64), Vec<(i64, u64, u64)>>> {
+    static B: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<(u64, u64), Vec<(i64, u64, u64)>>>> = std::sync::OnceLock::new();
+    B.get_or_init(Default::default)
+}
+
+/// `CS_MAX_BLOB_SIZE`.
+const CS_MAX_BLOB_SIZE: u64 = 40 * 1024 * 1024;
+
 impl Kernel {
+    /// fcntl's F_ADDSIGS, F_ADDFILESIGS and F_ADDFILESIGS_RETURN: the
+    /// signature of the slice at `fs_file_start`, from memory or from the
+    /// file, checked as `cs_validate_csblob` checks it and kept on the vnode
+    /// (found again, not added twice); for F_ADDFILESIGS_RETURN the end of
+    /// the range it covers. No MAC policy is loaded to judge it further.
+    pub(crate) fn darwin_addsigs(&mut self, m: &mut GuestMem<'_>, fd: i32, cmd: u64, argp: u64) -> Result<u64, crate::errno::Errno> {
+        use crate::errno::Errno;
+        const F_ADDSIGS: u64 = 59;
+        const F_ADDFILESIGS_RETURN: u64 = 97;
+        let file = self.fds.get(fd)?;
+        let Some(vnode) = self.darwin_vnode_of(&file) else { return Err(Errno::EBADF) };
+        let file_start = m.read_u64(argp)? as i64;
+        let blob_start = m.read_u64(argp + 8)?;
+        let blob_size = m.read_u64(argp + 16)?;
+        let found = blobs().lock().unwrap_or_else(|e| e.into_inner()).get(&vnode).and_then(|v| {
+            v.iter().find(|&&(base, start, end)| file_start >= base + start as i64 && file_start < base + end as i64).copied()
+        });
+        let end = match found {
+            Some((_, _, end)) => end,
+            None => {
+                if blob_size > CS_MAX_BLOB_SIZE {
+                    return Err(Errno::E2BIG);
+                }
+                let mut b = vec![0u8; blob_size as usize];
+                if cmd == F_ADDSIGS {
+                    b.copy_from_slice(m.read(blob_start, blob_size as usize)?);
+                } else {
+                    let at = (file_start as u64).checked_add(blob_start).ok_or(Errno::EINVAL)?;
+                    // vn_rdwr: what is past the file's end reads as zeros.
+                    let mut got = 0;
+                    while got < b.len() {
+                        let n = file.handle.read_at(at + got as u64, &mut b[got..])? as usize;
+                        if n == 0 {
+                            break;
+                        }
+                        got += n;
+                    }
+                }
+                let (cd_at, cd_len) = validate_csblob(&b)?;
+                let cd = &b[cd_at..cd_at + cd_len];
+                let end = end_offset(cd);
+                // csb_start_offset: the first scattered page, if scattered.
+                let scatter = be32(cd, 44).unwrap_or(0) as usize;
+                let start = if be32(cd, 8).unwrap_or(0) >= CS_SUPPORTSSCATTER && scatter != 0 { u64::from(be32(cd, scatter + 4).unwrap_or(0)) << cd[39] } else { 0 };
+                blobs().lock().unwrap_or_else(|e| e.into_inner()).entry(vnode).or_default().push((file_start, start, end));
+                end
+            }
+        };
+        if cmd == F_ADDFILESIGS_RETURN {
+            m.write_u64(argp, end)?;
+        }
+        Ok(0)
+    }
+
+    /// fcntl's F_CHECK_LV: its argument read; library validation is a MAC
+    /// policy's, and none is loaded, so the file may be mapped.
+    pub(crate) fn darwin_check_lv(&mut self, m: &mut GuestMem<'_>, fd: i32, argp: u64) -> Result<u64, crate::errno::Errno> {
+        let file = self.fds.get(fd)?;
+        if self.darwin_vnode_of(&file).is_none() {
+            return Err(crate::errno::Errno::EBADF);
+        }
+        m.read(argp, 24)?;
+        Ok(0)
+    }
+
+    /// An open file's vnode (its mount and inode), or `None` for what is
+    /// not a vnode.
+    fn darwin_vnode_of(&mut self, file: &std::sync::Arc<crate::file::OpenFile>) -> Option<(u64, u64)> {
+        if file.handle.pipe_end().is_some() || std::sync::Arc::clone(&file.handle).as_kqueue().is_some() || std::sync::Arc::clone(&file.handle).as_posix_shm().is_some() {
+            return None;
+        }
+        let md = file.handle.metadata().ok()?;
+        if md.file_type == crate::vfs::FileType::Socket {
+            return None;
+        }
+        Some((self.vfs.mount_id_of(&file.path), md.ino))
+    }
+
     /// `task_get_platform_binary`: the CodeDirectory names a platform. (AMFI
     /// takes it from the trust cache the binary is in; Apple's signing sets
     /// the field for exactly those binaries.)
@@ -114,6 +203,174 @@ impl Kernel {
     pub(crate) fn darwin_task_entitled(&self, name: &str) -> bool {
         self.dtask.codesign.as_ref().is_some_and(|c| c.entitled(name))
     }
+}
+
+/// `CS_CodeDirectory`'s size, to its linkage fields (packed).
+const CD_SIZE: usize = 108;
+const CS_SUPPORTSSCATTER: u32 = 0x20100;
+const CS_SUPPORTSTEAMID: u32 = 0x20200;
+const CS_SUPPORTSLINKAGE: u32 = 0x20600;
+const CSSLOT_DER_ENTITLEMENTS: u32 = 7;
+const CSSLOT_LAUNCH_CONSTRAINT_SELF: u32 = 8;
+const CSSLOT_LIBRARY_CONSTRAINT: u32 = 11;
+const CSSLOT_ALTERNATE_CODEDIRECTORIES: u32 = 0x1000;
+const CSSLOT_ALTERNATE_CODEDIRECTORY_LIMIT: u32 = 0x1005;
+const CSMAGIC_EMBEDDED_DER_ENTITLEMENTS: u32 = 0xfade_7172;
+const CSMAGIC_EMBEDDED_LAUNCH_CONSTRAINT: u32 = 0xfade_8181;
+/// `PAGE_SHIFT_4K`, and the A10X's `PAGE_SHIFT`.
+const PAGE_SHIFT_4K: u8 = 12;
+const PAGE_SHIFT: u8 = 14;
+
+/// `cs_find_md`'s hash sizes, by type.
+fn hash_size(ty: u8) -> Option<usize> {
+    match ty {
+        1 => Some(20),
+        2 => Some(32),
+        3 => Some(20),
+        4 => Some(48),
+        _ => None,
+    }
+}
+
+/// `hash_rank`: `hashPriorities` order, 0 for none.
+fn hash_rank(ty: u8) -> u32 {
+    [1u8, 3, 2, 4].iter().position(|&t| t == ty).map_or(0, |n| n as u32 + 1)
+}
+
+/// `cs_validate_codedirectory`.
+fn validate_cd(cd: &[u8]) -> bool {
+    if cd.len() < CD_SIZE || be32(cd, 0) != Some(CSMAGIC_CODEDIRECTORY) {
+        return false;
+    }
+    let length = cd.len();
+    let u = |o| be32(cd, o).unwrap_or(0) as usize;
+    let (version, hash_offset, ident, nspecial, ncode) = (u(8) as u32, u(16), u(20), u(24), u(28));
+    let (hsize, htype, page) = (cd[36], cd[37], cd[39]);
+    if page != PAGE_SHIFT_4K && page != PAGE_SHIFT {
+        return false;
+    }
+    let Some(size) = hash_size(htype) else { return false };
+    if hsize as usize != size || length < hash_offset || hash_offset / size < nspecial || (length - hash_offset) / size < ncode {
+        return false;
+    }
+    let scatter = u(44);
+    if version >= CS_SUPPORTSSCATTER && scatter != 0 {
+        if length < scatter {
+            return false;
+        }
+        let (mut at, mut pages) = (scatter, 0u32);
+        loop {
+            // SC_Scatter: count, base, targetOffset (8), spare (8).
+            if at + 24 > length {
+                return false;
+            }
+            let count = be32(cd, at).unwrap_or(0);
+            if count == 0 {
+                break;
+            }
+            let Some(p) = pages.checked_add(count) else { return false };
+            pages = p;
+            at += 24;
+        }
+    }
+    let cstr = |off: usize| length >= off && cd[off..].contains(&0);
+    if length < ident || (ident != 0 && !cstr(ident)) {
+        return false;
+    }
+    let team = u(48);
+    if version >= CS_SUPPORTSTEAMID && team != 0 && (length < team || !cstr(team)) {
+        return false;
+    }
+    if version >= CS_SUPPORTSLINKAGE && cd[96] != 0 {
+        let (off, size) = (u(100), u(104));
+        if off.checked_add(size).is_none_or(|end| end > length) {
+            return false;
+        }
+    }
+    true
+}
+
+/// `cs_validate_csblob`: a superblob (or a bare CodeDirectory) whose
+/// blobs are all inside it; the offset and length of the CodeDirectory of
+/// the best hash, or EBADEXEC.
+pub fn validate_csblob(b: &[u8]) -> Result<(usize, usize), crate::errno::Errno> {
+    let bad = Err(super::errno::EBADEXEC);
+    let blob_ok = |at: usize, room: usize| room >= 8 && be32(b, at + 4).is_some_and(|l| room >= l as usize);
+    if !blob_ok(0, b.len()) {
+        return bad;
+    }
+    let length = be32(b, 4).unwrap() as usize;
+    match be32(b, 0) {
+        Some(CSMAGIC_EMBEDDED_SIGNATURE) => {
+            if length < 12 {
+                return bad;
+            }
+            let count = be32(b, 8).unwrap() as usize;
+            if (length - 12) / 8 < count {
+                return bad;
+            }
+            let (mut best, mut best_rank) = (None, 0);
+            let (mut ents, mut der, mut cons) = (false, false, [false; 4]);
+            for n in 0..count {
+                let (ty, off) = (be32(b, 12 + 8 * n).unwrap(), be32(b, 16 + 8 * n).unwrap() as usize);
+                if length < off || !blob_ok(off, length - off) {
+                    return bad;
+                }
+                let sub_len = be32(b, off + 4).unwrap() as usize;
+                let magic = be32(b, off).unwrap();
+                let mut once = |seen: &mut bool, want: u32| -> bool {
+                    if magic != want || *seen {
+                        return false;
+                    }
+                    *seen = true;
+                    true
+                };
+                if ty == CSSLOT_CODEDIRECTORY || (CSSLOT_ALTERNATE_CODEDIRECTORIES..CSSLOT_ALTERNATE_CODEDIRECTORY_LIMIT).contains(&ty) {
+                    let cd = &b[off..off + sub_len];
+                    if !validate_cd(cd) {
+                        return bad;
+                    }
+                    let rank = hash_rank(cd[37]);
+                    if best.is_none() || rank > best_rank {
+                        best = Some((off, sub_len));
+                        best_rank = rank;
+                    } else if rank == best_rank {
+                        return bad;
+                    }
+                } else if ty == CSSLOT_ENTITLEMENTS {
+                    if !once(&mut ents, CSMAGIC_EMBEDDED_ENTITLEMENTS) {
+                        return bad;
+                    }
+                } else if ty == CSSLOT_DER_ENTITLEMENTS {
+                    if !once(&mut der, CSMAGIC_EMBEDDED_DER_ENTITLEMENTS) {
+                        return bad;
+                    }
+                } else if (CSSLOT_LAUNCH_CONSTRAINT_SELF..=CSSLOT_LIBRARY_CONSTRAINT).contains(&ty) {
+                    let i = (ty - CSSLOT_LAUNCH_CONSTRAINT_SELF) as usize;
+                    if !once(&mut cons[i], CSMAGIC_EMBEDDED_LAUNCH_CONSTRAINT) {
+                        return bad;
+                    }
+                }
+            }
+            best.ok_or(super::errno::EBADEXEC)
+        }
+        Some(CSMAGIC_CODEDIRECTORY) => {
+            if validate_cd(&b[..length]) {
+                Ok((0, length))
+            } else {
+                bad
+            }
+        }
+        _ => bad,
+    }
+}
+
+/// `ubc_cs_blob_add`'s `csb_end_offset`: the CodeDirectory's code limit,
+/// to the end of its last hashed page.
+pub fn end_offset(cd: &[u8]) -> u64 {
+    let limit = u64::from(be32(cd, 32).unwrap_or(0));
+    let mask = (1u64 << cd[39]) - 1;
+    (limit + mask) & !mask
 }
 
 #[cfg(test)]

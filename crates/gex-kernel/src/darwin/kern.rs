@@ -73,6 +73,8 @@ mod f {
     pub const CHECK_LV: u64 = 98;
     pub const SPECULATIVE_READ: u64 = 101;
     pub const RDAHEAD: u64 = 45;
+    pub const ADDFILESIGS_FOR_DYLD_SIM: u64 = 83;
+    pub const ADDFILESIGS_INFO: u64 = 103;
     pub const NODIRECT: u64 = 62;
     pub const SINGLE_WRITER: u64 = 76;
 }
@@ -466,8 +468,14 @@ impl Kernel {
             }
             // A signature covering the whole file: fs_file_start, the end
             // of what the signature covers, is the largest offset.
-            f::ADDFILESIGS_RETURN => res(m.write_u64(a[2], i64::MAX as u64).map(|_| 0)),
-            f::ADDSIGS | f::ADDFILESIGS | f::CHECK_LV => 0,
+            f::ADDSIGS | f::ADDFILESIGS | f::ADDFILESIGS_RETURN => res(self.darwin_addsigs(m, fd as i32, a[1], a[2])),
+            f::CHECK_LV => res(self.darwin_check_lv(m, fd as i32, a[2])),
+            // The simulator's form, and the form that also returns the
+            // cdhash (a SHA digest of the CodeDirectory).
+            f::ADDFILESIGS_FOR_DYLD_SIM | f::ADDFILESIGS_INFO => {
+                self.darwin_unimplemented(format!("fcntl {} (F_ADDFILESIGS_FOR_DYLD_SIM, F_ADDFILESIGS_INFO)", a[1]));
+                neg(Errno::EINVAL)
+            }
             f::NOCACHE | f::RDAHEAD | f::NODIRECT | f::SINGLE_WRITER | f::RDADVISE | f::FULLFSYNC | f::BARRIERFSYNC | f::PREALLOCATE | f::SPECULATIVE_READ | f::GETPROTECTIONCLASS | f::SETPROTECTIONCLASS => {
                 res(self.darwin_fcntl_vnode(m, fd as i32, a[1], a[2]))
             }
