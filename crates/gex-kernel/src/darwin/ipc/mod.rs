@@ -168,12 +168,23 @@ pub struct Port {
     pub impdonation: bool,
     pub no_grant: bool,
     pub service_port: bool,
+    /// A service port labeled as a bootstrap port
+    /// (`ipc_service_port_label_is_bootstrap_port`).
+    pub bootstrap_port: bool,
+    /// A libxpc connection port (`ip_is_libxpc_connection_port`).
+    pub connection_port: bool,
     /// `ip_sprequests`: a send-possible request is armed.
     pub sprequests: bool,
     /// `ip_nsrequest`: the send-once right a no-senders notification goes
     /// to, or the kernel's own arming for a kernel object.
     pub nsrequest: Option<ObjId>,
     pub nsrequest_kobject: bool,
+    /// A labeled control port's immovable equivalent (`ikol_alt_port`,
+    /// `IPC_LABEL_SUBST_TASK`/`_THREAD`): what a send right to it becomes
+    /// when copied out into its own task's space.
+    pub subst: Option<ObjId>,
+    /// `ip_klist`: the EVFILT_MACHPORT knotes on the port.
+    pub knotes: u32,
     /// `ip_pdrequest`: where the receive right goes when destroyed.
     pub pdrequest: Option<ObjId>,
     /// `ip_requests`: the dead-name and send-possible request table, slot
@@ -219,9 +230,13 @@ impl Port {
             impdonation: false,
             no_grant: false,
             service_port: false,
+            bootstrap_port: false,
+            connection_port: false,
             sprequests: false,
             nsrequest: None,
             nsrequest_kobject: false,
+            subst: None,
+            knotes: 0,
             pdrequest: None,
             requests: None,
             psets: Vec::new(),
@@ -259,6 +274,8 @@ pub enum Notify {
     PortDeleted { to: ObjId, name: u32 },
     /// `MACH_NOTIFY_SEND_POSSIBLE` for `name`.
     SendPossible { to: ObjId, name: u32 },
+    /// A kernel object's port was destroyed (`iko_op_destroy`).
+    KobjectDestroyed { port: ObjId },
     /// `MACH_NOTIFY_PORT_DESTROYED`, carrying the receive right to `port`.
     PortDestroyed { to: ObjId, port: ObjId },
     /// `MACH_NOTIFY_NO_SENDERS` with the make-send count.
@@ -294,7 +311,15 @@ pub enum Guard {
     SendInvalidVoucher = 1 << 17,
     SendInvalidRight = 1 << 18,
     RcvInvalidName = 1 << 19,
+    ModRefsNonFatal = 1 << 21,
     RequireReplyPortSemantics = 1 << 23,
+}
+
+/// `MPG_FLAGS_MOD_REFS_PINNED_*`: what was done to a pinned right.
+pub mod mpg_pinned {
+    pub const DEALLOC: u64 = 0x01 << 56;
+    pub const DESTROY: u64 = 0x02 << 56;
+    pub const COPYIN: u64 = 0x04 << 56;
 }
 
 /// A task's IPC state: its objects and its name space.
@@ -311,6 +336,8 @@ pub struct Ipc {
     pub queues: msg::Queues,
     /// `ipc_port_timestamp`: a counter dead ports are stamped with.
     timestamp: u32,
+    /// `TASK_CONTROL_PORT_PINNED_HARD`: a pinned right's misuse is fatal.
+    pub pinned_hard: bool,
 }
 
 /// `ipc_port_request_table_next_size(2, osize, 16)` in entries (16-byte
@@ -534,6 +561,49 @@ impl Ipc {
     }
 
     /// `mach_port_guard_exception`: recorded for the kernel to raise.
+    /// `ipc_port_request_sparm`: arm the send-possible request at `index`
+    /// (a sender found the port full).
+    pub fn request_sparm(&mut self, port: ObjId, index: u32) {
+        let p = self.port_mut(port);
+        let r = &mut p.requests.as_mut().expect("a request table")[index as usize];
+        if r.spreq {
+            r.sparm = true;
+            p.sprequests = true;
+        }
+    }
+
+    /// `ipc_port_spnotify`: the port has room; every armed send-possible
+    /// request fires.
+    pub fn spnotify(&mut self, port: ObjId) {
+        if !self.port(port).sprequests {
+            return;
+        }
+        let p = self.port_mut(port);
+        p.sprequests = false;
+        if !p.active {
+            return;
+        }
+        let Some(table) = p.requests.as_mut() else { return };
+        let mut fired = Vec::new();
+        for r in table.iter_mut().skip(1) {
+            if name_valid(r.name) && r.sparm {
+                if let Some(to) = r.notify.take() {
+                    fired.push((to, r.name));
+                }
+            }
+        }
+        for (to, name) in fired {
+            self.outbox.push(Notify::SendPossible { to, name });
+        }
+    }
+
+    /// `mach_port_guard_exception_pinned`: a pinned control port's last
+    /// send right was asked to go.
+    pub fn guard_pinned(&mut self, name: u32, what: u64) {
+        let g = if self.pinned_hard { Guard::ModRefs } else { Guard::ModRefsNonFatal };
+        self.guard_exception(name, g, what);
+    }
+
     pub fn guard_exception(&mut self, name: u32, guard: Guard, portguard: u64) {
         self.guards.push((name, guard, portguard));
     }
@@ -603,6 +673,10 @@ impl Ipc {
                 }
             }
         }
+        // ipc_kobject_destroy: the object's destroy op (an mk_timer's).
+        if self.port(port).kobject == Some(Kobject::Timer) {
+            self.outbox.push(Notify::KobjectDestroyed { port });
+        }
         self.release(port);
     }
 
@@ -671,7 +745,7 @@ impl Ipc {
                 let port = e.object.expect("a port");
                 if t == ty::SEND {
                     if self.port(port).pinned {
-                        self.guard_exception(name, Guard::ModRefs, 0);
+                        self.guard_pinned(name, mpg_pinned::DESTROY);
                         return kr::INVALID_CAPABILITY;
                     }
                     self.space.hash_delete(port);
@@ -752,7 +826,7 @@ impl Ipc {
                 let mut request = None;
                 if e.urefs() == 1 {
                     if self.port(port).pinned {
-                        self.guard_exception(name, Guard::ModRefs, 0);
+                        self.guard_pinned(name, mpg_pinned::DEALLOC);
                         return kr::INVALID_CAPABILITY;
                     }
                     let p = self.port_mut(port);
@@ -930,7 +1004,7 @@ impl Ipc {
                 }
                 if urefs as i32 + delta == 0 {
                     if self.port(port).pinned {
-                        self.guard_exception(name, Guard::ModRefs, 0);
+                        self.guard_pinned(name, mpg_pinned::DEALLOC);
                         return kr::INVALID_CAPABILITY;
                     }
                     let p = self.port_mut(port);
@@ -1096,7 +1170,8 @@ impl Ipc {
                     return Ok(previous);
                 };
                 let p = self.port(port);
-                let full = p.messages.len() as u32 >= p.qlimit;
+                // ip_full: the queue's count, reservations included.
+                let full = p.msgcount >= p.qlimit;
                 if spreq && sparm && (e.bits & ty::SEND_ONCE != 0 || p.receiver == Receiver::Kernel || !full) {
                     if prev != 0 {
                         previous = self.port_request_cancel(port, prev);

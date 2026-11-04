@@ -180,6 +180,9 @@ pub struct Kmsg {
     pub sender: Sender,
     /// Auxiliary data (`MACH64_MSG_VECTOR`'s second vector).
     pub aux: Vec<u8>,
+    /// A kept-alive kernel message (`IPC_KMSG_ALLOC_USE_KEEP_ALIVE`): an
+    /// mk_timer's expiry message, reused once received.
+    pub keep_alive: bool,
 }
 
 /// What a receive came to, for the receiving thread
@@ -343,13 +346,16 @@ impl Ipc {
             let Some((t, obj)) = self.identify_receiver(port, &skip) else {
                 let p = self.port_mut(port);
                 p.messages.push_back(kmsg);
+                let has_knotes = p.knotes != 0;
                 for s in p.psets.clone() {
                     let q = self.queues.preposts.entry(s).or_default();
                     if !q.contains(&port) {
                         q.push_back(port);
                     }
                 }
-                self.queues.knotes.push(port);
+                if has_knotes {
+                    self.queues.knotes.push(port);
+                }
                 return;
             };
             let w = self.queues.rcv_wait[&t];

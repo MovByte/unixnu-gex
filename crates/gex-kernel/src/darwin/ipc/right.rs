@@ -67,6 +67,9 @@ pub struct CopyinFlags {
     pub allow_reply_make_send_once: bool,
     pub allow_reply_move_send_once: bool,
     pub allow_dead_send_once: bool,
+    /// `IPC_OBJECT_COPYIN_FLAGS_ALLOW_CONN_IMMOVABLE_RECEIVE`: a message's
+    /// descriptors may move a libxpc connection port's receive right.
+    pub allow_conn_immovable_receive: bool,
 }
 
 /// `MACH_MSG_GUARD_FLAGS_*`.
@@ -182,7 +185,17 @@ impl Ipc {
                     self.guard_exception(name, Guard::Immovable, 0);
                     return Err(kr::INVALID_CAPABILITY);
                 }
-                if (!flags.allow_immovable_receive && p.immovable_receive) || p.reply_port || p.specialreply {
+                // Only a service port that is not a bootstrap port, or a
+                // libxpc connection port, may have its immovable receive
+                // right moved, and only when the caller allows it.
+                let allow_imm_recv = if p.service_port && !p.bootstrap_port {
+                    flags.allow_immovable_receive
+                } else if p.connection_port {
+                    flags.allow_conn_immovable_receive
+                } else {
+                    false
+                };
+                if (!allow_imm_recv && p.immovable_receive) || p.reply_port || p.specialreply {
                     self.guard_exception(name, Guard::Immovable, 0);
                     return Err(kr::INVALID_CAPABILITY);
                 }
@@ -264,7 +277,7 @@ impl Ipc {
                                 self.reference(port);
                             } else {
                                 if self.port(port).pinned {
-                                    self.guard_exception(name, Guard::ModRefs, 0);
+                                    self.guard_pinned(name, super::mpg_pinned::COPYIN);
                                     return Err(kr::INVALID_CAPABILITY);
                                 }
                                 request = self.right_request_cancel_pub(port, name);
@@ -418,10 +431,22 @@ impl Ipc {
     /// `ipc_object_copyout`: carried right `t` into the space, under the
     /// name it already has there (send rights coalesce) or a new one.
     pub fn object_copyout(&mut self, c: Carried, t: u32, guard: Option<(&mut u32, &mut u64, u64)>) -> Result<u32, u64> {
-        let Carried::Port(port) = c else { return Ok(super::PORT_DEAD) };
+        let Carried::Port(mut port) = c else { return Ok(super::PORT_DEAD) };
         if !self.port(port).active {
             self.object_destroy(c, t);
             return Err(kr::INVALID_CAPABILITY);
+        }
+        // ipc_kobject_label_check: a labeled control port is substituted
+        // by its immovable equivalent, the space being its task's; any
+        // right but a send right to it is refused.
+        if let Some(alt) = self.port(port).subst {
+            if t != msgt::PORT_SEND {
+                self.object_destroy(c, t);
+                return Err(kr::INVALID_CAPABILITY);
+            }
+            self.release_send(port);
+            self.make_send(alt);
+            port = alt;
         }
         let name = match (t != msgt::PORT_SEND_ONCE).then(|| self.right_reverse(port)).flatten() {
             Some(n) => n,

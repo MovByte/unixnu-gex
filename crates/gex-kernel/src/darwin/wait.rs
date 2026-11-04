@@ -57,6 +57,11 @@ impl Waits {
         self.slots.get(&tid).is_some_and(|s| s.waiting)
     }
 
+    /// How many threads are in a wait.
+    pub fn waiting_count(&self) -> usize {
+        self.slots.values().filter(|s| s.waiting).count()
+    }
+
     /// Forget a thread that has ended, its word back to the free list.
     pub fn forget(&mut self, tid: i32) {
         if let Some(s) = self.slots.remove(&tid) {
@@ -130,11 +135,7 @@ impl Kernel {
     fn darwin_sleep(&mut self, m: &mut GuestMem<'_>, word: u64, wait: Wait) -> SyscallOutcome {
         let val = m.read_u32(word).unwrap_or(0);
         let now = Instant::now();
-        let until = match (wait.deadline, self.darwin_next_timer()) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
-        let deadline = until.map(|t| t.saturating_duration_since(now));
+        let deadline = wait.deadline.map(|t| t.saturating_duration_since(now));
         self.darwin_finish = Some(wait);
         let table = std::sync::Arc::clone(&self.futexes);
         let parked = Some(table.park(word));
@@ -158,11 +159,9 @@ impl Kernel {
 
     /// A blocked Darwin wait's end: the result a waker left, or else the
     /// deadline or a signal. A wake with no result (one meant for an earlier
-    /// wait of the thread) or a wake for a timer the kernel had to fire
-    /// sleeps again.
-    pub(crate) fn darwin_wait_end(&mut self, m: &mut GuestMem<'_>, r: Result<u64, Errno>) -> End {
+    /// wait of the thread) sleeps again.
+    pub(crate) fn darwin_wait_end(&mut self, r: Result<u64, Errno>) -> End {
         let Some(wait) = self.darwin_finish.take() else { return End::NotDarwin };
-        self.darwin_fire_timers(m);
         let tid = self.tid;
         let slot = self.dtask.waits.slots.get_mut(&tid).expect("a waiting thread has a slot");
         if let Some(res) = slot.result.take() {
@@ -182,8 +181,8 @@ impl Kernel {
     }
 
     /// Run an ended wait's continuation: the blocked call's result.
-    pub(crate) fn darwin_wait_done(&mut self, m: &mut GuestMem<'_>, wait: Wait, res: WaitResult) {
-        self.darwin_thread_wait_done(m, wait.cont, res);
+    pub(crate) fn darwin_wait_done(&mut self, m: &mut GuestMem<'_>, wait: Wait, res: WaitResult) -> Option<SyscallOutcome> {
+        self.darwin_thread_wait_done(m, wait.cont, res)
     }
 
     /// Sleep again for a wait that has not ended ([`End::Again`]).

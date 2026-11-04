@@ -227,7 +227,7 @@ pub struct Psynch {
 
 /// Seconds of uptime, as `microuptime` gives them.
 fn uptime_secs() -> u64 {
-    super::mach::monotonic_ns() / 1_000_000_000
+    super::mach::uptime().as_secs()
 }
 
 /// How a blocked psynch call finishes.
@@ -1084,8 +1084,8 @@ impl Kernel {
             return Err(Errno::EINVAL);
         }
         let th = if threadport != 0 {
-            match self.darwin_ports.get(threadport) {
-                Some(super::mach::Port::Thread(t)) => Some(*t),
+            match self.darwin_name_to_thread(threadport) {
+                Some(t) => Some(t),
                 _ => return Err(Errno::ESRCH),
             }
         } else {

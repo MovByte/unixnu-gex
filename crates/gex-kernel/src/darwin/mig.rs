@@ -1,10 +1,12 @@
-//! The kernel's MIG servers: requests sent to a kernel object's port (the
-//! task, the host, a thread), answered in place.
-//!
-//! A client sends a request and receives the reply in one `mach_msg`; the
-//! reply goes back into its receive buffer with the request's id plus 100,
-//! an NDR record, the return code and the routine's out arguments, laid out
-//! as MIG's generated client code checks them.
+//! The kernel's MIG routines: requests sent to the task's, host's, a
+//! thread's, the clock's or a semaphore's port, decoded from the request
+//! message and answered as MIG's generated kernel server code answers them.
+
+use super::ipc::msg::{Desc, Kmsg};
+use super::ipc::right::Carried;
+use super::ipc::{kr, Kobject};
+use super::kobject::{Reply, MIG_BAD_ID};
+use crate::syscalls::Kernel;
 
 /// `mach_msg_header_t` and the NDR record after it.
 pub const HEADER: usize = 24;
@@ -13,92 +15,27 @@ pub const NDR: usize = 8;
 /// The NDR record every MIG message carries: little-endian, IEEE floats.
 pub const NDR_RECORD: [u8; 8] = [0, 0, 0, 0, 1, 0, 0, 0];
 
-/// `MACH_MSGH_BITS(0, MACH_MSG_TYPE_PORT_SEND_ONCE)`: a reply as received.
-pub const REPLY_BITS: u32 = 18 << 8;
-/// `MACH_MSGH_BITS_COMPLEX`: descriptors follow the header.
-pub const COMPLEX: u32 = 0x8000_0000;
-/// `MACH_MSG_TYPE_PORT_SEND`: a send right, as a receiver sees one moved
-/// to it.
-pub const PORT_SEND: u8 = 17;
+/// `kern_return_t`s as MIG return codes.
+const KERN_SUCCESS: i32 = 0;
+const KERN_INVALID_ARGUMENT: i32 = 4;
+const KERN_FAILURE: i32 = 5;
+const KERN_RESOURCE_SHORTAGE: i32 = 6;
+const KERN_NO_ACCESS: i32 = 8;
+const KERN_INVALID_RIGHT: i32 = 17;
+const KERN_NOT_SUPPORTED: i32 = 46;
+/// `MIG_BAD_ARGUMENTS`: a request without the routine's shape.
+const MIG_BAD_ARGUMENTS: i32 = -304;
 
-/// `MIG_BAD_ID`: no such routine.
-pub const MIG_BAD_ID: i32 = -303;
-
-/// `kern_return_t`s routines return.
-pub const KERN_SUCCESS: i32 = 0;
-pub const KERN_INVALID_ARGUMENT: i32 = 4;
-pub const KERN_FAILURE: i32 = 5;
-
-/// The kernel object a request was sent to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Object {
-    Task,
-    Host,
-    Thread(i32),
-    Clock,
+/// The machine the profile describes, as the host routines report it.
+pub mod machine {
+    pub const NCPUS: u32 = 2;
+    pub const MEMORY: u64 = 4 << 30;
+    pub const CPU_TYPE_ARM64: u32 = 0x0100_000c;
+    pub const PAGE_SIZE: u32 = 4096;
 }
 
-/// A routine's outcome: its return code and the out arguments after it,
-/// or (a routine that returns rights) the send rights it hands back.
-pub struct Reply {
-    pub ret: i32,
-    pub out: Vec<u8>,
-    pub ports: Vec<u32>,
-    /// What the routine was asked that it does not do, for the kernel to
-    /// report ([`crate::syscalls::Kernel::darwin_unimplemented`]).
-    pub unimplemented: Option<String>,
-}
-
-impl Reply {
-    fn ok(out: Vec<u8>) -> Reply {
-        Reply { ret: KERN_SUCCESS, out, ports: Vec::new(), unimplemented: None }
-    }
-
-    fn err(ret: i32) -> Reply {
-        Reply { ret, out: Vec::new(), ports: Vec::new(), unimplemented: None }
-    }
-
-    fn port(name: u32) -> Reply {
-        Reply { ret: KERN_SUCCESS, out: Vec::new(), ports: vec![name], unimplemented: None }
-    }
-
-    /// The whole reply message, to the request's reply port `local`. A
-    /// successful reply carrying rights is complex: a descriptor count and
-    /// one port descriptor per right, with no return code.
-    pub fn message(&self, id: i32, local: u32) -> Vec<u8> {
-        if self.ret == KERN_SUCCESS && !self.ports.is_empty() {
-            let size = HEADER + 4 + 12 * self.ports.len() + self.out.len();
-            let mut m = Vec::with_capacity(size);
-            for w in [REPLY_BITS | COMPLEX, size as u32, 0, local, 0, (id + 100) as u32, self.ports.len() as u32] {
-                m.extend_from_slice(&w.to_le_bytes());
-            }
-            for &name in &self.ports {
-                m.extend_from_slice(&name.to_le_bytes());
-                m.extend_from_slice(&0u32.to_le_bytes());
-                m.extend_from_slice(&0u16.to_le_bytes());
-                m.push(PORT_SEND);
-                m.push(0); // MACH_MSG_PORT_DESCRIPTOR
-            }
-            m.extend_from_slice(&self.out);
-            return m;
-        }
-        let size = HEADER + NDR + 4 + self.out.len();
-        let mut m = Vec::with_capacity(size);
-        m.extend_from_slice(&REPLY_BITS.to_le_bytes());
-        m.extend_from_slice(&(size as u32).to_le_bytes());
-        m.extend_from_slice(&0u32.to_le_bytes());
-        m.extend_from_slice(&local.to_le_bytes());
-        m.extend_from_slice(&0u32.to_le_bytes());
-        m.extend_from_slice(&(id + 100).to_le_bytes());
-        m.extend_from_slice(&NDR_RECORD);
-        m.extend_from_slice(&self.ret.to_le_bytes());
-        m.extend_from_slice(&self.out);
-        m
-    }
-}
-
-fn i32_at(b: &[u8], o: usize) -> i32 {
-    b.get(o..o + 4).map_or(0, |s| i32::from_le_bytes(s.try_into().unwrap()))
+fn i32_at(b: &[u8], o: usize) -> Option<i32> {
+    b.get(o..o + 4).map(|s| i32::from_le_bytes(s.try_into().unwrap()))
 }
 
 /// An out array of `integer_t`s, MIG-style: its count, then the words.
@@ -110,72 +47,99 @@ fn words(w: &[u32]) -> Vec<u8> {
     o
 }
 
-/// The machine the profile describes, as the host routines report it.
-pub mod machine {
-    pub const NCPUS: u32 = 2;
-    pub const MEMORY: u64 = 4 << 30;
-    pub const CPU_TYPE_ARM64: u32 = 0x0100_000c;
-    pub const PAGE_SIZE: u32 = 4096;
+/// The `i`th in argument after the NDR record of a simple request.
+fn arg(req: &Kmsg, i: usize) -> Option<i32> {
+    i32_at(&req.body, NDR + 4 * i)
 }
 
-/// What the routines read of the process, and where they make names.
-pub struct Task<'a> {
-    /// dyld's `dyld_all_image_infos`, once registered.
-    pub dyld_infos: u64,
-    pub ports: &'a mut super::mach::Space,
-    pub threads: &'a mut super::thread::Threads,
-    /// Threads a routine started, for the host to run.
-    pub spawns: &'a mut Vec<crate::syscalls::SpawnRequest>,
+/// The right in a complex request's `i`th port descriptor.
+fn desc_port(req: &Kmsg, i: usize) -> Option<(Option<Carried>, u32)> {
+    match req.descs.get(i)? {
+        Desc::Port { right, disp, .. } => Some((*right, *disp)),
+        _ => None,
+    }
 }
 
-/// Answer request `id` with body `body` (after the header) sent to `obj`.
-pub fn serve(obj: Object, id: i32, body: &[u8], task: Task<'_>) -> Reply {
-    // The in arguments start after the NDR record.
-    let arg = |i: usize| i32_at(body, NDR + 4 * i);
-    match (obj, id) {
-        // host_info(host, flavor, out, count)
-        (Object::Host, 200) => host_info(arg(0)),
+/// The `i`th in argument after a complex request's descriptors (and their
+/// NDR record).
+fn arg_after(req: &Kmsg, ndesc: usize, i: usize) -> Option<i32> {
+    i32_at(&req.body, 4 + 12 * ndesc + NDR + 4 * i)
+}
+
+/// Answer request `req` sent to kernel object `obj`.
+pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
+    let bad = || Reply::err(MIG_BAD_ARGUMENTS);
+    match (obj, req.id) {
+        // host_info(host, flavor, out, &count)
+        (Kobject::Host | Kobject::HostPriv, 200) => match (arg(req, 0), arg(req, 1)) {
+            (Some(flavor), Some(count)) => host_info(flavor, count as u32),
+            _ => bad(),
+        },
         // host_page_size(host) -> vm_size_t
-        (Object::Host, 202) => Reply::ok(u64::from(machine::PAGE_SIZE).to_le_bytes().to_vec()),
-        // task_info(task, flavor, out, count)
-        (Object::Task, 3405) => task_info(arg(0), task.dyld_infos),
+        (Kobject::Host | Kobject::HostPriv, 202) => Reply::ok(u64::from(machine::PAGE_SIZE).to_le_bytes().to_vec()),
+        // host_get_clock_service(host, clock_id) -> clock_serv_t: the system
+        // clock (SYSTEM_CLOCK) or the calendar (CALENDAR_CLOCK).
+        (Kobject::Host | Kobject::HostPriv, 206) => match arg(req, 0) {
+            Some(0) | Some(1) => {
+                let p = k.darwin_clock_port();
+                k.dtask.ipc.make_send(p);
+                Reply::port(Carried::Port(p))
+            }
+            Some(_) => Reply::err(KERN_INVALID_ARGUMENT),
+            None => bad(),
+        },
+        // clock_get_time(clock) -> mach_timespec_t
+        (Kobject::Clock, 1000) => {
+            let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+            let mut o = (t.as_secs() as u32).to_le_bytes().to_vec();
+            o.extend_from_slice(&(t.subsec_nanos() as i32).to_le_bytes());
+            Reply::ok(o)
+        }
+        // task_info(task, flavor, out, &count)
+        (Kobject::Task, 3405) => match (arg(req, 0), arg(req, 1)) {
+            (Some(flavor), Some(count)) => task_info(flavor, count as u32, k.darwin_dyld_infos),
+            _ => bad(),
+        },
+        // task_get_special_port(task, which) -> port
+        (Kobject::Task, 3409) => match arg(req, 0) {
+            Some(which) => task_get_special_port(k, which),
+            None => bad(),
+        },
+        // task_set_special_port(task, which, port)
+        (Kobject::Task, 3410) => match (desc_port(req, 0), arg_after(req, 1, 0)) {
+            (Some((right, _)), Some(which)) => task_set_special_port(k, which, right),
+            _ => bad(),
+        },
         // semaphore_create(task, policy, value) -> semaphore_t
-        (Object::Task, 3418) => Reply::port(task.ports.semaphore(i64::from(arg(1)))),
-        // semaphore_destroy(task, semaphore): the name is in the
-        // request's port descriptor, after the descriptor count.
-        (Object::Task, 3419) => {
-            let name = i32_at(body, 4) as u32;
-            if task.ports.remove(name) {
-                Reply::ok(Vec::new())
-            } else {
-                Reply::err(KERN_INVALID_ARGUMENT)
+        (Kobject::Task, 3418) => match (arg(req, 0), arg(req, 1)) {
+            (Some(policy), Some(value)) => match k.semaphore_create(policy, value) {
+                Ok(p) => Reply::port(Carried::Port(p)),
+                Err(e) => Reply::err(e as i32),
+            },
+            _ => bad(),
+        },
+        // semaphore_destroy(task, semaphore): the send right in the request
+        // is consumed.
+        (Kobject::Task, 3419) => match desc_port(req, 0) {
+            Some((Some(Carried::Port(p)), disp)) => {
+                let r = k.semaphore_destroy(p);
+                if r == kr::SUCCESS {
+                    k.dtask.ipc.object_destroy(Carried::Port(p), disp);
+                }
+                Reply::err(r as i32)
             }
-        }
-        // task_get_special_port(task, which) -> port. The task's own and the
-        // host's are real; the bootstrap port (launchd's) and the rest are
-        // MACH_PORT_NULL until launchd runs.
-        (Object::Task, 3409) => {
-            const TASK_KERNEL_PORT: i32 = 1;
-            const TASK_HOST_PORT: i32 = 2;
-            const TASK_NAME_PORT: i32 = 3;
-            match arg(0) {
-                TASK_KERNEL_PORT | TASK_NAME_PORT => Reply::port(super::mach::TASK_SELF_NAME),
-                TASK_HOST_PORT => Reply::port(super::mach::HOST_SELF_NAME),
-                _ => Reply::port(0),
-            }
-        }
-        // task_set_special_port(task, which, port): nothing reads them back
-        // but task_get_special_port, which answers from its own table.
-        (Object::Task, 3410) => Reply::ok(Vec::new()),
-        // task_restartable_ranges_register / _synchronize: code the kernel
-        // must restart if it preempts a thread inside. Nothing is
-        // preempted mid-block here, so there is nothing to restart.
-        (Object::Task, 8000) | (Object::Task, 8001) => Reply::ok(Vec::new()),
-        // thread_suspend(thread) (`thread_act.defs`): one more user stop.
-        // A thread made suspended has not run, so there is nothing to wait
-        // for; one that runs would have to be stopped where it is.
-        (Object::Thread(t), 3605) => {
-            let th = task.threads.map.entry(t).or_default();
+            Some(_) => Reply::err(KERN_INVALID_ARGUMENT),
+            None => bad(),
+        },
+        // task_restartable_ranges_register(task, ranges, count) and
+        // task_restartable_ranges_synchronize(task).
+        (Kobject::Task, 8000) => restartable_register(k, req),
+        (Kobject::Task, 8001) => Reply::ok(Vec::new()),
+        // thread_suspend(thread) (`thread_act.defs`): one more user stop. A
+        // thread made suspended has not run, so nothing waits for it to
+        // stop; one that runs would have to be stopped where it is.
+        (Kobject::Thread(t), 3605) => {
+            let th = k.dtask.threads.map.entry(*t).or_default();
             if th.unstarted.is_none() {
                 let mut r = Reply::err(KERN_FAILURE);
                 r.unimplemented = Some("thread_suspend of a running thread".into());
@@ -184,122 +148,239 @@ pub fn serve(obj: Object, id: i32, body: &[u8], task: Task<'_>) -> Reply {
             th.suspend += 1;
             Reply::ok(Vec::new())
         }
-        // thread_resume(thread): one user stop fewer; at none, a thread
-        // that has never run starts.
-        (Object::Thread(t), 3606) => {
-            let th = task.threads.map.entry(t).or_default();
+        // thread_resume(thread): one user stop fewer; at none, a thread that
+        // has never run starts.
+        (Kobject::Thread(t), 3606) => {
+            let th = k.dtask.threads.map.entry(*t).or_default();
             if th.suspend == 0 {
                 return Reply::err(KERN_FAILURE);
             }
             th.suspend -= 1;
             if th.suspend == 0 {
-                if let Some(req) = th.unstarted.take() {
-                    task.spawns.push(req);
+                if let Some(r) = th.unstarted.take() {
+                    k.dtask.spawns.push(r);
                 }
             }
             Reply::ok(Vec::new())
         }
-        // host_get_clock_service(host, clock_id) -> clock_serv_t
-        (Object::Host, 206) => Reply::port(task.ports.clock()),
-        // clock_get_time(clock) -> mach_timespec_t
-        (Object::Clock, 1000) => {
-            let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-            let mut o = (t.as_secs() as u32).to_le_bytes().to_vec();
-            o.extend_from_slice(&(t.subsec_nanos() as i32).to_le_bytes());
-            Reply::ok(o)
+        (o, id) => {
+            let mut r = Reply::err(MIG_BAD_ID);
+            r.unimplemented = Some(format!("MIG routine {id} on {o:?}"));
+            r
         }
-        _ => Reply::err(MIG_BAD_ID),
     }
 }
 
-fn host_info(flavor: i32) -> Reply {
+/// `host_info`, with the caller's count checked as XNU checks it.
+fn host_info(flavor: i32, count: u32) -> Reply {
     use machine::*;
     const HOST_BASIC_INFO: i32 = 1;
     const HOST_SCHED_INFO: i32 = 3;
+    const HOST_RESOURCE_SIZES: i32 = 4;
     const HOST_PRIORITY_INFO: i32 = 5;
+    const HOST_SEMAPHORE_TRAPS: i32 = 7;
+    const HOST_MACH_MSG_TRAP: i32 = 8;
     const HOST_PREFERRED_USER_ARCH: i32 = 12;
     let mem32 = MEMORY.min(u64::from(u32::MAX)) as u32;
     match flavor {
-        // max_cpus, avail_cpus, memory_size, cpu_type, cpu_subtype,
-        // cpu_threadtype, physical_cpu, physical_cpu_max, logical_cpu,
-        // logical_cpu_max, max_mem (two words).
-        HOST_BASIC_INFO => Reply::ok(words(&[
-            NCPUS,
-            NCPUS,
-            mem32,
-            CPU_TYPE_ARM64,
-            0,
-            0,
-            NCPUS,
-            NCPUS,
-            NCPUS,
-            NCPUS,
-            MEMORY as u32,
-            (MEMORY >> 32) as u32,
-        ])),
-        // min_timeout, min_quantum (milliseconds).
-        HOST_SCHED_INFO => Reply::ok(words(&[10, 10])),
-        // kernel, system, server, user, depress, idle, minimum, maximum.
-        HOST_PRIORITY_INFO => Reply::ok(words(&[95, 81, 63, 31, 0, 0, 0, 127])),
-        HOST_PREFERRED_USER_ARCH => Reply::ok(words(&[CPU_TYPE_ARM64, 0])),
-        _ => Reply::err(KERN_INVALID_ARGUMENT),
-    }
-}
-
-fn task_info(flavor: i32, dyld_infos: u64) -> Reply {
-    const TASK_DYLD_INFO: i32 = 17;
-    /// `sizeof(struct dyld_all_image_infos)` for a 64-bit process.
-    const ALL_IMAGE_INFOS_SIZE: u32 = 0x170;
-    match flavor {
-        // all_image_info_addr, all_image_info_size (8 bytes each),
-        // all_image_info_format (TASK_DYLD_ALL_IMAGE_INFO_64).
-        TASK_DYLD_INFO => {
-            let a = dyld_infos;
-            let size = if a == 0 { 0 } else { ALL_IMAGE_INFOS_SIZE };
-            Reply::ok(words(&[a as u32, (a >> 32) as u32, size, 0, 1]))
+        // max_cpus, avail_cpus, memory_size, cpu_type, cpu_subtype, then
+        // with room cpu_threadtype, physical_cpu, physical_cpu_max,
+        // logical_cpu, logical_cpu_max, max_mem.
+        HOST_BASIC_INFO => {
+            if count < 5 {
+                return Reply::err(KERN_FAILURE);
+            }
+            let mut w = vec![NCPUS, NCPUS, mem32, CPU_TYPE_ARM64, 0];
+            if count >= 12 {
+                w.extend([0, NCPUS, NCPUS, NCPUS, NCPUS, MEMORY as u32, (MEMORY >> 32) as u32]);
+            }
+            Reply::ok(words(&w))
+        }
+        // min_timeout, min_quantum: the 10 ms quantum, in milliseconds.
+        HOST_SCHED_INFO => {
+            if count < 2 {
+                return Reply::err(KERN_FAILURE);
+            }
+            Reply::ok(words(&[10, 10]))
+        }
+        HOST_RESOURCE_SIZES => Reply::err(if count < 5 { KERN_FAILURE } else { KERN_INVALID_ARGUMENT }),
+        // MINPRI_KERNEL, MINPRI_KERNEL, MINPRI_RESERVED, BASEPRI_DEFAULT,
+        // DEPRESSPRI, IDLEPRI, MINPRI_USER, MAXPRI_RESERVED.
+        HOST_PRIORITY_INFO => {
+            if count < 8 {
+                return Reply::err(KERN_FAILURE);
+            }
+            Reply::ok(words(&[80, 80, 64, 31, 0, 0, 0, 79]))
+        }
+        HOST_SEMAPHORE_TRAPS | HOST_MACH_MSG_TRAP => Reply::ok(words(&[])),
+        HOST_PREFERRED_USER_ARCH => {
+            if count < 2 {
+                return Reply::err(KERN_FAILURE);
+            }
+            Reply::ok(words(&[CPU_TYPE_ARM64, 0]))
         }
         _ => Reply::err(KERN_INVALID_ARGUMENT),
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn host_basic_info_replies_as_mig_expects() {
-        let mut body = NDR_RECORD.to_vec();
-        body.extend_from_slice(&1i32.to_le_bytes());
-        body.extend_from_slice(&12u32.to_le_bytes());
-        let mut sp = super::super::mach::Space::default();
-        let r = serve(Object::Host, 200, &body, Task { dyld_infos: 0, ports: &mut sp, threads: &mut Default::default(), spawns: &mut Vec::new() });
-        assert_eq!(r.ret, KERN_SUCCESS);
-        let m = r.message(200, 0x703);
-        assert_eq!(i32_at(&m, 20), 300, "id + 100");
-        assert_eq!(i32_at(&m, 4) as usize, m.len(), "msgh_size");
-        assert_eq!(i32_at(&m, 12), 0x703, "to the reply port");
-        assert_eq!(i32_at(&m, HEADER + NDR), 0, "RetCode");
-        assert_eq!(i32_at(&m, HEADER + NDR + 4), 12, "count");
-        assert_eq!(i32_at(&m, HEADER + NDR + 8), 2, "max_cpus");
+/// `task_info`, with the caller's count checked as XNU checks it.
+fn task_info(flavor: i32, count: u32, dyld_infos: u64) -> Reply {
+    const TASK_DYLD_INFO: i32 = 17;
+    const TASK_DYLD_INFO_COUNT: u32 = 5;
+    const TASK_LEGACY_DYLD_INFO_COUNT: u32 = 4;
+    /// `sizeof(struct dyld_all_image_infos)` for a 64-bit process.
+    const ALL_IMAGE_INFOS_SIZE: u32 = 0x170;
+    match flavor {
+        // all_image_info_addr and all_image_info_size (8 bytes each), and
+        // with room all_image_info_format (TASK_DYLD_ALL_IMAGE_INFO_64).
+        TASK_DYLD_INFO => {
+            if count < TASK_LEGACY_DYLD_INFO_COUNT {
+                return Reply::err(KERN_INVALID_ARGUMENT);
+            }
+            let a = dyld_infos;
+            let size = if a == 0 { 0 } else { ALL_IMAGE_INFOS_SIZE };
+            let mut w = vec![a as u32, (a >> 32) as u32, size, 0];
+            if count >= TASK_DYLD_INFO_COUNT {
+                w.push(1);
+            }
+            Reply::ok(words(&w))
+        }
+        _ => {
+            let mut r = Reply::err(KERN_INVALID_ARGUMENT);
+            r.unimplemented = Some(format!("task_info flavor {flavor}"));
+            r
+        }
     }
+}
 
-    #[test]
-    fn an_unknown_routine_is_mig_bad_id() {
-        let mut sp = super::super::mach::Space::default();
-        let r = serve(Object::Task, 9999, &NDR_RECORD, Task { dyld_infos: 0, ports: &mut sp, threads: &mut Default::default(), spawns: &mut Vec::new() });
-        assert_eq!(r.ret, MIG_BAD_ID);
-        assert_eq!(r.message(9999, 1).len(), HEADER + NDR + 4);
+/// `task_get_special_port_internal` for the control flavor.
+fn task_get_special_port(k: &mut Kernel, which: i32) -> Reply {
+    const TASK_KERNEL_PORT: i32 = 1;
+    const TASK_HOST_PORT: i32 = 2;
+    const TASK_NAME_PORT: i32 = 3;
+    const TASK_BOOTSTRAP_PORT: i32 = 4;
+    const TASK_INSPECT_PORT: i32 = 5;
+    const TASK_READ_PORT: i32 = 6;
+    const TASK_ACCESS_PORT: i32 = 9;
+    const TASK_DEBUG_CONTROL_PORT: i32 = 10;
+    const TASK_RESOURCE_NOTIFY_PORT: i32 = 11;
+    match which {
+        TASK_KERNEL_PORT => {
+            let p = k.darwin_task_port();
+            k.dtask.ipc.copy_send(p);
+            Reply::port(Carried::Port(p))
+        }
+        TASK_HOST_PORT => {
+            let p = k.darwin_host_port();
+            k.dtask.ipc.copy_send(p);
+            Reply::port(Carried::Port(p))
+        }
+        TASK_NAME_PORT => {
+            let p = match k.dtask.kports.task_name {
+                Some(p) => p,
+                None => {
+                    let p = k.dtask.ipc.kobject_port(Kobject::TaskName);
+                    k.dtask.kports.task_name = Some(p);
+                    p
+                }
+            };
+            k.dtask.ipc.make_send(p);
+            Reply::port(Carried::Port(p))
+        }
+        // ipc_port_copy_send_mqueue: a copy of what was set; null when
+        // nothing was, dead when it died.
+        TASK_BOOTSTRAP_PORT | TASK_ACCESS_PORT | TASK_DEBUG_CONTROL_PORT | TASK_RESOURCE_NOTIFY_PORT => match k.dtask.kports.special.get(&which).copied() {
+            Some(p) if k.dtask.ipc.port(p).active => {
+                k.dtask.ipc.copy_send(p);
+                Reply::port(Carried::Port(p))
+            }
+            Some(_) => Reply { ret: KERN_SUCCESS, out: Vec::new(), ports: Vec::new(), unimplemented: None }.with_null_port(super::ipc::PORT_DEAD),
+            None => Reply { ret: KERN_SUCCESS, out: Vec::new(), ports: Vec::new(), unimplemented: None }.with_null_port(0),
+        },
+        TASK_INSPECT_PORT | TASK_READ_PORT => {
+            let mut r = Reply::err(KERN_INVALID_ARGUMENT);
+            r.unimplemented = Some("task inspect and read ports".into());
+            r
+        }
+        _ => Reply::err(KERN_INVALID_ARGUMENT),
     }
+}
 
-    #[test]
-    fn a_returned_right_makes_a_complex_reply() {
-        let mut sp = super::super::mach::Space::default();
-        let r = serve(Object::Host, 206, &NDR_RECORD, Task { dyld_infos: 0, ports: &mut sp, threads: &mut Default::default(), spawns: &mut Vec::new() });
-        let m = r.message(206, 0x703);
-        assert_eq!(m.len(), 40);
-        assert_eq!(i32_at(&m, 0) as u32 & COMPLEX, COMPLEX);
-        assert_eq!(i32_at(&m, 24), 1, "one descriptor");
-        assert_eq!(m[24 + 4 + 10], PORT_SEND);
-        assert_eq!(sp.get(i32_at(&m, 28) as u32), Some(&super::super::mach::Port::Clock));
+/// `task_set_special_port`: KERNEL and HOST are refused (no CSR on iOS);
+/// the rest replace what was set, the old send right released.
+fn task_set_special_port(k: &mut Kernel, which: i32, right: Option<Carried>) -> Reply {
+    const TASK_KERNEL_PORT: i32 = 1;
+    const TASK_HOST_PORT: i32 = 2;
+    const TASK_BOOTSTRAP_PORT: i32 = 4;
+    const TASK_ACCESS_PORT: i32 = 9;
+    const TASK_DEBUG_CONTROL_PORT: i32 = 10;
+    const TASK_RESOURCE_NOTIFY_PORT: i32 = 11;
+    let port = match right {
+        Some(Carried::Port(p)) => Some(p),
+        _ => None,
+    };
+    if let Some(p) = port {
+        if k.dtask.ipc.port(p).immovable_send {
+            return Reply::err(KERN_INVALID_RIGHT);
+        }
     }
+    match which {
+        TASK_KERNEL_PORT | TASK_HOST_PORT => Reply::err(KERN_NO_ACCESS),
+        TASK_BOOTSTRAP_PORT | TASK_DEBUG_CONTROL_PORT | TASK_RESOURCE_NOTIFY_PORT | TASK_ACCESS_PORT => {
+            if which == TASK_ACCESS_PORT && k.dtask.kports.special.get(&which).is_some_and(|&p| k.dtask.ipc.port(p).active) {
+                return Reply::err(KERN_NO_ACCESS);
+            }
+            let old = match port {
+                Some(p) => k.dtask.kports.special.insert(which, p),
+                None => k.dtask.kports.special.remove(&which),
+            };
+            if let Some(o) = old {
+                k.dtask.ipc.release_send(o);
+            }
+            Reply::ok(Vec::new())
+        }
+        _ => Reply::err(KERN_INVALID_ARGUMENT),
+    }
+}
+
+/// `task_restartable_ranges_register(task, ranges, count)`
+/// (`osfmk/kern/restartable.c`): ranges of `task_restartable_range_t`
+/// {location u64, length u16, recovery_offs u16, flags u32}, validated
+/// sorted, registered while the task has one thread and only once.
+fn restartable_register(k: &mut Kernel, req: &Kmsg) -> Reply {
+    const RR_RANGES_MAX: usize = 64;
+    const TASK_RESTARTABLE_OFFSET_MAX: u16 = 4096;
+    let Some(count) = arg(req, 0) else { return Reply::err(MIG_BAD_ARGUMENTS) };
+    let count = count as usize;
+    let base = NDR + 4;
+    let mut ranges = Vec::with_capacity(count);
+    for i in 0..count {
+        let o = base + 16 * i;
+        let Some(b) = req.body.get(o..o + 16) else { return Reply::err(MIG_BAD_ARGUMENTS) };
+        ranges.push((u64::from_le_bytes(b[0..8].try_into().unwrap()), u16::from_le_bytes([b[8], b[9]]), u16::from_le_bytes([b[10], b[11]]), u32::from_le_bytes(b[12..16].try_into().unwrap())));
+    }
+    // _ranges_validate
+    ranges.sort_by_key(|r| r.0);
+    if count == 0 {
+        return Reply::err(KERN_INVALID_ARGUMENT);
+    }
+    for (i, &(loc, len, rec, flags)) in ranges.iter().enumerate() {
+        if len > TASK_RESTARTABLE_OFFSET_MAX || rec > TASK_RESTARTABLE_OFFSET_MAX || flags != 0 {
+            return Reply::err(KERN_INVALID_ARGUMENT);
+        }
+        let (Some(end), Some(_)) = (loc.checked_add(u64::from(len)), loc.checked_add(u64::from(rec))) else {
+            return Reply::err(KERN_INVALID_ARGUMENT);
+        };
+        if ranges.get(i + 1).is_some_and(|n| end > n.0) {
+            return Reply::err(KERN_INVALID_ARGUMENT);
+        }
+    }
+    if k.live_threads.load(std::sync::atomic::Ordering::Acquire) > 1 || !k.dtask.kports.restartable.is_empty() {
+        return Reply::err(KERN_NOT_SUPPORTED);
+    }
+    if ranges.len() > RR_RANGES_MAX {
+        return Reply::err(KERN_RESOURCE_SHORTAGE);
+    }
+    k.dtask.kports.restartable = ranges.into_iter().map(|(l, n, r, f)| (l, n, r, f)).collect();
+    Reply::ok(Vec::new())
 }

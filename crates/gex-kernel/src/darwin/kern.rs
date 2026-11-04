@@ -140,7 +140,7 @@ fn darwin_gettimeofday(m: &mut GuestMem<'_>, tp: u64, tzp: u64, abs: u64) -> Res
         tv[8..12].copy_from_slice(&(now.subsec_micros() as i32).to_le_bytes());
         m.write(tp, &tv)?;
         if abs != 0 {
-            m.write_u64(abs, super::mach::monotonic_ns())?;
+            m.write_u64(abs, super::mach::absolute_time())?;
         }
     }
     if tzp != 0 {
@@ -168,6 +168,56 @@ impl Kernel {
             sys::FSGETPATH => res(self.darwin_fsgetpath(m, a)),
             sys::PROC_INFO => res(self.darwin_proc_info(m, a)),
             sys::GETTIMEOFDAY => res(darwin_gettimeofday(m, a[0], a[1], a[2])),
+            // A new mapping's entries have the default maximum protection.
+            sys::MMAP => {
+                let mut b = *a;
+                let n = super::bsd::translate(raw, &mut b);
+                match self.canonical(m, n, b) {
+                    Ok(at) => {
+                        use super::mach::PAGE_MASK;
+                        let end = at.saturating_add(a[1]).saturating_add(PAGE_MASK) & !PAGE_MASK;
+                        self.dtask.maxprot.clear(at & !PAGE_MASK, end);
+                        at
+                    }
+                    Err(e) => neg(e),
+                }
+            }
+            // munmap and mprotect (`kern_mman.c`) are mach_vm_deallocate
+            // and mach_vm_protect, with the address page aligned.
+            sys::MUNMAP => {
+                use super::mach::PAGE_MASK;
+                if a[0] & PAGE_MASK != 0 || a[0].checked_add(a[1]).is_none() || a[1] == 0 {
+                    return Some(neg(Errno::EINVAL));
+                }
+                match self.darwin_vm_deallocate(m, a[0], a[1]) {
+                    0 => 0,
+                    _ => neg(Errno::EINVAL),
+                }
+            }
+            sys::MPROTECT => {
+                use super::mach::{prot, PAGE_MASK};
+                const VM_PROT_TRUSTED: u64 = 0x20;
+                const VM_PROT_STRIP_READ: u64 = 0x80;
+                let mut p = a[2] as u32 as u64 & (prot::ALL | VM_PROT_TRUSTED | VM_PROT_STRIP_READ);
+                if a[0].checked_add(a[1]).is_none() || a[0] & PAGE_MASK != 0 {
+                    return Some(neg(Errno::EINVAL));
+                }
+                if p & (prot::EXECUTE | prot::WRITE) != 0 {
+                    p |= prot::READ;
+                }
+                // CONFIG_DYNAMIC_CODE_SIGNING is not in a RELEASE kernel.
+                if p & VM_PROT_TRUSTED != 0 {
+                    return Some(neg(Errno::EOPNOTSUPP));
+                }
+                // VM_PROT_STRIP_READ goes on to mach_vm_protect, which takes
+                // no such bit.
+                match self.vm_protect(m, a[0], a[1], false, p) {
+                    0 => 0,
+                    2 => neg(Errno::EACCES),
+                    1 => neg(Errno::ENOMEM),
+                    _ => neg(Errno::EINVAL),
+                }
+            }
             // No descriptor is a terminal to a Darwin process yet: stdio
             // buffers fully, and termios structures need not be converted.
             sys::IOCTL => neg(Errno::ENOTTY),
@@ -187,19 +237,14 @@ impl Kernel {
             // whether the thread is there.
             sys::PTHREAD_KILL => {
                 let sig = signal_to_linux(a[1] as u32);
-                let target = match self.darwin_ports.get(a[0] as u32) {
-                    Some(&super::mach::Port::Thread(tid)) => Some(tid),
-                    _ => None,
-                };
+                let target = self.darwin_name_to_thread(a[0] as u32);
                 let no_sigmask = target.is_some_and(|t| self.dtask.threads.map.get(&t).is_some_and(|d| d.cancel.no_sigmask));
-                match self.darwin_ports.get(a[0] as u32) {
-                    _ if (a[1] as u32) >= 32 && target.is_some() => neg(Errno::EINVAL),
+                match target {
+                    Some(_) if (a[1] as u32) >= 32 => neg(Errno::EINVAL),
                     _ if no_sigmask => neg(Errno::ESRCH),
-                    Some(super::mach::Port::Thread(_)) if sig == 0 => 0,
-                    Some(&super::mach::Port::Thread(tid)) => {
-                        res(self.canonical(m, nr::TGKILL, [self.pid as u64, tid as u64, u64::from(sig), 0, 0, 0]))
-                    }
-                    _ => neg(Errno::ESRCH),
+                    Some(_) if sig == 0 => 0,
+                    Some(tid) => res(self.canonical(m, nr::TGKILL, [self.pid as u64, tid as u64, u64::from(sig), 0, 0, 0])),
+                    None => neg(Errno::ESRCH),
                 }
             }
             // Handlers are not delivered in Darwin's frame format yet: a
@@ -209,13 +254,6 @@ impl Kernel {
                     let _ = m.zero(a[2], 16);
                 }
                 0
-            }
-            // The sleep primitive: wait out the timeout, then report it.
-            sys::SEMWAIT_SIGNAL | sys::SEMWAIT_SIGNAL_NOCANCEL => {
-                if a[2] != 0 {
-                    std::thread::sleep(std::time::Duration::new(a[4], a[5] as u32));
-                }
-                neg(Errno::ETIMEDOUT)
             }
             sys::GETFSSTAT64 => res(self.darwin_getfsstat(m, a[0], a[1])),
             sys::STATFS64 => res(self.darwin_statfs(m, Some(a[0]), a[1])),

@@ -222,6 +222,12 @@ pub enum Finish {
     Ulock { addr: u64, no_errno: bool },
     /// A psynch wait.
     Psynch(super::psynch::Cont),
+    /// A `mach_msg` send or receive.
+    MachMsg(super::mach_msg::Cont),
+    /// A semaphore wait.
+    Sema(super::sema::Cont),
+    /// A trap's sleep (`mach_wait_until`, `thread_switch`).
+    Sleep(super::mach::Sleep),
 }
 
 /// `wait_result_to_return_code` (`sys_ulock.c`).
@@ -267,6 +273,8 @@ impl Kernel {
                 Some(self.darwin_ulock_wait(m, &a2))
             }
             sys::ULOCK_WAIT2 => Some(self.darwin_ulock_wait(m, a)),
+            sys::SEMWAIT_SIGNAL => Some(self.darwin_semwait_signal(m, a, true)),
+            sys::SEMWAIT_SIGNAL_NOCANCEL => Some(self.darwin_semwait_signal(m, a, false)),
             sys::ULOCK_WAKE => {
                 let no_errno = a[0] & ul::NO_ERRNO != 0;
                 let r = self.darwin_ulock_wake(m, a[0], a[1], a[2]).map(|()| 0);
@@ -387,7 +395,15 @@ impl Kernel {
         let suspended = flags & start::SUSPENDED != 0;
         let clone = cf::VM | cf::FS | cf::FILES | cf::SIGHAND | cf::THREAD | cf::SYSVSEM;
         let req = self.darwin_clone(m, [clone, stack.max(1), 0, 0, 0, 0]).map_err(|_| Errno::ENOMEM)?;
-        let port = self.darwin_ports.thread(req.tid);
+        // The thread's self port, copied out and pinned; a full space is
+        // EMFILE (`!MACH_PORT_VALID`).
+        let pport = self.darwin_thread_ports(req.tid).1;
+        self.dtask.ipc.make_send(pport);
+        let port = self.darwin_copyout_send_pinned(pport);
+        if !super::ipc::name_valid(port) {
+            self.darwin_unmake_thread(m, req, port);
+            return Err(Errno::EMFILE);
+        }
         if flags & start::CUSTOM == 0 {
             self.darwin_unmake_thread(m, req, port);
             return Err(Errno::EINVAL);
@@ -441,10 +457,13 @@ impl Kernel {
         Ok(Some(req))
     }
 
-    /// A create that failed after making its thread: the port name goes
-    /// and the thread is terminated before it ever ran.
+    /// A create that failed after making its thread: its port name is
+    /// deallocated (a pinned right refuses, as on XNU), then the thread is
+    /// terminated before it ever ran, its ports with it.
     fn darwin_unmake_thread(&mut self, m: &mut GuestMem<'_>, req: SpawnRequest, port: u32) {
-        self.darwin_ports.remove(port);
+        let _ = self.dtask.ipc.mach_port_deallocate(port);
+        self.darwin_thread_ports_terminate(req.tid);
+        self.darwin_ipc_settle(m);
         self.darwin_discard_thread(m, req);
     }
 
@@ -466,12 +485,20 @@ impl Kernel {
                 let _ = self.canonical(m, crate::syscalls::nr::MUNMAP, [freeaddr, freesize, 0, 0, 0, 0]);
             }
         }
+        // thread_terminate_pinned: the self port is unpinned as the thread
+        // ends, so its name can then be deallocated.
+        let tid = self.tid;
+        if let Some(&(_, pport)) = self.dtask.kports.threads.get(&tid) {
+            self.dtask.ipc.port_mut(pport).pinned = false;
+        }
         if sem != 0 {
-            self.semaphore_signal(sem);
+            let _ = self.darwin_semaphore_signal_name(m, sem);
         }
         if kport != 0 {
-            self.darwin_ports.remove(kport);
+            let _ = self.dtask.ipc.mach_port_deallocate(kport);
         }
+        self.darwin_thread_ports_terminate(tid);
+        self.darwin_ipc_settle(m);
         self.dtask.threads.map.remove(&self.tid);
         self.dtask.waits.forget(self.tid);
     }
@@ -526,8 +553,8 @@ impl Kernel {
             // dead name leaves no owner; anything else that is not another
             // thread's port is EOWNERDEAD.
             let name = (want as u32) | 3;
-            let owner = match self.darwin_ports.get(name) {
-                Some(super::mach::Port::Thread(t)) if *t != self.tid => Some(*t),
+            let owner = match self.darwin_name_to_thread(name) {
+                Some(t) if t != self.tid => Some(t),
                 _ if name == u32::MAX => None,
                 _ => {
                     self.darwin_ulock_wait_cleanup(addr);
@@ -539,8 +566,8 @@ impl Kernel {
         let deadline = match timeout {
             0 => None,
             t if flags & ul::DEADLINE != 0 => {
-                let now = super::mach::monotonic_ns();
-                Some(Instant::now() + Duration::from_nanos(t.saturating_sub(now)))
+                // An absolute deadline, in mach_absolute_time.
+                Some(super::mach::abs_to_instant(t))
             }
             t => Some(Instant::now() + Duration::from_nanos(t)),
         };
@@ -584,8 +611,8 @@ impl Kernel {
             return Err(Errno::EINVAL);
         }
         let wake_thread = if flags & ul::WAKE_THREAD != 0 {
-            match self.darwin_ports.get(wake_value as u32) {
-                Some(super::mach::Port::Thread(t)) if *t != self.tid => Some(*t),
+            match self.darwin_name_to_thread(wake_value as u32) {
+                Some(t) if t != self.tid => Some(t),
                 _ => return Err(Errno::ESRCH),
             }
         } else {
@@ -625,8 +652,11 @@ impl Kernel {
     }
 
     /// A blocked thread call's wait has ended: its result, written back.
-    pub(crate) fn darwin_thread_wait_done(&mut self, m: &mut GuestMem<'_>, f: Finish, res: WaitResult) {
+    pub(crate) fn darwin_thread_wait_done(&mut self, m: &mut GuestMem<'_>, f: Finish, res: WaitResult) -> Option<SyscallOutcome> {
         match f {
+            Finish::MachMsg(c) => return self.darwin_mach_msg_wait_done(m, c, res),
+            Finish::Sema(c) => self.darwin_sema_wait_done(m, c, res),
+            Finish::Sleep(s) => self.darwin_sleep_done(m, s, res),
             Finish::Psynch(c) => self.darwin_psynch_wait_done(m, c, res),
             Finish::Ulock { addr, no_errno } => {
                 // A waiter that was not woken is still on the queue.
@@ -643,6 +673,7 @@ impl Kernel {
                 bsd_result(m, self.ctx_addr, r, no_errno);
             }
         }
+        None
     }
 }
 
@@ -701,10 +732,7 @@ impl Kernel {
 
     /// `__pthread_markcancel(thread_port)`.
     pub(crate) fn darwin_markcancel(&mut self, m: &mut GuestMem<'_>, port: u32) -> Result<u64, Errno> {
-        let tid = match self.darwin_ports.get(port) {
-            Some(super::mach::Port::Thread(t)) => *t,
-            _ => return Err(Errno::ESRCH),
-        };
+        let Some(tid) = self.darwin_name_to_thread(port) else { return Err(Errno::ESRCH) };
         let c = &mut self.dtask.threads.map.entry(tid).or_default().cancel;
         if !c.cancel && !c.canceled {
             c.cancel = true;

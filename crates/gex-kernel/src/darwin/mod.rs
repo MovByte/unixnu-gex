@@ -18,13 +18,18 @@ pub mod commpage;
 pub mod errno;
 pub mod ipc;
 pub mod kern;
+pub mod kobject;
 pub mod mach;
+pub mod mach_msg;
 pub mod mig;
+pub mod mk_timer;
 pub mod psynch;
+pub mod sema;
 pub mod sysctl;
 pub mod sysno;
 pub mod thread;
 pub mod timer;
+pub mod vm;
 pub mod wait;
 
 /// A Darwin process's kernel state beyond the BSD side's: its threads and
@@ -43,6 +48,25 @@ pub struct Task {
     /// `GEX_DARWIN_STRICT=1`: stop the process at the first thing it asks
     /// for that this kernel does not do.
     pub strict: bool,
+    /// The program's `LC_BUILD_VERSION` platform and SDK (`p_platform`,
+    /// `p_sdk`).
+    pub platform: (u32, u32),
+    /// The task's IPC.
+    pub ipc: ipc::Ipc,
+    /// The kernel objects' ports.
+    pub kports: kobject::Kports,
+    pub semas: sema::Semas,
+    pub mk_timers: mk_timer::MkTimers,
+    /// Maximum protections lowered from `VM_PROT_ALL`.
+    pub maxprot: vm::MaxProt,
+    /// Threads a semaphore operation woke, and how.
+    pub sema_wake: Vec<(i32, wait::WaitResult)>,
+    /// A blocked send's message and its send buffer, by thread.
+    pub pending_send: std::collections::HashMap<i32, Box<ipc::msg::Kmsg>>,
+    pub pending_send_buf: std::collections::HashMap<i32, (u64, u32)>,
+    /// A fatal guard exception was raised: the task is killed when the call
+    /// returns.
+    pub guard_kill: bool,
     /// What has been reported as not done, so each is said once.
     said: std::collections::HashSet<String>,
     /// Under strict mode, the unimplemented thing that stops the process
@@ -66,6 +90,13 @@ impl crate::syscalls::Kernel {
     /// The strict-mode stop a call left, taken.
     pub(crate) fn darwin_strict_stop(&mut self) -> Option<String> {
         self.dtask.stop.take()
+    }
+
+    /// A fatal Mach port guard exception was raised: with no exception
+    /// handler the task exits as `exit_with_mach_exception` makes it, killed
+    /// by SIGKILL.
+    pub(crate) fn darwin_guard_kill(&mut self) -> Option<crate::syscalls::SyscallOutcome> {
+        std::mem::take(&mut self.dtask.guard_kill).then_some(crate::syscalls::SyscallOutcome::Killed { signal: crate::signal::sig::SIGKILL as u32, core: false })
     }
 }
 

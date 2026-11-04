@@ -673,8 +673,6 @@ pub struct Kernel {
     /// A Darwin process's shared region, `(start, size)`, which the host
     /// mapped the shared cache into: `(0, 0)` when there is none.
     pub darwin_region: (u64, u64),
-    /// A Darwin process's Mach port names.
-    pub darwin_ports: crate::darwin::mach::Space,
     /// Where a Darwin process's dyld keeps its image list
     /// (`dyld_all_image_infos`), once it has said: 0 before.
     pub darwin_dyld_infos: u64,
@@ -8804,7 +8802,6 @@ impl Kernel {
             compat: false,
             darwin: false,
             darwin_region: (0, 0),
-            darwin_ports: Default::default(),
             darwin_dyld_infos: 0,
             dtask: Default::default(),
             darwin_arg_base: 0,
@@ -9196,7 +9193,6 @@ impl Kernel {
             compat: self.compat,
             darwin: self.darwin,
             darwin_region: self.darwin_region,
-            darwin_ports: Default::default(),
             darwin_dyld_infos: 0,
             dtask: Default::default(),
             darwin_arg_base: 0,
@@ -9322,6 +9318,9 @@ impl Kernel {
             self.darwin_syscall_exit();
         }
         if self.darwin {
+            if let Some(out) = self.darwin_guard_kill() {
+                return out;
+            }
             if let Some(what) = self.darwin_strict_stop() {
                 eprintln!("[gex:{}] GEX_DARWIN_STRICT: stopping at pc {pc:#x}: {what}", self.pid);
                 return SyscallOutcome::Killed { signal: crate::signal::sig::SIGSYS as u32, core: false };
@@ -9392,13 +9391,14 @@ impl Kernel {
         if self.darwin {
             self.darwin_syscall_enter();
             if let Some(t) = crate::darwin::mach_trap_number(raw) {
-                let kr = self.mach_trap(m, t, &a);
+                let out = self.mach_trap(m, t, &a);
                 if self.trace {
-                    eprintln!("[gex:{}] pc=0x{pc:x} mach {t}({:#x}, {:#x}, {:#x}) = {kr:#x}", self.pid, a[0], a[1], a[2]);
+                    let kr = m.read_u64(self.ctx_addr + ctx::x(0) as u64).unwrap_or(0);
+                    let how = if matches!(out, SyscallOutcome::Blocking(_)) { "blocks".to_string() } else { format!("{kr:#x}") };
+                    eprintln!("[gex:{}] pc=0x{pc:x} mach {t}({:#x}, {:#x}, {:#x}) = {how}", self.pid, a[0], a[1], a[2]);
                     self.strace_stack(m);
                 }
-                let _ = crate::darwin::set_mach_result(m, self.ctx_addr, kr);
-                return SyscallOutcome::Continue;
+                return out;
             }
             let raw = if raw as u32 as u64 == crate::darwin::PLATFORM {
                 raw
@@ -10019,13 +10019,20 @@ impl Kernel {
     pub fn finish_blocking(&mut self, m: &mut GuestMem<'_>, r: SysResult) -> SyscallOutcome {
         // A Darwin wait: its own call writes the result, or it sleeps again.
         if self.darwin {
-            match self.darwin_wait_end(m, r) {
+            match self.darwin_wait_end(r) {
                 crate::darwin::wait::End::NotDarwin => {}
                 crate::darwin::wait::End::Again => return self.darwin_sleep_again(m),
                 crate::darwin::wait::End::Done(wait, res) => {
                     self.block_restart = crate::signal::Restart::Never;
                     self.block_pc = 0;
-                    self.darwin_wait_done(m, wait, res);
+                    // A wait that leads into another (a send that then
+                    // receives) blocks again.
+                    if let Some(out @ SyscallOutcome::Blocking(_)) = self.darwin_wait_done(m, wait, res) {
+                        return out;
+                    }
+                    if let Some(out) = self.darwin_guard_kill() {
+                        return out;
+                    }
                     self.darwin_syscall_exit();
                     return match self.deliver_pending(m) {
                         Delivery::None => SyscallOutcome::Continue,

@@ -224,6 +224,8 @@ pub struct RunOptions {
     /// `GEX_DARWIN_STRICT=1`: stop at the first thing the Darwin kernel
     /// does not do.
     pub darwin_strict: bool,
+    /// The program's `LC_BUILD_VERSION` platform and SDK.
+    pub darwin_platform: (u32, u32),
     /// Run ahead-of-time code only (`aot_only`): an ejected Windows
     /// program's runtime, with no tier-1 module and no run-time translator.
     pub aot_only: bool,
@@ -237,6 +239,7 @@ impl Default for RunOptions {
             darwin_cache: None,
             darwin_dyld_infos: 0,
             darwin_strict: false,
+            darwin_platform: (0, 0),
             args: Vec::new(),
             env: Vec::new(),
             trace: false,
@@ -1127,6 +1130,7 @@ fn run_program_with(
     kernel.darwin = opts.darwin;
     kernel.darwin_dyld_infos = opts.darwin_dyld_infos;
     kernel.dtask.strict = opts.darwin_strict;
+    kernel.dtask.platform = opts.darwin_platform;
     // A Darwin program other than launchd is not pid 1: dyld treats pid 1
     // as launchd and boots the system from it. Pid 1 is the kernel's own
     // then, and the program its child, as in the browser's global kernel.
@@ -2398,6 +2402,28 @@ fn give_runner() {
 /// Start a host thread for a guest thread a `clone` (or an NT thread
 /// creation) asked for: the one its `clone` was promised, else a new one.
 /// Called between guest calls, where nothing is borrowed.
+/// The Darwin kernel's thread calls (`gex_kernel::darwin::timer`): a host
+/// thread that sleeps until the earliest armed deadline, or an earlier one
+/// is armed, and fires what is due with the kernel locked. It ends with the
+/// process.
+fn start_darwin_thread_calls(kernel: std::sync::Weak<Mutex<Kernel>>, memory: gex_mem::GuestMemory) {
+    let Some(k) = kernel.upgrade() else { return };
+    let bell = k.lock().unwrap_or_else(|e| e.into_inner()).darwin_timer_bell();
+    drop(k);
+    let _ = std::thread::Builder::new().name("gex-darwin-thread-call".into()).spawn(move || loop {
+        let seen = bell.generation();
+        let next = {
+            let Some(k) = kernel.upgrade() else { return };
+            let mut k = k.lock().unwrap_or_else(|e| e.into_inner());
+            let mut mem = GuestMem::new(memory.bytes());
+            k.darwin_thread_calls(&mut mem)
+        };
+        if !bell.wait(seen, next) {
+            return;
+        }
+    });
+}
+
 fn start_guest_thread(cx: Arc<SpawnContext>, child: ThreadState) -> Result<()> {
     // Detached: a guest thread is joined through its own futex, not
     // through the host's handle, and `exit_group` ends the process
@@ -4001,6 +4027,7 @@ fn place_image(
     }
     if opts.darwin {
         store.data_mut().with_kernel(|k| k.darwin_user_stack = gex_abi::STACK_TOP);
+        start_darwin_thread_calls(Arc::downgrade(&store.data().kernel), memory.clone());
     }
     // And its commpage, at the alias its constant addresses are folded to.
     if opts.darwin {

@@ -1,34 +1,30 @@
-//! Mach traps: the negative system call numbers.
+//! Mach traps: the negative system call numbers (`osfmk/kern/syscall_sw.c`
+//! of the profile's XNU, `osfmk/arm64/bsd_arm64.c`'s `mach_syscall`).
 //!
-//! A trap returns a `kern_return_t` in x0 and leaves the carry flag alone.
-//! Port names live in the task's [`Space`]. This is the trap surface
-//! libsystem's start-up uses; messages (`mach_msg`) are not delivered yet.
+//! A trap returns a `kern_return_t` (or a port name) in x0 and leaves the
+//! carry flag alone. A number with no trap raises `EXC_SYSCALL`, which with
+//! no handler is SIGSYS. The `_kernelrpc_*` traps are
+//! `osfmk/ipc/mach_kernelrpc.c`'s.
 
+use super::ipc::kr;
+use super::wait::{Wait, WaitResult};
 use crate::errno::Errno;
-use crate::syscalls::{nr, Kernel};
+use crate::syscalls::{nr, Kernel, SyscallOutcome};
 use crate::GuestMem;
+use std::time::{Duration, Instant};
 
-/// `kern_return_t`.
-pub mod kr {
-    pub const SUCCESS: u64 = 0;
-    pub const INVALID_ADDRESS: u64 = 1;
+/// `kern_return_t`s and `mach_msg_return_t`s the traps return beyond
+/// [`kr`].
+pub mod kr2 {
     pub const PROTECTION_FAILURE: u64 = 2;
-    pub const NO_SPACE: u64 = 3;
-    pub const INVALID_ARGUMENT: u64 = 4;
-    pub const FAILURE: u64 = 5;
-    pub const INVALID_NAME: u64 = 15;
-    pub const INVALID_RIGHT: u64 = 17;
-    pub const INVALID_VALUE: u64 = 18;
-    /// `MACH_SEND_INVALID_DEST`: what `mach_msg` answers until messages are
-    /// delivered.
-    pub const ABORTED: u64 = 14;
-    pub const OPERATION_TIMED_OUT: u64 = 49;
+    pub const MEMORY_ERROR: u64 = 10;
+    pub const NOT_SUPPORTED: u64 = 46;
     pub const SEND_INVALID_DEST: u64 = 0x1000_0003;
-    /// `MACH_RCV_TOO_LARGE`: the reply does not fit the receive buffer.
-    pub const RCV_TOO_LARGE: u64 = 0x1000_4004;
+    /// `MIG_ARRAY_TOO_LARGE`.
+    pub const MIG_ARRAY_TOO_LARGE: u64 = (-307i64) as u64;
 }
 
-/// Trap numbers, negated (XNU's `osfmk/kern/syscall_sw.c`).
+/// The trap numbers (`mach_trap_table`).
 pub mod trap {
     pub const MACH_ABSOLUTE_TIME: i32 = -3;
     pub const MACH_CONTINUOUS_TIME: i32 = -4;
@@ -60,320 +56,710 @@ pub mod trap {
     pub const SEMAPHORE_WAIT_SIGNAL: i32 = -37;
     pub const SEMAPHORE_TIMEDWAIT: i32 = -38;
     pub const SEMAPHORE_TIMEDWAIT_SIGNAL: i32 = -39;
+    pub const MACH_PORT_GET_ATTRIBUTES: i32 = -40;
     pub const MACH_PORT_GUARD: i32 = -41;
     pub const MACH_PORT_UNGUARD: i32 = -42;
+    pub const MACH_GENERATE_ACTIVITY_ID: i32 = -43;
+    pub const TASK_NAME_FOR_PID: i32 = -44;
+    pub const TASK_FOR_PID: i32 = -45;
+    pub const PID_FOR_TASK: i32 = -46;
     pub const MACH_MSG2: i32 = -47;
+    pub const MACX_SWAPON: i32 = -48;
+    pub const MACX_SWAPOFF: i32 = -49;
     pub const THREAD_GET_SPECIAL_REPLY_PORT: i32 = -50;
+    pub const MACX_TRIGGERS: i32 = -51;
+    pub const MACX_BACKING_STORE_SUSPEND: i32 = -52;
+    pub const MACX_BACKING_STORE_RECOVERY: i32 = -53;
+    pub const PFZ_EXIT: i32 = -58;
     pub const SWTCH_PRI: i32 = -59;
     pub const SWTCH: i32 = -60;
     pub const THREAD_SWITCH: i32 = -61;
+    pub const CLOCK_SLEEP: i32 = -62;
+    pub const HOST_CREATE_MACH_VOUCHER: i32 = -70;
+    pub const MACH_VOUCHER_EXTRACT_ATTR_RECIPE: i32 = -72;
+    pub const MACH_PORT_TYPE: i32 = -76;
+    pub const MACH_PORT_REQUEST_NOTIFICATION: i32 = -77;
+    pub const EXCLAVES_CTL: i32 = -88;
     pub const MACH_TIMEBASE_INFO: i32 = -89;
     pub const MACH_WAIT_UNTIL: i32 = -90;
     pub const MK_TIMER_CREATE: i32 = -91;
     pub const MK_TIMER_DESTROY: i32 = -92;
     pub const MK_TIMER_ARM: i32 = -93;
     pub const MK_TIMER_CANCEL: i32 = -94;
+    pub const MK_TIMER_ARM_LEEWAY: i32 = -95;
+    pub const DEBUG_CONTROL_PORT_FOR_PID: i32 = -96;
+    pub const IOKIT_USER_CLIENT: i32 = -100;
+    /// `MACH_TRAP_TABLE_COUNT`.
+    pub const COUNT: i32 = 128;
 }
 
-/// What a port name denotes in this task.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Port {
-    Task,
-    Thread(i32),
-    Host,
-    /// A receive right this task allocated (a reply port, a port set member).
-    Receive,
-    PortSet,
-    Timer,
-    /// The system clock (`host_get_clock_service`).
-    Clock,
-    /// A semaphore and its count.
-    Semaphore(i64),
+/// The device's time base: a 24 MHz counter, which `mach_timebase_info`
+/// gives as 125/3 nanoseconds per tick.
+pub const TIMEBASE: (u32, u32) = (125, 3);
+
+fn time_origin() -> Instant {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *START.get_or_init(Instant::now)
 }
 
-/// A task's port name space. Names are `index << 8 | 3`, as XNU's look.
-#[derive(Clone, Debug, Default)]
-pub struct Space {
-    names: std::collections::BTreeMap<u32, Port>,
-    next: u32,
+/// Time since the counter's origin.
+pub(crate) fn uptime() -> Duration {
+    time_origin().elapsed()
 }
 
-/// The fixed names every task starts with.
-pub const TASK_SELF_NAME: u32 = 0x103;
-pub const HOST_SELF_NAME: u32 = 0x203;
-
-impl Space {
-    fn fresh(&mut self, p: Port) -> u32 {
-        if self.names.is_empty() {
-            self.names.insert(TASK_SELF_NAME, Port::Task);
-            self.names.insert(HOST_SELF_NAME, Port::Host);
-            self.next = 3;
-        }
-        let name = (self.next << 8) | 3;
-        self.next += 1;
-        self.names.insert(name, p);
-        name
-    }
-
-    /// The name for this thread's own port, made on first use.
-    pub fn thread(&mut self, tid: i32) -> u32 {
-        if let Some((&n, _)) = self.names.iter().find(|(_, p)| **p == Port::Thread(tid)) {
-            return n;
-        }
-        self.fresh(Port::Thread(tid))
-    }
-
-    /// The task's name for the system clock, made on first use.
-    pub fn clock(&mut self) -> u32 {
-        if let Some((&n, _)) = self.names.iter().find(|(_, p)| **p == Port::Clock) {
-            return n;
-        }
-        self.fresh(Port::Clock)
-    }
-
-    /// A new semaphore with `value`, by its name.
-    pub fn semaphore(&mut self, value: i64) -> u32 {
-        self.fresh(Port::Semaphore(value))
-    }
-
-    /// Forget `name`.
-    pub fn remove(&mut self, name: u32) -> bool {
-        self.names.remove(&name).is_some()
-    }
-
-    pub fn get_mut(&mut self, name: u32) -> Option<&mut Port> {
-        self.names.get_mut(&name)
-    }
-
-    pub fn get(&self, name: u32) -> Option<&Port> {
-        match name {
-            TASK_SELF_NAME => Some(&Port::Task),
-            HOST_SELF_NAME => Some(&Port::Host),
-            _ => self.names.get(&name),
-        }
-    }
+/// `mach_absolute_time`: counter ticks.
+pub(crate) fn absolute_time() -> u64 {
+    (uptime().as_nanos() * u128::from(TIMEBASE.1) / u128::from(TIMEBASE.0)) as u64
 }
 
-/// A monotonic nanosecond count, from the first time it is asked: what
-/// `mach_absolute_time` returns, with the 1/1 timebase.
-pub(crate) fn monotonic_ns() -> u64 {
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    START.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+/// The instant an absolute time names.
+pub(crate) fn abs_to_instant(abs: u64) -> Instant {
+    let ns = u128::from(abs) * u128::from(TIMEBASE.0) / u128::from(TIMEBASE.1);
+    time_origin() + Duration::from_nanos(ns.min(u128::from(u64::MAX)) as u64)
 }
 
-/// `MACH_PORT_RIGHT_*`.
-const RIGHT_RECEIVE: u64 = 1;
-const RIGHT_PORT_SET: u64 = 3;
+/// `VM_FLAGS_*` and the masks the traps check them against.
+mod vmf {
+    pub const ANYWHERE: u64 = 0x1;
+    pub const PURGABLE: u64 = 0x2;
+    pub const CHUNK_4GB: u64 = 0x4;
+    pub const RANDOM_ADDR: u64 = 0x8;
+    pub const NO_CACHE: u64 = 0x10;
+    pub const PERMANENT: u64 = 0x80;
+    pub const TPRO: u64 = 0x1000;
+    pub const OVERWRITE: u64 = 0x4000;
+    pub const SUPERPAGE_MASK: u64 = 0x70000;
+    pub const RETURN_DATA_ADDR: u64 = 0x10_0000;
+    pub const RETURN_4K_DATA_ADDR: u64 = 0x80_0000;
+    pub const ALIAS_MASK: u64 = 0xff00_0000;
+    pub const USER_ALLOCATE: u64 = ANYWHERE | PURGABLE | CHUNK_4GB | RANDOM_ADDR | NO_CACHE | PERMANENT | OVERWRITE | SUPERPAGE_MASK | TPRO | ALIAS_MASK;
+    pub const USER_MAP: u64 = USER_ALLOCATE | RETURN_4K_DATA_ADDR | RETURN_DATA_ADDR;
+    /// What this kernel's VM does not do yet.
+    pub const UNDONE: u64 = PURGABLE | CHUNK_4GB | RANDOM_ADDR | PERMANENT | SUPERPAGE_MASK | TPRO;
+}
 
-/// `VM_FLAGS_ANYWHERE`: the kernel picks the address.
-const VM_FLAGS_ANYWHERE: u64 = 1;
+/// `VM_PROT_*`.
+pub(crate) mod prot {
+    pub const WRITE: u64 = 0x2;
+    pub const EXECUTE: u64 = 0x4;
+    pub const ALL: u64 = 0x7;
+    pub const COPY: u64 = 0x10;
+    pub const READ: u64 = 0x1;
+}
+
+/// The map's page mask (`VM_MAP_PAGE_MASK`): gex's 4 KiB pages.
+pub(crate) const PAGE_MASK: u64 = 0xfff;
+
+/// `VM_PURGABLE_*` controls and the state masks.
+mod purgable {
+    pub const SET_STATE: u64 = 0;
+    pub const GET_STATE: u64 = 1;
+    pub const PURGE_ALL: u64 = 2;
+    pub const SET_STATE_FROM_KERNEL: u64 = 3;
+    pub const STATE_MASK: i32 = 3;
+    /// `VM_PURGABLE_ALL_MASKS`.
+    pub const ALL_MASKS: i32 = 3 | (1 << 4) | (1 << 5) | (1 << 6) | (7 << 8) | (3 << 12) | (1 << 16);
+}
+
+/// `SWITCH_OPTION_*`.
+mod switch {
+    pub const NONE: u64 = 0;
+    pub const DEPRESS: u64 = 1;
+    pub const WAIT: u64 = 2;
+    pub const DISPATCH_CONTENTION: u64 = 3;
+    pub const OSLOCK_DEPRESS: u64 = 4;
+    pub const OSLOCK_WAIT: u64 = 5;
+}
+
+/// A trap's sleep that nothing wakes: it ends at its deadline or when the
+/// thread is aborted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sleep {
+    /// `mach_wait_until`: `KERN_ABORTED` when interrupted.
+    WaitUntil,
+    /// `thread_switch` with a wait option: `KERN_SUCCESS` either way.
+    Switch,
+}
+
+/// `MACH_ACTIVITY_ID_COUNT_MAX`.
+const ACTIVITY_ID_COUNT_MAX: u32 = 16;
+
+/// `voucher_activity_id`: one counter for the system, starting at 1.
+static ACTIVITY_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// `offsetof(struct user64_dyld_all_image_infos, notifyMachPorts)`
+/// (`osfmk/kdp/kdp_dyld.h`).
+const NOTIFY_MACH_PORTS_OFFSET: u64 = 0xc8;
 
 impl Kernel {
-    /// Run Mach trap `t` (negative); the value is the `kern_return_t` or
-    /// port name for x0.
-    pub(crate) fn mach_trap(&mut self, m: &mut GuestMem<'_>, t: i32, a: &[u64; 6]) -> u64 {
-        let tid = self.tid;
-        let space = &mut self.darwin_ports;
-        match t {
-            trap::TASK_SELF => {
-                space.fresh(Port::Task);
-                u64::from(TASK_SELF_NAME)
-            }
-            trap::HOST_SELF => u64::from(HOST_SELF_NAME),
-            trap::THREAD_SELF => u64::from(space.thread(tid)),
-            trap::MACH_REPLY_PORT | trap::THREAD_GET_SPECIAL_REPLY_PORT => u64::from(space.fresh(Port::Receive)),
-            trap::MACH_PORT_ALLOCATE => {
-                let p = match a[1] {
-                    RIGHT_RECEIVE => Port::Receive,
-                    RIGHT_PORT_SET => Port::PortSet,
-                    _ => return kr::INVALID_VALUE,
-                };
-                let name = space.fresh(p);
-                match m.write_u32(a[2], name) {
-                    Ok(()) => kr::SUCCESS,
-                    Err(_) => kr::INVALID_ADDRESS,
-                }
-            }
-            trap::MACH_PORT_CONSTRUCT => {
-                let name = space.fresh(Port::Receive);
-                match m.write_u32(a[3], name) {
-                    Ok(()) => kr::SUCCESS,
-                    Err(_) => kr::INVALID_ADDRESS,
-                }
-            }
-            trap::MK_TIMER_CREATE => u64::from(space.fresh(Port::Timer)),
-            // Rights are not counted yet: every name stays valid.
-            trap::MACH_PORT_DEALLOCATE
-            | trap::MACH_PORT_MOD_REFS
-            | trap::MACH_PORT_DESTRUCT
-            | trap::MACH_PORT_INSERT_RIGHT
-            | trap::MACH_PORT_MOVE_MEMBER
-            | trap::MACH_PORT_INSERT_MEMBER
-            | trap::MACH_PORT_EXTRACT_MEMBER
-            | trap::MACH_PORT_GUARD
-            | trap::MACH_PORT_UNGUARD
-            | trap::MK_TIMER_DESTROY
-            | trap::MK_TIMER_CANCEL
-            | trap::MK_TIMER_ARM => kr::SUCCESS,
-            // Nanoseconds since the process's first call, as the 1/1
-            // timebase says (libsystem asks the kernel because the
-            // commpage offers no user timebase).
-            trap::MACH_ABSOLUTE_TIME | trap::MACH_CONTINUOUS_TIME => monotonic_ns(),
-            trap::MACH_TIMEBASE_INFO => {
-                // mach_absolute_time counts nanoseconds: 1/1.
-                let ok = m.write_u32(a[0], 1).and_then(|_| m.write_u32(a[0] + 4, 1));
-                if ok.is_ok() {
-                    kr::SUCCESS
-                } else {
-                    kr::INVALID_ADDRESS
-                }
-            }
-            trap::SWTCH_PRI | trap::SWTCH | trap::THREAD_SWITCH => {
-                std::thread::yield_now();
-                kr::SUCCESS
-            }
-            trap::MACH_VM_ALLOCATE => self.vm_allocate(m, a[1], a[2], 0, a[3]),
-            // _kernelrpc_mach_vm_map_trap(target, address, size, mask, flags, prot)
-            trap::MACH_VM_MAP => self.vm_allocate(m, a[1], a[2], a[3], a[4]),
-            trap::MACH_VM_DEALLOCATE => match self.canonical(m, nr::MUNMAP, [a[1], a[2], 0, 0, 0, 0]) {
-                Ok(_) => kr::SUCCESS,
-                Err(_) => kr::INVALID_ADDRESS,
-            },
-            trap::MACH_VM_PROTECT => match self.canonical(m, nr::MPROTECT, [a[1], a[2], a[4] & 7, 0, 0, 0]) {
-                Ok(_) => kr::SUCCESS,
-                Err(_) => kr::PROTECTION_FAILURE,
-            },
-            trap::MACH_VM_PURGABLE_CONTROL => kr::SUCCESS,
-            trap::SEMAPHORE_SIGNAL | trap::SEMAPHORE_SIGNAL_ALL | trap::SEMAPHORE_SIGNAL_THREAD => self.semaphore_signal(a[0] as u32),
-            trap::SEMAPHORE_WAIT | trap::SEMAPHORE_TIMEDWAIT => self.semaphore_wait(a[0] as u32, t == trap::SEMAPHORE_TIMEDWAIT),
-            // Signal one, then wait on the other.
-            trap::SEMAPHORE_WAIT_SIGNAL | trap::SEMAPHORE_TIMEDWAIT_SIGNAL => match self.semaphore_signal(a[1] as u32) {
-                kr::SUCCESS => self.semaphore_wait(a[0] as u32, t == trap::SEMAPHORE_TIMEDWAIT_SIGNAL),
-                e => e,
-            },
-            trap::MACH_MSG2 => self.mach_msg2(m, a),
-            trap::MACH_MSG | trap::MACH_MSG_OVERWRITE => {
-                self.darwin_unimplemented("mach_msg (trap -31/-32)".into());
-                kr::SEND_INVALID_DEST
-            }
+    /// Run Mach trap `t` (negative), writing its result.
+    pub(crate) fn mach_trap(&mut self, m: &mut GuestMem<'_>, t: i32, a: &[u64; 6]) -> SyscallOutcome {
+        let r = match t {
+            trap::MACH_MSG2 => return self.darwin_mach_msg2(m, a),
+            trap::MACH_MSG => return self.darwin_mach_msg_trap(m, a, false),
+            trap::MACH_MSG_OVERWRITE => return self.darwin_mach_msg_trap(m, a, true),
+            trap::MACH_WAIT_UNTIL => return self.mach_wait_until(m, a[0]),
+            trap::THREAD_SWITCH => return self.thread_switch(m, a[0] as u32, a[1] as u32 as u64, a[2] as u32),
             _ => {
-                if !self.unimplemented.contains(&(t as i64 as u64)) {
-                    self.unimplemented.push(t as i64 as u64);
+                if let Some(out) = self.darwin_semaphore_trap(m, t, a) {
+                    return out;
                 }
+                match self.mach_trap_simple(m, t, a) {
+                    Some(r) => r,
+                    None => {
+                        // kern_invalid, or past the table: EXC_SYSCALL, which
+                        // no handler takes, is SIGSYS; x0 is left alone.
+                        let _ = self.canonical(m, nr::TGKILL, [self.pid as u64, self.tid as u64, u64::from(crate::signal::sig::SIGSYS), 0, 0, 0]);
+                        return SyscallOutcome::Continue;
+                    }
+                }
+            }
+        };
+        self.darwin_ipc_settle(m);
+        let _ = super::set_mach_result(m, self.ctx_addr, r);
+        SyscallOutcome::Continue
+    }
+
+    /// The traps that answer at once; `None` for a number with no trap.
+    fn mach_trap_simple(&mut self, m: &mut GuestMem<'_>, t: i32, a: &[u64; 6]) -> Option<u64> {
+        let x = |m: &GuestMem<'_>, k: &Kernel, i: u8| m.read_u64(k.ctx_addr + gex_abi::ctx::x(i) as u64).unwrap_or(0);
+        let w = |i: usize| a[i] as u32;
+        let copyout32 = |m: &mut GuestMem<'_>, at: u64, v: u32| if m.write_u32(at, v).is_ok() { kr::SUCCESS } else { kr2::MEMORY_ERROR };
+        Some(match t {
+            // sleh.c's fast traps.
+            trap::MACH_ABSOLUTE_TIME | trap::MACH_CONTINUOUS_TIME => absolute_time(),
+            trap::MACH_TIMEBASE_INFO => {
+                let ok = m.write_u32(a[0], TIMEBASE.0).and_then(|_| m.write_u32(a[0] + 4, TIMEBASE.1));
+                if ok.is_ok() { kr::SUCCESS } else { kr2::MEMORY_ERROR }
+            }
+            trap::MACH_VM_ALLOCATE => {
+                if !self.darwin_name_is_task(w(0)) {
+                    return Some(kr2::SEND_INVALID_DEST);
+                }
+                let Ok(mut addr) = m.read_u64(a[1]) else { return Some(kr2::MEMORY_ERROR) };
+                match self.vm_allocate(m, &mut addr, a[2], 0, a[3] as u32 as u64, prot::READ | prot::WRITE) {
+                    kr::SUCCESS => {
+                        if m.write_u64(a[1], addr).is_ok() { kr::SUCCESS } else { kr2::MEMORY_ERROR }
+                    }
+                    e => e,
+                }
+            }
+            // _kernelrpc_mach_vm_map_trap(target, addr, size, mask, flags,
+            // cur_protection): anonymous memory, max protection VM_PROT_ALL.
+            trap::MACH_VM_MAP => {
+                if !self.darwin_name_is_task(w(0)) {
+                    return Some(kr2::SEND_INVALID_DEST);
+                }
+                let Ok(mut addr) = m.read_u64(a[1]) else { return Some(kr2::MEMORY_ERROR) };
+                let flags = a[4] as u32 as u64;
+                if flags & !vmf::USER_MAP != 0 {
+                    return Some(kr::INVALID_ARGUMENT);
+                }
+                let cur = a[5] as u32 as u64;
+                if cur & !prot::ALL != 0 || a[2] == 0 {
+                    return Some(kr::INVALID_ARGUMENT);
+                }
+                // An executable mapping is readable.
+                let cur = if cur & prot::EXECUTE != 0 { cur | prot::READ } else { cur };
+                match self.vm_allocate(m, &mut addr, a[2], a[3], flags & !(vmf::RETURN_DATA_ADDR | vmf::RETURN_4K_DATA_ADDR), cur) {
+                    kr::SUCCESS => {
+                        if m.write_u64(a[1], addr).is_ok() { kr::SUCCESS } else { kr2::MEMORY_ERROR }
+                    }
+                    e => e,
+                }
+            }
+            trap::MACH_VM_DEALLOCATE => {
+                if !self.darwin_name_is_task(w(0)) {
+                    return Some(kr2::SEND_INVALID_DEST);
+                }
+                self.darwin_vm_deallocate(m, a[1], a[2])
+            }
+            // _kernelrpc_mach_vm_protect_trap(target, address, size,
+            // set_maximum, new_protection)
+            trap::MACH_VM_PROTECT => {
+                if !self.darwin_name_is_task(w(0)) {
+                    return Some(kr2::SEND_INVALID_DEST);
+                }
+                self.vm_protect(m, a[1], a[2], w(3) != 0, a[4] as u32 as u64)
+            }
+            trap::MACH_VM_PURGABLE_CONTROL => {
+                // The read flavor suffices to get the state.
+                if !self.darwin_name_is_task(w(0)) {
+                    return Some(kr2::SEND_INVALID_DEST);
+                }
+                let Ok(state) = m.read_u32(a[3]) else { return Some(kr2::MEMORY_ERROR) };
+                self.vm_purgable_control(a[1], a[2] as u32 as u64, state as i32)
+            }
+            trap::TASK_DYLD_PROCESS_INFO_NOTIFY_GET => self.dyld_process_info_notify_get(m, a[0], a[1]),
+            trap::MACH_PORT_ALLOCATE => {
+                if !self.darwin_name_is_task(w(0)) {
+                    return Some(kr2::SEND_INVALID_DEST);
+                }
+                match self.dtask.ipc.mach_port_allocate(w(1), None) {
+                    Ok(name) => copyout32(m, a[2], name),
+                    Err(e) => e,
+                }
+            }
+            trap::MACH_PORT_DEALLOCATE => self.task_op(w(0), |k| k.dtask.ipc.mach_port_deallocate(w(1))),
+            trap::MACH_PORT_MOD_REFS => self.task_op(w(0), |k| k.dtask.ipc.mach_port_mod_refs(w(1), w(2), w(3) as i32)),
+            trap::MACH_PORT_MOVE_MEMBER => self.task_op(w(0), |k| k.dtask.ipc.mach_port_move_member(w(1), w(2))),
+            trap::MACH_PORT_INSERT_MEMBER => self.task_op(w(0), |k| k.dtask.ipc.mach_port_insert_member(w(1), w(2))),
+            trap::MACH_PORT_EXTRACT_MEMBER => self.task_op(w(0), |k| k.dtask.ipc.mach_port_extract_member(w(1), w(2))),
+            trap::MACH_PORT_INSERT_RIGHT => {
+                if !self.darwin_name_is_task(w(0)) {
+                    return Some(kr2::SEND_INVALID_DEST);
+                }
+                self.port_insert_right(w(1), w(2), w(3))
+            }
+            // _kernelrpc_mach_port_construct_trap(target, options, context,
+            // name): mach_port_options_t is flags, mpl_qlimit, then a
+            // 64-bit union (reserved / work_interval / service fields).
+            trap::MACH_PORT_CONSTRUCT => {
+                if !self.darwin_name_is_task(w(0)) {
+                    return Some(kr2::SEND_INVALID_DEST);
+                }
+                let Ok(opts) = m.read(a[1], 8).map(|b| b.to_vec()) else { return Some(kr2::MEMORY_ERROR) };
+                let (flags, qlimit) = (u32::from_le_bytes(opts[0..4].try_into().unwrap()), u32::from_le_bytes(opts[4..8].try_into().unwrap()));
+                let hardened = self.darwin_hardened();
+                match self.dtask.ipc.mach_port_construct(flags, qlimit, a[2], hardened) {
+                    Ok(name) => copyout32(m, a[3], name),
+                    Err(kr::UNIMPLEMENTED_SERVICE_PORT) => {
+                        self.darwin_unimplemented("mach_port_construct of a service or connection port".into());
+                        kr::FAILURE
+                    }
+                    Err(e) => e,
+                }
+            }
+            trap::MACH_PORT_DESTRUCT => self.task_op(w(0), |k| k.dtask.ipc.mach_port_destruct(w(1), w(2) as i32, a[3])),
+            trap::MACH_PORT_GUARD => self.task_op(w(0), |k| k.dtask.ipc.mach_port_guard(w(1), a[2], u64::from(w(3) != 0))),
+            trap::MACH_PORT_UNGUARD => self.task_op(w(0), |k| k.dtask.ipc.mach_port_unguard(w(1), a[2])),
+            trap::MACH_PORT_TYPE => {
+                if !self.darwin_name_is_task(w(0)) {
+                    return Some(kr2::SEND_INVALID_DEST);
+                }
+                match self.dtask.ipc.mach_port_type(w(1)) {
+                    Ok(ty) => copyout32(m, a[2], ty),
+                    Err(e) => e,
+                }
+            }
+            // _kernelrpc_mach_port_get_attributes_trap(target, name, flavor,
+            // info, count): the count is clamped to what the reply carries
+            // (`mach_port_info_t`, `array[*:17] of integer_t`).
+            trap::MACH_PORT_GET_ATTRIBUTES => {
+                const MAX_COUNT: u32 = 17;
+                if !self.darwin_name_is_task(w(0)) {
+                    return Some(kr2::SEND_INVALID_DEST);
+                }
+                let Ok(count) = m.read_u32(a[4]) else { return Some(kr2::MEMORY_ERROR) };
+                let count = count.min(MAX_COUNT);
+                match self.dtask.ipc.mach_port_get_attributes(w(1), w(2) as i32, count) {
+                    Ok(info) => {
+                        if m.write_u32(a[4], info.len() as u32).is_err() {
+                            return Some(kr2::MEMORY_ERROR);
+                        }
+                        let bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
+                        if !bytes.is_empty() && m.write(a[3], &bytes).is_err() {
+                            return Some(kr2::MEMORY_ERROR);
+                        }
+                        kr::SUCCESS
+                    }
+                    Err(e) => e,
+                }
+            }
+            // _kernelrpc_mach_port_request_notification_trap(target, name,
+            // msgid, sync, notify, notifyPoly, previous). Its result starts
+            // as MACH_SEND_INVALID_DEST, which a null notify port leaves in
+            // place: libsyscall then asks the MIG routine.
+            trap::MACH_PORT_REQUEST_NOTIFICATION => {
+                let (name, msgid, sync, notify, poly, previous) = (w(1), w(2) as i32, w(3), w(4), w(5), x(m, self, 6));
+                if !self.darwin_name_is_task(w(0)) {
+                    return Some(kr2::SEND_INVALID_DEST);
+                }
+                use super::ipc::right::msgt;
+                if msgt::copyin_type(poly) != msgt::PORT_SEND_ONCE {
+                    return Some(kr2::SEND_INVALID_DEST);
+                }
+                if !super::ipc::name_valid(notify) {
+                    return Some(kr2::SEND_INVALID_DEST);
+                }
+                let ipc = &mut self.dtask.ipc;
+                let right = match ipc.object_copyin(notify, poly, Default::default(), 0, None) {
+                    Ok(c) => c,
+                    Err(e) => return Some(e),
+                };
+                match ipc.mach_port_request_notification(name, msgid, sync, right) {
+                    Ok(prev) => {
+                        let mut pname = 0;
+                        if let Some(p) = prev {
+                            match ipc.object_copyout(super::ipc::right::Carried::Port(p), msgt::PORT_SEND_ONCE, None) {
+                                Ok(n) => pname = n,
+                                Err(e) => return Some(e),
+                            }
+                        }
+                        copyout32(m, previous, pname)
+                    }
+                    Err(e) => {
+                        ipc.object_destroy(right, msgt::PORT_SEND_ONCE);
+                        e
+                    }
+                }
+            }
+            trap::MACH_REPLY_PORT => match self.dtask.ipc.port_alloc(false) {
+                Ok((name, _)) => u64::from(name),
+                Err(_) => 0,
+            },
+            trap::THREAD_GET_SPECIAL_REPLY_PORT => {
+                let tid = self.tid;
+                // The thread's previous special reply port is unbound.
+                self.dtask.kports.special_reply.remove(&tid);
+                match self.dtask.ipc.port_alloc(true) {
+                    Ok((name, port)) => {
+                        self.dtask.ipc.port_mut(port).specialreply = true;
+                        self.dtask.kports.special_reply.insert(tid, port);
+                        u64::from(name)
+                    }
+                    Err(_) => 0,
+                }
+            }
+            trap::TASK_SELF => {
+                let p = self.darwin_task_self_port();
+                self.dtask.ipc.make_send(p);
+                u64::from(self.darwin_copyout_send(p))
+            }
+            trap::THREAD_SELF => {
+                let p = self.darwin_thread_ports(self.tid).1;
+                self.dtask.ipc.make_send(p);
+                u64::from(self.darwin_copyout_send(p))
+            }
+            trap::HOST_SELF => {
+                let p = self.darwin_host_port();
+                self.dtask.ipc.make_send(p);
+                u64::from(self.darwin_copyout_send(p))
+            }
+            trap::PID_FOR_TASK => {
+                // port_name_to_task_name: any flavor of this task's ports.
+                let ok = super::ipc::name_valid(w(0))
+                    && self.dtask.ipc.translate_send(w(0)).is_ok_and(|p| {
+                        let p = self.dtask.ipc.port(p);
+                        p.active && matches!(p.kobject, Some(super::ipc::Kobject::Task | super::ipc::Kobject::TaskName))
+                    });
+                let (pid, r) = if ok { (self.pid, kr::SUCCESS) } else { (-1, kr::FAILURE) };
+                let _ = m.write_u32(a[1], pid as u32);
+                r
+            }
+            trap::MACH_GENERATE_ACTIVITY_ID => {
+                let count = w(1);
+                if count == 0 || count > ACTIVITY_ID_COUNT_MAX {
+                    return Some(kr::INVALID_ARGUMENT);
+                }
+                let id = ACTIVITY_ID.fetch_add(u64::from(count), std::sync::atomic::Ordering::Relaxed);
+                // A copyout's failure is its errno.
+                if m.write_u64(a[2], id).is_ok() { kr::SUCCESS } else { Errno::EFAULT.0 as u64 }
+            }
+            trap::MK_TIMER_CREATE => u64::from(self.mk_timer_create()),
+            trap::MK_TIMER_DESTROY => self.mk_timer_destroy(w(0)),
+            trap::MK_TIMER_ARM => self.mk_timer_arm(w(0), a[1], 0, 0),
+            trap::MK_TIMER_ARM_LEEWAY => self.mk_timer_arm(w(0), a[2], a[3], a[1]),
+            trap::MK_TIMER_CANCEL => self.mk_timer_cancel(m, w(0), a[1]),
+            // swtch and swtch_pri: give up the processor; whether another
+            // thread wants it (`thread_should_yield`).
+            trap::SWTCH | trap::SWTCH_PRI => {
+                std::thread::yield_now();
+                u64::from(self.darwin_others_runnable())
+            }
+            trap::PFZ_EXIT => kr::SUCCESS,
+            // CONFIG_EXCLAVES is not in the iPhoneOS kernel configuration.
+            trap::EXCLAVES_CTL => kr2::NOT_SUPPORTED,
+            // dp_backing_file.c: no swap on iOS.
+            trap::MACX_SWAPON | trap::MACX_SWAPOFF | trap::MACX_BACKING_STORE_SUSPEND | trap::MACX_BACKING_STORE_RECOVERY => Errno::EOPNOTSUPP.0 as u64,
+            trap::MACX_TRIGGERS => {
+                const SWAP_COMPACT_DISABLE: u32 = 0x1;
+                const SWAP_COMPACT_ENABLE: u32 = 0x2;
+                if w(0) & (SWAP_COMPACT_DISABLE | SWAP_COMPACT_ENABLE) == 0 {
+                    Errno::EOPNOTSUPP.0 as u64
+                } else if self.creds.uid() != 0 {
+                    Errno::EPERM.0 as u64
+                } else {
+                    self.darwin_unimplemented("macx_triggers swap compaction".into());
+                    kr::FAILURE
+                }
+            }
+            trap::CLOCK_SLEEP
+            | trap::HOST_CREATE_MACH_VOUCHER
+            | trap::MACH_VOUCHER_EXTRACT_ATTR_RECIPE
+            | trap::TASK_NAME_FOR_PID
+            | trap::TASK_FOR_PID
+            | trap::DEBUG_CONTROL_PORT_FOR_PID
+            | trap::IOKIT_USER_CLIENT => {
                 self.darwin_unimplemented(format!("Mach trap {t}"));
                 kr::FAILURE
             }
-        }
+            _ => return None,
+        })
     }
 
-    pub(crate) fn semaphore_signal(&mut self, name: u32) -> u64 {
-        match self.darwin_ports.get_mut(name) {
-            Some(Port::Semaphore(v)) => {
-                *v += 1;
-                kr::SUCCESS
+    /// A `_kernelrpc` trap on the task's space, after the target check.
+    fn task_op(&mut self, target: u32, f: impl FnOnce(&mut Kernel) -> u64) -> u64 {
+        if !self.darwin_name_is_task(target) {
+            return kr2::SEND_INVALID_DEST;
+        }
+        f(self)
+    }
+
+    /// `_kernelrpc_mach_port_insert_right_trap(target, name, poly,
+    /// polyPoly)`.
+    fn port_insert_right(&mut self, name: u32, poly: u32, poly_poly: u32) -> u64 {
+        use super::ipc::right::{msgt, CopyinFlags};
+        let ipc = &mut self.dtask.ipc;
+        if name == poly && (poly_poly == msgt::MAKE_SEND || poly_poly == msgt::COPY_SEND) {
+            return ipc.insert_send_right(poly, poly_poly);
+        }
+        let flags = CopyinFlags { allow_immovable_send: true, ..Default::default() };
+        let right = match ipc.object_copyin(poly, poly_poly, flags, 0, None) {
+            Ok(c) => c,
+            Err(e) => return e,
+        };
+        let disp = msgt::copyin_type(poly_poly);
+        let r = ipc.mach_port_insert_right(name, right, disp);
+        if r != kr::SUCCESS {
+            ipc.object_destroy(right, disp);
+        }
+        r
+    }
+
+    /// Whether some other thread of the task is runnable: the host
+    /// schedules threads, so the nearest view of a run queue is the threads
+    /// not blocked in a Darwin wait.
+    fn darwin_others_runnable(&self) -> bool {
+        let live = self.live_threads.load(std::sync::atomic::Ordering::Acquire) as usize;
+        let waiting = self.dtask.waits.waiting_count();
+        live.saturating_sub(waiting) > 1
+    }
+
+    /// `mach_wait_until_trap(deadline)`.
+    fn mach_wait_until(&mut self, m: &mut GuestMem<'_>, deadline: u64) -> SyscallOutcome {
+        if deadline <= absolute_time() {
+            let _ = super::set_mach_result(m, self.ctx_addr, kr::SUCCESS);
+            return SyscallOutcome::Continue;
+        }
+        self.darwin_block(m, Wait { deadline: Some(abs_to_instant(deadline)), cont: super::thread::Finish::Sleep(Sleep::WaitUntil) })
+    }
+
+    /// `thread_switch(thread_name, option, option_time)`. The host runs
+    /// every thread on its own processor, so a hint names no thread to hand
+    /// the processor to and a depression changes no order; a wait option
+    /// sleeps for its time.
+    fn thread_switch(&mut self, m: &mut GuestMem<'_>, thread_name: u32, option: u64, option_time: u32) -> SyscallOutcome {
+        let scale = match option {
+            switch::NONE | switch::DEPRESS | switch::OSLOCK_DEPRESS => None,
+            switch::WAIT | switch::OSLOCK_WAIT => Some(1_000_000u64),
+            switch::DISPATCH_CONTENTION => Some(1_000),
+            _ => {
+                let _ = super::set_mach_result(m, self.ctx_addr, kr::INVALID_ARGUMENT);
+                return SyscallOutcome::Continue;
             }
-            _ => kr::INVALID_ARGUMENT,
-        }
-    }
-
-    /// Take one from the count. With none and only this thread to give
-    /// one, nothing ever will: a timed wait times out, a wait is aborted.
-    fn semaphore_wait(&mut self, name: u32, timed: bool) -> u64 {
-        match self.darwin_ports.get_mut(name) {
-            Some(Port::Semaphore(v)) if *v > 0 => {
-                *v -= 1;
-                kr::SUCCESS
+        };
+        let _ = thread_name;
+        match scale {
+            Some(ns) => {
+                let d = Duration::from_nanos(u64::from(option_time) * ns);
+                self.darwin_block(m, Wait { deadline: Some(Instant::now() + d), cont: super::thread::Finish::Sleep(Sleep::Switch) })
             }
-            Some(Port::Semaphore(_)) if timed => kr::OPERATION_TIMED_OUT,
-            Some(Port::Semaphore(_)) => kr::ABORTED,
-            _ => kr::INVALID_ARGUMENT,
+            None => {
+                std::thread::yield_now();
+                let _ = super::set_mach_result(m, self.ctx_addr, kr::SUCCESS);
+                SyscallOutcome::Continue
+            }
         }
     }
 
-    /// `mach_msg2(data, options, bits|send_size, remote|local,
-    /// voucher|id, desc_count|rcv_name, rcv_size|priority, timeout)`. A
-    /// send and receive to a kernel object is a MIG call, answered into
-    /// the same buffer; anything else is not delivered yet.
-    fn mach_msg2(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> u64 {
-        const SEND: u64 = 0x1;
-        const RCV: u64 = 0x2;
-        let opts = a[1];
-        let send_size = (a[2] >> 32) as usize;
-        let (remote, local) = (a[3] as u32, (a[3] >> 32) as u32);
-        let id = (a[4] >> 32) as u32 as i32;
-        let rcv_size = m.read_u64(self.ctx_addr + gex_abi::ctx::x(6) as u64).unwrap_or(0) as u32 as usize;
-        let obj = match self.darwin_ports.get(remote) {
-            Some(Port::Task) => Some(super::mig::Object::Task),
-            Some(Port::Host) => Some(super::mig::Object::Host),
-            Some(Port::Thread(t)) => Some(super::mig::Object::Thread(*t)),
-            Some(Port::Clock) => Some(super::mig::Object::Clock),
-            _ => None,
+    /// A trap's sleep has ended.
+    pub(crate) fn darwin_sleep_done(&mut self, m: &mut GuestMem<'_>, s: Sleep, res: WaitResult) {
+        let r = match (s, res) {
+            (Sleep::WaitUntil, WaitResult::Interrupted) => kr::ABORTED,
+            _ => kr::SUCCESS,
         };
-        let (Some(obj), true) = (obj, opts & (SEND | RCV) == SEND | RCV) else {
-            self.darwin_unimplemented(format!("mach_msg2 delivery (options {opts:#x}, id {id})"));
-            return kr::SEND_INVALID_DEST;
-        };
-        let header = super::mig::HEADER;
-        let body = match m.read(a[0] + header as u64, send_size.saturating_sub(header)) {
-            Ok(b) => b.to_vec(),
-            Err(_) => return kr::INVALID_ADDRESS,
-        };
-        let task = super::mig::Task {
-            dyld_infos: self.darwin_dyld_infos,
-            ports: &mut self.darwin_ports,
-            threads: &mut self.dtask.threads,
-            spawns: &mut self.dtask.spawns,
-        };
-        let reply = super::mig::serve(obj, id, &body, task);
-        if self.trace {
-            eprintln!("[gex:{}] mig {obj:?} id {id} -> {}", self.pid, reply.ret);
-        }
-        if reply.ret == super::mig::MIG_BAD_ID {
-            self.darwin_unimplemented(format!("MIG routine {id} on {obj:?}"));
-        }
-        if let Some(what) = &reply.unimplemented {
-            self.darwin_unimplemented(what.clone());
-        }
-        let msg = reply.message(id, local);
-        if msg.len() > rcv_size {
-            return kr::RCV_TOO_LARGE;
-        }
-        match m.write(a[0], &msg) {
-            Ok(()) => kr::SUCCESS,
-            Err(_) => kr::INVALID_ADDRESS,
-        }
+        let _ = super::set_mach_result(m, self.ctx_addr, r);
     }
 
-    /// `mach_vm_allocate`/`mach_vm_map` of anonymous memory: the address at
-    /// `*addr_p` when the flags fix it, anywhere otherwise, aligned to
-    /// `mask + 1` (libmalloc finds a region from a pointer by masking).
-    fn vm_allocate(&mut self, m: &mut GuestMem<'_>, addr_p: u64, size: u64, mask: u64, flags: u64) -> u64 {
+    /// `task_dyld_process_info_notify_get_trap(names_addr,
+    /// names_count_addr)`: no notifier is registered
+    /// (`task_dyld_process_info_notify_register` is not served), so the
+    /// image infos' port array is cleared and the count is 0.
+    fn dyld_process_info_notify_get(&mut self, m: &mut GuestMem<'_>, names: u64, count_addr: u64) -> u64 {
+        if names == 0 || count_addr == 0 {
+            return kr::INVALID_ARGUMENT;
+        }
+        let Ok(n) = m.read_u32(count_addr) else { return kr2::MEMORY_ERROR };
+        if n == 0 {
+            return kr::NO_SPACE;
+        }
+        if self.darwin_dyld_infos != 0 {
+            let _ = m.write_u32(self.darwin_dyld_infos + NOTIFY_MACH_PORTS_OFFSET, 0);
+        }
+        if m.write_u32(count_addr, 0).is_ok() { kr::SUCCESS } else { kr2::MEMORY_ERROR }
+    }
+
+    /// `mach_vm_allocate_kernel` and the anonymous case of
+    /// `vm_map_enter_mem_object`: `size` bytes of `cur` protection at
+    /// `*addr` (fixed) or anywhere, aligned to `mask + 1`.
+    fn vm_allocate(&mut self, m: &mut GuestMem<'_>, addr: &mut u64, size: u64, mask: u64, flags: u64, cur: u64) -> u64 {
         use crate::mem::flags as mf;
-        let want = m.read_u64(addr_p).unwrap_or(0);
-        let fixed = flags & VM_FLAGS_ANYWHERE == 0;
-        let f = mf::PRIVATE | mf::ANONYMOUS | if fixed { mf::FIXED } else { 0 };
-        let hint = if fixed { want } else { 0 };
-        // Below a page the kernel's own alignment does.
-        let mask = if fixed { 0 } else { mask & !0xfff };
-        let len = size + mask;
-        let at = match self.canonical(m, nr::MMAP, [hint, len, 3, f, u64::MAX, 0]) {
+        if flags & !vmf::USER_ALLOCATE != 0 {
+            return kr::INVALID_ARGUMENT;
+        }
+        if size == 0 {
+            *addr = 0;
+            return kr::SUCCESS;
+        }
+        if flags & vmf::UNDONE != 0 {
+            self.darwin_unimplemented(format!("mach_vm_allocate/mach_vm_map flags {:#x}", flags & vmf::UNDONE));
+            return kr::FAILURE;
+        }
+        let fixed = flags & vmf::ANYWHERE == 0;
+        let start = if fixed { *addr & !PAGE_MASK } else { 0 };
+        let Some(len) = size.checked_add(PAGE_MASK).map(|s| s & !PAGE_MASK).filter(|&l| l != 0) else { return kr::INVALID_ARGUMENT };
+        let p = (cur & prot::ALL) as u64;
+        let linux_prot = (p & 1) | (p & 2) | (p & 4);
+        if fixed {
+            // Without VM_FLAGS_OVERWRITE a fixed request over anything
+            // mapped fails.
+            if flags & vmf::OVERWRITE == 0 && self.mem.lock().vmas().iter().any(|v| v.start < start + len && start < v.end) {
+                return kr::NO_SPACE;
+            }
+            return match self.canonical(m, nr::MMAP, [start, len, linux_prot, mf::PRIVATE | mf::ANONYMOUS | mf::FIXED, u64::MAX, 0]) {
+                Ok(_) => {
+                    self.dtask.maxprot.clear(start, start + len);
+                    *addr = start;
+                    kr::SUCCESS
+                }
+                Err(_) => kr::NO_SPACE,
+            };
+        }
+        // Anywhere: over-allocate by the alignment and trim.
+        let mask = mask & !PAGE_MASK;
+        let Some(want) = len.checked_add(mask) else { return kr::NO_SPACE };
+        let at = match self.canonical(m, nr::MMAP, [0, want, linux_prot, mf::PRIVATE | mf::ANONYMOUS, u64::MAX, 0]) {
             Ok(at) => at,
             Err(_) => return kr::NO_SPACE,
         };
         let start = (at + mask) & !mask;
-        // Trim what the alignment left over, before and after.
         if start > at {
             let _ = self.canonical(m, nr::MUNMAP, [at, start - at, 0, 0, 0, 0]);
         }
-        let end = at + len;
-        let page_end = (start + size + 0xfff) & !0xfff;
-        if end > page_end {
-            let _ = self.canonical(m, nr::MUNMAP, [page_end, end - page_end, 0, 0, 0, 0]);
+        let end = at + want;
+        if end > start + len {
+            let _ = self.canonical(m, nr::MUNMAP, [start + len, end - start - len, 0, 0, 0, 0]);
         }
-        match m.write_u64(addr_p, start) {
-            Ok(()) => kr::SUCCESS,
+        self.dtask.maxprot.clear(start, start + len);
+        *addr = start;
+        kr::SUCCESS
+    }
+
+    /// Memory for a received message's out-of-line data (`vm_map_copyout`):
+    /// anywhere, read and write.
+    pub(crate) fn darwin_vm_allocate_anywhere(&mut self, m: &mut GuestMem<'_>, len: u64) -> Result<u64, u64> {
+        let mut addr = 0;
+        match self.vm_allocate(m, &mut addr, len, 0, vmf::ANYWHERE, prot::READ | prot::WRITE) {
+            kr::SUCCESS => Ok(addr),
+            e => Err(e),
+        }
+    }
+
+    /// `mach_vm_deallocate`: unmapped parts of the range are skipped
+    /// (`vm_map_delete` raises a non-fatal `kGUARD_EXC_DEALLOC_GAP`, which a
+    /// task without VM guard behavior drops).
+    pub(crate) fn darwin_vm_deallocate(&mut self, m: &mut GuestMem<'_>, start: u64, size: u64) -> u64 {
+        let Some(end) = start.checked_add(size) else { return kr::INVALID_ARGUMENT };
+        if size == 0 {
+            return kr::SUCCESS;
+        }
+        let (s, e) = (start & !PAGE_MASK, end.checked_add(PAGE_MASK).map_or(0, |e| e & !PAGE_MASK));
+        if e == 0 {
+            return kr::SUCCESS;
+        }
+        self.dtask.maxprot.clear(s, e);
+        match self.canonical(m, nr::MUNMAP, [s, e - s, 0, 0, 0, 0]) {
+            Ok(_) => kr::SUCCESS,
+            Err(_) => kr::INVALID_ARGUMENT,
+        }
+    }
+
+    /// `mach_vm_protect` and `vm_map_protect`. Every page must be mapped
+    /// and allow the protection; an iOS map strips execute from a writable
+    /// request (`VM_MAP_POLICY_WX_STRIP_X`: no entry here is a JIT region).
+    pub(crate) fn vm_protect(&mut self, m: &mut GuestMem<'_>, start: u64, size: u64, set_max: bool, new: u64) -> u64 {
+        if start.checked_add(size).is_none() || new & !(prot::ALL | prot::COPY) != 0 {
+            return kr::INVALID_ARGUMENT;
+        }
+        if size == 0 {
+            return kr::SUCCESS;
+        }
+        if new & prot::COPY != 0 {
+            // A copy-on-write remapping of the range (vm_map_remap).
+            self.darwin_unimplemented("mach_vm_protect VM_PROT_COPY".into());
+            return kr::FAILURE;
+        }
+        let (s, e) = (start & !PAGE_MASK, (start + size + PAGE_MASK) & !PAGE_MASK);
+        let vmas: Vec<(u64, u64, u64)> = {
+            let mm = self.mem.lock();
+            let mut v: Vec<_> = mm.vmas().iter().filter(|v| v.end > s && v.start < e).map(|v| (v.start.max(s), v.end.min(e), u64::from(v.prot) & prot::ALL)).collect();
+            v.sort();
+            v
+        };
+        let mut at = s;
+        for &(vs, ve, _) in &vmas {
+            if vs > at {
+                return kr::INVALID_ADDRESS;
+            }
+            at = at.max(ve);
+        }
+        if at < e {
+            return kr::INVALID_ADDRESS;
+        }
+        let mut new = new & prot::ALL;
+        if self.dtask.maxprot.pieces(s, e).iter().any(|&(_, _, max)| new & u64::from(max) != new) {
+            return kr2::PROTECTION_FAILURE;
+        }
+        if new & prot::WRITE != 0 && new & prot::EXECUTE != 0 {
+            new &= !prot::EXECUTE;
+        }
+        if set_max {
+            // The current protection keeps only what the new maximum allows.
+            for (vs, ve, cur) in vmas {
+                if self.canonical(m, nr::MPROTECT, [vs, ve - vs, cur & new, 0, 0, 0]).is_err() {
+                    return kr::INVALID_ADDRESS;
+                }
+            }
+            self.dtask.maxprot.set(s, e, new as u8);
+            return kr::SUCCESS;
+        }
+        match self.canonical(m, nr::MPROTECT, [s, e - s, new, 0, 0, 0]) {
+            Ok(_) => kr::SUCCESS,
             Err(_) => kr::INVALID_ADDRESS,
         }
+    }
+
+    /// `mach_vm_purgable_control` and `vm_map_purgable_control`: no memory
+    /// here is purgeable (`VM_FLAGS_PURGABLE` is reported as not done), so
+    /// a mapped address is `VM_PURGABLE_DENY`.
+    fn vm_purgable_control(&mut self, address: u64, control: u64, state: i32) -> u64 {
+        use purgable::*;
+        if !matches!(control, SET_STATE | GET_STATE | PURGE_ALL | SET_STATE_FROM_KERNEL) {
+            return kr::INVALID_ARGUMENT;
+        }
+        if control == PURGE_ALL {
+            return kr::SUCCESS;
+        }
+        if (control == SET_STATE || control == SET_STATE_FROM_KERNEL) && (state & !ALL_MASKS != 0 || (state & STATE_MASK) > STATE_MASK) {
+            return kr::INVALID_ARGUMENT;
+        }
+        let mm = self.mem.lock();
+        let Some(v) = mm.vma_at(address) else { return kr::INVALID_ADDRESS };
+        if v.prot & 2 == 0 && control != GET_STATE {
+            return kr2::PROTECTION_FAILURE;
+        }
+        kr::INVALID_ARGUMENT
     }
 
     /// Run canonical call `n` from inside a Darwin call.

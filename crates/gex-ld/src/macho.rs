@@ -152,8 +152,10 @@ pub struct MachO {
     pub function_starts: Option<(u32, u32)>,
     pub chained_fixups: Option<(u32, u32)>,
     pub exports_trie: Option<(u32, u32)>,
-    /// `LC_BUILD_VERSION`'s platform (2 is iOS).
+    /// `LC_BUILD_VERSION`'s platform (2 is iOS) and SDK version
+    /// (`xxxx.yy.zz` nibbles).
     pub platform: Option<u32>,
+    pub sdk: Option<u32>,
 }
 
 pub fn is_macho(data: &[u8]) -> bool {
@@ -220,6 +222,7 @@ pub fn parse(d: &[u8]) -> Result<MachO, LoadError> {
         chained_fixups: None,
         exports_trie: None,
         platform: None,
+        sdk: None,
     };
     let mut o = 32usize;
     for i in 0..ncmds {
@@ -262,7 +265,10 @@ pub fn parse(d: &[u8]) -> Result<MachO, LoadError> {
             LC_FUNCTION_STARTS => m.function_starts = linkedit(c),
             LC_DYLD_CHAINED_FIXUPS => m.chained_fixups = linkedit(c),
             LC_DYLD_EXPORTS_TRIE => m.exports_trie = linkedit(c),
-            LC_BUILD_VERSION => m.platform = u32_at(c, o + 8),
+            LC_BUILD_VERSION => {
+                m.platform = u32_at(c, o + 8);
+                m.sdk = u32_at(c, o + 16);
+            }
             _ => {}
         }
         o += size;
