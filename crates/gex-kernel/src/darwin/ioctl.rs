@@ -256,8 +256,8 @@ impl Kernel {
     /// `fcntl(F_GETFL)`: `OFLAGS(f_flag)`.
     pub(crate) fn darwin_getfl(&mut self, fd: i32) -> Result<u64, Errno> {
         let file = self.fds.get(fd)?;
-        let waslocked = file.darwin_lflags.load(std::sync::atomic::Ordering::Acquire) & super::lockf::FWASLOCKED;
-        Ok(open_flags_back(file.flags()) | u64::from(waslocked))
+        let fg = file.darwin_lflags.load(std::sync::atomic::Ordering::Acquire) & (super::lockf::FWASLOCKED | fflag::FNOCACHE | fflag::FNORDAHEAD | fflag::FNODIRECT | fflag::FSINGLE_WRITER);
+        Ok(open_flags_back(file.flags()) | u64::from(fg))
     }
 
     /// `fcntl(F_SETFL)`: the `FCNTLFLAGS` replaced, then `fo_ioctl`'s
@@ -276,6 +276,99 @@ impl Kernel {
             put_int(&mut tmp, 0);
             let _ = self.darwin_fo_ioctl(&file, cmd::FIONBIO, &mut tmp);
             return Err(e);
+        }
+        Ok(0)
+    }
+}
+
+/// The `fg_flag` bits fcntl sets (`bsd/sys/fcntl.h`), kept with the open
+/// file's other Darwin flags.
+pub mod fflag {
+    pub const FNOCACHE: u32 = 0x0004_0000;
+    pub const FNORDAHEAD: u32 = 0x0008_0000;
+    pub const FNODIRECT: u32 = 0x0080_0000;
+    pub const FSINGLE_WRITER: u32 = 0x0400_0000;
+}
+
+impl Kernel {
+    /// The fcntl commands a vnode alone takes (EBADF for anything else):
+    /// the flags F_NOCACHE, F_RDAHEAD, F_NODIRECT and F_SINGLE_WRITER set,
+    /// and what the filesystem's VNOP_IOCTL, VNOP_ALLOCATE and data
+    /// protection give for the rest.
+    pub(crate) fn darwin_fcntl_vnode(&mut self, m: &mut GuestMem<'_>, fd: i32, c: u64, arg: u64) -> Result<u64, Errno> {
+        use std::sync::atomic::Ordering::AcqRel;
+        const F_PREALLOCATE: u64 = 42;
+        const F_RDADVISE: u64 = 44;
+        const F_RDAHEAD: u64 = 45;
+        const F_NOCACHE: u64 = 48;
+        const F_FULLFSYNC: u64 = 51;
+        const F_NODIRECT: u64 = 62;
+        const F_GETPROTECTIONCLASS: u64 = 63;
+        const F_SETPROTECTIONCLASS: u64 = 64;
+        const F_SINGLE_WRITER: u64 = 76;
+        const F_BARRIERFSYNC: u64 = 85;
+        const F_SPECULATIVE_READ: u64 = 101;
+        const F_PEOFPOSMODE: i32 = 3;
+        const F_VOLPOSMODE: i32 = 4;
+        let file = self.fds.get(fd)?;
+        if !matches!(self.darwin_file_kind(&file), Kind::Vnode(_) | Kind::HostStream(_)) {
+            return Err(Errno::EBADF);
+        }
+        let set = |bit: u32, on: bool| {
+            if on {
+                file.darwin_lflags.fetch_or(bit, AcqRel);
+            } else {
+                file.darwin_lflags.fetch_and(!bit, AcqRel);
+            }
+        };
+        match c {
+            F_NOCACHE => set(fflag::FNOCACHE, arg != 0),
+            F_RDAHEAD => set(fflag::FNORDAHEAD, arg == 0),
+            F_NODIRECT => set(fflag::FNODIRECT, arg != 0),
+            F_SINGLE_WRITER => set(fflag::FSINGLE_WRITER, arg != 0),
+            // The filesystem's sync, with its writes to the media: what is
+            // here keeps no journal or cache of its own past its fsync.
+            F_FULLFSYNC | F_BARRIERFSYNC => {
+                self.canonical(m, nr::FSYNC, [fd as u64, 0, 0, 0, 0, 0])?;
+            }
+            // An advisory read: checked, and nothing to fetch ahead here.
+            F_RDADVISE => {
+                let (off, count) = (m.read_u64(arg)? as i64, m.read_u32(arg + 8)? as i32);
+                if off < 0 || count < 0 {
+                    return Err(Errno::EINVAL);
+                }
+            }
+            F_SPECULATIVE_READ => {
+                let (off, len) = (m.read_u64(arg + 8)? as i64, m.read_u64(arg + 16)? as i64);
+                if off < 0 || len < 0 {
+                    return Err(Errno::EINVAL);
+                }
+                let foff = off & !(16384 - 1);
+                let len = len.checked_add(off - foff).ok_or(Errno::EOVERFLOW)?;
+                foff.checked_add(len).ok_or(Errno::EOVERFLOW)?;
+            }
+            // fstore_t checked, then VNOP_ALLOCATE: the filesystems here
+            // allocate no storage ahead (ENOTSUP), and none is allocated.
+            F_PREALLOCATE => {
+                if !file.writable {
+                    return Err(Errno::EBADF);
+                }
+                let posmode = m.read_u32(arg + 4)? as i32;
+                let offset = m.read_u64(arg + 8)? as i64;
+                m.write_u64(arg + 24, 0)?;
+                match posmode {
+                    F_PEOFPOSMODE if offset != 0 => return Err(Errno::EINVAL),
+                    F_VOLPOSMODE if offset <= 0 => return Err(Errno::EINVAL),
+                    F_PEOFPOSMODE | F_VOLPOSMODE => {}
+                    _ => return Err(Errno::EINVAL),
+                }
+                return Err(Errno::EOPNOTSUPP);
+            }
+            // The filesystems here keep no data protection class: the
+            // attribute is unsupported to get and ignored when set.
+            F_GETPROTECTIONCLASS => return Err(Errno::EOPNOTSUPP),
+            F_SETPROTECTIONCLASS => {}
+            _ => unreachable!("darwin_fcntl_vnode: {c}"),
         }
         Ok(0)
     }

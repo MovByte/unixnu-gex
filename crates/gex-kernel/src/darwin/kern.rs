@@ -72,6 +72,9 @@ mod f {
     pub const ADDFILESIGS_RETURN: u64 = 97;
     pub const CHECK_LV: u64 = 98;
     pub const SPECULATIVE_READ: u64 = 101;
+    pub const RDAHEAD: u64 = 45;
+    pub const NODIRECT: u64 = 62;
+    pub const SINGLE_WRITER: u64 = 76;
 }
 
 /// `MAXPATHLEN`.
@@ -465,7 +468,9 @@ impl Kernel {
             // of what the signature covers, is the largest offset.
             f::ADDFILESIGS_RETURN => res(m.write_u64(a[2], i64::MAX as u64).map(|_| 0)),
             f::ADDSIGS | f::ADDFILESIGS | f::CHECK_LV => 0,
-            f::NOCACHE | f::RDADVISE | f::FULLFSYNC | f::BARRIERFSYNC | f::PREALLOCATE | f::SPECULATIVE_READ => 0,
+            f::NOCACHE | f::RDAHEAD | f::NODIRECT | f::SINGLE_WRITER | f::RDADVISE | f::FULLFSYNC | f::BARRIERFSYNC | f::PREALLOCATE | f::SPECULATIVE_READ | f::GETPROTECTIONCLASS | f::SETPROTECTIONCLASS => {
+                res(self.darwin_fcntl_vnode(m, fd as i32, a[1], a[2]))
+            }
             // FG_NOSIGPIPE on the open file; a socket's is its SO_NOSIGPIPE.
             f::SETNOSIGPIPE | f::GETNOSIGPIPE => match self.fds.get(fd as i32) {
                 Err(e) => neg(e),
@@ -488,8 +493,6 @@ impl Kernel {
                     }
                 }
             },
-            f::SETPROTECTIONCLASS => 0,
-            f::GETPROTECTIONCLASS => 0,
             _ => neg(Errno::EINVAL),
         }
     }
