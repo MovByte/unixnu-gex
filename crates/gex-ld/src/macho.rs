@@ -9,6 +9,7 @@
 //! static image (or one with nothing to fix up) runs without it.
 
 use crate::elf::{headers_only, Image, LoadError, Segment, Symbol};
+use crate::stack::StackLayout;
 
 /// Where a position-independent Mach-O executable is placed. Its linked
 /// base, 0x1_0000_0000 past a 4 GiB `__PAGEZERO`, is where a 64-bit gex
@@ -473,6 +474,46 @@ pub fn load(d: &[u8], pie_base: u64) -> Result<(MachO, Image), LoadError> {
     Ok((m, img))
 }
 
+/// Darwin's initial stack, laid out the way XNU's exec leaves it: for a
+/// program dyld starts, the main executable's header address first (dyld
+/// takes it from the stack), then `argc`, the argument, environment and
+/// `apple[]` vectors, each ending in NULL, and their strings above them.
+/// `sp` is 16-byte aligned and points at the first word.
+pub fn build_stack(stack_top: u64, exe_header: Option<u64>, args: &[String], env: &[String], apple: &[String]) -> StackLayout {
+    // Strings at the top, then the vectors below them.
+    let strings: Vec<&String> = args.iter().chain(env).chain(apple).collect();
+    let text: usize = strings.iter().map(|s| s.len() + 1).sum();
+    let strings_low = (stack_top - text as u64) & !0xf;
+    let mut addrs = Vec::with_capacity(strings.len());
+    let mut a = strings_low;
+    for s in &strings {
+        addrs.push(a);
+        a += s.len() as u64 + 1;
+    }
+    let (argv, rest) = addrs.split_at(args.len());
+    let (envp, applev) = rest.split_at(env.len());
+    let mut words: Vec<u64> = Vec::new();
+    words.extend(exe_header);
+    words.push(args.len() as u64);
+    words.extend(argv);
+    words.push(0);
+    words.extend(envp);
+    words.push(0);
+    words.extend(applev);
+    words.push(0);
+    let sp = (strings_low - words.len() as u64 * 8) & !0xf;
+    let mut bytes = vec![0u8; (stack_top - sp) as usize];
+    for (i, w) in words.iter().enumerate() {
+        bytes[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+    }
+    let mut o = (strings_low - sp) as usize;
+    for s in &strings {
+        bytes[o..o + s.len()].copy_from_slice(s.as_bytes());
+        o += s.len() + 1;
+    }
+    StackLayout { sp, low: sp, bytes }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,6 +632,38 @@ mod tests {
         assert!(SHARED_REGION_BASE >= gex_abi::HIGH_TABLES_END);
         assert!(PIE_BASE > SHARED_REGION_BASE + 0xcc5f_0000);
         assert!(PIE_BASE < gex_abi::LIMIT64);
+    }
+
+    #[test]
+    fn the_stack_has_the_header_then_argc_and_the_vectors() {
+        let top = 0x0580_0000;
+        let args = ["/bin/hello".to_string(), "x".to_string()];
+        let env = ["HOME=/var/mobile".to_string()];
+        let apple = ["executable_path=/bin/hello".to_string()];
+        let st = build_stack(top, Some(0x2_8000_0000), &args, &env, &apple);
+        assert_eq!(st.sp % 16, 0);
+        assert_eq!(st.low + st.bytes.len() as u64, top);
+        let w = |i: usize| u64::from_le_bytes(st.bytes[i * 8..i * 8 + 8].try_into().unwrap());
+        let s = |a: u64| {
+            let o = (a - st.low) as usize;
+            let n = st.bytes[o..].iter().position(|&c| c == 0).unwrap();
+            String::from_utf8(st.bytes[o..o + n].to_vec()).unwrap()
+        };
+        assert_eq!(w(0), 0x2_8000_0000);
+        assert_eq!(w(1), 2);
+        assert_eq!(s(w(2)), "/bin/hello");
+        assert_eq!(s(w(3)), "x");
+        assert_eq!(w(4), 0);
+        assert_eq!(s(w(5)), "HOME=/var/mobile");
+        assert_eq!(w(6), 0);
+        assert_eq!(s(w(7)), "executable_path=/bin/hello");
+        assert_eq!(w(8), 0);
+    }
+
+    #[test]
+    fn a_static_program_starts_at_argc() {
+        let st = build_stack(0x0580_0000, None, &["a".to_string()], &[], &[]);
+        assert_eq!(u64::from_le_bytes(st.bytes[0..8].try_into().unwrap()), 1);
     }
 
     #[test]
