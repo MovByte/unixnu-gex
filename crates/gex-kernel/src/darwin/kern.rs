@@ -310,6 +310,28 @@ impl Kernel {
                     None => neg(Errno::ESRCH),
                 }
             }
+            // unlink(path) and unlinkat(fd, path, flag): Linux's unlinkat,
+            // but a directory is EPERM (vn_authorize_unlink), and
+            // AT_REMOVEDIR is rmdirat_internal.
+            sys::UNLINK | sys::UNLINKAT => {
+                const AT_REMOVEDIR: u64 = 0x80;
+                const AT_REMOVEDIR_DATALESS: u64 = 0x100;
+                const AT_SYMLINK_NOFOLLOW_ANY: u64 = 0x800;
+                let (fd, path, flag) = if raw == sys::UNLINK { (super::bsd::dirfd(super::bsd::AT_FDCWD as u64), a[0], 0) } else { (super::bsd::dirfd(a[0]), a[1], a[2] as u32 as u64) };
+                if flag & !(AT_REMOVEDIR | AT_REMOVEDIR_DATALESS | AT_SYMLINK_NOFOLLOW_ANY) != 0 {
+                    neg(Errno::EINVAL)
+                } else if flag & (AT_REMOVEDIR_DATALESS | AT_SYMLINK_NOFOLLOW_ANY) != 0 {
+                    self.darwin_unimplemented(format!("unlinkat flags {flag:#x} (dataless directories, AT_SYMLINK_NOFOLLOW_ANY)"));
+                    neg(Errno::EINVAL)
+                } else if flag & AT_REMOVEDIR != 0 {
+                    res(self.canonical(m, nr::UNLINKAT, [fd, path, 0x200, 0, 0, 0]))
+                } else {
+                    match self.canonical(m, nr::UNLINKAT, [fd, path, 0, 0, 0, 0]) {
+                        Err(Errno::EISDIR) => neg(Errno::EPERM),
+                        r => res(r),
+                    }
+                }
+            }
             sys::SIGACTION => res(self.darwin_sigaction(m, a[0], a[1], a[2])),
             sys::SIGALTSTACK => res(self.darwin_sigaltstack(m, a[0], a[1])),
             sys::GETFSSTAT64 => res(self.darwin_getfsstat(m, a[0], a[1])),
