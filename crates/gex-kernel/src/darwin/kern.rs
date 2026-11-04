@@ -310,6 +310,7 @@ impl Kernel {
                     None => neg(Errno::ESRCH),
                 }
             }
+            sys::PIPE => res(self.darwin_pipe(m)),
             // unlink(path) and unlinkat(fd, path, flag): Linux's unlinkat,
             // but a directory is EPERM (vn_authorize_unlink), and
             // AT_REMOVEDIR is rmdirat_internal.
@@ -332,6 +333,7 @@ impl Kernel {
                     }
                 }
             }
+            sys::FSTAT64 if self.darwin_pipe_of(a[0]).is_some() => res(self.darwin_pipe_stat(m, a[0], a[1])),
             sys::SIGACTION => res(self.darwin_sigaction(m, a[0], a[1], a[2])),
             sys::SIGALTSTACK => res(self.darwin_sigaltstack(m, a[0], a[1])),
             sys::GETFSSTAT64 => res(self.darwin_getfsstat(m, a[0], a[1])),
@@ -432,8 +434,30 @@ impl Kernel {
             f::ADDFILESIGS_RETURN => res(m.write_u64(a[2], i64::MAX as u64).map(|_| 0)),
             f::ADDSIGS | f::ADDFILESIGS | f::CHECK_LV => 0,
             f::NOCACHE | f::RDADVISE | f::FULLFSYNC | f::BARRIERFSYNC | f::PREALLOCATE | f::SPECULATIVE_READ => 0,
-            f::SETNOSIGPIPE | f::SETPROTECTIONCLASS => 0,
-            f::GETNOSIGPIPE | f::GETPROTECTIONCLASS => 0,
+            // FG_NOSIGPIPE on the open file; a socket's is its SO_NOSIGPIPE.
+            f::SETNOSIGPIPE | f::GETNOSIGPIPE => match self.fds.get(fd as i32) {
+                Err(e) => neg(e),
+                Ok(file) if file.handle.metadata().is_ok_and(|md| md.file_type == crate::vfs::FileType::Socket) => {
+                    self.darwin_unimplemented("F_SETNOSIGPIPE and F_GETNOSIGPIPE on a socket (SO_NOSIGPIPE)".into());
+                    neg(Errno::EINVAL)
+                }
+                Ok(file) => {
+                    use std::sync::atomic::Ordering::AcqRel;
+                    let bit = super::pipe::FG_NOSIGPIPE;
+                    if a[1] == f::SETNOSIGPIPE {
+                        if a[2] as i32 != 0 {
+                            file.darwin_lflags.fetch_or(bit, AcqRel);
+                        } else {
+                            file.darwin_lflags.fetch_and(!bit, AcqRel);
+                        }
+                        0
+                    } else {
+                        u64::from(file.darwin_lflags.load(std::sync::atomic::Ordering::Acquire) & bit != 0)
+                    }
+                }
+            },
+            f::SETPROTECTIONCLASS => 0,
+            f::GETPROTECTIONCLASS => 0,
             _ => neg(Errno::EINVAL),
         }
     }

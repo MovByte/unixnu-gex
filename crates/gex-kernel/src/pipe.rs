@@ -8,6 +8,12 @@
 //! Blocking uses a condition variable, which works because a guest thread is
 //! a real host thread. The browser runtime blocks the same way
 //! through `Atomics.wait`.
+//!
+//! A Darwin process's pipe keeps XNU's rules instead (`bsd/kern/sys_pipe.c`,
+//! [`xnu`]): a buffer that starts at 512 bytes and is regrown at a write
+//! that needs more, up to 64 KiB while the system's pipes hold less than
+//! `maxpipekva`; atomic writes of up to 512 bytes; writable for `select`
+//! with `PIPE_BUF` free of `MAX_PIPESIZE`.
 
 use crate::errno::{Errno, SysResult};
 use std::collections::VecDeque;
@@ -19,6 +25,42 @@ pub const PIPE_BUF: usize = 65536;
 /// Linux's `PIPE_BUF`: a write of at most this many bytes goes in whole or
 /// not at all, so no other writer's bytes land inside it.
 pub const PIPE_ATOMIC: usize = 4096;
+
+/// XNU's pipe sizes and limits (`bsd/sys/pipe.h`, `sys_pipe.c`).
+pub mod xnu {
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    /// `pipesize_blocks`.
+    pub const BLOCKS: [usize; 7] = [512, 1024, 2048, 4096, 4096 * 2, PIPE_SIZE, PIPE_SIZE * 4];
+    /// `PIPE_SIZE`: the least `MAX_PIPESIZE` is.
+    pub const PIPE_SIZE: usize = 16384;
+    /// `PIPE_BUF`: a write of at most this many bytes is atomic.
+    pub const PIPE_BUF: usize = 512;
+    /// `PIPE_KVAMAX`, `maxpipekva`'s value.
+    pub const KVA_MAX: i64 = 1024 * 1024 * 16;
+
+    /// `amountpipekva`: what every Darwin pipe's buffer holds, together.
+    pub static KVA: AtomicI64 = AtomicI64::new(0);
+
+    /// `choose_pipespace`: the block that fits the larger of `current` and
+    /// `expected`.
+    pub fn choose(current: usize, expected: usize) -> usize {
+        let target = current.max(expected);
+        let mut i = BLOCKS.len() - 1;
+        while i > 0 && BLOCKS[i - 1] > target {
+            i -= 1;
+        }
+        BLOCKS[i]
+    }
+
+    pub(super) fn add(n: i64) {
+        KVA.fetch_add(n, Ordering::AcqRel);
+    }
+
+    pub(super) fn room() -> bool {
+        KVA.load(Ordering::Acquire) < KVA_MAX
+    }
+}
 
 #[derive(Debug, Default)]
 struct State {
@@ -40,6 +82,9 @@ struct State {
     /// Writes that found no reader (EPIPE). Distinct from refused (EAGAIN):
     /// here the message is gone, not merely deferred.
     broken: u64,
+    /// A Darwin pipe's buffer size (`pipe_buffer.size`, 0 once it is
+    /// freed); `None` for a Linux pipe.
+    xnu_size: Option<usize>,
 }
 
 /// One pipe, shared by both ends.
@@ -49,6 +94,16 @@ pub struct Pipe {
     ready: Condvar,
     /// Who waits on either end (`crate::wait`): notified wherever `ready` is.
     queue: crate::wait::Queue,
+}
+
+impl Drop for Pipe {
+    /// A Darwin pipe's buffer, if no read-side close freed it, goes back.
+    fn drop(&mut self) {
+        let s = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
+        if let Some(size) = s.xnu_size.filter(|&n| n > 0) {
+            xnu::add(-(size as i64));
+        }
+    }
 }
 
 impl Default for Pipe {
@@ -70,10 +125,113 @@ impl Pipe {
                 written: 0,
                 last: Vec::new(),
                 broken: 0,
+                xnu_size: None,
             }),
             ready: Condvar::new(),
             queue: crate::wait::Queue::new(),
         }
+    }
+
+    /// A Darwin pipe (`pipepair_alloc`): its buffer is the smallest block.
+    pub fn new_xnu() -> Pipe {
+        let p = Pipe::new();
+        let size = xnu::choose(0, 0);
+        xnu::add(size as i64);
+        p.state.lock().unwrap().xnu_size = Some(size);
+        p
+    }
+
+    /// Whether the pipe keeps XNU's rules.
+    pub fn is_xnu(&self) -> bool {
+        self.state.lock().unwrap().xnu_size.is_some()
+    }
+
+    /// A Darwin pipe's buffer size, `MAX_PIPESIZE` and bytes buffered.
+    pub fn xnu_sizes(&self) -> Option<(usize, usize, usize)> {
+        let s = self.state.lock().unwrap();
+        s.xnu_size.map(|size| (size, size.max(xnu::PIPE_SIZE), s.buf.len()))
+    }
+
+    /// A Darwin write of `orig` bytes begins (`pipe_write`): `EPIPE` with no
+    /// reader, else the buffer grown to what the write needs, if the
+    /// system's pipes have room.
+    pub fn xnu_begin_write(&self, orig: usize) -> Result<(), Errno> {
+        let mut s = self.state.lock().unwrap();
+        if s.readers == 0 {
+            s.broken += 1;
+            return Err(Errno::EPIPE);
+        }
+        let size = s.xnu_size.expect("a Darwin pipe");
+        let cnt = s.buf.len();
+        if size == 0 || (orig > size - cnt && xnu::room()) {
+            let want = xnu::choose(size, cnt + orig);
+            // pipespace when empty, else expand_pipespace, which never
+            // shrinks it.
+            if cnt == 0 || want > size {
+                xnu::add(want as i64 - size as i64);
+                s.xnu_size = Some(want);
+            }
+        }
+        Ok(())
+    }
+
+    /// One pass of a Darwin write's loop, `left` of `orig` bytes still to
+    /// go: what fits, unless a write of at most `PIPE_BUF` would be split.
+    /// `EAGAIN` for none, `EPIPE` with no reader left.
+    pub fn xnu_write_with(&self, left: usize, orig: usize, fill: impl FnMut(&mut [u8], usize)) -> SysResult {
+        let mut s = self.state.lock().unwrap();
+        if s.readers == 0 {
+            s.broken += 1;
+            return Err(Errno::EPIPE);
+        }
+        let size = s.xnu_size.expect("a Darwin pipe");
+        let mut space = size.saturating_sub(s.buf.len());
+        if space < left && orig <= xnu::PIPE_BUF {
+            space = 0;
+        }
+        if space == 0 {
+            s.refused += 1;
+            return Err(Errno::EAGAIN);
+        }
+        let n = space.min(left);
+        Self::put(&mut s, n, fill);
+        drop(s);
+        self.ready.notify_all();
+        self.queue.notify();
+        Ok(n as u64)
+    }
+
+    /// Whether a Darwin write with `left` of `orig` bytes to go would put
+    /// some in now, or end (no reader).
+    pub fn xnu_write_ready(&self, left: usize, orig: usize) -> bool {
+        let s = self.state.lock().unwrap();
+        let size = s.xnu_size.unwrap_or(0);
+        let space = size.saturating_sub(s.buf.len());
+        s.readers == 0 || (space > 0 && !(space < left && orig <= xnu::PIPE_BUF))
+    }
+
+    /// Append `n` bytes that `fill` copies in.
+    fn put(s: &mut State, n: usize, mut fill: impl FnMut(&mut [u8], usize)) {
+        let old = s.buf.len();
+        s.buf.resize(old + n, 0);
+        let (front, back) = s.buf.as_mut_slices();
+        if back.len() >= n {
+            let at = back.len() - n;
+            fill(&mut back[at..], 0);
+        } else {
+            let k = n - back.len();
+            let at = front.len() - k;
+            fill(&mut front[at..], 0);
+            if !back.is_empty() {
+                fill(back, k);
+            }
+        }
+        s.writes += 1;
+        s.written += n as u64;
+        s.last.clear();
+        let take = n.min(160);
+        let st = &mut *s;
+        st.last.extend(st.buf.range(old..old + take));
     }
 
     /// The wait queue both ends' waiters register on.
@@ -104,6 +262,14 @@ impl Pipe {
             s.writers = s.writers.saturating_sub(1);
         } else {
             s.readers = s.readers.saturating_sub(1);
+            // pipeclose of the read side frees its buffer (pipe_free_kmem).
+            if s.readers == 0 {
+                if let Some(size) = s.xnu_size.filter(|&n| n > 0) {
+                    xnu::add(-(size as i64));
+                    s.xnu_size = Some(0);
+                    s.buf.clear();
+                }
+            }
         }
         // Waking both sides is what turns the last close into an EOF or an
         // EPIPE rather than a hang.
@@ -315,8 +481,13 @@ impl Pipe {
     /// once a page of the pipe is free. Less room than that is not
     /// writable: a small write would be refused, and its waiter would only
     /// wake to be refused again.
+    /// A Darwin pipe is writable (`pipe_select`) with `PIPE_BUF` free of
+    /// `MAX_PIPESIZE`.
     pub fn writable(&self) -> bool {
         let s = self.state.lock().unwrap();
+        if let Some(size) = s.xnu_size {
+            return s.readers == 0 || size.max(xnu::PIPE_SIZE).saturating_sub(s.buf.len()) >= xnu::PIPE_BUF;
+        }
         PIPE_BUF.saturating_sub(s.buf.len()) >= PIPE_ATOMIC || s.readers == 0
     }
 }

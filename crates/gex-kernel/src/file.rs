@@ -34,6 +34,8 @@ pub struct OpenFile {
     dir_cache: Mutex<Option<Vec<DirEntry>>>,
     pub readable: bool,
     pub writable: bool,
+    /// A Darwin process's `fg_lflags` for the open file (`FG_NOSIGPIPE`).
+    pub darwin_lflags: std::sync::atomic::AtomicU32,
     /// A path to unlink when the last descriptor to this file closes. Set for
     /// `O_TMPFILE`: Linux makes such a file nameless at once, but gex keeps it
     /// named (`.gex-tmpfile-*`) so the `linkat("/proc/self/fd/N", target,
@@ -129,6 +131,7 @@ impl OpenFile {
             unlink_on_close: None,
             locks: OnceLock::new(),
             ino: OnceLock::new(),
+            darwin_lflags: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -155,6 +158,7 @@ impl OpenFile {
             dir_cache: Mutex::new(None),
             readable,
             writable,
+            darwin_lflags: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -714,6 +718,11 @@ impl FileHandle for PipeEnd {
         if !self.write {
             return Err(Errno::EBADF);
         }
+        // A Darwin pipe written whole in one pass, as a write of its own.
+        if self.pipe.is_xnu() {
+            self.pipe.xnu_begin_write(buf.len())?;
+            return self.write_part(buf, buf.len());
+        }
         self.pipe.write(buf)
     }
 
@@ -740,6 +749,27 @@ impl FileHandle for PipeEnd {
 
     fn wakes(&self) -> Option<u64> {
         Some(self.pipe.wakes())
+    }
+
+    fn pipe_end(&self) -> Option<(Arc<Pipe>, bool)> {
+        Some((Arc::clone(&self.pipe), self.write))
+    }
+
+    fn write_part(&self, buf: &[u8], orig: usize) -> SysResult {
+        if !self.write {
+            return Err(Errno::EBADF);
+        }
+        if self.pipe.is_xnu() {
+            return self.pipe.xnu_write_with(buf.len(), orig, |dst, from| dst.copy_from_slice(&buf[from..from + dst.len()]));
+        }
+        self.pipe.write(buf)
+    }
+
+    fn write_ready(&self, left: usize, orig: usize) -> bool {
+        if self.write && self.pipe.is_xnu() {
+            return self.pipe.xnu_write_ready(left, orig);
+        }
+        self.poll_writable()
     }
 }
 

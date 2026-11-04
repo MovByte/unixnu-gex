@@ -14414,7 +14414,11 @@ fn finish_parked(
                 r => r,
             }
         }
-        gex_kernel::BlockOp::WriteStream { handle, buf, len, gathered } => {
+        // A Darwin pipe's parked write (its whole size and what it already
+        // wrote) is finished by the native host only: the page runs no
+        // Darwin process yet.
+        gex_kernel::BlockOp::WriteStream { xnu: Some(_), .. } => Err(Errno::ENOSYS),
+        gex_kernel::BlockOp::WriteStream { handle, buf, len, gathered, xnu: None } => {
             // One turn's worth; the scheduler brings the thread back while
             // anything is left, because the descriptor stays unwritable until
             // the reader has drained.

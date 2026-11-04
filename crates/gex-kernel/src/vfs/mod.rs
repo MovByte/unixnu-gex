@@ -401,6 +401,27 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         false
     }
 
+    /// The pipe an anonymous pipe end is on, and whether it is the write
+    /// end.
+    fn pipe_end(&self) -> Option<(Arc<crate::pipe::Pipe>, bool)> {
+        None
+    }
+
+    /// A pass of a parked write with `buf` left of the `orig` bytes it was
+    /// asked for: [`Self::write_at`], for a handle whose rules do not
+    /// depend on the whole write's size.
+    fn write_part(&self, buf: &[u8], orig: usize) -> SysResult {
+        let _ = orig;
+        self.write_at(0, buf)
+    }
+
+    /// Whether a parked write with `left` of `orig` bytes to go would make
+    /// progress now: [`Self::poll_writable`], but for such a handle.
+    fn write_ready(&self, left: usize, orig: usize) -> bool {
+        let _ = (left, orig);
+        self.poll_writable()
+    }
+
     /// The wait queue a change in this handle's readiness is announced on
     /// ([`crate::wait`]): a thread waiting for it registers its wait slot
     /// there. 0 for a handle whose readiness no event changes (a file is

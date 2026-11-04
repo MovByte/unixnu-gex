@@ -1976,24 +1976,30 @@ fn perform_block(
                 turn!(seen);
             }
         }
-        BlockOp::WriteStream { handle, buf, len, gathered } => {
+        BlockOp::WriteStream { handle, buf, len, gathered, xnu } => {
             let data = match gathered {
                 Some(g) => g.to_vec(),
                 None => GuestMem::new(data).read(buf, len)?.to_vec(),
             };
+            // A Darwin pipe write goes by the whole write's size, counts what
+            // it put in before it parked, and ends in EPIPE whatever it wrote
+            // (fp_writev).
+            let (orig, before) = xnu.map_or((data.len(), 0), |(orig, before)| (orig, before));
             let mut done = 0usize;
             while done < data.len() {
                 let seen = ready::seq();
-                if !handle.poll_writable() {
+                if !handle.write_ready(data.len() - done, orig) {
                     // A partial write already delivered is the caller's
                     // answer; only an untouched write reports the signal.
                     if interrupted() {
-                        return if done > 0 { Ok(done as u64) } else { Err(Errno::EINTR) };
+                        let total = before + done as u64;
+                        return if total > 0 { Ok(total) } else { Err(Errno::EINTR) };
                     }
                     ready::wait(seen, std::time::Duration::from_millis(1));
                     continue;
                 }
-                match handle.write_at(0, &data[done..]) {
+                match handle.write_part(&data[done..], orig) {
+                    Err(Errno::EPIPE) if xnu.is_some() => return Err(Errno::EPIPE),
                     Ok(0) => std::thread::sleep(std::time::Duration::from_millis(1)),
                     Ok(n) => done += n as usize,
                     // Another writer filled it between the check and the
@@ -2010,7 +2016,7 @@ fn perform_block(
                     Err(e) => return Err(e),
                 }
             }
-            Ok(done as u64)
+            Ok(before + done as u64)
         }
         BlockOp::ReadStream { handle, buf, len, vectors } => {
             let mut tmp = vec![0u8; len];

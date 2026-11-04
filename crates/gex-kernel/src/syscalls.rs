@@ -403,6 +403,10 @@ pub enum BlockOp {
         /// A vectored write of at most `PIPE_ATOMIC` bytes, gathered: written
         /// whole, in place of `buf`/`len` (see [`gather_small`]).
         gathered: Option<Arc<[u8]>>,
+        /// A Darwin pipe write: the whole write's size, which its rules go
+        /// by ([`crate::vfs::FileHandle::write_part`]), and the bytes it put
+        /// in before it parked, which the call's answer counts.
+        xnu: Option<(usize, u64)>,
     },
     /// `wait4`. Blocks until one of `children` has a status to collect.
     WaitChild {
@@ -687,6 +691,9 @@ pub struct Kernel {
     pub darwin_user_stack: u64,
     /// How the Darwin call that blocked writes its result back.
     pub darwin_finish: Option<crate::darwin::wait::Wait>,
+    /// A parked write to a Darwin pipe: whether its EPIPE sends the process
+    /// SIGPIPE (the open file has no `FG_NOSIGPIPE`).
+    pub darwin_pipe_sigpipe: Option<bool>,
     /// Set by a syscall that may have made a descriptor readable or
     /// writable for someone else (a write, a read that freed room, a close,
     /// a signal); the host takes it after the call and wakes threads parked
@@ -1782,6 +1789,7 @@ impl FdIo<'_> {
                     buf: a[1],
                     len: a[2].min(1 << 24) as usize,
                     gathered: None,
+                    xnu: None,
                 })
             }
             // `writev` and `readv` on a stream block as `write` and `read` do,
@@ -1814,6 +1822,7 @@ impl FdIo<'_> {
                     buf,
                     len: len.min(1 << 24) as usize,
                     gathered,
+                    xnu: None,
                 })
             }
             nr::READV => {
@@ -1871,9 +1880,9 @@ impl FdIo<'_> {
             nr::WRITEV if file.write_is_atomic() => {
                 let gathered = self.small_writev(m, a);
                 let len = gathered.as_ref().map_or(len, |g| g.len());
-                Some(BlockOp::WriteStream { handle, buf, len, gathered })
+                Some(BlockOp::WriteStream { handle, buf, len, gathered, xnu: None })
             }
-            nr::WRITE if file.write_is_atomic() => Some(BlockOp::WriteStream { handle, buf, len, gathered: None }),
+            nr::WRITE if file.write_is_atomic() => Some(BlockOp::WriteStream { handle, buf, len, gathered: None, xnu: None }),
             _ => None,
         }
     }
@@ -8730,6 +8739,9 @@ pub struct PendingCall {
     pub block_restart: crate::signal::Restart,
     pub block_pc: u64,
     pub darwin_finish: Option<crate::darwin::wait::Wait>,
+    /// A parked write to a Darwin pipe: whether its EPIPE sends the process
+    /// SIGPIPE (the open file has no `FG_NOSIGPIPE`).
+    pub darwin_pipe_sigpipe: Option<bool>,
 }
 
 /// A thread the kernel has prepared and the host must start.
@@ -8790,6 +8802,7 @@ impl Kernel {
             block_restart: std::mem::take(&mut self.block_restart),
             block_pc: std::mem::take(&mut self.block_pc),
             darwin_finish: self.darwin_finish.take(),
+            darwin_pipe_sigpipe: self.darwin_pipe_sigpipe.take(),
         };
         if call != PendingCall::default() {
             self.thread_calls.insert(self.sig_tid, call);
@@ -8804,6 +8817,7 @@ impl Kernel {
         self.block_restart = call.block_restart;
         self.block_pc = call.block_pc;
         self.darwin_finish = call.darwin_finish;
+        self.darwin_pipe_sigpipe = call.darwin_pipe_sigpipe;
         let blocked = self.signals.blocked();
         let next = self
             .thread_signals
@@ -8948,6 +8962,7 @@ impl Kernel {
             darwin_arg_base: 0,
             darwin_user_stack: 0,
             darwin_finish: None,
+            darwin_pipe_sigpipe: None,
             fd_activity: false,
             wasm32: false,
             sigreturn_legacy: false,
@@ -9340,6 +9355,7 @@ impl Kernel {
             darwin_arg_base: 0,
             darwin_user_stack: 0,
             darwin_finish: None,
+            darwin_pipe_sigpipe: None,
             fd_activity: false,
             wasm32: self.wasm32,
             sigreturn_legacy: false,
@@ -10282,6 +10298,9 @@ impl Kernel {
         // has to carry it -- restoring it here instead would block the very
         // signal that ended the wait, leaving it pending forever.
         let suspended = self.restore_sigmask.take();
+        if self.darwin_pipe_sigpipe.take() == Some(true) && r == Err(Errno::EPIPE) {
+            self.darwin_send_sigpipe();
+        }
         if std::mem::take(&mut self.write_blocked) && r == Err(Errno::EPIPE) {
             self.signals.raise_from(
                 crate::signal::sig::SIGPIPE,

@@ -28,6 +28,7 @@ pub mod mach;
 pub mod mach_msg;
 pub mod mig;
 pub mod mk_timer;
+pub mod pipe;
 pub mod psynch;
 pub mod sema;
 pub mod shm;

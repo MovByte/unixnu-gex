@@ -333,6 +333,7 @@ impl Kernel {
                 Some(SyscallOutcome::Blocking(crate::syscalls::BlockOp::SigSuspend { restore_mask }))
             }
             sys::SIGRETURN => Some(self.darwin_sigreturn(m, a)),
+            sys::WRITE | sys::WRITE_NOCANCEL | sys::WRITEV | sys::WRITEV_NOCANCEL if self.darwin_pipe_of(a[0]).is_some() => Some(self.darwin_pipe_write(m, raw, a)),
             sys::KEVENT => Some(<Kq as KQueue>::kevent_legacy(self, m, a, false)),
             sys::KEVENT64 => Some(<Kq as KQueue>::kevent_legacy(self, m, a, true)),
             sys::KEVENT_QOS => Some(<Kq as KQueue>::kevent_qos(self, m, a)),
