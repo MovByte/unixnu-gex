@@ -1480,6 +1480,7 @@ fn run_program_with(
     if opts.aot_only {
         aot_only::bind_root(&mut store, &instance)?;
     }
+    gex_kernel::darwin::workq::thread_started(store.data().thread.tid);
     let stopped = match run_thread_loop(&mut store, &instance, ctx_addr, entry) {
         Ok(s) => s,
         Err(e) => {
@@ -2808,6 +2809,7 @@ fn say_killed(pid: i32, exit: &Exit) {
 
 /// Run a child process to completion in this host thread.
 fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> Result<Exit> {
+    gex_kernel::darwin::workq::thread_started(thread.tid);
     let mut store = Store::new(
         &cx.engine,
         HostState {
@@ -3185,7 +3187,52 @@ fn exec_program(
 /// A guest thread: its own store, its own instances, the same memory.
 /// Run one spawned thread to its end. `Some` when its end is the process's
 /// (`exit_group`, a fatal signal), not just its own.
+/// The kernel's first entry for a new thread, if it has one
+/// (`Kernel::darwin_thread_entry`), with its waits done here as a system
+/// call's are. `Some` when it ends the process.
+fn darwin_thread_entry(cx: &Arc<SpawnContext>, store: &mut Store<HostState>) -> Result<Option<Exit>> {
+    let memory = cx.memory.clone();
+    let mut gm = GuestMem::new(memory.bytes());
+    let Some(mut outcome) = store.data_mut().with_kernel(|k| k.darwin_thread_entry(&mut gm)) else { return Ok(None) };
+    let tid = store.data().thread.tid;
+    while let SyscallOutcome::Blocking(op) = outcome {
+        let kernel = Arc::clone(&store.data().kernel);
+        let stopping = Arc::clone(&cx.stopping);
+        let interrupted = move || {
+            stopping.load(std::sync::atomic::Ordering::Acquire) || kernel.lock().unwrap_or_else(|e| e.into_inner()).signal_pending_for(tid)
+        };
+        cx.gate.leave();
+        let r = perform_block(op, memory.bytes(), &|_: &mut [u8]| {}, &interrupted);
+        cx.gate.enter();
+        let mut gm = GuestMem::new(memory.bytes());
+        outcome = store.data_mut().with_kernel(|k| k.finish_blocking(&mut gm, r));
+    }
+    for req in store.data_mut().with_kernel(|k| k.take_spawns()) {
+        start_guest_thread(Arc::clone(cx), ThreadState { ctx_addr: req.ctx_addr, tid: req.tid })?;
+    }
+    match outcome {
+        SyscallOutcome::Continue => Ok(None),
+        SyscallOutcome::Resume(pc) => {
+            let ctx_addr = store.data().thread.ctx_addr;
+            let mut gm = GuestMem::new(memory.bytes());
+            gm.write_u64(ctx_addr + ctx::PC as u64, pc).map_err(|e| anyhow!("thread {tid}: setting its entry: {e:?}"))?;
+            Ok(None)
+        }
+        SyscallOutcome::Killed { signal, core } => Ok(Some(Exit::Signal { signal: signal as i32, pc: 0, detail: format!("killed by signal {signal}{}", if core { " (core)" } else { "" }), internal: false })),
+        SyscallOutcome::Exit(code) => Ok(Some(Exit::Status(code))),
+        other => Err(anyhow!("thread {tid}: unexpected outcome of its first kernel entry: {other:?}")),
+    }
+}
+
 fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option<Exit>> {
+    gex_kernel::darwin::workq::thread_started(thread.tid);
+    struct Unregister(i32);
+    impl Drop for Unregister {
+        fn drop(&mut self) {
+            gex_kernel::darwin::workq::thread_ended(self.0);
+        }
+    }
+    let _unregister = Unregister(thread.tid);
     let mut store = Store::new(
         &cx.engine,
         HostState {
@@ -3250,6 +3297,13 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option
     // so everything translated since has to be replayed into it before the
     // first branch reaches for it.
     catch_up_table(&mut store)?;
+
+    // A thread whose first act is the kernel's (a Darwin workqueue
+    // thread, made parked) runs that before any guest code; it may wait,
+    // and it leaves the context set for where the guest begins.
+    if let Some(exit) = darwin_thread_entry(&cx, &mut store)? {
+        return Ok(Some(exit));
+    }
 
     let entry = {
         let data = cx.memory.bytes();

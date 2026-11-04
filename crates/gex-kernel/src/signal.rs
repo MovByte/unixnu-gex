@@ -499,6 +499,12 @@ impl ThreadSig {
         self.blocked.load(Ordering::Acquire)
     }
 
+    /// Set this thread's mask from outside it (a thread the kernel makes
+    /// with a mask of its own, before it runs).
+    pub fn set_blocked(&self, mask: u64) {
+        self.blocked.store(mask, Ordering::Release);
+    }
+
     /// Whether a signal that would do something is ready for this thread,
     /// counting its process's shared set ([`ProcSig::would_deliver_with`]).
     /// Takes no lock unless an unblocked signal is pending.

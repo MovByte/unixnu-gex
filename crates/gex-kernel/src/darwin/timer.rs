@@ -17,6 +17,8 @@ use std::time::Instant;
 pub enum Action {
     /// `mk_timer_expire` for the timer whose port this is.
     MkTimer(super::ipc::ObjId),
+    /// One of the workqueue's thread calls.
+    Workq(super::workq::Call),
 }
 
 /// How the thread-call thread learns that an earlier deadline was armed, or
@@ -117,6 +119,7 @@ impl Kernel {
             }
             match self.dtask.timers.armed.remove(&key).expect("first key") {
                 Action::MkTimer(port) => self.mk_timer_expire(m, port, key),
+                Action::Workq(c) => self.darwin_workq_call(m, c),
             }
         }
     }

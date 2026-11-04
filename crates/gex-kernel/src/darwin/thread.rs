@@ -63,7 +63,27 @@ pub mod pp {
     pub const PRIORITY_MASK: u64 = 0xff;
     pub const FLAGS_MASK: u64 = 0xff00_0000;
     pub const SCHED_PRI_FLAG: u64 = 0x2000_0000;
+    pub const SCHED_PRI_MASK: u64 = 0x0000_ffff;
     pub const EVENT_MANAGER_FLAG: u64 = 0x0200_0000;
+    pub const OVERCOMMIT_FLAG: u64 = 0x8000_0000;
+    pub const COOPERATIVE_FLAG: u64 = 0x0800_0000;
+    pub const OVERRIDE_QOS_FLAG: u64 = 0x0080_0000;
+    pub const VALID_OVERRIDE_QOS_MASK: u64 = 0x003f_c000;
+    pub const QOS_OVERRIDE_SHIFT: u32 = 14;
+
+    /// `_pthread_priority_has_override_qos`.
+    pub fn has_override_qos(p: u64) -> bool {
+        p & (SCHED_PRI_FLAG | EVENT_MANAGER_FLAG) == 0 && p & OVERRIDE_QOS_FLAG != 0 && p & VALID_OVERRIDE_QOS_MASK != 0
+    }
+
+    /// `_pthread_priority_thread_override_qos`.
+    pub fn override_qos(p: u64) -> u8 {
+        if !has_override_qos(p) {
+            return 0;
+        }
+        let v = (p & VALID_OVERRIDE_QOS_MASK) >> QOS_OVERRIDE_SHIFT;
+        v.trailing_zeros() as u8 + 1
+    }
 
     /// `_pthread_priority_make_from_thread_qos`.
     pub fn from_qos(qos: u8, relpri: i32, flags: u64) -> u64 {
@@ -157,7 +177,7 @@ pub const CANCEL_POINTS: &[u64] = &[
 ];
 
 /// A Darwin thread's kernel state.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct DThread {
     pub policy: Policy,
     pub cancel: Cancel,
@@ -166,6 +186,10 @@ pub struct DThread {
     pub suspend: u32,
     /// The thread, made but not started (created suspended).
     pub unstarted: Option<SpawnRequest>,
+    /// A workqueue thread's state (`THREAD_TAG_WORKQUEUE`).
+    pub wq: Option<Box<super::workq::WqThread>>,
+    /// The QoS overrides others put on it (`thread->overrides`).
+    pub overrides: Vec<super::workq::QosOverride>,
 }
 
 /// Every Darwin thread of the process, by tid.
@@ -228,6 +252,8 @@ pub enum Finish {
     Sema(super::sema::Cont),
     /// A trap's sleep (`mach_wait_until`, `thread_switch`).
     Sleep(super::mach::Sleep),
+    /// A workqueue thread parked (`workq_unpark_continue`).
+    WorkqPark,
 }
 
 /// `wait_result_to_return_code` (`sys_ulock.c`).
@@ -274,6 +300,12 @@ impl Kernel {
             }
             sys::ULOCK_WAIT2 => Some(self.darwin_ulock_wait(m, a)),
             sys::SEMWAIT_SIGNAL => Some(self.darwin_semwait_signal(m, a, true)),
+            sys::WORKQ_OPEN => {
+                let r = self.darwin_workq_open();
+                bsd_result(m, self.ctx_addr, r, false);
+                Some(SyscallOutcome::Continue)
+            }
+            sys::WORKQ_KERNRETURN => Some(self.darwin_workq_kernreturn(m, a)),
             sys::SEMWAIT_SIGNAL_NOCANCEL => Some(self.darwin_semwait_signal(m, a, false)),
             sys::ULOCK_WAKE => {
                 let no_errno = a[0] & ul::NO_ERRNO != 0;
@@ -499,6 +531,8 @@ impl Kernel {
         }
         self.darwin_thread_ports_terminate(tid);
         self.darwin_ipc_settle(m);
+        self.darwin_workq_thread_terminate(self.tid);
+        self.darwin_workq_settle(m);
         self.dtask.threads.map.remove(&self.tid);
         self.dtask.waits.forget(self.tid);
     }
@@ -657,6 +691,7 @@ impl Kernel {
             Finish::MachMsg(c) => return self.darwin_mach_msg_wait_done(m, c, res),
             Finish::Sema(c) => self.darwin_sema_wait_done(m, c, res),
             Finish::Sleep(s) => self.darwin_sleep_done(m, s, res),
+            Finish::WorkqPark => return self.darwin_workq_wait_done(m, res),
             Finish::Psynch(c) => self.darwin_psynch_wait_done(m, c, res),
             Finish::Ulock { addr, no_errno } => {
                 // A waiter that was not woken is still on the queue.

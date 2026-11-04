@@ -267,7 +267,7 @@ impl Kernel {
                 0
             }
             // QoS overrides and the like: no scheduler classes to apply.
-            sys::BSDTHREAD_CTL => 0,
+            sys::BSDTHREAD_CTL => res(self.darwin_bsdthread_ctl(m, a)),
             // A signal to a thread by its Mach port; signal 0 only asks
             // whether the thread is there.
             sys::PTHREAD_KILL => {

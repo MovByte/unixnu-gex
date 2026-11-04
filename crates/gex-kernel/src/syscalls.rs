@@ -9385,6 +9385,16 @@ impl Kernel {
         self.sys_clone(m, a)
     }
 
+    /// A thread of this process made from thread context `parent` (a
+    /// workqueue thread, which the kernel makes without a caller), its
+    /// registers set before it first runs.
+    pub(crate) fn darwin_clone_from(&mut self, m: &mut GuestMem<'_>, parent: u64) -> Result<SpawnRequest, Errno> {
+        use crate::syscalls::clone_flags as cf;
+        let fs = self.fs_of(parent);
+        let flags = cf::VM | cf::FS | cf::FILES | cf::SIGHAND | cf::THREAD | cf::SYSVSEM;
+        self.thread_maker(&fs).make(m, parent, [flags, 1, 0, 0, 0, 0])
+    }
+
     /// End a thread made by [`Self::darwin_clone`] that never ran: what
     /// its exit would have ended, and the host thread promised for it.
     pub(crate) fn darwin_discard_thread(&mut self, m: &mut GuestMem<'_>, req: SpawnRequest) {
@@ -9458,6 +9468,9 @@ impl Kernel {
         let out = self.syscall_cwd(m, pc);
         if self.darwin && !matches!(out, SyscallOutcome::Blocking(_)) {
             self.darwin_syscall_exit();
+        }
+        if self.darwin && matches!(out, SyscallOutcome::Blocking(_)) {
+            self.darwin_workq_sched_block();
         }
         if self.darwin {
             if let Some(out) = self.darwin_guard_kill() {
@@ -9566,6 +9579,9 @@ impl Kernel {
                     }
                 }
             };
+            if raw == crate::darwin::sysno::EXIT {
+                self.darwin_workq_mark_exiting();
+            }
             if crate::darwin::thread::CANCEL_POINTS.contains(&raw) && self.darwin_testcancel(true) {
                 let _ = crate::darwin::set_result(m, self.ctx_addr, Errno::EINTR.as_return());
                 return SyscallOutcome::Continue;
@@ -10159,6 +10175,19 @@ impl Kernel {
     }
 
     pub fn finish_blocking(&mut self, m: &mut GuestMem<'_>, r: SysResult) -> SyscallOutcome {
+        // A workqueue thread's scheduler callback (`workq_sched_callback`):
+        // it runs again, and blocks again if the call goes on waiting.
+        if self.darwin {
+            self.darwin_workq_sched_unblock();
+        }
+        let out = self.finish_blocking_inner(m, r);
+        if self.darwin && matches!(out, SyscallOutcome::Blocking(_)) {
+            self.darwin_workq_sched_block();
+        }
+        out
+    }
+
+    fn finish_blocking_inner(&mut self, m: &mut GuestMem<'_>, r: SysResult) -> SyscallOutcome {
         // A Darwin wait: its own call writes the result, or it sleeps again.
         if self.darwin {
             match self.darwin_wait_end(r) {
@@ -10169,15 +10198,24 @@ impl Kernel {
                     self.block_pc = 0;
                     // A wait that leads into another (a send that then
                     // receives) blocks again.
-                    if let Some(out @ SyscallOutcome::Blocking(_)) = self.darwin_wait_done(m, wait, res) {
+                    // The call goes on: it blocks again (a send that then
+                    // receives, a workqueue thread parked anew) or comes
+                    // back to user space somewhere new (a workqueue thread
+                    // given work).
+                    let next = self.darwin_wait_done(m, wait, res);
+                    if let Some(out @ SyscallOutcome::Blocking(_)) = next {
                         return out;
                     }
                     if let Some(out) = self.darwin_guard_kill() {
                         return out;
                     }
                     self.darwin_syscall_exit();
+                    let resume_at = match next {
+                        Some(SyscallOutcome::Resume(pc)) => Some(pc),
+                        _ => None,
+                    };
                     return match self.deliver_pending(m) {
-                        Delivery::None => SyscallOutcome::Continue,
+                        Delivery::None => resume_at.map_or(SyscallOutcome::Continue, SyscallOutcome::Resume),
                         Delivery::Resume(_) if self.wasm32 => SyscallOutcome::Continue,
                         Delivery::Resume(pc) => SyscallOutcome::Resume(pc),
                         Delivery::Terminate { signal, core } => SyscallOutcome::Killed { signal, core },

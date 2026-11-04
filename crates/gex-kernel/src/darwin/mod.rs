@@ -35,6 +35,7 @@ pub mod thread;
 pub mod timer;
 pub mod vm;
 pub mod wait;
+pub mod workq;
 
 /// A Darwin process's kernel state beyond the BSD side's: its threads and
 /// what they wait on.
@@ -63,6 +64,18 @@ pub struct Task {
     pub mk_timers: mk_timer::MkTimers,
     /// `p_idversion`, from the system's `nextpidversion` at exec.
     pub pidversion: i32,
+    /// The workqueue, once opened (`p_wqptr`), and what it owes: threads
+    /// to wake or start, a creator pass.
+    pub workq: Option<Box<workq::Workq>>,
+    pub workq_wake: Vec<i32>,
+    pub workq_creator_pending: Option<u32>,
+    /// `p_workq_allow_sigmask`.
+    pub workq_allow_sigmask: u32,
+    /// `p_dispatchqueue_serialno_offset`, `p_dispatchqueue_label_offset`.
+    pub dispatchqueue_serialno_offset: u64,
+    pub dispatchqueue_label_offset: u64,
+    /// The task's app type (`trp_apptype`).
+    pub apptype: workq::AppType,
     /// Maximum protections lowered from `VM_PROT_ALL`.
     pub maxprot: vm::MaxProt,
     /// Threads a semaphore operation woke, and how.

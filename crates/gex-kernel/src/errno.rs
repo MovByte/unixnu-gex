@@ -50,6 +50,7 @@ impl Errno {
     pub const ENODATA: Errno = Errno(61);
     pub const ETIMEDOUT: Errno = Errno(110);
     pub const EOPNOTSUPP: Errno = Errno(95);
+    pub const EBADMSG: Errno = Errno(74);
     pub const EAFNOSUPPORT: Errno = Errno(97);
     pub const ECONNREFUSED: Errno = Errno(111);
     pub const EADDRINUSE: Errno = Errno(98);

@@ -656,6 +656,11 @@ impl Kernel {
         kr::SUCCESS
     }
 
+    /// `mach_vm_map` of anonymous memory, read and write.
+    pub(crate) fn darwin_vm_map_anon(&mut self, m: &mut GuestMem<'_>, addr: &mut u64, size: u64, mask: u64, flags: u64) -> u64 {
+        self.vm_allocate(m, addr, size, mask, flags, prot::READ | prot::WRITE)
+    }
+
     /// Memory for a received message's out-of-line data (`vm_map_copyout`):
     /// anywhere, read and write.
     pub(crate) fn darwin_vm_allocate_anywhere(&mut self, m: &mut GuestMem<'_>, len: u64) -> Result<u64, u64> {
