@@ -346,6 +346,25 @@ impl OpenFile {
         Ok(bytes)
     }
 
+    /// The `idx`th entry of the directory's listing (the snapshot
+    /// [`OpenFile::read_dirents`] reads from), or `None` past its end.
+    pub fn dir_entry(&self, idx: usize) -> Result<Option<DirEntry>, Errno> {
+        let mut cache = self.dir_cache.lock().unwrap();
+        if cache.is_none() {
+            *cache = Some(self.handle.read_dir()?);
+        }
+        Ok(cache.as_ref().unwrap().get(idx).cloned())
+    }
+
+    /// Where the directory is read from next, in entries.
+    pub fn dir_cursor(&self) -> usize {
+        self.dir_pos.load(Ordering::Relaxed)
+    }
+
+    pub fn set_dir_cursor(&self, pos: usize) {
+        self.dir_pos.store(pos, Ordering::Relaxed);
+    }
+
     pub fn is_tty(&self) -> bool {
         self.handle.is_tty()
     }

@@ -108,20 +108,45 @@ pub const MOUNTS: &[Mount] = &[
 /// `sizeof(struct statfs64)`.
 pub const STATFS64_SIZE: usize = 2168;
 
+/// What the volumes report of themselves, in `statfs` and `getattrlist`
+/// alike: the block size, the preferred transfer size and the counts.
+pub mod vfsstat {
+    pub const BSIZE: u32 = 4096;
+    pub const IOSIZE: u32 = 1 << 20;
+    pub const BLOCKS: u64 = 8 << 20;
+    pub const BFREE: u64 = 4 << 20;
+    pub const BAVAIL: u64 = 4 << 20;
+    pub const FILES: u64 = 1 << 24;
+    pub const FFREE: u64 = 1 << 23;
+    /// `vfs_typenum` of APFS: `f_type`, and the second word of `f_fsid`.
+    pub const APFS_TYPENUM: u32 = 0x1a;
+}
+
+/// The mount a path is on: the one with the longest mount point that
+/// holds it.
+pub fn mount_of(path: &str) -> &'static Mount {
+    MOUNTS
+        .iter()
+        .filter(|mt| path == mt.on || path.starts_with(&format!("{}/", mt.on.trim_end_matches('/'))))
+        .max_by_key(|mt| mt.on.len())
+        .unwrap_or(&MOUNTS[0])
+}
+
 /// One `struct statfs64` for `mnt`, as an APFS volume.
 pub fn statfs64(mnt: &Mount) -> Vec<u8> {
     let mut b = vec![0u8; STATFS64_SIZE];
     let mut put = |o: usize, v: &[u8]| b[o..o + v.len()].copy_from_slice(v);
-    put(0, &4096u32.to_le_bytes());
-    put(4, &(1u32 << 20).to_le_bytes());
-    put(8, &(8u64 << 20).to_le_bytes());
-    put(16, &(4u64 << 20).to_le_bytes());
-    put(24, &(4u64 << 20).to_le_bytes());
-    put(32, &(1u64 << 24).to_le_bytes());
-    put(40, &(1u64 << 23).to_le_bytes());
+    put(0, &vfsstat::BSIZE.to_le_bytes());
+    put(4, &vfsstat::IOSIZE.to_le_bytes());
+    put(8, &vfsstat::BLOCKS.to_le_bytes());
+    put(16, &vfsstat::BFREE.to_le_bytes());
+    put(24, &vfsstat::BAVAIL.to_le_bytes());
+    put(32, &vfsstat::FILES.to_le_bytes());
+    put(40, &vfsstat::FFREE.to_le_bytes());
+    // The mount's device number, and the filesystem type beside it.
     put(48, &(mnt.fsid as u32).to_le_bytes());
-    put(52, &((mnt.fsid >> 32) as u32).to_le_bytes());
-    put(60, &0x1au32.to_le_bytes());
+    put(52, &vfsstat::APFS_TYPENUM.to_le_bytes());
+    put(60, &vfsstat::APFS_TYPENUM.to_le_bytes());
     put(64, &mnt.flags.to_le_bytes());
     put(72, b"apfs");
     put(88, mnt.on.as_bytes());
@@ -256,6 +281,10 @@ impl Kernel {
                 0
             }
             sys::GETFSSTAT64 => res(self.darwin_getfsstat(m, a[0], a[1])),
+            sys::GETATTRLIST => res(self.darwin_getattrlist(m, a)),
+            sys::FGETATTRLIST => res(self.darwin_fgetattrlist(m, a)),
+            sys::GETATTRLISTAT => res(self.darwin_getattrlistat(m, a)),
+            sys::GETATTRLISTBULK => res(self.darwin_getattrlistbulk(m, a)),
             sys::STATFS64 => res(self.darwin_statfs(m, Some(a[0]), a[1])),
             sys::FSTATFS64 => res(self.darwin_statfs(m, None, a[1])),
             sys::SYSCTL => res(self.darwin_sysctl(m, a)),
@@ -419,11 +448,7 @@ impl Kernel {
             }
             None => String::from("/"),
         };
-        let mnt = MOUNTS
-            .iter()
-            .filter(|mt| p == mt.on || p.starts_with(&format!("{}/", mt.on.trim_end_matches('/'))))
-            .max_by_key(|mt| mt.on.len())
-            .unwrap_or(&MOUNTS[0]);
+        let mnt = mount_of(&p);
         m.write(buf, &statfs64(mnt))?;
         Ok(0)
     }

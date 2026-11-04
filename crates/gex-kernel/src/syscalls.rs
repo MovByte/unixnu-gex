@@ -10546,7 +10546,7 @@ impl Kernel {
         self.fd_io().pipe2(m, fds, flags)
     }
 
-    fn stat_from(md: &crate::vfs::Metadata) -> Stat {
+    pub(crate) fn stat_from(md: &crate::vfs::Metadata) -> Stat {
         Stat {
             ino: md.ino,
             mode: md.file_type.mode_bits() | md.mode,
