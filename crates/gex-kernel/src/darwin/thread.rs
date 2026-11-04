@@ -271,6 +271,8 @@ pub enum Finish {
     WorkqPark,
     /// A kevent call's scan, or a workloop's synchronous wait.
     Kevent(super::kevent::Cont),
+    /// An advisory lock's wait (`lf_setlock`).
+    Lockf(super::lockf::Cont),
 }
 
 /// `wait_result_to_return_code` (`sys_ulock.c`).
@@ -333,6 +335,21 @@ impl Kernel {
                 Some(SyscallOutcome::Blocking(crate::syscalls::BlockOp::SigSuspend { restore_mask }))
             }
             sys::SIGRETURN => Some(self.darwin_sigreturn(m, a)),
+            sys::FCNTL | sys::FCNTL_NOCANCEL if super::lockf::is_lock_cmd(a[1]) => Some(self.darwin_fcntl_lock(m, a)),
+            sys::FLOCK => Some(self.darwin_flock(m, a)),
+            // open1's O_EXLOCK and O_SHLOCK: the open, then the lock.
+            sys::OPEN | sys::OPEN_NOCANCEL | sys::OPENAT | sys::OPENAT_NOCANCEL if (if raw == sys::OPEN || raw == sys::OPEN_NOCANCEL { a[1] } else { a[2] }) & 0x30 != 0 => {
+                let dflags = if raw == sys::OPEN || raw == sys::OPEN_NOCANCEL { a[1] } else { a[2] };
+                let mut la = *a;
+                let n = super::bsd::translate(raw, &mut la);
+                match self.canonical(m, n, la) {
+                    Ok(fd) => Some(self.darwin_open_lock(m, fd as i32, dflags)),
+                    Err(e) => {
+                        let _ = super::set_result(m, self.ctx_addr, e.as_return());
+                        Some(SyscallOutcome::Continue)
+                    }
+                }
+            }
             sys::WRITE | sys::WRITE_NOCANCEL | sys::WRITEV | sys::WRITEV_NOCANCEL if self.darwin_pipe_of(a[0]).is_some() => Some(self.darwin_pipe_write(m, raw, a)),
             sys::KEVENT => Some(<Kq as KQueue>::kevent_legacy(self, m, a, false)),
             sys::KEVENT64 => Some(<Kq as KQueue>::kevent_legacy(self, m, a, true)),
@@ -728,6 +745,7 @@ impl Kernel {
             Finish::Sleep(s) => self.darwin_sleep_done(m, s, res),
             Finish::WorkqPark => return <Wq as WorkQueue>::wait_done(self, m, res),
             Finish::Kevent(c) => return <Kq as KQueue>::wait_done(self, m, c, res),
+            Finish::Lockf(c) => return self.darwin_lockf_wait_done(m, c, res),
             Finish::Psynch(c) => self.darwin_psynch_wait_done(m, c, res),
             Finish::Ulock { addr, no_errno } => {
                 // A waiter that was not woken is still on the queue.
@@ -767,6 +785,7 @@ impl Kernel {
         c.notcancelpt = false;
         c.abort_safely = false;
         self.darwin_knote_fdcheck();
+        self.darwin_lock_wakes(m);
         if self.darwin_pipe_knotes() {
             self.darwin_kevent_settle(m);
         }

@@ -67,6 +67,7 @@ run() {
     kq-pipe) check_root kq-pipe "kq-pipe 7" 0 ;;
     pipe) check_root pipe "pipe ok" 0 ;;
     ioctl) check_root ioctl "ioctl ok" 0 ;;
+    lockf) check_root lockf "lockf ok" 0 ;;
     cfrunloop) check_root cfrunloop "cfrunloop 3 1" 0 ;;
     xpc-anon) check_root xpc-anon "xpc-anon 42" 0 ;;
     *)
@@ -81,7 +82,7 @@ if [ "$named" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl cfrunloop xpc-anon; do
+    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf cfrunloop xpc-anon; do
         run "$p"
     done
 fi

@@ -397,7 +397,17 @@ impl Kernel {
                 Ok(_) => a[1],
                 Err(e) => neg(e),
             },
-            sys::DUP2 => res(self.canonical(m, nr::DUP3, [a[0], a[1], 0, 0, 0, 0])),
+            sys::DUP2 => {
+                // The descriptor it replaces is closed (closef_locked).
+                if self.fds.get(a[0] as i32).is_ok() {
+                    self.darwin_closing(a[1] as i32);
+                }
+                res(self.canonical(m, nr::DUP3, [a[0], a[1], 0, 0, 0, 0]))
+            }
+            sys::CLOSE | sys::CLOSE_NOCANCEL if self.dtask.ladvlock => {
+                self.darwin_closing(a[0] as i32);
+                return None;
+            }
             sys::SIGPROCMASK | sys::PTHREAD_SIGMASK => res(self.darwin_sigprocmask(m, a[0], a[1], a[2])),
             sys::CSOPS | sys::CSOPS_AUDITTOKEN => res(self.darwin_csops(m, a[1], a[2], a[3])),
             sys::MAC_SYSCALL => res(self.darwin_mac_syscall(m, a[0], a[1], a[2])),
@@ -428,8 +438,6 @@ impl Kernel {
             f::GETOWN => canon(self, m, 9, 0),
             f::SETOWN => canon(self, m, 8, a[2]),
             f::DUPFD_CLOEXEC => canon(self, m, 1030, a[2]),
-            // Record locks: one process's view of its files; granted.
-            f::GETLK | f::SETLK | f::SETLKW => 0,
             f::GETPATH => {
                 let path = self.fds.list().into_iter().find(|&(n, _)| n as u64 == fd).map(|(_, p)| p);
                 match path {

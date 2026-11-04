@@ -49,6 +49,7 @@ impl Errno {
     /// Also `ENOATTR`: no such extended attribute.
     pub const ENODATA: Errno = Errno(61);
     pub const ETIMEDOUT: Errno = Errno(110);
+    pub const EOVERFLOW: Errno = Errno(75);
     pub const EOPNOTSUPP: Errno = Errno(95);
     pub const EBADMSG: Errno = Errno(74);
     pub const EAFNOSUPPORT: Errno = Errno(97);

@@ -240,7 +240,9 @@ impl Kernel {
 
     /// `fcntl(F_GETFL)`: `OFLAGS(f_flag)`.
     pub(crate) fn darwin_getfl(&mut self, fd: i32) -> Result<u64, Errno> {
-        Ok(open_flags_back(self.fds.get(fd)?.flags()))
+        let file = self.fds.get(fd)?;
+        let waslocked = file.darwin_lflags.load(std::sync::atomic::Ordering::Acquire) & super::lockf::FWASLOCKED;
+        Ok(open_flags_back(file.flags()) | u64::from(waslocked))
     }
 
     /// `fcntl(F_SETFL)`: the `FCNTLFLAGS` replaced, then `fo_ioctl`'s

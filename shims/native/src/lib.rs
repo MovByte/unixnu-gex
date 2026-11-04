@@ -1499,7 +1499,7 @@ fn run_program_with(
             // for it for ever).
             stop_other_threads(&spawn, false);
             let mut k = spawn.kernel.lock().unwrap_or_else(|e| e.into_inner());
-            k.fds.close_all();
+            k.close_all_fds();
             return Err(e);
         }
     };
@@ -2362,8 +2362,7 @@ fn guest_thread_body(cx: Arc<SpawnContext>, child: ThreadState) {
             cx.kernel
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .fds
-                .close_all();
+                .close_all_fds();
         }
         // `exit_group` or a fatal signal on this thread: the process
         // ends with it, and the first thread, parked in a futex
@@ -2791,8 +2790,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
                     kernel
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .fds
-                        .close_all();
+                        .close_all_fds();
                     (127, 127 << 8)
                 }
             };
@@ -2809,7 +2807,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
             // Linux: a listening socket's port is free once `wait4` returns.
             {
                 let mut k = kernel.lock().unwrap_or_else(|e| e.into_inner());
-                k.fds.close_all();
+                k.close_all_fds();
             }
             procs.exit(pid, wstatus);
             let (st, done) = status;

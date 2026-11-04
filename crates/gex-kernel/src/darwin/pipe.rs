@@ -15,7 +15,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 /// `FG_NOSIGPIPE`.
-pub const FG_NOSIGPIPE: u32 = 0x1;
+pub const FG_NOSIGPIPE: u32 = 0x40;
 
 /// `UIO_MAXIOV`.
 const UIO_MAXIOV: u64 = 1024;

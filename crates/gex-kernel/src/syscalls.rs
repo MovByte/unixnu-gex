@@ -10666,6 +10666,15 @@ impl Kernel {
         }
     }
 
+    /// Close every descriptor, as at the process's end; a Darwin process's
+    /// advisory locks and sleeping lock requests go with it.
+    pub fn close_all_fds(&self) {
+        self.fds.close_all();
+        if self.darwin {
+            crate::darwin::lockf::process_gone(self.pid);
+        }
+    }
+
     /// Restore the context a handler frame captured.
     pub fn sigreturn(&mut self, m: &mut GuestMem<'_>) -> Result<u64, Errno> {
         let legacy = std::mem::replace(&mut self.sigreturn_legacy, false);

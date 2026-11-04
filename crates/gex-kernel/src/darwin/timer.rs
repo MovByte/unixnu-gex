@@ -119,6 +119,7 @@ impl Kernel {
         if self.darwin_signal_knotes() | self.darwin_pipe_knotes() {
             self.darwin_kevent_settle(m);
         }
+        self.darwin_lock_wakes(m);
         loop {
             let now = Instant::now();
             let (&key, _) = self.dtask.timers.armed.first_key_value()?;

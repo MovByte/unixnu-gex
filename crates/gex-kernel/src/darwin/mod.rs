@@ -25,6 +25,7 @@ pub mod kern;
 pub mod kevent;
 pub mod kfilt;
 pub mod kobject;
+pub mod lockf;
 pub mod mach;
 pub mod mach_msg;
 pub mod mig;
@@ -86,6 +87,10 @@ pub struct Task {
     pub vouchers: voucher::Vouchers,
     /// The program's code signature, when it has one.
     pub codesign: Option<codesign::CodeSign>,
+    /// `P_LADVLOCK`: the process has taken a POSIX record lock.
+    pub ladvlock: bool,
+    /// Threads whose lock requests another thread or process woke.
+    pub lock_wakes: std::sync::Arc<std::sync::Mutex<Vec<i32>>>,
     /// `p_sigacts` and `p_sigignore`.
     pub sigacts: signal::Sigacts,
     /// `p_workq_allow_sigmask`.

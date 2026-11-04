@@ -34,8 +34,12 @@ pub struct OpenFile {
     dir_cache: Mutex<Option<Vec<DirEntry>>>,
     pub readable: bool,
     pub writable: bool,
-    /// A Darwin process's `fg_lflags` for the open file (`FG_NOSIGPIPE`).
+    /// A Darwin process's `fg_lflags` for the open file (`FG_NOSIGPIPE`,
+    /// `FG_HAS_OFDLOCK`) and its `FWASLOCKED`.
     pub darwin_lflags: std::sync::atomic::AtomicU32,
+    /// The vnode its Darwin advisory locks are kept on, once one is taken
+    /// through it (`crate::darwin::lockf`).
+    pub darwin_lock_key: OnceLock<(u64, u64)>,
     /// A path to unlink when the last descriptor to this file closes. Set for
     /// `O_TMPFILE`: Linux makes such a file nameless at once, but gex keeps it
     /// named (`.gex-tmpfile-*`) so the `linkat("/proc/self/fd/N", target,
@@ -73,6 +77,10 @@ impl Drop for OpenFile {
     fn drop(&mut self) {
         if let Some(locks) = self.locks.get() {
             locks.release(self as *const OpenFile as usize);
+        }
+        // A Darwin open file's flock and OFD locks (vn_closefile).
+        if self.darwin_lock_key.get().is_some() {
+            crate::darwin::lockf::last_close(self);
         }
         // If a `linkat` gave it another name (the atomic-write idiom), that
         // name keeps the inode.
@@ -132,6 +140,7 @@ impl OpenFile {
             locks: OnceLock::new(),
             ino: OnceLock::new(),
             darwin_lflags: std::sync::atomic::AtomicU32::new(0),
+            darwin_lock_key: OnceLock::new(),
         })
     }
 
@@ -159,6 +168,7 @@ impl OpenFile {
             readable,
             writable,
             darwin_lflags: std::sync::atomic::AtomicU32::new(0),
+            darwin_lock_key: OnceLock::new(),
         })
     }
 
