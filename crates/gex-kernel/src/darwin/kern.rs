@@ -311,6 +311,22 @@ impl Kernel {
                 }
             }
             sys::PIPE => res(self.darwin_pipe(m)),
+            // Process groups and sessions: the same rules as Linux's, but
+            // setpgid's target may be any descendant (inferior()), where
+            // Linux's must be a child.
+            sys::GETPGRP => res(self.canonical(m, nr::GETPGID, [0, 0, 0, 0, 0, 0])),
+            sys::GETPGID => res(self.canonical(m, nr::GETPGID, [a[0] as i32 as i64 as u64, 0, 0, 0, 0, 0])),
+            sys::GETSID => res(self.canonical(m, nr::GETSID, [a[0] as i32 as i64 as u64, 0, 0, 0, 0, 0])),
+            sys::SETSID => res(self.canonical(m, nr::SETSID, [0; 6])),
+            sys::SETPGID => {
+                let pid = a[0] as i32;
+                if pid != 0 && pid != self.pid {
+                    self.darwin_unimplemented("setpgid of another process (a descendant, as inferior() allows)".into());
+                    neg(Errno::ESRCH)
+                } else {
+                    res(self.canonical(m, nr::SETPGID, [0, a[1] as i32 as i64 as u64, 0, 0, 0, 0]))
+                }
+            }
             // unlink(path) and unlinkat(fd, path, flag): Linux's unlinkat,
             // but a directory is EPERM (vn_authorize_unlink), and
             // AT_REMOVEDIR is rmdirat_internal.
