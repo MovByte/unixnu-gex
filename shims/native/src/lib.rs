@@ -226,6 +226,8 @@ pub struct RunOptions {
     pub darwin_strict: bool,
     /// The program's `LC_BUILD_VERSION` platform and SDK.
     pub darwin_platform: (u32, u32),
+    /// The program's embedded code signature (`LC_CODE_SIGNATURE`).
+    pub darwin_code_signature: Option<Vec<u8>>,
     /// Run ahead-of-time code only (`aot_only`): an ejected Windows
     /// program's runtime, with no tier-1 module and no run-time translator.
     pub aot_only: bool,
@@ -240,6 +242,7 @@ impl Default for RunOptions {
             darwin_dyld_infos: 0,
             darwin_strict: false,
             darwin_platform: (0, 0),
+            darwin_code_signature: None,
             args: Vec::new(),
             env: Vec::new(),
             trace: false,
@@ -1131,6 +1134,7 @@ fn run_program_with(
     kernel.darwin_dyld_infos = opts.darwin_dyld_infos;
     kernel.dtask.strict = opts.darwin_strict;
     kernel.dtask.platform = opts.darwin_platform;
+    kernel.dtask.codesign = opts.darwin_code_signature.as_deref().map(gex_kernel::darwin::codesign::CodeSign::parse);
     // An exec takes the next pidversion (`proc_setpidversion`).
     if opts.darwin {
         kernel.dtask.pidversion = gex_kernel::darwin::next_pidversion();

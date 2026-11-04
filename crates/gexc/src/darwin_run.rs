@@ -21,6 +21,7 @@ fn dyld_base(exe: &gex_ld::Image) -> u64 {
 pub fn run(mut ra: RunArgs, bytes: &[u8]) -> Result<ExitCode> {
     let (m, exe) = gex_ld::macho::load(bytes, gex_ld::macho::PIE_BASE).with_context(|| format!("loading {}", ra.path))?;
     ra.opts.darwin_platform = (m.platform.unwrap_or(0), m.sdk.unwrap_or(0));
+    ra.opts.darwin_code_signature = m.code_signature.and_then(|(o, n)| bytes.get(o as usize..(o as usize).checked_add(n as usize)?)).map(<[u8]>::to_vec);
     let root = ra.opts.sysroot.clone();
     // The program's path as the guest sees it: inside the root when there
     // is one.

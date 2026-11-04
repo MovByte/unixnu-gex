@@ -39,6 +39,7 @@ pub const LC_ID_DYLIB: u32 = 0xd;
 pub const LC_LOAD_DYLINKER: u32 = 0xe;
 pub const LC_SEGMENT_64: u32 = 0x19;
 pub const LC_UUID: u32 = 0x1b;
+pub const LC_CODE_SIGNATURE: u32 = 0x1d;
 pub const LC_FUNCTION_STARTS: u32 = 0x26;
 pub const LC_BUILD_VERSION: u32 = 0x32;
 pub const LC_LOAD_WEAK_DYLIB: u32 = 0x18 | LC_REQ_DYLD;
@@ -152,6 +153,9 @@ pub struct MachO {
     pub function_starts: Option<(u32, u32)>,
     pub chained_fixups: Option<(u32, u32)>,
     pub exports_trie: Option<(u32, u32)>,
+    /// `LC_CODE_SIGNATURE`: the embedded signature's superblob, as
+    /// `(dataoff, datasize)` in the file.
+    pub code_signature: Option<(u32, u32)>,
     /// `LC_BUILD_VERSION`'s platform (2 is iOS) and SDK version
     /// (`xxxx.yy.zz` nibbles).
     pub platform: Option<u32>,
@@ -221,6 +225,7 @@ pub fn parse(d: &[u8]) -> Result<MachO, LoadError> {
         function_starts: None,
         chained_fixups: None,
         exports_trie: None,
+        code_signature: None,
         platform: None,
         sdk: None,
     };
@@ -265,6 +270,7 @@ pub fn parse(d: &[u8]) -> Result<MachO, LoadError> {
             LC_FUNCTION_STARTS => m.function_starts = linkedit(c),
             LC_DYLD_CHAINED_FIXUPS => m.chained_fixups = linkedit(c),
             LC_DYLD_EXPORTS_TRIE => m.exports_trie = linkedit(c),
+            LC_CODE_SIGNATURE => m.code_signature = linkedit(c),
             LC_BUILD_VERSION => {
                 m.platform = u32_at(c, o + 8);
                 m.sdk = u32_at(c, o + 16);

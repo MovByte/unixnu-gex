@@ -16,6 +16,7 @@ use gex_abi::ctx;
 pub mod attrcall;
 pub mod attrlist;
 pub mod bsd;
+pub mod codesign;
 pub mod commpage;
 pub mod errno;
 pub mod ipc;
@@ -77,6 +78,8 @@ pub struct Task {
     pub next_threadreq: u64,
     /// The process's kqueues and knotes.
     pub kevents: kevent::Kevents,
+    /// The program's code signature, when it has one.
+    pub codesign: Option<codesign::CodeSign>,
     /// `p_workq_allow_sigmask`.
     pub workq_allow_sigmask: u32,
     /// `p_dispatchqueue_serialno_offset`, `p_dispatchqueue_label_offset`.
