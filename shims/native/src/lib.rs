@@ -228,6 +228,10 @@ pub struct RunOptions {
     pub darwin_platform: (u32, u32),
     /// The program's embedded code signature (`LC_CODE_SIGNATURE`).
     pub darwin_code_signature: Option<Vec<u8>>,
+    /// `LC_MAIN`'s stack size (0: the default stack).
+    pub darwin_stacksize: u64,
+    /// `LC_LOAD_DYLINKER`'s path, as the guest names it.
+    pub darwin_dylinker: Option<String>,
     /// Run ahead-of-time code only (`aot_only`): an ejected Windows
     /// program's runtime, with no tier-1 module and no run-time translator.
     pub aot_only: bool,
@@ -243,6 +247,8 @@ impl Default for RunOptions {
             darwin_strict: false,
             darwin_platform: (0, 0),
             darwin_code_signature: None,
+            darwin_stacksize: 0,
+            darwin_dylinker: None,
             args: Vec::new(),
             env: Vec::new(),
             trace: false,
@@ -4115,7 +4121,6 @@ fn place_image(
         store.data_mut().with_kernel(|k| k.darwin_region = region);
     }
     if opts.darwin {
-        store.data_mut().with_kernel(|k| k.darwin_user_stack = gex_abi::STACK_TOP);
         start_darwin_thread_calls(Arc::downgrade(&store.data().kernel), memory.clone());
     }
     // And its commpage, at the alias its constant addresses are folded to.
@@ -4132,17 +4137,27 @@ fn place_image(
 
     // Then the stack. Determinism by default means a fixed
     // AT_RANDOM unless the caller asks otherwise.
+    // A Darwin program's main stack is the kernel's to lay out
+    // (`create_unix_stack`, the `apple[]` strings, `exec_copyout_strings`).
+    let mut darwin_stack = None;
     let layout = if opts.darwin {
-        // dyld finds the program by the header address on top of its stack.
         let header = image.segments.iter().map(|s| s.vaddr).min().unwrap_or(0);
         let path = opts.exe.clone().or_else(|| opts.args.first().cloned()).unwrap_or_default();
-        gex_ld::macho::build_stack(
-            gex_abi::STACK_TOP,
-            program.interp.as_ref().map(|_| header),
-            &opts.args,
-            &opts.env,
-            &gex_kernel::darwin::apple_strings(&path),
-        )
+        let loaded = gex_kernel::darwin::exec::Loaded {
+            mach_header: header,
+            dylinker: opts.darwin_dylinker.as_deref().filter(|_| program.interp.is_some()),
+            stacksize: opts.darwin_stacksize,
+            exe_path: &path,
+            code_signature: opts.darwin_code_signature.as_deref(),
+            nano: false,
+        };
+        let st = store
+            .data_mut()
+            .with_kernel(|k| k.darwin_start(None, &loaded, gex_abi::STACK_TOP))
+            .map_err(|e| anyhow!("starting {path}: errno {}", e.0))?;
+        let layout = gex_ld::stack::StackLayout { sp: st.sp, low: st.sp, bytes: st.bytes };
+        darwin_stack = Some((st.alloc, st.size, st.guard));
+        layout
     } else {
         build_initial_stack(
             image,
@@ -4161,15 +4176,25 @@ fn place_image(
     }
     data[start..end].copy_from_slice(&layout.bytes);
 
-    let stack_low = gex_abi::STACK_TOP - gex_abi::STACK_SIZE;
-    store.data_mut().with_kernel(|k| {
-        k.mem.lock().insert(
-            stack_low,
-            gex_abi::STACK_TOP,
-            prot::READ | prot::WRITE,
-            "[stack]",
-        )
-    });
+    match darwin_stack {
+        // The allocation, its bottom the guard below the stack limit.
+        Some((alloc, size, guard)) => store.data_mut().with_kernel(|k| {
+            let mut mm = k.mem.lock();
+            mm.insert(alloc, alloc + guard, prot::NONE, "[stack]");
+            mm.insert(alloc + guard, alloc + size, prot::READ | prot::WRITE, "[stack]");
+        }),
+        None => {
+            let stack_low = gex_abi::STACK_TOP - gex_abi::STACK_SIZE;
+            store.data_mut().with_kernel(|k| {
+                k.mem.lock().insert(
+                    stack_low,
+                    gex_abi::STACK_TOP,
+                    prot::READ | prot::WRITE,
+                    "[stack]",
+                )
+            });
+        }
+    }
 
     // Finally the initial register state: sp, and x0 cleared the way Linux
     // leaves it.

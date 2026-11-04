@@ -23,12 +23,14 @@ for p in hello-static bsd-carry commpage exclusive-pair aes; do
         -o "$OUT/$p" "$HERE/src/$p.c"
 done
 
-for p in hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit xpc-anon; do
+for p in hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple xpc-anon; do
     cc -O2 -o "$OUT/$p" "$HERE/src/$p.c"
 done
 cc -O2 -framework CoreFoundation -o "$OUT/cfrunloop" "$HERE/src/cfrunloop.c"
 # codesig reads its own signature: signed ad hoc, as the linker leaves an
 # iOS program unsigned.
 codesign -s - -f "$OUT/codesig" 2>/dev/null
+# apple checks the cdhash exec hands it: signed as every iOS program is.
+codesign -s - -f "$OUT/apple" 2>/dev/null
 
 echo "built: $(cd "$OUT" && ls | tr '\n' ' ')"

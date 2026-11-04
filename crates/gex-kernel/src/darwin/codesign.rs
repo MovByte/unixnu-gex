@@ -392,6 +392,29 @@ pub fn validate_csblob(b: &[u8]) -> Result<(usize, usize), crate::errno::Errno> 
     }
 }
 
+/// `CS_CDHASH_LEN`.
+pub const CDHASH_LEN: usize = 20;
+
+/// The blob's `csb_cdhash`: its best CodeDirectory's digest by that
+/// directory's own hash type (`cs_find_md`), cut to `CS_CDHASH_LEN`.
+/// EBADEXEC for a blob `cs_validate_csblob` refuses.
+pub fn cdhash(blob: &[u8]) -> Result<[u8; CDHASH_LEN], crate::errno::Errno> {
+    use sha2::Digest;
+    let (off, len) = validate_csblob(blob)?;
+    let cd = &blob[off..off + len];
+    // ntohl(cd->length): the directory itself, not the slot's room.
+    let cd = &cd[..be32(cd, 4).unwrap_or(0) as usize];
+    let digest: Vec<u8> = match cd[37] {
+        1 => sha1::Sha1::digest(cd).to_vec(),
+        2 | 3 => sha2::Sha256::digest(cd).to_vec(),
+        4 => sha2::Sha384::digest(cd).to_vec(),
+        _ => return Err(super::errno::EBADEXEC),
+    };
+    let mut out = [0u8; CDHASH_LEN];
+    out.copy_from_slice(&digest[..CDHASH_LEN]);
+    Ok(out)
+}
+
 /// `ubc_cs_blob_add`'s `csb_end_offset`: the CodeDirectory's code limit,
 /// to the end of its last hashed page.
 pub fn end_offset(cd: &[u8]) -> u64 {

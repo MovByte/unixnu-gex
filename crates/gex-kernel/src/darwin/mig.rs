@@ -39,6 +39,9 @@ pub mod machine {
     /// `CONFIG_THREAD_MAX` for the xsmall memory tag.
     pub const CONFIG_THREAD_MAX: u32 = 1536;
     pub const CPU_TYPE_ARM64: u32 = 0x0100_000c;
+    /// `cpu_subtype` of an ARMv8 core without pointer authentication
+    /// (`CPU_SUBTYPE_ARM64_V8`), what `cpu_machine_init` gives the A10X.
+    pub const CPU_SUBTYPE: u32 = 1;
     pub const PAGE_SIZE: u32 = 4096;
 }
 
@@ -247,7 +250,7 @@ fn host_info(flavor: i32, count: u32) -> Reply {
             if count < 5 {
                 return Reply::err(KERN_FAILURE);
             }
-            let mut w = vec![NCPUS, NCPUS, mem32, CPU_TYPE_ARM64, 0];
+            let mut w = vec![NCPUS, NCPUS, mem32, CPU_TYPE_ARM64, machine::CPU_SUBTYPE];
             if count >= 12 {
                 w.extend([0, NCPUS, NCPUS, NCPUS, NCPUS, MEMORY as u32, (MEMORY >> 32) as u32]);
             }
@@ -274,7 +277,7 @@ fn host_info(flavor: i32, count: u32) -> Reply {
             if count < 2 {
                 return Reply::err(KERN_FAILURE);
             }
-            Reply::ok(words(&[CPU_TYPE_ARM64, 0]))
+            Reply::ok(words(&[CPU_TYPE_ARM64, machine::CPU_SUBTYPE]))
         }
         _ => Reply::err(KERN_INVALID_ARGUMENT),
     }

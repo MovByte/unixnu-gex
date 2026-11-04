@@ -768,7 +768,7 @@ impl Kernel {
     }
 
     /// `read_random` for a 64-bit value.
-    fn darwin_read_random(&self) -> Result<u64, Errno> {
+    pub(crate) fn darwin_read_random(&self) -> Result<u64, Errno> {
         let h = self.vfs.open("/dev/urandom", crate::fs::oflags::O_RDONLY, 0)?;
         let mut b = [0u8; 8];
         h.read_at(0, &mut b)?;

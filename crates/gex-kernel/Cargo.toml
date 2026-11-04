@@ -12,6 +12,9 @@ gex-atomic.workspace = true
 gex-f80.workspace = true
 # PE parsing and mapping for the NT personality.
 gex-ld.workspace = true
+# The code signature's digests: a CodeDirectory's cdhash.
+sha1 = { version = "0.10", default-features = false }
+sha2 = { version = "0.10", default-features = false }
 
 [features]
 # Serve an x86-64 guest: its syscall numbers, struct layouts and signal frame.

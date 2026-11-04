@@ -33,7 +33,8 @@ check() {
 }
 
 # check_root NAME WANT_OUT WANT_STATUS [ARGS...]: a dynamic program, run
-# from the root's /tmp.
+# from the root's /var/tmp (its /tmp is the guest's own, in memory, so a
+# program there could not see its own file).
 check_root() {
     name=$1 want_out=$2 want_status=$3
     shift 3
@@ -46,9 +47,9 @@ check_root() {
         fi
         return
     fi
-    mkdir -p "$GEX_DARWIN_ROOT/tmp"
-    cp "$HERE/bin/$name" "$GEX_DARWIN_ROOT/tmp/gex-darwin-$name"
-    out=$("$GEXC" run --sysroot "$GEX_DARWIN_ROOT" "$GEX_DARWIN_ROOT/tmp/gex-darwin-$name" "$@" 2>/dev/null)
+    mkdir -p "$GEX_DARWIN_ROOT/var/tmp"
+    cp "$HERE/bin/$name" "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$name"
+    out=$("$GEXC" run --sysroot "$GEX_DARWIN_ROOT" "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$name" "$@" 2>/dev/null)
     report "$name" "$out" $? "$want_out" "$want_status"
 }
 
@@ -59,7 +60,7 @@ run() {
     commpage) check commpage "" 0 ;;
     exclusive-pair) check exclusive-pair "" 0 ;;
     aes) check aes "" 0 ;;
-    hello) check_root hello "hello from /tmp/gex-darwin-hello with 2 arguments" 0 a b ;;
+    hello) check_root hello "hello from /var/tmp/gex-darwin-hello with 2 arguments" 0 a b ;;
     pthread) check_root pthread "pthread 4000" 0 ;;
     dispatch) check_root dispatch "dispatch 55 140" 0 ;;
     dispatch-signal) check_root dispatch-signal "dispatch-signal 2" 0 ;;
@@ -74,6 +75,7 @@ run() {
     vnode) check_root vnode "vnode ok" 0 ;;
     codesig) check_root codesig "codesig ok" 0 ;;
     rlimit) check_root rlimit "rlimit ok" 0 ;;
+    apple) check_root apple "apple ok" 0 ;;
     cfrunloop) check_root cfrunloop "cfrunloop 3 1" 0 ;;
     xpc-anon) check_root xpc-anon "xpc-anon 42" 0 ;;
     *)
@@ -88,7 +90,7 @@ if [ "$named" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit cfrunloop xpc-anon; do
+    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple cfrunloop xpc-anon; do
         run "$p"
     done
 fi

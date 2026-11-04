@@ -42,6 +42,9 @@ pub const CTL_HW: i32 = 6;
 /// Where nodes without a standard number go.
 pub const PRIVATE: i32 = 0x7f00;
 
+/// `bootsessionuuid_string`.
+pub const BOOTSESSIONUUID: &str = "00000000-0000-0000-0000-000000000000";
+
 /// `(name, oid, value)`.
 pub fn table() -> Vec<(&'static str, Vec<i32>, Value)> {
     use Value::*;
@@ -80,7 +83,7 @@ pub fn table() -> Vec<(&'static str, Vec<i32>, Value)> {
         ("kern.secure_kernel", I32(0)),
         ("kern.hv_vmm_present", I32(0)),
         ("kern.dyld_system_flags", I64(0)),
-        ("kern.bootsessionuuid", Str("00000000-0000-0000-0000-000000000000")),
+        ("kern.bootsessionuuid", Str(BOOTSESSIONUUID)),
         ("kern.uuid", Str("00000000-0000-0000-0000-000000000000")),
         ("kern.willshutdown", I32(0)),
         ("kern.memorystatus_level", I32(100)),
@@ -90,7 +93,7 @@ pub fn table() -> Vec<(&'static str, Vec<i32>, Value)> {
         ("hw.logicalcpu", I32(NCPUS as i32)),
         ("hw.logicalcpu_max", I32(NCPUS as i32)),
         ("hw.cputype", I32(0x0100_000c)),
-        ("hw.cpusubtype", I32(0)),
+        ("hw.cpusubtype", I32(super::mig::machine::CPU_SUBTYPE as i32)),
         ("hw.cpufamily", I32(0x67ce_ee93u32 as i32)),
         ("hw.cachelinesize", I32(64)),
         ("hw.l1icachesize", I32(65_536)),
