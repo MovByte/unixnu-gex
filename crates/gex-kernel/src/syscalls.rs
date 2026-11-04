@@ -3569,14 +3569,23 @@ impl PathIo<'_> {
     }
 
     pub fn fstat(&self, m: &mut GuestMem<'_>, fd: i32, buf: u64) -> SysResult {
-        let md = self.map.fds.get(fd)?.metadata()?;
-        m.write(buf, &self.encode_stat(&self.stat_owned(&md)))?;
+        let file = self.map.fds.get(fd)?;
+        let md = file.metadata()?;
+        let at = self.darwin.then(|| self.ns.canonical(&file.path));
+        m.write(buf, &self.encode_stat(&self.stat_owned(&md), &md, at.as_deref()))?;
         Ok(0)
     }
 
-    /// A `struct stat` in this process's layout.
-    fn encode_stat(&self, st: &Stat) -> crate::fs::StatBytes {
+    /// A `struct stat` in this process's layout. A Darwin vnode's device is
+    /// its mount's (`va_fsid`, `f_fsid.val[0]`), what `at` is on; a socket
+    /// or anything else not in the namespace has none.
+    fn encode_stat(&self, st: &Stat, md: &crate::vfs::Metadata, at: Option<&str>) -> crate::fs::StatBytes {
         if self.darwin {
+            let mut st = st.clone();
+            st.dev = match at {
+                Some(p) if p.starts_with('/') && md.file_type != crate::vfs::FileType::Socket => crate::darwin::kern::mount_of(p).fsid as u32 as u64,
+                _ => 0,
+            };
             st.encode_darwin()
         } else {
             st.encode_for(self.compat)
@@ -3627,7 +3636,9 @@ impl PathIo<'_> {
         };
         crate::phase::mark(7);
         let md = md?;
-        m.write(buf, &self.encode_stat(&self.stat_owned(&md)))?;
+        // (a link's own device is its directory's)
+        let at = self.darwin.then(|| if flags & AT_SYMLINK_NOFOLLOW != 0 { self.ns.canonical(&crate::vfs::parent_of(&p)) } else { self.ns.canonical(&p) });
+        m.write(buf, &self.encode_stat(&self.stat_owned(&md), &md, at.as_deref()))?;
         crate::phase::mark(9);
         Ok(0)
     }
