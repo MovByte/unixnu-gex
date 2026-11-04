@@ -3,6 +3,12 @@
 //! The two agree from EPERM (1) to ERANGE (34) except at 11, which is
 //! EAGAIN on Linux and EDEADLK on Darwin; above 34 they diverge.
 
+/// The Linux errno whose Darwin number is `darwin` (EINVAL for one with
+/// none).
+pub fn from_darwin(darwin: i32) -> i32 {
+    (1..=133).find(|&l| to_darwin(l) == darwin && (l == 22 || darwin != 22)).unwrap_or(22)
+}
+
 /// Darwin's number for a Linux errno.
 pub fn to_darwin(linux: i32) -> i32 {
     match linux {

@@ -9467,7 +9467,7 @@ impl Kernel {
     pub fn syscall(&mut self, m: &mut GuestMem<'_>, pc: u64) -> SyscallOutcome {
         let out = self.syscall_cwd(m, pc);
         if self.darwin && !matches!(out, SyscallOutcome::Blocking(_)) {
-            self.darwin_syscall_exit();
+            self.darwin_syscall_exit(m);
         }
         if self.darwin && matches!(out, SyscallOutcome::Blocking(_)) {
             self.darwin_workq_sched_block();
@@ -9566,6 +9566,7 @@ impl Kernel {
                             }
                         }
                         self.darwin_arg_base = first;
+                        self.darwin_set_syscall_code(nr);
                         nr
                     }
                     crate::darwin::Bsd::Enosys => {
@@ -10209,7 +10210,7 @@ impl Kernel {
                     if let Some(out) = self.darwin_guard_kill() {
                         return out;
                     }
-                    self.darwin_syscall_exit();
+                    self.darwin_syscall_exit(m);
                     let resume_at = match next {
                         Some(SyscallOutcome::Resume(pc)) => Some(pc),
                         _ => None,
@@ -10280,7 +10281,7 @@ impl Kernel {
         }
         let ret = encode(r);
         let _ = if self.darwin {
-            self.darwin_syscall_exit();
+            self.darwin_syscall_exit(m);
             crate::darwin::set_result(m, self.ctx_addr, ret)
         } else {
             set_result(m, self.ctx_addr, ret)

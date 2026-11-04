@@ -113,6 +113,10 @@ pub mod opt {
     pub const SEND_ANY: u64 = 0x8_0000_0000;
     pub const SEND_DK_CALL: u64 = 0x10_0000_0000;
     pub const CFI_MASK: u64 = SEND_KOBJECT_CALL | SEND_MQ_CALL | SEND_ANY | SEND_DK_CALL;
+    /// A vector receive whose auxiliary data follows the message in the
+    /// one buffer (kevent's), and one placed at the buffer's end.
+    pub const RCV_LINEAR_VECTOR: u64 = 0x1000_0000_0000_0000;
+    pub const RCV_STACK: u64 = 0x2000_0000_0000_0000;
     pub const RCV_TRAILER_TYPE_SHIFT: u32 = 28;
     pub const RCV_TRAILER_ELEMENTS_SHIFT: u32 = 24;
 }
@@ -183,6 +187,11 @@ pub struct Kmsg {
     /// A kept-alive kernel message (`IPC_KMSG_ALLOC_USE_KEEP_ALIVE`): an
     /// mk_timer's expiry message, reused once received.
     pub keep_alive: bool,
+    /// `ikm_ppriority`, `ikm_qos_override`: the sender's priority and the
+    /// QoS the message carries (`ipc_kmsg_set_qos`); a kernel message's
+    /// are its port's kernel override, none here.
+    pub ppriority: u32,
+    pub qos_override: u8,
 }
 
 /// What a receive came to, for the receiving thread
@@ -226,13 +235,22 @@ pub struct Queues {
     pub preposts: HashMap<ObjId, VecDeque<ObjId>>,
     /// Threads woken by a queue operation, for the kernel to wake.
     pub wake: Vec<i32>,
-    /// Ports whose queue gained a message with no receiver waiting,
-    /// for kevent's EVFILT_MACHPORT (`KNOTE(&port->ip_klist)`).
+    /// Ports with knotes whose queue gained its first message, or whose
+    /// head message's QoS rose (`KNOTE(&port->ip_klist, 0)`), for kevent.
     pub knotes: Vec<ObjId>,
+    /// Sets with knotes newly preposted, and the port that preposted them
+    /// (`ipc_pset_prepost`).
+    pub pset_knotes: Vec<(ObjId, ObjId)>,
+    /// Ports and sets with knotes whose receivers lost them
+    /// (`ipc_mqueue_changed`'s `knote_vanish`).
+    pub vanish: Vec<ObjId>,
 }
 
 /// `ipc_mqueue_msg_too_large` for a non-linear receive.
 fn too_large(msize: u32, tsize: u32, asize: u32, w: &RcvWait) -> bool {
+    if w.options & opt::RCV_LINEAR_VECTOR != 0 {
+        return w.rcv_size < msize + tsize + asize;
+    }
     w.rcv_size < msize + tsize || (w.options & opt::MSG_VECTOR != 0 && w.aux_size < asize)
 }
 
@@ -326,16 +344,66 @@ impl Ipc {
     /// The thread that should get a message posted to `port`: one waiting
     /// on the port itself, then one waiting on a set it is in.
     fn identify_receiver(&mut self, port: ObjId, skip: &[i32]) -> Option<(i32, ObjId)> {
-        let mut objs = vec![port];
-        objs.extend(self.port(port).psets.iter().copied());
-        for o in objs {
-            if let Some(q) = self.queues.receivers.get(&o) {
-                if let Some(&t) = q.iter().find(|t| !skip.contains(t)) {
-                    return Some((t, o));
+        let waiter = |q: &Queues, o: ObjId| q.receivers.get(&o).and_then(|q| q.iter().copied().find(|t| !skip.contains(t)));
+        if let Some(t) = waiter(&self.queues, port) {
+            return Some((t, port));
+        }
+        // waitq_wakeup64_identify_locked walks the port's sets: one with a
+        // waiter takes the message, one without is preposted on the way.
+        for s in self.port(port).psets.clone() {
+            if let Some(t) = waiter(&self.queues, s) {
+                return Some((t, s));
+            }
+            let q = self.queues.preposts.entry(s).or_default();
+            if !q.contains(&port) {
+                q.push_back(port);
+                if self.pset(s).knotes != 0 {
+                    self.queues.pset_knotes.push((s, port));
                 }
             }
         }
         None
+    }
+
+    /// `ipc_kmsg_enqueue_qos`: whether the message is the queue's first,
+    /// or its QoS overrode every message ahead of it.
+    fn kmsg_enqueue_qos(&mut self, port: ObjId, kmsg: Box<Kmsg>) -> bool {
+        let q = &mut self.port_mut(port).messages;
+        let qos_ovr = kmsg.qos_override;
+        q.push_back(kmsg);
+        if q.len() == 1 {
+            return true;
+        }
+        let n = q.len();
+        for prev in q.iter_mut().take(n - 1).rev() {
+            if qos_ovr <= prev.qos_override {
+                return false;
+            }
+            prev.qos_override = qos_ovr;
+        }
+        true
+    }
+
+    /// A port's knotes are told of its queue (`ip_in_a_space`, the space
+    /// active, `ipc_port_has_klist`).
+    fn knote_port(&mut self, port: ObjId) {
+        let p = self.port(port);
+        if matches!(p.receiver, Receiver::Space(_)) && p.knotes != 0 {
+            self.queues.knotes.push(port);
+        }
+    }
+
+    /// `ipc_mqueue_override_send_locked`: a full queue's head message takes
+    /// a waiting sender's QoS (`ipc_kmsg_override_qos`).
+    pub fn mqueue_override_send(&mut self, port: ObjId, qos_ovr: u8) {
+        if !self.full(port) {
+            return;
+        }
+        let Some(first) = self.port_mut(port).messages.front_mut() else { return };
+        if qos_ovr > first.qos_override {
+            first.qos_override = qos_ovr;
+            self.knote_port(port);
+        }
     }
 
     /// `ipc_mqueue_post`: `kmsg` (its room reserved) to a waiting receiver,
@@ -344,17 +412,8 @@ impl Ipc {
         let mut skip = Vec::new();
         loop {
             let Some((t, obj)) = self.identify_receiver(port, &skip) else {
-                let p = self.port_mut(port);
-                p.messages.push_back(kmsg);
-                let has_knotes = p.knotes != 0;
-                for s in p.psets.clone() {
-                    let q = self.queues.preposts.entry(s).or_default();
-                    if !q.contains(&port) {
-                        q.push_back(port);
-                    }
-                }
-                if has_knotes {
-                    self.queues.knotes.push(port);
+                if self.kmsg_enqueue_qos(port, kmsg) {
+                    self.knote_port(port);
                 }
                 return;
             };
@@ -390,9 +449,13 @@ impl Ipc {
             let msize = kmsg.size;
             let asize = kmsg.aux.len() as u32;
             let Some(&t) = self.queues.receivers.get(&set).and_then(|q| q.iter().find(|t| !skip.contains(*t))) else {
+                // waitq_link_prepost_locked
                 let q = self.queues.preposts.entry(set).or_default();
                 if !q.contains(&port) {
                     q.push_back(port);
+                    if self.pset(set).knotes != 0 {
+                        self.queues.pset_knotes.push((set, port));
+                    }
                 }
                 break;
             };
@@ -505,6 +568,13 @@ impl Ipc {
     /// `ipc_mqueue_changed`: an object's receivers lose it (the port died
     /// or left the space); each wakes with `MACH_RCV_PORT_CHANGED`.
     pub fn mqueue_changed(&mut self, object: ObjId) {
+        let has_knotes = match &self.objects[&object] {
+            Object::Port(p) => p.knotes != 0,
+            Object::Pset(s) => s.knotes != 0,
+        };
+        if has_knotes {
+            self.queues.vanish.push(object);
+        }
         let waiters: Vec<i32> = self.queues.receivers.remove(&object).map(|q| q.into_iter().collect()).unwrap_or_default();
         for t in waiters {
             self.queues.rcv_wait.remove(&t);

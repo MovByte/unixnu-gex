@@ -498,6 +498,10 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn as_posix_shm(self: Arc<Self>) -> Option<Arc<crate::darwin::shm::Pshm>> {
         None
     }
+    /// The kqueue (`kqueue()`) this is a descriptor of.
+    fn as_kqueue(self: Arc<Self>) -> Option<Arc<crate::darwin::kevent::KqueueHandle>> {
+        None
+    }
 
     /// A short description of this handle's state, for a diagnostic: the
     /// buffer behind a descriptor -- empty, full, which way it points -- that

@@ -256,6 +256,12 @@ impl Kernel {
             // gettid(uidp, gidp): a thread's own credentials, which only
             // settid gives it (settid is not served, so none has them).
             sys::GETTID => neg(Errno::ESRCH),
+            sys::KQUEUE => res(self.darwin_kqueue()),
+            sys::KQUEUE_WORKLOOP_CTL => {
+                let r = self.darwin_kqueue_workloop_ctl(m, a);
+                self.darwin_kevent_settle(m);
+                res(r)
+            }
             sys::BSDTHREAD_REGISTER => res(self.darwin_bsdthread_register(m, a)),
             sys::PTHREAD_MARKCANCEL => res(self.darwin_markcancel(m, a[0] as u32)),
             sys::PTHREAD_CANCELED => res(self.darwin_canceled(a[0])),

@@ -302,6 +302,6 @@ impl Reply {
             }
             (b, Vec::new(), 0)
         };
-        Kmsg { bits: bits::set(reply_type, 0, 0, complex), size: 24 + body.len() as u32, dest, reply: None, voucher: None, voucher_raw: 0, id: id + 100, body, descs, sender: Sender::KERNEL, aux: Vec::new(), keep_alive: false }
+        Kmsg { bits: bits::set(reply_type, 0, 0, complex), size: 24 + body.len() as u32, dest, reply: None, voucher: None, voucher_raw: 0, id: id + 100, body, descs, sender: Sender::KERNEL, aux: Vec::new(), keep_alive: false, ppriority: 0, qos_override: 0 }
     }
 }

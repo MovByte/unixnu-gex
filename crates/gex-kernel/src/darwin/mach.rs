@@ -112,6 +112,11 @@ pub(crate) fn absolute_time() -> u64 {
     (uptime().as_nanos() * u128::from(TIMEBASE.1) / u128::from(TIMEBASE.0)) as u64
 }
 
+/// `nanoseconds_to_absolutetime`.
+pub(crate) fn ns_to_abs(ns: u64) -> u64 {
+    (u128::from(ns) * u128::from(TIMEBASE.1) / u128::from(TIMEBASE.0)).min(u128::from(u64::MAX)) as u64
+}
+
 /// The instant an absolute time names.
 pub(crate) fn abs_to_instant(abs: u64) -> Instant {
     let ns = u128::from(abs) * u128::from(TIMEBASE.0) / u128::from(TIMEBASE.1);

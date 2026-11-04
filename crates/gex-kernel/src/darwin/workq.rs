@@ -43,7 +43,7 @@ const QOS_MIN: u8 = qos::MAINTENANCE;
 const QOS_MAX: u8 = qos::LAST;
 const QOS_CLEANUP: u8 = qos::LEGACY;
 const QOS_ABOVEUI: u8 = qos::LAST;
-const QOS_MANAGER: u8 = qos::LAST + 1;
+pub(crate) const QOS_MANAGER: u8 = qos::LAST + 1;
 const NUM_QOS_BUCKETS: usize = (QOS_MAX - 1) as usize;
 const NUM_BUCKETS: usize = NUM_QOS_BUCKETS + 1;
 
@@ -76,7 +76,7 @@ mod ut {
 }
 
 /// `WORKQ_TR_FLAG_*` and `WORKQ_TR_STATE_*`.
-mod tr {
+pub(crate) mod tr {
     pub const KEVENT: u8 = 0x01;
     pub const WORKLOOP: u8 = 0x02;
     pub const OVERCOMMIT: u8 = 0x04;
@@ -84,9 +84,14 @@ mod tr {
     pub const WL_OUTSIDE_QOS: u8 = 0x10;
     pub const COOPERATIVE: u8 = 0x20;
 
+    pub const IDLE: u8 = 0;
     pub const NEW: u8 = 1;
     pub const QUEUED: u8 = 2;
     pub const CANCELED: u8 = 3;
+    /// Preposted for a bind (kevent only).
+    pub const BINDING: u8 = 4;
+    /// Bound to a thread (kevent only).
+    pub const BOUND: u8 = 5;
 }
 
 /// `WQ_FLAG_THREAD_*`: the upcall flags `_pthread_wqthread` is given.
@@ -136,16 +141,18 @@ mod wqf {
 }
 
 /// `workq_kern_threadreq_flags_t`.
-mod kflags {
+pub(crate) mod kflags {
     pub const NONE: u32 = 0;
     pub const SET_AST_ON_FAILURE: u32 = 0x01;
+    pub const ATTEMPT_REBIND: u32 = 0x02;
     pub const CAN_CREATE_THREADS: u32 = 0x04;
+    pub const MAKE_OVERCOMMIT: u32 = 0x08;
 }
 
 /// `TRP_*`: a workloop's thread parameters.
-const TRP_PRIORITY: u16 = 0x1;
-const TRP_POLICY: u16 = 0x2;
-const TRP_CPUPERCENT: u16 = 0x4;
+pub(crate) const TRP_PRIORITY: u16 = 0x1;
+pub(crate) const TRP_POLICY: u16 = 0x2;
+pub(crate) const TRP_CPUPERCENT: u16 = 0x4;
 
 const WORKQUEUE_MAXTHREADS: u32 = 512;
 const WORKQUEUE_CONSTRAINED_FACTOR: u32 = 5;
@@ -159,7 +166,11 @@ const PTH_DEFAULT_STACKSIZE: u64 = 512 * 1024;
 const PTHREAD_T_OFFSET: u64 = 12 * 1024;
 const STK_ALIGN: u64 = 16;
 /// `WORKQ_EXIT_THREAD_NKEVENT`.
-const EXIT_THREAD_NKEVENT: i64 = -1;
+const EXIT_THREAD_NKEVENT: i32 = -1;
+/// `WQ_KEVENT_LIST_LEN`, `WQ_KEVENT_DATA_SIZE`: the events and their data
+/// a workqueue thread is started with, on its stack.
+const WQ_KEVENT_LIST_LEN: i32 = 16;
+const WQ_KEVENT_DATA_SIZE: u64 = 32 * 1024;
 /// `VM_MAKE_TAG(VM_MEMORY_STACK)`, `VM_FLAGS_ANYWHERE`.
 const VM_TAG_STACK: u64 = 30 << 24;
 
@@ -189,6 +200,18 @@ mod dsig {
 /// The scheduler's priority for a QoS (`thread_qos_policy_params.qos_pri`).
 fn qos_pri(q: u8) -> u8 {
     [0, 4, 4, 20, 31, 37, 46][q as usize]
+}
+
+/// `thread_user_promotion_qos_for_pri`.
+pub(crate) fn promotion_qos_for_pri(pri: u8) -> u8 {
+    let mut q = qos::USER_INTERACTIVE;
+    while q > qos::MAINTENANCE {
+        if qos_pri(q) <= pri {
+            return q;
+        }
+        q -= 1;
+    }
+    qos::MAINTENANCE
 }
 
 /// `thread_workq_qos_for_pri`.
@@ -256,6 +279,9 @@ pub struct WqThread {
     pub kill_allowed: bool,
     pub park: ParkData,
     pub kqr_bound: Option<ReqId>,
+    /// `uu_kqueue_override`: the QoS a workloop it services overrides it
+    /// to.
+    pub kqueue_override: u8,
     /// Made parked and not yet run: its host thread starts when woken.
     pub unstarted: Option<SpawnRequest>,
     /// Its next entry is the kernel's (`workq_unpark_continue`).
@@ -290,6 +316,9 @@ pub struct Req {
     pub kq_qos_index: u8,
     /// `tr_thread` while binding or bound.
     pub thread: Option<i32>,
+    /// The kqueue whose request this is (`kqr_kqueue`): the workqueue
+    /// kqueue's per-QoS requests and a workloop's one.
+    pub kq: Option<u64>,
     /// Its priority in a priority queue, and its arrival.
     pri: u8,
     seq: u64,
@@ -365,8 +394,8 @@ pub struct Workq {
     coop_best_req_qos: u8,
     coop_limited: bool,
     coop_queue: [VecDeque<ReqId>; NUM_QOS_BUCKETS],
-    pub reqs: HashMap<ReqId, Req>,
-    next_req: u64,
+    /// Enqueue order, for requests of equal priority.
+    next_seq: u64,
     /// The thread whose context new threads are made from (the one that
     /// opened the workqueue).
     template_ctx: u64,
@@ -419,6 +448,20 @@ impl Kernel {
         self.dtask.workq.as_mut().expect("an open workqueue")
     }
 
+    /// The workqueue and every thread request, borrowed together.
+    fn wq_and_reqs(&mut self) -> (&mut Workq, &mut HashMap<ReqId, Req>) {
+        let d = &mut self.dtask;
+        (d.workq.as_mut().expect("an open workqueue"), &mut d.threadreqs)
+    }
+
+    /// A new thread request.
+    fn threadreq_alloc(&mut self, r: Req) -> ReqId {
+        self.dtask.next_threadreq += 1;
+        let id = self.dtask.next_threadreq;
+        self.dtask.threadreqs.insert(id, r);
+        id
+    }
+
     fn wqt(&mut self, tid: i32) -> &mut WqThread {
         self.dtask.threads.map.get_mut(&tid).and_then(|t| t.wq.as_mut()).expect("a workqueue thread")
     }
@@ -464,8 +507,8 @@ impl Kernel {
     }
 
     fn thactive_refresh_best_constrained_req_qos(&mut self) {
-        let wq = self.wq();
-        let new = wq.constrained_queue.max(&wq.reqs).map_or(qos::UNSPECIFIED, |r| wq.reqs[&r].qos);
+        let (wq, reqs) = self.wq_and_reqs();
+        let new = wq.constrained_queue.max(reqs).map_or(qos::UNSPECIFIED, |r| reqs[&r].qos);
         let old = Self::best_constrained_req_qos(wq.thactive);
         if old != new {
             let base = wq.thactive & !(0xffu128 << THACTIVE_QOS_SHIFT);
@@ -517,7 +560,10 @@ impl Kernel {
     /// `workq_thread_reset_cpupercent`: CPU limits come only with workloop
     /// parameters.
     fn workq_thread_reset_cpupercent(&mut self, req: Option<ReqId>, tid: i32) {
-        let trp = req.map_or(0, |r| self.workloop_param(r));
+        let trp = match req {
+            Some(r) if self.req(r).flags & tr::WL_PARAMS != 0 => self.workloop_param(r),
+            _ => 0,
+        };
         let t = self.wqt(tid);
         if t.flags & ut::CPUPERCENT != 0 {
             t.flags &= !ut::CPUPERCENT;
@@ -529,8 +575,11 @@ impl Kernel {
 
     /// `workq_thread_reset_pri`.
     fn workq_thread_reset_pri(&mut self, tid: i32, req: Option<ReqId>, unpark: bool) {
-        let mut q = req.map_or(QOS_CLEANUP, |r| self.wq().reqs[&r].qos);
-        let trp = req.map_or(0, |r| self.workloop_param(r));
+        let mut q = req.map_or(QOS_CLEANUP, |r| self.dtask.threadreqs[&r].qos);
+        let trp = match req {
+            Some(r) if self.req(r).flags & tr::WL_PARAMS != 0 => self.workloop_param(r),
+            _ => 0,
+        };
         let (trp_flags, trp_pri, trp_pol) = (trp as u16, (trp >> 16) as u8, (trp >> 24) as u8);
         let mut priority = 31u8;
         let mut policy = 1u8;
@@ -544,10 +593,7 @@ impl Kernel {
         }
         if q == QOS_MANAGER {
             if u64::from(mgr_pri) & pp::SCHED_PRI_FLAG != 0 {
-                let t = self.wqt(tid);
-                t.sched_qos = qos::UNSPECIFIED;
-                t.sched_pri = (u64::from(mgr_pri) & pp::SCHED_PRI_MASK) as u8;
-                t.sched_policy = 1;
+                self.thread_set_workq_pri(tid, qos::UNSPECIFIED, (u64::from(mgr_pri) & pp::SCHED_PRI_MASK) as u8, 1);
                 return;
             }
             q = pp::qos(u64::from(mgr_pri));
@@ -561,10 +607,42 @@ impl Kernel {
                 policy = trp_pol;
             }
         }
+        self.thread_set_workq_pri(tid, q, priority, policy);
+    }
+
+    /// `thread_set_workq_pri`: the thread's requested QoS (relative
+    /// priority 0) and base priority and policy, its workqueue override
+    /// cleared.
+    fn thread_set_workq_pri(&mut self, tid: i32, q: u8, priority: u8, policy: u8) {
         let t = self.wqt(tid);
         t.sched_qos = q;
         t.sched_pri = priority;
         t.sched_policy = policy;
+        t.sched_override = qos::UNSPECIFIED;
+        let p = &mut self.dtask.threads.map.entry(tid).or_default().policy;
+        p.qos = q;
+        p.relpri = 0;
+    }
+
+    /// `thread_get_requested_qos`.
+    pub(crate) fn darwin_thread_requested_qos(&self, tid: i32) -> (u8, i32) {
+        self.dtask.threads.map.get(&tid).map_or((qos::UNSPECIFIED, 0), |t| (t.policy.qos, t.policy.relpri))
+    }
+
+    /// A thread's base priority: its QoS's, else a workqueue thread's set
+    /// priority, else the task's (`BASEPRI_DEFAULT`) with its precedence
+    /// importance, within 0 to `MAXPRI_USER`.
+    pub(crate) fn darwin_thread_base_pri(&self, tid: i32) -> u8 {
+        const BASEPRI_DEFAULT: i32 = 31;
+        const MAXPRI_USER: i32 = 63;
+        let Some(t) = self.dtask.threads.map.get(&tid) else { return BASEPRI_DEFAULT as u8 };
+        if t.policy.qos != qos::UNSPECIFIED {
+            return (i32::from(qos_pri(t.policy.qos)) + t.policy.relpri).clamp(0, MAXPRI_USER) as u8;
+        }
+        if let Some(w) = &t.wq {
+            return w.sched_pri;
+        }
+        (BASEPRI_DEFAULT + t.policy.importance.unwrap_or(0)).clamp(0, MAXPRI_USER) as u8
     }
 
     // -- idle threads -----------------------------------------------------------
@@ -869,7 +947,7 @@ impl Kernel {
     // -- thread requests ---------------------------------------------------------
 
     fn req(&mut self, id: ReqId) -> &mut Req {
-        self.wq().reqs.get_mut(&id).expect("a thread request")
+        self.dtask.threadreqs.get_mut(&id).expect("a thread request")
     }
 
     fn tr_is_overcommit(f: u8) -> bool {
@@ -992,15 +1070,12 @@ impl Kernel {
             return self.coop_refresh_best_req_qos();
         }
         let pri = self.workq_priority_for_req(id);
-        let wq = self.wq();
-        wq.next_req += 1;
-        let seq = wq.next_req;
-        let rr = wq.reqs.get_mut(&id).expect("a request");
+        let (wq, reqs) = self.wq_and_reqs();
+        wq.next_seq += 1;
+        let rr = reqs.get_mut(&id).expect("a request");
         rr.pri = pri;
-        rr.seq = seq;
-        let reqs = std::mem::take(&mut wq.reqs);
-        let new_max = Self::queue_for(wq, r.flags).insert(id, &reqs);
-        wq.reqs = reqs;
+        rr.seq = wq.next_seq;
+        let new_max = Self::queue_for(wq, r.flags).insert(id, reqs);
         if new_max {
             if Self::tr_is_nonovercommit(r.flags) {
                 self.thactive_refresh_best_constrained_req_qos();
@@ -1032,10 +1107,8 @@ impl Kernel {
                 changed = self.coop_refresh_best_req_qos();
             }
             if !Self::tr_is_cooperative(r.flags) {
-                let wq = self.wq();
-                let reqs = std::mem::take(&mut wq.reqs);
-                let was_max = Self::queue_for(wq, r.flags).remove(id, &reqs);
-                wq.reqs = reqs;
+                let (wq, reqs) = self.wq_and_reqs();
+                let was_max = Self::queue_for(wq, r.flags).remove(id, reqs);
                 if was_max {
                     changed = true;
                     if Self::tr_is_nonovercommit(r.flags) {
@@ -1053,7 +1126,7 @@ impl Kernel {
         if self.req(id).flags & (tr::WORKLOOP | tr::KEVENT) != 0 {
             self.kqueue_threadreq_cancel(id);
         } else {
-            self.wq().reqs.remove(&id);
+            self.dtask.threadreqs.remove(&id);
         }
     }
 
@@ -1357,14 +1430,11 @@ impl Kernel {
         if Self::tr_is_cooperative(flags) && Self::tr_is_overcommit(flags) {
             return Err(Errno::EINVAL);
         }
-        let wq = self.wq();
-        wq.next_req += 1;
-        let id = wq.next_req;
-        wq.reqs.insert(id, Req { state: tr::NEW, qos: q, flags, ..Req::default() });
+        let id = self.threadreq_alloc(Req { state: tr::NEW, qos: q, flags, ..Req::default() });
         let l = limits();
         loop {
             if self.wq_exiting() {
-                self.wq().reqs.remove(&id);
+                self.dtask.threadreqs.remove(&id);
                 return Ok(0);
             }
             let mut unpaced = reqcount - 1;
@@ -1395,7 +1465,7 @@ impl Kernel {
             }
         }
         if self.wq_exiting() {
-            self.wq().reqs.remove(&id);
+            self.dtask.threadreqs.remove(&id);
             return Ok(0);
         }
         self.req(id).count = reqcount as u16;
@@ -1429,9 +1499,30 @@ impl Kernel {
             _ => 0,
         };
         if let Some(r) = kqr {
-            let _ = (r, eventlist, nevents);
-            self.darwin_unimplemented("workq_kernreturn from a thread bound to a kqueue".into());
-            return Err(Errno::EINVAL);
+            let mut upcall_flags = upcall::NEWSPI | upcall::REUSE;
+            if self.req(r).flags & tr::WORKLOOP != 0 {
+                upcall_flags |= upcall::WORKLOOP | upcall::KEVENT;
+            } else {
+                upcall_flags |= upcall::KEVENT;
+            }
+            if self.wqt(tid).pri.qos_bucket == QOS_MANAGER {
+                upcall_flags |= upcall::EVENT_MANAGER;
+            } else {
+                if self.workq_thread_is_overcommit(tid) {
+                    upcall_flags |= upcall::OVERCOMMIT;
+                }
+                if self.wqt(tid).flags & ut::OUTSIDE_QOS != 0 {
+                    upcall_flags |= upcall::OUTSIDEQOS;
+                } else {
+                    upcall_flags |= u32::from(self.wqt(tid).pri.qos_req) | upcall::PRIO_QOS;
+                }
+            }
+            if let Some(out) = self.workq_handle_stack_events(m, tid, eventlist, nevents, upcall_flags)? {
+                return Ok(out);
+            }
+            // KEVENT_FLAG_PARKING either returned events, failed, or
+            // unbound the thread.
+            assert!(self.wqt(tid).kqr_bound.is_none(), "a parking thread unbinds");
         }
         let t = self.wqt(tid);
         t.sched_call = false;
@@ -1541,17 +1632,17 @@ impl Kernel {
 
     /// `workq_threadreq_select_for_creator`.
     fn workq_threadreq_select_for_creator(&mut self) -> Option<ReqId> {
-        let wq = self.wq();
-        let req_pri = wq.special_queue.max(&wq.reqs);
-        let pri = req_pri.map_or(0, |r| wq.reqs[&r].pri);
+        let (wq, reqs) = self.wq_and_reqs();
+        let req_pri = wq.special_queue.max(reqs);
+        let pri = req_pri.map_or(0, |r| reqs[&r].pri);
         if let Some(mgr) = self.wq().event_manager_threadreq {
             if self.workq_may_start_event_mgr_thread(None) {
                 return if self.manager_pri() >= pri { Some(mgr) } else { req_pri };
             }
         }
-        let wq = self.wq();
-        let mut req_qos = wq.overcommit_queue.max(&wq.reqs);
-        let mut q = req_qos.map_or(qos::UNSPECIFIED, |r| wq.reqs[&r].qos);
+        let (wq, reqs) = self.wq_and_reqs();
+        let mut req_qos = wq.overcommit_queue.max(reqs);
+        let mut q = req_qos.map_or(qos::UNSPECIFIED, |r| reqs[&r].qos);
         if let Some(t) = self.workq_cooperative_queue_best_req(None) {
             let tq_ = self.req(t).qos;
             if q <= tq_ && self.workq_cooperative_allowance(tq_, None, true) {
@@ -1559,9 +1650,9 @@ impl Kernel {
                 q = tq_;
             }
         }
-        let wq = self.wq();
-        if let Some(t) = wq.constrained_queue.max(&wq.reqs) {
-            let tq_ = wq.reqs[&t].qos;
+        let (wq, reqs) = self.wq_and_reqs();
+        if let Some(t) = wq.constrained_queue.max(reqs) {
+            let tq_ = reqs[&t].qos;
             if q < tq_ {
                 if pri != 0 && pri >= qos_pri(tq_) {
                     return req_pri;
@@ -1616,17 +1707,17 @@ impl Kernel {
     fn workq_threadreq_select(&mut self, tid: i32) -> Option<ReqId> {
         let uth = if self.wq().creator == Some(tid) { None } else { Some(tid) };
         // No turnstile pushes (see workq_threadreq_select_for_creator).
-        let wq = self.wq();
-        let req_pri = wq.special_queue.max(&wq.reqs);
-        let pri = req_pri.map_or(0, |r| wq.reqs[&r].pri);
+        let (wq, reqs) = self.wq_and_reqs();
+        let req_pri = wq.special_queue.max(reqs);
+        let pri = req_pri.map_or(0, |r| reqs[&r].pri);
         if let Some(mgr) = self.wq().event_manager_threadreq {
             if self.workq_may_start_event_mgr_thread(uth) {
                 return if self.manager_pri() >= pri { Some(mgr) } else { req_pri };
             }
         }
-        let wq = self.wq();
-        let mut req_qos = wq.overcommit_queue.max(&wq.reqs);
-        let mut q = req_qos.map_or(qos::UNSPECIFIED, |r| wq.reqs[&r].qos);
+        let (wq, reqs) = self.wq_and_reqs();
+        let mut req_qos = wq.overcommit_queue.max(reqs);
+        let mut q = req_qos.map_or(qos::UNSPECIFIED, |r| reqs[&r].qos);
         if let Some(t) = self.workq_cooperative_queue_best_req(uth) {
             let tq_ = self.req(t).qos;
             if q <= tq_ && self.workq_cooperative_allowance(tq_, uth, true) {
@@ -1634,9 +1725,9 @@ impl Kernel {
                 q = tq_;
             }
         }
-        let wq = self.wq();
-        if let Some(t) = wq.constrained_queue.max(&wq.reqs) {
-            let tq_ = wq.reqs[&t].qos;
+        let (wq, reqs) = self.wq_and_reqs();
+        if let Some(t) = wq.constrained_queue.max(reqs) {
+            let tq_ = reqs[&t].qos;
             if q < tq_ {
                 if pri != 0 && pri >= qos_pri(tq_) {
                     return req_pri;
@@ -1707,7 +1798,8 @@ impl Kernel {
             if u32::from(self.wq().nthreads) >= l.max_threads {
                 flags = kflags::NONE;
             } else if flags & kflags::SET_AST_ON_FAILURE != 0 {
-                self.darwin_unimplemented("workqueue AST_KEVENT_REDRIVE_THREADREQ".into());
+                let me = self.tid;
+                self.darwin_set_astkevent(me, super::kevent::ast::REDRIVE_THREADREQ);
             } else if flags & kflags::CAN_CREATE_THREADS == 0 {
                 self.workq_schedule_immediate_thread_creation();
             } else if self.workq_add_new_idle_thread(m) {
@@ -1780,7 +1872,7 @@ impl Kernel {
             self.workq_schedule_creator_m(m, kflags::CAN_CREATE_THREADS);
         }
         if let Some(id) = free_req {
-            self.wq().reqs.remove(&id);
+            self.dtask.threadreqs.remove(&id);
         }
         let mut upcall_flags = upcall::NEWSPI;
         if self.wqt(tid).pri.qos_bucket == QOS_MANAGER {
@@ -1897,7 +1989,7 @@ impl Kernel {
         let page = super::mach::PAGE_MASK + 1;
         let this = self.darwin_ctx_of(tid);
         let selfp = stackaddr + PTH_DEFAULT_STACKSIZE + page + PTHREAD_T_OFFSET;
-        let stack_top = selfp & !(STK_ALIGN - 1);
+        let mut stack_top = selfp & !(STK_ALIGN - 1);
         let stack_bottom = stackaddr + page;
         if setup_flags & setup::FIRST_USE != 0 {
             let tsd_offset = self.dtask.pthread.tsd_offset;
@@ -1906,16 +1998,30 @@ impl Kernel {
                 upcall_flags |= upcall::TSD_BASE_SET;
             }
         }
-        let (kevent_list, kevent_count) = if setup_flags & setup::EXIT_THREAD != 0 {
-            (0u64, EXIT_THREAD_NKEVENT)
+        let (mut kevent_list, mut kevent_count) = (0u64, 0i32);
+        if setup_flags & setup::EXIT_THREAD != 0 {
+            kevent_count = EXIT_THREAD_NKEVENT;
         } else if upcall_flags & upcall::KEVENT != 0 {
-            self.darwin_unimplemented("kevent upcalls to workqueue threads".into());
-            (0, 0)
-        } else {
-            (0, 0)
-        };
+            // The events are the thread's own: it is the one running here.
+            assert_eq!(tid, self.tid, "a workqueue thread takes its events itself");
+            let flags = super::kevent::kf::STACK_DATA | super::kevent::kf::IMMEDIATE;
+            let (_, list, count, top) = self.workq_kevent(m, selfp, 0, 0, flags);
+            kevent_list = list;
+            kevent_count = count;
+            if let Some(t) = top {
+                stack_top = t;
+            }
+        }
+        self.workq_set_register_state(m, tid, selfp, stack_top, stack_bottom, kport, kevent_list, upcall_flags, kevent_count)
+    }
+
+    /// libpthread's `workq_set_register_state`: the registers for
+    /// `_pthread_wqthread`, and back to user space there.
+    #[allow(clippy::too_many_arguments)]
+    fn workq_set_register_state(&mut self, m: &mut GuestMem<'_>, tid: i32, selfp: u64, stack_top: u64, stack_bottom: u64, kport: u32, kevent_list: u64, upcall_flags: u32, kevent_count: i32) -> SyscallOutcome {
+        let this = self.darwin_ctx_of(tid);
         let wqthread = self.dtask.pthread.wqthread;
-        let regs = [(ctx::x(0), selfp), (ctx::x(1), u64::from(kport)), (ctx::x(2), stack_bottom), (ctx::x(3), kevent_list), (ctx::x(4), u64::from(upcall_flags)), (ctx::x(5), kevent_count as u64), (ctx::sp_slot(false), stack_top), (ctx::PC, wqthread)];
+        let regs = [(ctx::x(0), selfp), (ctx::x(1), u64::from(kport)), (ctx::x(2), stack_bottom), (ctx::x(3), kevent_list), (ctx::x(4), u64::from(upcall_flags)), (ctx::x(5), kevent_count as i64 as u64), (ctx::sp_slot(false), stack_top), (ctx::PC, wqthread)];
         for (slot, v) in regs {
             let _ = m.write_u64(this + slot as u64, v);
         }
@@ -2078,25 +2184,210 @@ impl Kernel {
 
     /// `kqueue_threadreq_workloop_param`.
     fn workloop_param(&mut self, id: ReqId) -> u64 {
-        if self.req(id).flags & tr::WL_PARAMS != 0 {
-            self.darwin_unimplemented("workloop thread parameters".into());
+        assert!(self.req(id).flags & tr::WORKLOOP != 0, "a workloop's request");
+        self.kqueue_threadreq_workloop_param(id)
+    }
+
+    /// A kqueue's thread request, idle (`kqwq_request`, `kqwl_request`).
+    pub(crate) fn darwin_workq_new_req(&mut self, flags: u8, qos_index: u8, kq: u64) -> ReqId {
+        self.threadreq_alloc(Req { flags, kq_qos_index: qos_index, kq: Some(kq), ..Req::default() })
+    }
+
+    /// A kqueue's thread request is freed with its kqueue.
+    pub(crate) fn darwin_workq_free_req(&mut self, id: ReqId) {
+        self.dtask.threadreqs.remove(&id);
+    }
+
+    pub(crate) fn darwin_workq_req(&self, id: ReqId) -> Req {
+        self.dtask.threadreqs[&id]
+    }
+
+    pub(crate) fn darwin_workq_req_mut(&mut self, id: ReqId) -> &mut Req {
+        self.req(id)
+    }
+
+    /// The request a thread is bound to (`uu_kqr_bound`).
+    pub(crate) fn darwin_kqr_bound(&self, tid: i32) -> Option<ReqId> {
+        self.dtask.threads.map.get(&tid).and_then(|t| t.wq.as_ref()).and_then(|w| w.kqr_bound)
+    }
+
+    pub(crate) fn darwin_set_kqr_bound(&mut self, tid: i32, req: Option<ReqId>) {
+        self.wqt(tid).kqr_bound = req;
+    }
+
+    /// `workq_is_exiting`.
+    pub(crate) fn darwin_workq_is_exiting(&self) -> bool {
+        self.dtask.workq.as_ref().map_or(true, |w| w.flags & wqf::EXITING != 0)
+    }
+
+    /// `workq_threadreq_admissible`.
+    fn workq_threadreq_admissible(&mut self, tid: i32, req: ReqId) -> bool {
+        let r = *self.req(req);
+        if r.qos == QOS_MANAGER {
+            return self.workq_may_start_event_mgr_thread(Some(tid));
         }
-        0
+        if Self::tr_is_cooperative(r.flags) {
+            return self.workq_cooperative_allowance(r.qos, Some(tid), true);
+        }
+        if Self::tr_is_nonovercommit(r.flags) {
+            return self.workq_constrained_allowance(r.qos, Some(tid), true) != 0;
+        }
+        true
     }
 
-    fn kqueue_threadreq_cancel(&mut self, id: ReqId) {
-        let _ = id;
-        self.darwin_unimplemented("kqueue thread requests".into());
+    /// `workq_kern_threadreq_initiate`: a kqueue asks for a thread at
+    /// `q`; false when the workqueue is going away.
+    pub(crate) fn darwin_workq_threadreq_initiate(&mut self, req: ReqId, mut q: u8, flags: u32) -> bool {
+        if self.req(req).flags & tr::WL_OUTSIDE_QOS != 0 {
+            let trp = self.workloop_param(req);
+            q = qos_for_pri((trp >> 16) as u8);
+            if q == qos::UNSPECIFIED {
+                q = QOS_ABOVEUI;
+            }
+        }
+        let r = self.req(req);
+        r.count = 1;
+        r.state = tr::NEW;
+        r.qos = q;
+        // ATTEMPT_REBIND: the thread unbinding from this workloop may take
+        // the request again at once.
+        let uth = if flags & kflags::ATTEMPT_REBIND != 0 { Some(self.tid) } else { None };
+        if self.dtask.workq.is_none() || self.wq_exiting() {
+            self.req(req).state = tr::IDLE;
+            return false;
+        }
+        match uth {
+            Some(t) if self.workq_threadreq_admissible(t, req) => {
+                let bucket_ = self.wqt(t).pri.qos_bucket;
+                if bucket_ != q {
+                    self.thactive_move(bucket_, q);
+                    self.workq_thread_reset_pri(t, Some(req), false);
+                }
+                self.wq().fulfilled += 1;
+                self.kqueue_threadreq_bind(req, t);
+            }
+            _ => {
+                if self.workq_threadreq_enqueue(req) {
+                    self.workq_schedule_creator(flags);
+                }
+            }
+        }
+        true
     }
 
-    fn kqueue_threadreq_bind_prepost(&mut self, id: ReqId, tid: i32) {
-        let _ = (id, tid);
-        self.darwin_unimplemented("kqueue thread requests".into());
+    /// `workq_kern_threadreq_modify`: a queued kqueue request moves to
+    /// `q`, or becomes overcommit.
+    pub(crate) fn darwin_workq_threadreq_modify(&mut self, req: ReqId, q: u8, flags: u32) {
+        if self.req(req).flags & tr::WL_OUTSIDE_QOS != 0 {
+            return;
+        }
+        if self.req(req).state == tr::BINDING {
+            let t = self.req(req).thread.expect("a binding request's thread");
+            self.kqueue_threadreq_bind(req, t);
+            return;
+        }
+        let make_overcommit = flags & kflags::MAKE_OVERCOMMIT != 0 && Self::tr_is_nonovercommit(self.req(req).flags);
+        if self.wq_exiting() || (self.req(req).qos == q && !make_overcommit) {
+            return;
+        }
+        assert_eq!(self.req(req).state, tr::QUEUED, "a thread request being modified is queued");
+        let flags0 = self.req(req).flags;
+        let (wq, reqs) = self.wq_and_reqs();
+        if Self::queue_for(wq, flags0).remove(req, reqs) && Self::tr_is_nonovercommit(flags0) {
+            self.thactive_refresh_best_constrained_req_qos();
+        }
+        if make_overcommit {
+            self.req(req).flags ^= tr::OVERCOMMIT;
+        }
+        self.req(req).qos = q;
+        let flags1 = self.req(req).flags;
+        let (wq, reqs) = self.wq_and_reqs();
+        if let Some(max) = Self::queue_for(wq, flags1).max(reqs) {
+            if reqs[&max].qos >= q {
+                let pri = self.workq_priority_for_req(req);
+                let (wq, reqs) = self.wq_and_reqs();
+                wq.next_seq += 1;
+                let r = reqs.get_mut(&req).expect("a request");
+                r.pri = pri;
+                r.seq = wq.next_seq;
+                Self::queue_for(wq, flags1).insert(req, reqs);
+                return;
+            }
+        }
+        // The request becomes the highest of its queue: it is put back as
+        // new, which may run the creator.
+        self.wq().reqcount -= 1;
+        self.req(req).state = tr::NEW;
+        if self.workq_threadreq_enqueue(req) {
+            self.workq_schedule_creator(flags);
+        }
     }
 
-    fn kqueue_threadreq_bind_commit(&mut self, tid: i32) {
-        let _ = tid;
-        self.darwin_unimplemented("kqueue thread requests".into());
+    /// `workq_kern_threadreq_redrive`.
+    pub(crate) fn darwin_workq_threadreq_redrive(&mut self, m: &mut GuestMem<'_>, flags: u32) {
+        if self.dtask.workq.is_some() {
+            self.workq_schedule_creator_m(m, flags);
+        }
+    }
+
+    /// `workq_thread_set_max_qos`: the bound thread delivers events of a
+    /// workloop whose requested QoS is this.
+    pub(crate) fn darwin_workq_thread_set_max_qos(&mut self, req: ReqId) {
+        let tid = self.tid;
+        let q = self.req(req).kq_qos_index;
+        if self.wqt(tid).pri.qos_max == q {
+            return;
+        }
+        let old = self.wqt(tid).pri;
+        let mut new = old;
+        new.qos_max = q;
+        self.workq_thread_update_bucket(tid, old, new, false);
+    }
+
+    /// The override a kqueue puts on the thread servicing it
+    /// (`uu_kqueue_override`).
+    pub(crate) fn darwin_kqueue_override(&self, tid: i32) -> u8 {
+        self.dtask.threads.map.get(&tid).and_then(|t| t.wq.as_ref()).map_or(0, |w| w.kqueue_override)
+    }
+
+    pub(crate) fn darwin_set_kqueue_override(&mut self, tid: i32, q: u8) {
+        self.wqt(tid).kqueue_override = q;
+    }
+
+    /// libpthread's `workq_kevent`: the events delivered to a thread on
+    /// its way to user space, below its `pthread_t` on its stack; their
+    /// address and count, with the stack's new top. `None` and no events
+    /// when there are none or the call failed.
+    fn workq_kevent(&mut self, m: &mut GuestMem<'_>, selfp: u64, eventlist: u64, nevents: i32, flags: u32) -> (Result<(), Errno>, u64, i32, Option<u64>) {
+        let kevent_list = selfp - WQ_KEVENT_LIST_LEN as u64 * super::kevent::Kev::QOS_SIZE as u64;
+        let data_buf = kevent_list - WQ_KEVENT_DATA_SIZE;
+        let mut data_available = WQ_KEVENT_DATA_SIZE;
+        let r = self.darwin_kevent_workq_internal(m, eventlist, nevents, kevent_list, WQ_KEVENT_LIST_LEN, data_buf, &mut data_available, flags);
+        match r {
+            Ok(n) if n != -1 => (Ok(()), kevent_list, n, Some((data_buf + data_available) & !(STK_ALIGN - 1))),
+            Ok(_) => (Ok(()), 0, 0, None),
+            Err(e) => (Err(e), 0, 0, None),
+        }
+    }
+
+    /// libpthread's `workq_handle_stack_events`: a kevent-bound thread
+    /// returns with events to deliver and acknowledges what it handled;
+    /// with more ready it goes straight back to user space with them.
+    fn workq_handle_stack_events(&mut self, m: &mut GuestMem<'_>, tid: i32, eventlist: u64, nevents: i32, upcall_flags: u32) -> Result<Option<SyscallOutcome>, Errno> {
+        let page = super::mach::PAGE_MASK + 1;
+        let stackaddr = self.wqt(tid).stackaddr;
+        let kport = self.wqt(tid).thport;
+        let selfp = stackaddr + PTH_DEFAULT_STACKSIZE + page + PTHREAD_T_OFFSET;
+        let flags = super::kevent::kf::STACK_DATA | super::kevent::kf::IMMEDIATE | super::kevent::kf::PARKING;
+        let (r, list, count, top) = self.workq_kevent(m, selfp, eventlist, nevents, flags);
+        r?;
+        if count == 0 {
+            return Ok(None);
+        }
+        // thread_set_voucher_name(MACH_PORT_NULL): the thread adopts no
+        // voucher; it holds none, vouchers not being made by this kernel.
+        let stack_top = top.unwrap_or(selfp & !(STK_ALIGN - 1));
+        Ok(Some(self.workq_set_register_state(m, tid, selfp, stack_top, stackaddr + page, kport, list, upcall_flags, count)))
     }
 
     // -- bsdthread_ctl --------------------------------------------------------------------
@@ -2256,10 +2547,7 @@ impl Kernel {
                 match bound {
                     None => unbind_rv = Some(Errno::EALREADY),
                     Some(r) if self.req(r).flags & tr::WORKLOOP != 0 => unbind_rv = Some(Errno::EINVAL),
-                    Some(_) => {
-                        self.darwin_unimplemented("kqueue thread unbinding".into());
-                        unbind_rv = Some(Errno::EINVAL);
-                    }
+                    Some(r) => self.kqueue_threadreq_unbind(r),
                 }
             }
         }
@@ -2410,7 +2698,7 @@ impl Kernel {
     }
 
     /// The context of thread `tid`.
-    fn darwin_ctx_of(&self, tid: i32) -> u64 {
+    pub(crate) fn darwin_ctx_of(&self, tid: i32) -> u64 {
         if tid == self.tid {
             return self.ctx_addr;
         }

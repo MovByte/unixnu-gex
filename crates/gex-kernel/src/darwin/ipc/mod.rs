@@ -257,6 +257,8 @@ pub struct Pset {
     pub name: u32,
     pub members: Vec<ObjId>,
     pub refs: u32,
+    /// `ips_klist`: the EVFILT_MACHPORT knotes on the set.
+    pub knotes: u32,
 }
 
 /// An IPC object.
@@ -383,6 +385,13 @@ impl Ipc {
         }
     }
 
+    pub fn pset(&self, id: ObjId) -> &Pset {
+        match self.objects.get(&id) {
+            Some(Object::Pset(p)) => p,
+            _ => panic!("object {id} is not a port set"),
+        }
+    }
+
     pub fn pset_mut(&mut self, id: ObjId) -> &mut Pset {
         match self.objects.get_mut(&id) {
             Some(Object::Pset(p)) => p,
@@ -453,7 +462,7 @@ impl Ipc {
     pub fn pset_alloc(&mut self) -> Result<(u32, ObjId), u64> {
         let id = self.new_id();
         let name = self.space.alloc(Some(id)).ok_or(kr::NO_SPACE)?;
-        self.objects.insert(id, Object::Pset(Pset { active: true, name, members: Vec::new(), refs: 1 }));
+        self.objects.insert(id, Object::Pset(Pset { active: true, name, members: Vec::new(), refs: 1, knotes: 0 }));
         self.space.lookup_mut_any(name).bits |= ty::PORT_SET;
         Ok((name, id))
     }
@@ -563,12 +572,17 @@ impl Ipc {
     /// `mach_port_guard_exception`: recorded for the kernel to raise.
     /// `ipc_port_request_sparm`: arm the send-possible request at `index`
     /// (a sender found the port full).
-    pub fn request_sparm(&mut self, port: ObjId, index: u32) {
+    /// With `MACH_SEND_OVERRIDE`, the message at the queue's head takes
+    /// the sender's QoS (`ipc_mqueue_override_send_locked`).
+    pub fn request_sparm(&mut self, port: ObjId, index: u32, options: u64, qos_ovr: u8) {
         let p = self.port_mut(port);
         let r = &mut p.requests.as_mut().expect("a request table")[index as usize];
         if r.spreq {
             r.sparm = true;
             p.sprequests = true;
+            if options & msg::opt::SEND_OVERRIDE != 0 && qos_ovr != 0 {
+                self.mqueue_override_send(port, qos_ovr);
+            }
         }
     }
 

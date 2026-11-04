@@ -98,7 +98,7 @@ impl Ipc {
         if !claimed {
             return Err(kr::NAME_EXISTS);
         }
-        let id = self.new_object(Object::Pset(super::Pset { active: true, name, members: Vec::new(), refs: 1 }));
+        let id = self.new_object(Object::Pset(super::Pset { active: true, name, members: Vec::new(), refs: 1, knotes: 0 }));
         let e = self.space.lookup_mut_any(name);
         e.object = Some(id);
         e.bits |= ty::PORT_SET;

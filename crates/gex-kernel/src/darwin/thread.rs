@@ -190,6 +190,14 @@ pub struct DThread {
     pub wq: Option<Box<super::workq::WqThread>>,
     /// The QoS overrides others put on it (`thread->overrides`).
     pub overrides: Vec<super::workq::QosOverride>,
+    /// The BSD call it is in or last made (`uu_syscall_code`).
+    pub syscall_code: u64,
+    /// `AST_KEVENT_*` owed on its way back to user space.
+    pub astkevent: u16,
+    /// The kevent override (an owner's or a workqueue kqueue servicer's)
+    /// and the servicer override (a workloop's) on its QoS.
+    pub kevent_override: u8,
+    pub servicer_override: u8,
 }
 
 /// Every Darwin thread of the process, by tid.
@@ -254,6 +262,8 @@ pub enum Finish {
     Sleep(super::mach::Sleep),
     /// A workqueue thread parked (`workq_unpark_continue`).
     WorkqPark,
+    /// A kevent call's scan, or a workloop's synchronous wait.
+    Kevent(super::kevent::Cont),
 }
 
 /// `wait_result_to_return_code` (`sys_ulock.c`).
@@ -306,6 +316,10 @@ impl Kernel {
                 Some(SyscallOutcome::Continue)
             }
             sys::WORKQ_KERNRETURN => Some(self.darwin_workq_kernreturn(m, a)),
+            sys::KEVENT => Some(self.darwin_kevent_legacy(m, a, false)),
+            sys::KEVENT64 => Some(self.darwin_kevent_legacy(m, a, true)),
+            sys::KEVENT_QOS => Some(self.darwin_kevent_qos(m, a)),
+            sys::KEVENT_ID => Some(self.darwin_kevent_id(m, a)),
             sys::SEMWAIT_SIGNAL_NOCANCEL => Some(self.darwin_semwait_signal(m, a, false)),
             sys::ULOCK_WAKE => {
                 let no_errno = a[0] & ul::NO_ERRNO != 0;
@@ -692,6 +706,7 @@ impl Kernel {
             Finish::Sema(c) => self.darwin_sema_wait_done(m, c, res),
             Finish::Sleep(s) => self.darwin_sleep_done(m, s, res),
             Finish::WorkqPark => return self.darwin_workq_wait_done(m, res),
+            Finish::Kevent(c) => return self.darwin_kevent_wait_done(m, c, res),
             Finish::Psynch(c) => self.darwin_psynch_wait_done(m, c, res),
             Finish::Ulock { addr, no_errno } => {
                 // A waiter that was not woken is still on the queue.
@@ -724,11 +739,19 @@ impl Kernel {
     }
 
     /// A Darwin call has returned to the program: an abort it did not wait
-    /// for is spent.
-    pub(crate) fn darwin_syscall_exit(&mut self) {
+    /// for is spent, the knotes of descriptors it closed are gone
+    /// (`knote_fdclose`), and kevent's ASTs are taken.
+    pub(crate) fn darwin_syscall_exit(&mut self, m: &mut GuestMem<'_>) {
         let c = &mut self.darwin_me().cancel;
         c.notcancelpt = false;
         c.abort_safely = false;
+        self.darwin_knote_fdcheck();
+        self.darwin_kevent_ast(m);
+    }
+
+    /// The BSD call the thread is in (`uu_syscall_code`).
+    pub(crate) fn darwin_set_syscall_code(&mut self, code: u64) {
+        self.darwin_me().syscall_code = code;
     }
 
     /// `__pthread_testcancel(presyscall)`: this call is a cancellation

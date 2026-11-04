@@ -20,6 +20,8 @@ pub mod commpage;
 pub mod errno;
 pub mod ipc;
 pub mod kern;
+pub mod kevent;
+pub mod kfilt;
 pub mod kobject;
 pub mod mach;
 pub mod mach_msg;
@@ -69,6 +71,12 @@ pub struct Task {
     pub workq: Option<Box<workq::Workq>>,
     pub workq_wake: Vec<i32>,
     pub workq_creator_pending: Option<u32>,
+    /// Every thread request: the workqueue's (`workq_kernreturn`'s) and
+    /// the kqueues' (`kqwq_request`, `kqwl_request`).
+    pub threadreqs: std::collections::HashMap<workq::ReqId, workq::Req>,
+    pub next_threadreq: u64,
+    /// The process's kqueues and knotes.
+    pub kevents: kevent::Kevents,
     /// `p_workq_allow_sigmask`.
     pub workq_allow_sigmask: u32,
     /// `p_dispatchqueue_serialno_offset`, `p_dispatchqueue_label_offset`.

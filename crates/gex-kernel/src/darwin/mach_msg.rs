@@ -18,6 +18,8 @@ const BASE: u32 = 28;
 const MAX_BODY: u32 = 64 * 1024 * 1024 * 3 / 4 - 68;
 /// `IPC_KMSG_MAX_AUX_DATA_SPACE`.
 const MAX_AUX: u32 = 1024;
+/// `sizeof(mach_msg_aux_header_t)`.
+const AUX_HEADER: u32 = 8;
 /// `IPC_KMSG_MAX_OOL_PORT_COUNT`.
 const MAX_OOL_PORTS: u64 = 16383;
 /// `IPC_KOBJECT_DESC_MAX`.
@@ -84,6 +86,21 @@ struct SendUctx {
     msg_size: u32,
     aux_addr: u64,
     aux_size: u32,
+    /// The `mach_msg_priority_t` the send passed.
+    priority: u32,
+}
+
+/// What a receive put where (`mach_msg_recv_result_t`): the message's,
+/// trailer's and auxiliary data's sizes, the receiving name of a message
+/// too large, and the message's priority and QoS.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Msgr {
+    pub msg_size: u32,
+    pub trailer_size: u32,
+    pub aux_size: u32,
+    pub recv_name: u32,
+    pub priority: u32,
+    pub qos_ovrd: u8,
 }
 
 /// A receive's buffers (`mach_msg_recv_bufs_t`).
@@ -113,6 +130,18 @@ pub struct RecvArgs {
     pub timeout_ms: u32,
 }
 
+/// `mach_msg_priority_qos`, `mach_msg_priority_overide_qos`: the QoS
+/// fields of a `mach_msg_priority_t`, nothing past the last.
+fn msg_priority_qos(p: u32) -> u8 {
+    let q = (p >> 16) & 0xf;
+    if q <= 6 { q as u8 } else { 0 }
+}
+
+fn msg_priority_override_qos(p: u32) -> u8 {
+    let q = (p >> 20) & 0xf;
+    if q <= 6 { q as u8 } else { 0 }
+}
+
 fn rd32(b: &[u8], o: usize) -> u32 {
     u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
 }
@@ -126,6 +155,37 @@ impl Kernel {
     /// options user space may pass.
     fn user_policy(&self, options: u64) -> u64 {
         options & OPTION_USER
+    }
+
+    /// `ipc_kmsg_set_qos`: the message's priority and QoS, from the send's
+    /// override (`MACH_SEND_OVERRIDE`) or the sending thread
+    /// (`MACH_SEND_PROPAGATE_QOS`). Vouchers carry no priority here: iOS's
+    /// kernel has no deprecated voucher managers.
+    fn kmsg_set_qos(&self, kmsg: &mut Kmsg, options: u64, priority: u32) {
+        use super::thread::pp;
+        if options & opt::SEND_OVERRIDE != 0 && priority & 0xff != 0xff {
+            let q = msg_priority_qos(priority);
+            let relpri = if q != 0 { i32::from((priority >> 8) as u8 as i8) + 1 } else { 0 };
+            let ovr = msg_priority_override_qos(priority);
+            kmsg.ppriority = pp::from_qos(q, relpri, 0) as u32;
+            kmsg.qos_override = q.max(ovr);
+        } else {
+            kmsg.ppriority = if options & opt::SEND_PROPAGATE_QOS != 0 { self.ipc_current_thread_priority() } else { 0 };
+            kmsg.qos_override = if options & opt::SEND_OVERRIDE != 0 {
+                pp::qos(u64::from(kmsg.ppriority)).max(pp::qos(u64::from(priority)))
+            } else {
+                pp::qos(u64::from(kmsg.ppriority))
+            };
+        }
+    }
+
+    /// `ipc_get_current_thread_priority`: the calling thread's requested
+    /// QoS, else the QoS its base priority would be promoted to.
+    fn ipc_current_thread_priority(&self) -> u32 {
+        use super::thread::pp;
+        let (q, relpri) = self.darwin_thread_requested_qos(self.tid);
+        let (q, relpri) = if q != 0 { (q, relpri) } else { (super::workq::promotion_qos_for_pri(self.darwin_thread_base_pri(self.tid)), 0) };
+        pp::from_qos(q, relpri, 0) as u32
     }
 
     /// `ipc_preflight_msg_option64`.
@@ -184,7 +244,7 @@ impl Kernel {
                 let mut aux = RecvBufs { msg_addr: 0, msg_size: 0, aux_addr: 0, aux_size: 0 };
                 if rcv_count == 2 {
                     let rcv_addr = if aux_vec[1] != 0 { aux_vec[1] } else { aux_vec[0] };
-                    if rcv_addr == 0 || (aux_vec[3] as u32) < 16 {
+                    if rcv_addr == 0 || (aux_vec[3] as u32) < AUX_HEADER {
                         return self.mach_result(m, mr::RCV_INVALID_ARGUMENTS);
                     }
                     aux.aux_addr = rcv_addr;
@@ -224,7 +284,7 @@ impl Kernel {
                     if u.aux_size != 0 && aux_vec[0] == 0 {
                         return self.mach_result(m, mr::SEND_INVALID_DATA);
                     }
-                    if u.aux_size != 0 && u.aux_size < 16 {
+                    if u.aux_size != 0 && u.aux_size < AUX_HEADER {
                         return self.mach_result(m, mr::SEND_AUX_TOO_SMALL);
                     }
                     if u.aux_size > MAX_AUX {
@@ -238,8 +298,7 @@ impl Kernel {
                 u.msg_addr = data;
                 u.msg_size = (mb_ss >> 32) as u32;
             }
-            let priority = (rs_pr >> 32) as u32;
-            let _ = priority;
+            u.priority = (rs_pr >> 32) as u32;
             return self.mach_msg_send(m, u, options, timeout, then);
         }
         match then {
@@ -287,7 +346,7 @@ impl Kernel {
                 self.dtask.ipc.guard_exception(u.id as u32, Guard::InvalidOptions, 0);
                 return self.mach_result(m, mr::KERN_NOT_SUPPORTED);
             }
-            let _ = priority;
+            u.priority = priority;
             return self.mach_msg_send(m, u, options, timeout, then);
         }
         match then {
@@ -323,7 +382,8 @@ impl Kernel {
         } else if u.dsc_count != 0 {
             return self.mach_result(m, mr::SEND_TOO_LARGE);
         }
-        let kmsg = match self.kmsg_copyin(m, u, options) {
+        // Copying the header in may add MACH64_SEND_ALWAYS.
+        let (kmsg, options) = match self.kmsg_copyin(m, u, options) {
             Ok(k) => k,
             Err(r) => return self.mach_result(m, r),
         };
@@ -352,7 +412,7 @@ impl Kernel {
 
     /// `ipc_kmsg_copyin_from_user`: the message at `u` read and its rights
     /// taken from the sender's space.
-    fn kmsg_copyin(&mut self, m: &mut GuestMem<'_>, u: SendUctx, options: u64) -> Result<Kmsg, u32> {
+    fn kmsg_copyin(&mut self, m: &mut GuestMem<'_>, u: SendUctx, options: u64) -> Result<(Kmsg, u64), u32> {
         // ipc_validate_kmsg_header_schema_from_user
         if options & opt::SEND_KOBJECT_CALL != 0 && u.dsc_count > KOBJECT_DESC_MAX {
             return Err(mr::SEND_TOO_LARGE);
@@ -424,7 +484,7 @@ impl Kernel {
         if vm_size + port_count * 8 > MAX_VM_SPACE {
             return Err(mr::MSG_VM_KERNEL);
         }
-        let (dest, reply, voucher, out_bits) = self.kmsg_copyin_header(u, options)?;
+        let (dest, reply, voucher, out_bits, options) = self.kmsg_copyin_header(u, options)?;
         // ipc_validate_kmsg_header_from_user: the destination's kind must
         // match the call's.
         if options & MACH_MSG2 != 0 {
@@ -439,7 +499,8 @@ impl Kernel {
             self.clean_header(dest, out_bits, reply, voucher);
             return Err(0x1000_0016);
         }
-        let mut kmsg = Kmsg { bits: out_bits, size: u.msg_size, dest, reply, voucher, voucher_raw: u.voucher, id: u.id, body, descs: Vec::new(), sender: self.darwin_sender(), aux, keep_alive: false };
+        let mut kmsg = Kmsg { bits: out_bits, size: u.msg_size, dest, reply, voucher, voucher_raw: u.voucher, id: u.id, body, descs: Vec::new(), sender: self.darwin_sender(), aux, keep_alive: false, ppriority: 0, qos_override: 0 };
+        self.kmsg_set_qos(&mut kmsg, options, u.priority);
         if u.bits & bits::COMPLEX != 0 {
             // A message to a dead port or to a kernel object may carry
             // immovable send rights.
@@ -450,7 +511,7 @@ impl Kernel {
                 return Err(r);
             }
         }
-        Ok(kmsg)
+        Ok((kmsg, options))
     }
 
     /// `ipc_validate_kmsg_dest_from_user` on iOS.
@@ -505,7 +566,7 @@ impl Kernel {
 
     /// `ipc_kmsg_copyin_header`: the destination, reply and voucher rights
     /// taken from the space.
-    fn kmsg_copyin_header(&mut self, u: SendUctx, options: u64) -> Result<(ObjId, Option<Carried>, Option<ObjId>, u32), u32> {
+    fn kmsg_copyin_header(&mut self, u: SendUctx, options: u64) -> Result<(ObjId, Option<Carried>, Option<ObjId>, u32, u64), u32> {
         let mbits = u.bits & bits::USER;
         let (dest_name, reply_name) = (u.remote, u.local);
         let (dest_type, reply_type, mut voucher_type) = (bits::remote(mbits), bits::local(mbits), bits::voucher(mbits));
@@ -637,18 +698,20 @@ impl Kernel {
             if let Some(e) = ipc.space.lookup(dest_name).copied() {
                 if e.request != 0 && ipc.port(dport).active && ipc.port(dport).receiver != Receiver::Kernel {
                     if ipc.port(dport).msgcount >= ipc.port(dport).qlimit {
-                        ipc.request_sparm(dport, e.request);
+                        let qos_ovr = if u.priority & 0xff == 0xff { super::thread::pp::qos(u64::from(u.priority)) } else { msg_priority_override_qos(u.priority) };
+                        ipc.request_sparm(dport, e.request, options, qos_ovr);
                     } else {
+                        // The port has room: the request armed now cannot
+                        // be missed, so the send ignores the limit.
                         opts |= opt::SEND_ALWAYS;
                     }
                 }
             }
         }
-        let _ = opts;
         let dt = msgt::copyin_type(dest_type);
         let rt = msgt::copyin_type(reply_type);
         let vt = if voucher.is_some() { msgt::MOVE_SEND } else { voucher_type };
-        Ok((dport, reply, voucher, bits::set(dt, rt, vt, mbits)))
+        Ok((dport, reply, voucher, bits::set(dt, rt, vt, mbits), opts))
     }
 
     /// `ipc_right_copyin_check_reply`.
@@ -943,12 +1006,25 @@ impl Kernel {
 
     /// `mach_msg_receive_results`.
     fn receive_results(&mut self, m: &mut GuestMem<'_>, object: ObjId, rcv: Received, bufs: RecvBufs, options: u64) -> u32 {
+        self.receive_results_msgr(m, object, rcv, bufs, options).0
+    }
+
+    /// `mach_msg_receive_results`, with what it put where.
+    pub(crate) fn receive_results_msgr(&mut self, m: &mut GuestMem<'_>, object: ObjId, rcv: Received, bufs: RecvBufs, options: u64) -> (u32, Msgr) {
         self.dtask.ipc.release(object);
+        let mut msgr = Msgr::default();
         let mut r = rcv.state;
         if r == mr::RCV_TOO_LARGE {
+            msgr.msg_size = rcv.msize;
+            msgr.aux_size = rcv.asize;
+            msgr.recv_name = rcv.receiver_name;
             if options & opt::RCV_LARGE != 0 {
-                // mach_msg_receive_too_large: the size, and the port's name
-                // with MACH_RCV_LARGE_IDENTITY.
+                // mach_msg_receive_too_large: a linear vector receive has
+                // the sizes in its result alone; another gets the size,
+                // and the port's name with MACH_RCV_LARGE_IDENTITY.
+                if options & opt::RCV_LINEAR_VECTOR != 0 {
+                    return (r, msgr);
+                }
                 if options & opt::RCV_LARGE_IDENTITY != 0 && bufs.msg_size >= 16 && m.write_u32(bufs.msg_addr + 12, rcv.receiver_name).is_err() {
                     r = mr::RCV_INVALID_DATA;
                 }
@@ -958,26 +1034,33 @@ impl Kernel {
                 if bufs.aux_addr != 0 && m.write_u32(bufs.aux_addr, rcv.asize).is_err() {
                     r = mr::RCV_INVALID_DATA;
                 }
-                return r;
+                return (r, msgr);
             }
             let kmsg = rcv.kmsg.expect("a too-large message taken off the queue");
-            return self.receive_error(m, kmsg, rcv.seqno, bufs, options, r);
+            let r = self.receive_error(m, kmsg, rcv.seqno, bufs, options, r, &mut msgr);
+            return (r, msgr);
         }
         if r != mr::SUCCESS {
-            return r;
+            return (r, msgr);
         }
         let kmsg = rcv.kmsg.expect("a received message");
         let context = self.dtask.ipc.port(kmsg.dest).context;
-        match self.kmsg_copyout(m, *kmsg, options) {
-            Ok(out) => self.put_to_user(m, out, rcv.seqno, context, bufs, options, mr::SUCCESS),
-            Err((out, e)) if e & !mr::MSG_MASK == mr::RCV_BODY_ERROR => self.put_to_user(m, out, rcv.seqno, context, bufs, options, e),
-            Err((out, e)) => self.put_to_user(m, out, rcv.seqno, context, bufs, options, e),
-        }
+        let (priority, qos_ovrd) = (kmsg.ppriority, kmsg.qos_override);
+        let r = match self.kmsg_copyout(m, *kmsg, options) {
+            Ok(out) => {
+                msgr.priority = priority;
+                msgr.qos_ovrd = qos_ovrd;
+                self.put_to_user(m, out, rcv.seqno, context, bufs, options, mr::SUCCESS, &mut msgr)
+            }
+            Err((out, e)) => self.put_to_user(m, out, rcv.seqno, context, bufs, options, e, &mut msgr),
+        };
+        (r, msgr)
     }
 
     /// `mach_msg_receive_error`: the message's header copied out with its
     /// body's rights destroyed (`ipc_kmsg_copyout_dest_to_user`), then put.
-    fn receive_error(&mut self, m: &mut GuestMem<'_>, kmsg: Box<Kmsg>, seqno: u32, bufs: RecvBufs, options: u64, r: u32) -> u32 {
+    #[allow(clippy::too_many_arguments)]
+    fn receive_error(&mut self, m: &mut GuestMem<'_>, kmsg: Box<Kmsg>, seqno: u32, bufs: RecvBufs, options: u64, r: u32, msgr: &mut Msgr) -> u32 {
         let k = *kmsg;
         let ipc = &mut self.dtask.ipc;
         let dest_name = if ipc.port(k.dest).active {
@@ -1013,7 +1096,7 @@ impl Kernel {
         let header_bits = bits::set(bits::local(k.bits), bits::remote(k.bits), 0, k.bits);
         let out = Out { bits: header_bits, remote: reply_name, local: dest_name, voucher: 0, id: k.id, body, sender: k.sender, aux: k.aux };
         let context = 0;
-        self.put_to_user(m, out, seqno, context, bufs, options, r)
+        self.put_to_user(m, out, seqno, context, bufs, options, r, msgr)
     }
 
     /// `ipc_kmsg_copyout`: header and body into the receiver's space.
@@ -1254,15 +1337,45 @@ impl Kernel {
     /// `ipc_kmsg_put_to_user`: the message, its trailer and aux data written
     /// to the receive buffers.
     #[allow(clippy::too_many_arguments)]
-    fn put_to_user(&mut self, m: &mut GuestMem<'_>, out: Out, seqno: u32, context: u64, bufs: RecvBufs, options: u64, mut r: u32) -> u32 {
+    #[allow(clippy::too_many_arguments)]
+    fn put_to_user(&mut self, m: &mut GuestMem<'_>, out: Out, seqno: u32, context: u64, bufs: RecvBufs, options: u64, mut r: u32, msgr: &mut Msgr) -> u32 {
         let msg_size = HEADER + out.body.len() as u32;
-        let mut tsize = super::ipc::msg::trailer_size(options);
-        if msg_size > bufs.msg_size {
-            return mr::RCV_INVALID_DATA;
-        }
-        if msg_size + tsize > bufs.msg_size {
-            tsize = bufs.msg_size - msg_size;
-        }
+        let full_tsize = super::ipc::msg::trailer_size(options);
+        msgr.msg_size = msg_size;
+        msgr.trailer_size = full_tsize;
+        msgr.aux_size = out.aux.len() as u32;
+        let invalid = |msgr: &mut Msgr| {
+            *msgr = Msgr { recv_name: msgr.recv_name, priority: msgr.priority, qos_ovrd: msgr.qos_ovrd, ..Msgr::default() };
+            mr::RCV_INVALID_DATA
+        };
+        let mut aux = out.aux;
+        let (msg_addr, aux_addr, tsize) = if options & opt::RCV_LINEAR_VECTOR != 0 {
+            // The auxiliary data follows the message and its trailer in
+            // the one buffer, all of it at the buffer's end for a stack
+            // receive.
+            let usize_ = msg_size + full_tsize;
+            if usize_ + aux.len() as u32 > bufs.msg_size {
+                return invalid(msgr);
+            }
+            let at = if options & opt::RCV_STACK != 0 { bufs.msg_addr + u64::from(bufs.msg_size - (usize_ + aux.len() as u32)) } else { bufs.msg_addr };
+            (at, at + u64::from(usize_), full_tsize)
+        } else {
+            if msg_size > bufs.msg_size {
+                return invalid(msgr);
+            }
+            let tsize = if msg_size + full_tsize > bufs.msg_size { bufs.msg_size - msg_size } else { full_tsize };
+            // A receiver with an auxiliary buffer gets an empty header when
+            // there is no data, and nothing when its buffer is too small.
+            if bufs.aux_addr != 0 && aux.is_empty() {
+                aux = vec![0u8; AUX_HEADER as usize];
+                msgr.aux_size = AUX_HEADER;
+            }
+            if aux.len() as u32 > bufs.aux_size {
+                aux.clear();
+                msgr.aux_size = 0;
+            }
+            (bufs.msg_addr, if aux.is_empty() { 0 } else { bufs.aux_addr }, tsize)
+        };
         let mut msg = Vec::with_capacity((msg_size + 68) as usize);
         for w in [out.bits, msg_size, out.remote, out.local, out.voucher, out.id as u32] {
             msg.extend_from_slice(&w.to_le_bytes());
@@ -1272,7 +1385,7 @@ impl Kernel {
         // context, then zeroes.
         let mut trailer = vec![0u8; 68];
         trailer[0..4].copy_from_slice(&0u32.to_le_bytes());
-        trailer[4..8].copy_from_slice(&super::ipc::msg::trailer_size(options).to_le_bytes());
+        trailer[4..8].copy_from_slice(&full_tsize.to_le_bytes());
         trailer[8..12].copy_from_slice(&seqno.to_le_bytes());
         trailer[12..16].copy_from_slice(&out.sender.sec[0].to_le_bytes());
         trailer[16..20].copy_from_slice(&out.sender.sec[1].to_le_bytes());
@@ -1281,18 +1394,11 @@ impl Kernel {
         }
         trailer[52..60].copy_from_slice(&context.to_le_bytes());
         msg.extend_from_slice(&trailer[..tsize as usize]);
-        if m.write(bufs.msg_addr, &msg).is_err() {
-            return mr::RCV_INVALID_DATA;
+        if m.write(msg_addr, &msg).is_err() {
+            return invalid(msgr);
         }
-        let mut aux = out.aux;
-        if bufs.aux_addr != 0 && aux.is_empty() {
-            aux = vec![0u8; 16];
-        }
-        if aux.len() as u32 > bufs.aux_size {
-            aux.clear();
-        }
-        if !aux.is_empty() && bufs.aux_addr != 0 && m.write(bufs.aux_addr, &aux).is_err() {
-            r = mr::RCV_INVALID_DATA;
+        if !aux.is_empty() && m.write(aux_addr, &aux).is_err() {
+            r = invalid(msgr);
         }
         r
     }
@@ -1315,11 +1421,10 @@ impl Kernel {
         for (name, g, portguard) in std::mem::take(&mut self.dtask.ipc.guards) {
             self.darwin_guard_exception(name, g, portguard);
         }
-        // EVFILT_MACHPORT knotes of ports that got a message: kevent is not
-        // here yet, so no port has one to fire.
-        if !std::mem::take(&mut self.dtask.ipc.queues.knotes).is_empty() {
-            self.darwin_unimplemented("EVFILT_MACHPORT delivery".into());
-        }
+        // The EVFILT_MACHPORT knotes of what changed, and the threads
+        // their kqueues wake; then the thread requests they made.
+        self.darwin_kevent_owed(m);
+        self.darwin_workq_settle(m);
     }
 
     /// `mach_port_guard_exception` for a task without exception-guard
@@ -1361,7 +1466,7 @@ impl Kernel {
             }
         };
         let complex = if descs.is_empty() { 0 } else { bits::COMPLEX };
-        let k = Kmsg { bits: bits::set(msgt::PORT_SEND_ONCE, 0, 0, complex), size: HEADER + body.len() as u32, dest: to, reply: None, voucher: None, voucher_raw: 0, id: msgid, body, descs, sender: Sender::KERNEL, aux: Vec::new(), keep_alive: false };
+        let k = Kmsg { bits: bits::set(msgt::PORT_SEND_ONCE, 0, 0, complex), size: HEADER + body.len() as u32, dest: to, reply: None, voucher: None, voucher_raw: 0, id: msgid, body, descs, sender: Sender::KERNEL, aux: Vec::new(), keep_alive: false, ppriority: 0, qos_override: 0 };
         self.darwin_kernel_send(Box::new(k));
     }
 
