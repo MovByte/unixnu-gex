@@ -18,6 +18,7 @@ pub mod commpage;
 pub mod errno;
 pub mod kern;
 pub mod mach;
+pub mod mig;
 pub mod sysctl;
 pub mod sysno;
 

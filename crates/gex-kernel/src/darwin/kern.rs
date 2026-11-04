@@ -73,6 +73,10 @@ mod f {
     pub const SPECULATIVE_READ: u64 = 101;
 }
 
+/// What `bsdthread_register` reports: dispatch function, fine priority,
+/// bsdthread_ctl, set-self, the maintenance and default QoS classes.
+const PTHREAD_FEATURES: u64 = 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x4000_0000;
+
 /// `MAXPATHLEN`.
 const MAXPATHLEN: usize = 1024;
 
@@ -143,6 +147,44 @@ impl Kernel {
             sys::GETENTROPY => res(self.canonical(m, nr::GETRANDOM, [a[0], a[1], 0, 0, 0, 0]).map(|_| 0)),
             sys::FCNTL | sys::FCNTL_NOCANCEL => self.darwin_fcntl(m, a),
             sys::FSGETPATH => res(self.darwin_fsgetpath(m, a)),
+            sys::PROC_INFO => res(self.darwin_proc_info(m, a)),
+            // No descriptor is a terminal to a Darwin process yet: stdio
+            // buffers fully, and termios structures need not be converted.
+            sys::IOCTL => neg(Errno::ENOTTY),
+            // libpthread's entry points for new threads and workqueue
+            // threads, kept for when threads are created; the features are
+            // what this kernel does (no kevent or workloop support yet).
+            sys::BSDTHREAD_REGISTER => {
+                self.darwin_thread_entry = (a[0], a[1]);
+                PTHREAD_FEATURES
+            }
+            // QoS overrides and the like: no scheduler classes to apply.
+            sys::BSDTHREAD_CTL => 0,
+            // A signal to a thread by its Mach port: this one, the only
+            // thread a Darwin process has yet.
+            sys::PTHREAD_KILL => {
+                let sig = signal_to_linux(a[1] as u32);
+                if sig == 0 {
+                    0
+                } else {
+                    res(self.canonical(m, nr::TGKILL, [self.pid as u64, self.tid as u64, u64::from(sig), 0, 0, 0]))
+                }
+            }
+            // Handlers are not delivered in Darwin's frame format yet: a
+            // new one is accepted, the old one reported as the default.
+            sys::SIGACTION => {
+                if a[2] != 0 {
+                    let _ = m.zero(a[2], 16);
+                }
+                0
+            }
+            // The sleep primitive: wait out the timeout, then report it.
+            sys::SEMWAIT_SIGNAL | sys::SEMWAIT_SIGNAL_NOCANCEL => {
+                if a[2] != 0 {
+                    std::thread::sleep(std::time::Duration::new(a[4], a[5] as u32));
+                }
+                neg(Errno::ETIMEDOUT)
+            }
             sys::GETFSSTAT64 => res(self.darwin_getfsstat(m, a[0], a[1])),
             sys::STATFS64 => res(self.darwin_statfs(m, Some(a[0]), a[1])),
             sys::FSTATFS64 => res(self.darwin_statfs(m, None, a[1])),
@@ -210,6 +252,55 @@ impl Kernel {
             f::SETNOSIGPIPE | f::SETPROTECTIONCLASS => 0,
             f::GETNOSIGPIPE | f::GETPROTECTIONCLASS => 0,
             _ => neg(Errno::EINVAL),
+        }
+    }
+
+    /// `proc_info(callnum, pid, flavor, arg, buffer, buffersize)`.
+    fn darwin_proc_info(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
+        const CALL_PIDINFO: u64 = 2;
+        const CALL_SET_DYLD_IMAGES: u64 = 15;
+        const PIDPATHINFO: u64 = 11;
+        const UNIQIDENTIFIERINFO: u64 = 17;
+        let (call, pid, flavor, buf, size) = (a[0], a[1] as i32, a[2] as u32 as u64, a[4], a[5] as u32 as usize);
+        let me = pid == self.pid || pid == 0;
+        match (call, flavor) {
+            // dyld says where its image list is (`buf`, `size` bytes),
+            // which task_info(TASK_DYLD_INFO) reports from then on.
+            (CALL_SET_DYLD_IMAGES, _) if me => {
+                if buf == 0 || size == 0 {
+                    return Err(Errno::EINVAL);
+                }
+                self.darwin_dyld_infos = buf;
+                Ok(0)
+            }
+            // proc_uniqidentifierinfo: a uuid, the unique id and the
+            // parent's, an id version.
+            (CALL_PIDINFO, UNIQIDENTIFIERINFO) if me => {
+                if size < 64 {
+                    return Err(Errno::ENOMEM);
+                }
+                let mut b = [0u8; 64];
+                b[16..24].copy_from_slice(&(self.pid as u64).to_le_bytes());
+                b[24..32].copy_from_slice(&1u64.to_le_bytes());
+                m.write(buf, &b)?;
+                Ok(64)
+            }
+            // proc_pidpath: the program's path.
+            (CALL_PIDINFO, PIDPATHINFO) if me => {
+                let mut p = self.exe_path.clone().into_bytes();
+                p.push(0);
+                if size < p.len() {
+                    return Err(Errno::ENOMEM);
+                }
+                m.write(buf, &p)?;
+                Ok(p.len() as u64 - 1)
+            }
+            _ => {
+                if self.trace {
+                    eprintln!("[gex:{}] proc_info call {call} flavor {flavor} pid {pid} is not answered", self.pid);
+                }
+                Err(Errno::EOPNOTSUPP)
+            }
         }
     }
 

@@ -151,6 +151,13 @@ pub fn translate(raw: u64, a: &mut [u64; 6]) -> u64 {
             a[3] = l;
             nr::MMAP
         }
+        sys::SOCKET => {
+            // AF_UNIX and AF_INET agree; Darwin's AF_INET6 is 30.
+            if a[0] == 30 {
+                a[0] = 10;
+            }
+            nr::SOCKET
+        }
         sys::MUNMAP => nr::MUNMAP,
         sys::MPROTECT => nr::MPROTECT,
         sys::THREAD_SELFID => nr::GETTID,

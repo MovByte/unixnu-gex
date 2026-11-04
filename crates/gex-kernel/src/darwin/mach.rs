@@ -21,7 +21,11 @@ pub mod kr {
     pub const INVALID_VALUE: u64 = 18;
     /// `MACH_SEND_INVALID_DEST`: what `mach_msg` answers until messages are
     /// delivered.
+    pub const ABORTED: u64 = 14;
+    pub const OPERATION_TIMED_OUT: u64 = 49;
     pub const SEND_INVALID_DEST: u64 = 0x1000_0003;
+    /// `MACH_RCV_TOO_LARGE`: the reply does not fit the receive buffer.
+    pub const RCV_TOO_LARGE: u64 = 0x1000_4004;
 }
 
 /// Trap numbers, negated (XNU's `osfmk/kern/syscall_sw.c`).
@@ -50,7 +54,12 @@ pub mod trap {
     pub const MACH_MSG: i32 = -31;
     pub const MACH_MSG_OVERWRITE: i32 = -32;
     pub const SEMAPHORE_SIGNAL: i32 = -33;
+    pub const SEMAPHORE_SIGNAL_ALL: i32 = -34;
+    pub const SEMAPHORE_SIGNAL_THREAD: i32 = -35;
     pub const SEMAPHORE_WAIT: i32 = -36;
+    pub const SEMAPHORE_WAIT_SIGNAL: i32 = -37;
+    pub const SEMAPHORE_TIMEDWAIT: i32 = -38;
+    pub const SEMAPHORE_TIMEDWAIT_SIGNAL: i32 = -39;
     pub const MACH_PORT_GUARD: i32 = -41;
     pub const MACH_PORT_UNGUARD: i32 = -42;
     pub const MACH_MSG2: i32 = -47;
@@ -76,6 +85,10 @@ pub enum Port {
     Receive,
     PortSet,
     Timer,
+    /// The system clock (`host_get_clock_service`).
+    Clock,
+    /// A semaphore and its count.
+    Semaphore(i64),
 }
 
 /// A task's port name space. Names are `index << 8 | 3`, as XNU's look.
@@ -108,6 +121,28 @@ impl Space {
             return n;
         }
         self.fresh(Port::Thread(tid))
+    }
+
+    /// The task's name for the system clock, made on first use.
+    pub fn clock(&mut self) -> u32 {
+        if let Some((&n, _)) = self.names.iter().find(|(_, p)| **p == Port::Clock) {
+            return n;
+        }
+        self.fresh(Port::Clock)
+    }
+
+    /// A new semaphore with `value`, by its name.
+    pub fn semaphore(&mut self, value: i64) -> u32 {
+        self.fresh(Port::Semaphore(value))
+    }
+
+    /// Forget `name`.
+    pub fn remove(&mut self, name: u32) -> bool {
+        self.names.remove(&name).is_some()
+    }
+
+    pub fn get_mut(&mut self, name: u32) -> Option<&mut Port> {
+        self.names.get_mut(&name)
     }
 
     pub fn get(&self, name: u32) -> Option<&Port> {
@@ -207,7 +242,15 @@ impl Kernel {
                 Err(_) => kr::PROTECTION_FAILURE,
             },
             trap::MACH_VM_PURGABLE_CONTROL => kr::SUCCESS,
-            trap::MACH_MSG | trap::MACH_MSG_OVERWRITE | trap::MACH_MSG2 => kr::SEND_INVALID_DEST,
+            trap::SEMAPHORE_SIGNAL | trap::SEMAPHORE_SIGNAL_ALL | trap::SEMAPHORE_SIGNAL_THREAD => self.semaphore_signal(a[0] as u32),
+            trap::SEMAPHORE_WAIT | trap::SEMAPHORE_TIMEDWAIT => self.semaphore_wait(a[0] as u32, t == trap::SEMAPHORE_TIMEDWAIT),
+            // Signal one, then wait on the other.
+            trap::SEMAPHORE_WAIT_SIGNAL | trap::SEMAPHORE_TIMEDWAIT_SIGNAL => match self.semaphore_signal(a[1] as u32) {
+                kr::SUCCESS => self.semaphore_wait(a[0] as u32, t == trap::SEMAPHORE_TIMEDWAIT_SIGNAL),
+                e => e,
+            },
+            trap::MACH_MSG2 => self.mach_msg2(m, a),
+            trap::MACH_MSG | trap::MACH_MSG_OVERWRITE => kr::SEND_INVALID_DEST,
             _ => {
                 if self.trace || !self.unimplemented.contains(&(t as i64 as u64)) {
                     eprintln!("[gex:{}] unimplemented Mach trap {t}", self.pid);
@@ -215,6 +258,74 @@ impl Kernel {
                 }
                 kr::FAILURE
             }
+        }
+    }
+
+    fn semaphore_signal(&mut self, name: u32) -> u64 {
+        match self.darwin_ports.get_mut(name) {
+            Some(Port::Semaphore(v)) => {
+                *v += 1;
+                kr::SUCCESS
+            }
+            _ => kr::INVALID_ARGUMENT,
+        }
+    }
+
+    /// Take one from the count. With none and only this thread to give
+    /// one, nothing ever will: a timed wait times out, a wait is aborted.
+    fn semaphore_wait(&mut self, name: u32, timed: bool) -> u64 {
+        match self.darwin_ports.get_mut(name) {
+            Some(Port::Semaphore(v)) if *v > 0 => {
+                *v -= 1;
+                kr::SUCCESS
+            }
+            Some(Port::Semaphore(_)) if timed => kr::OPERATION_TIMED_OUT,
+            Some(Port::Semaphore(_)) => kr::ABORTED,
+            _ => kr::INVALID_ARGUMENT,
+        }
+    }
+
+    /// `mach_msg2(data, options, bits|send_size, remote|local,
+    /// voucher|id, desc_count|rcv_name, rcv_size|priority, timeout)`. A
+    /// send and receive to a kernel object is a MIG call, answered into
+    /// the same buffer; anything else is not delivered yet.
+    fn mach_msg2(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> u64 {
+        const SEND: u64 = 0x1;
+        const RCV: u64 = 0x2;
+        let opts = a[1];
+        let send_size = (a[2] >> 32) as usize;
+        let (remote, local) = (a[3] as u32, (a[3] >> 32) as u32);
+        let id = (a[4] >> 32) as u32 as i32;
+        let rcv_size = m.read_u64(self.ctx_addr + gex_abi::ctx::x(6) as u64).unwrap_or(0) as u32 as usize;
+        let obj = match self.darwin_ports.get(remote) {
+            Some(Port::Task) => Some(super::mig::Object::Task),
+            Some(Port::Host) => Some(super::mig::Object::Host),
+            Some(Port::Thread(t)) => Some(super::mig::Object::Thread(*t)),
+            Some(Port::Clock) => Some(super::mig::Object::Clock),
+            _ => None,
+        };
+        let (Some(obj), true) = (obj, opts & (SEND | RCV) == SEND | RCV) else {
+            if self.trace {
+                eprintln!("[gex:{}] mach_msg2 options {opts:#x} id {id} to {remote:#x}: not delivered", self.pid);
+            }
+            return kr::SEND_INVALID_DEST;
+        };
+        let header = super::mig::HEADER;
+        let body = match m.read(a[0] + header as u64, send_size.saturating_sub(header)) {
+            Ok(b) => b.to_vec(),
+            Err(_) => return kr::INVALID_ADDRESS,
+        };
+        let reply = super::mig::serve(obj, id, &body, super::mig::Task { dyld_infos: self.darwin_dyld_infos, ports: &mut self.darwin_ports });
+        if self.trace || reply.ret == super::mig::MIG_BAD_ID {
+            eprintln!("[gex:{}] mig {obj:?} id {id} -> {}", self.pid, reply.ret);
+        }
+        let msg = reply.message(id, local);
+        if msg.len() > rcv_size {
+            return kr::RCV_TOO_LARGE;
+        }
+        match m.write(a[0], &msg) {
+            Ok(()) => kr::SUCCESS,
+            Err(_) => kr::INVALID_ADDRESS,
         }
     }
 

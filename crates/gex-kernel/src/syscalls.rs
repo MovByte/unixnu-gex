@@ -672,6 +672,12 @@ pub struct Kernel {
     pub darwin_region: (u64, u64),
     /// A Darwin process's Mach port names.
     pub darwin_ports: crate::darwin::mach::Space,
+    /// Where a Darwin process's dyld keeps its image list
+    /// (`dyld_all_image_infos`), once it has said: 0 before.
+    pub darwin_dyld_infos: u64,
+    /// libpthread's thread and workqueue thread entry points, as
+    /// `bsdthread_register` gave them.
+    pub darwin_thread_entry: (u64, u64),
     /// Set by a syscall that may have made a descriptor readable or
     /// writable for someone else (a write, a read that freed room, a close,
     /// a signal); the host takes it after the call and wakes threads parked
@@ -8771,6 +8777,8 @@ impl Kernel {
             darwin: false,
             darwin_region: (0, 0),
             darwin_ports: Default::default(),
+            darwin_dyld_infos: 0,
+            darwin_thread_entry: (0, 0),
             fd_activity: false,
             wasm32: false,
             sigreturn_legacy: false,
@@ -9158,6 +9166,8 @@ impl Kernel {
             darwin: self.darwin,
             darwin_region: self.darwin_region,
             darwin_ports: Default::default(),
+            darwin_dyld_infos: 0,
+            darwin_thread_entry: (0, 0),
             fd_activity: false,
             wasm32: self.wasm32,
             sigreturn_legacy: false,
