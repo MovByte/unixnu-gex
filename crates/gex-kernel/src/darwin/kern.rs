@@ -194,7 +194,14 @@ impl Kernel {
             sys::PROC_INFO => res(self.darwin_proc_info(m, a)),
             sys::GETTIMEOFDAY => res(darwin_gettimeofday(m, a[0], a[1], a[2])),
             // A new mapping's entries have the default maximum protection.
+            // MAP_ANON is 0x1000: a file mapping has a descriptor to look at
+            // (a POSIX shared memory object's checks).
             sys::MMAP => {
+                if a[3] & 0x1000 == 0 && (a[4] as i32) >= 0 {
+                    if let Err(e) = self.darwin_shm_mmap_check(a) {
+                        return Some(neg(e));
+                    }
+                }
                 let mut b = *a;
                 let n = super::bsd::translate(raw, &mut b);
                 match self.canonical(m, n, b) {
@@ -299,11 +306,6 @@ impl Kernel {
             {
                 neg(self.darwin_shm_io(a[0], true))
             }
-            // MAP_ANON is 0x1000: a file mapping has a descriptor to look at.
-            sys::MMAP if a[3] & 0x1000 == 0 && (a[4] as i32) >= 0 => match self.darwin_shm_mmap_check(a) {
-                Ok(()) => return None,
-                Err(e) => neg(e),
-            },
             // A family or an option this kernel has no Linux counterpart for
             // is refused where the caller is told, and said.
             sys::SOCKET | sys::SOCKETPAIR if !matches!(a[0], 0..=2) => {
