@@ -170,6 +170,9 @@ pub struct ProcSig {
     /// raise, so a collect that finds the inbox empty because another is
     /// under way waits for that one's signals to be pending.
     collecting: Mutex<()>,
+    /// What each signal does with no handler, for a personality whose
+    /// defaults are not Linux's ([`default_action`] when unset).
+    defaults: std::sync::OnceLock<fn(u32) -> DefaultAction>,
 }
 
 impl std::fmt::Debug for ProcSig {
@@ -190,7 +193,23 @@ impl ProcSig {
             timers: Mutex::new([None; 3]),
             collecting: Mutex::new(()),
             timer_next: AtomicU64::new(NO_TIMER),
+            defaults: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Take `f` for what a signal does by default ([`ProcSig::default_of`]).
+    pub fn set_defaults(&self, f: fn(u32) -> DefaultAction) {
+        let _ = self.defaults.set(f);
+    }
+
+    /// What `signal` does with no handler in this process.
+    pub fn default_of(&self, signal: u32) -> DefaultAction {
+        self.defaults.get().map_or_else(|| default_action(signal), |f| f(signal))
+    }
+
+    /// Drop `signal` from the process-directed pending set.
+    pub fn discard(&self, signal: u32) {
+        self.shared.fetch_and(!bit(signal), Ordering::AcqRel);
     }
 
     /// Mark a process-directed signal pending: whichever thread does not
@@ -228,7 +247,7 @@ impl ProcSig {
             if action.handler == SIG_IGN {
                 continue;
             }
-            if action.handler == SIG_DFL && default_action(signal) == DefaultAction::Ignore {
+            if action.handler == SIG_DFL && self.default_of(signal) == DefaultAction::Ignore {
                 continue;
             }
             return true;
@@ -390,6 +409,13 @@ pub struct ThreadSigs(Mutex<std::collections::HashMap<i32, Arc<ThreadSig>>>);
 impl ThreadSigs {
     pub fn get(&self, tid: i32) -> Option<Arc<ThreadSig>> {
         self.0.lock().get(&tid).cloned()
+    }
+
+    /// Drop `signal` from every thread's own pending set.
+    pub fn discard(&self, signal: u32) {
+        for t in self.0.lock().values() {
+            t.pending.fetch_and(!bit(signal), Ordering::AcqRel);
+        }
     }
 
     pub fn contains(&self, tid: i32) -> bool {
@@ -691,6 +717,14 @@ impl Signals {
     /// last sender is the one reported.
     pub fn raise_from(&self, signal: u32, source: Source) {
         self.cur.raise(signal, Some(source));
+    }
+
+    /// Drop `signal` wherever it is pending: the running thread's, every
+    /// other thread's in `threads`, the process's.
+    pub fn discard_everywhere(&self, signal: u32, threads: &ThreadSigs) {
+        self.cur.pending.fetch_and(!bit(signal), Ordering::AcqRel);
+        threads.discard(signal);
+        self.proc.discard(signal);
     }
 
     /// Clear `signal` as delivered or taken: the thread's own first, else
@@ -1712,13 +1746,13 @@ fn fault_code(signal: u32) -> u32 {
 }
 
 /// Pack the four condition flags into a PSTATE word.
-fn read_pstate(m: &GuestMem<'_>, ctx_addr: u64) -> Result<u64, Errno> {
+pub(crate) fn read_pstate(m: &GuestMem<'_>, ctx_addr: u64) -> Result<u64, Errno> {
     let (n, z, c, v) = ctx::unpack_nzcv(m.read_u32(ctx_addr + ctx::NZCV as u64)?);
     // EL0t with interrupts enabled, plus NZCV in their architectural places.
     Ok(((n as u64) << 31) | ((z as u64) << 30) | ((c as u64) << 29) | ((v as u64) << 28))
 }
 
-fn write_pstate(m: &mut GuestMem<'_>, ctx_addr: u64, pstate: u64) -> Result<(), Errno> {
+pub(crate) fn write_pstate(m: &mut GuestMem<'_>, ctx_addr: u64, pstate: u64) -> Result<(), Errno> {
     m.write_u32(
         ctx_addr + ctx::NZCV as u64,
         ctx::pack_nzcv(

@@ -9465,9 +9465,18 @@ impl Kernel {
 
     /// Handle one system call (`svc #0`, or `syscall`).
     pub fn syscall(&mut self, m: &mut GuestMem<'_>, pc: u64) -> SyscallOutcome {
-        let out = self.syscall_cwd(m, pc);
+        let mut out = self.syscall_cwd(m, pc);
         if self.darwin && !matches!(out, SyscallOutcome::Blocking(_)) {
             self.darwin_syscall_exit(m);
+        }
+        // A call that returns takes the signals pending for it on the way
+        // back (`bsd_ast`), the ones it raised itself among them.
+        if self.darwin && matches!(out, SyscallOutcome::Continue) {
+            out = match self.deliver_pending(m) {
+                Delivery::None => SyscallOutcome::Continue,
+                Delivery::Resume(pc) => SyscallOutcome::Resume(pc),
+                Delivery::Terminate { signal, core } => SyscallOutcome::Killed { signal, core },
+            };
         }
         if self.darwin && matches!(out, SyscallOutcome::Blocking(_)) {
             self.darwin_workq_sched_block();
@@ -9545,6 +9554,7 @@ impl Kernel {
         };
         if self.darwin {
             self.darwin_syscall_enter();
+            self.darwin_note_svc(m, pc);
             if let Some(t) = crate::darwin::mach_trap_number(raw) {
                 let out = self.mach_trap(m, t, &a);
                 if self.trace {
@@ -10518,6 +10528,9 @@ impl Kernel {
         if !self.signals.has_pending() {
             return Delivery::None;
         }
+        if self.darwin {
+            return self.darwin_deliver(m);
+        }
         if self.trace {
             eprintln!(
                 "[gex:{}.{}] delivering signal {} (pending {:#x}, blocked {:#x})",
@@ -10598,6 +10611,9 @@ impl Kernel {
         pc: u64,
         fault_address: u64,
     ) -> Delivery {
+        if self.darwin {
+            return self.darwin_raise_fault(m, signo, pc, fault_address);
+        }
         let action = self.signals.action(signo);
         let blocked = self.signals.blocked() & (1u64 << (signo - 1)) != 0;
         // A synchronous fault that is blocked or ignored is fatal, because

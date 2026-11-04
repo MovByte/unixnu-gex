@@ -203,6 +203,8 @@ pub struct DThread {
     /// and the servicer override (a workloop's) on its QoS.
     pub kevent_override: u8,
     pub servicer_override: u8,
+    /// Its alternate stack, sigreturn token and last exception state.
+    pub sig: super::signal::ThreadSig,
 }
 
 /// Every Darwin thread of the process, by tid.
@@ -330,6 +332,7 @@ impl Kernel {
                 self.restore_sigmask = Some(restore_mask);
                 Some(SyscallOutcome::Blocking(crate::syscalls::BlockOp::SigSuspend { restore_mask }))
             }
+            sys::SIGRETURN => Some(self.darwin_sigreturn(m, a)),
             sys::KEVENT => Some(<Kq as KQueue>::kevent_legacy(self, m, a, false)),
             sys::KEVENT64 => Some(<Kq as KQueue>::kevent_legacy(self, m, a, true)),
             sys::KEVENT_QOS => Some(<Kq as KQueue>::kevent_qos(self, m, a)),
@@ -746,7 +749,7 @@ impl Kernel {
 
 impl Kernel {
     /// The calling thread's Darwin state, made on first use.
-    fn darwin_me(&mut self) -> &mut DThread {
+    pub(crate) fn darwin_me(&mut self) -> &mut DThread {
         self.dtask.threads.map.entry(self.tid).or_default()
     }
 

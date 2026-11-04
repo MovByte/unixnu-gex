@@ -31,6 +31,7 @@ pub mod mk_timer;
 pub mod psynch;
 pub mod sema;
 pub mod shm;
+pub mod signal;
 pub mod sockaddr;
 pub mod sysctl;
 pub mod sysno;
@@ -83,6 +84,8 @@ pub struct Task {
     pub vouchers: voucher::Vouchers,
     /// The program's code signature, when it has one.
     pub codesign: Option<codesign::CodeSign>,
+    /// `p_sigacts` and `p_sigignore`.
+    pub sigacts: signal::Sigacts,
     /// `p_workq_allow_sigmask`.
     pub workq_allow_sigmask: u32,
     /// `p_dispatchqueue_serialno_offset`, `p_dispatchqueue_label_offset`.

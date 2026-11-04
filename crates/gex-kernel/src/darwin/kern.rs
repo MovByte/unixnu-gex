@@ -310,14 +310,8 @@ impl Kernel {
                     None => neg(Errno::ESRCH),
                 }
             }
-            // Handlers are not delivered in Darwin's frame format yet: a
-            // new one is accepted, the old one reported as the default.
-            sys::SIGACTION => {
-                if a[2] != 0 {
-                    let _ = m.zero(a[2], 16);
-                }
-                0
-            }
+            sys::SIGACTION => res(self.darwin_sigaction(m, a[0], a[1], a[2])),
+            sys::SIGALTSTACK => res(self.darwin_sigaltstack(m, a[0], a[1])),
             sys::GETFSSTAT64 => res(self.darwin_getfsstat(m, a[0], a[1])),
             sys::SHM_OPEN => res(self.darwin_shm_open(m, a)),
             sys::SHM_UNLINK => res(self.darwin_shm_unlink(m, a)),
@@ -595,20 +589,22 @@ impl Kernel {
     }
 
     fn darwin_sigprocmask(&mut self, m: &mut GuestMem<'_>, how: u64, set: u64, old: u64) -> Result<u64, Errno> {
+        // The old mask is the one before the call, copied out after the new
+        // one is read (they may be the same word).
         let blocked = self.signals.blocked();
-        if old != 0 {
-            m.write_u32(old, mask_from_linux(blocked))?;
-        }
         if set != 0 {
             let mask = mask_to_linux(m.read_u32(set)?);
             let next = match how {
                 1 => blocked | mask,
                 2 => blocked & !mask,
-                3 => mask,
+                3 => (blocked & !mask_to_linux(!0)) | mask,
                 _ => return Err(Errno::EINVAL),
             };
             let unblockable = (1u64 << (crate::signal::sig::SIGKILL - 1)) | (1u64 << (crate::signal::sig::SIGSTOP - 1));
             self.signals.set_blocked(next & !unblockable);
+        }
+        if old != 0 {
+            m.write_u32(old, mask_from_linux(blocked))?;
         }
         Ok(0)
     }
