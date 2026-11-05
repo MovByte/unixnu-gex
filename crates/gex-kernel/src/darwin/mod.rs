@@ -46,6 +46,7 @@ pub mod sockaddr;
 pub mod spawn;
 pub mod sysctl;
 pub mod sysno;
+pub mod taskpolicy;
 pub mod thread;
 pub mod timer;
 pub mod vm;
@@ -115,8 +116,8 @@ pub struct Task {
     /// `p_dispatchqueue_serialno_offset`, `p_dispatchqueue_label_offset`.
     pub dispatchqueue_serialno_offset: u64,
     pub dispatchqueue_label_offset: u64,
-    /// The task's app type (`trp_apptype`).
-    pub apptype: workq::AppType,
+    /// The task's policy: app type, role, QoS clamp and what follows.
+    pub policy: taskpolicy::TaskPolicy,
     /// Maximum protections lowered from `VM_PROT_ALL`.
     pub maxprot: vm::MaxProt,
     /// Threads a semaphore operation woke, and how.

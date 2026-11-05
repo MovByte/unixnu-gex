@@ -449,7 +449,18 @@ impl Kernel {
             rlimits: old.rlimits,
             dispatchqueue_serialno_offset: old.dispatchqueue_serialno_offset,
             dispatchqueue_label_offset: old.dispatchqueue_label_offset,
-            apptype: old.apptype,
+            // A new process's policy came at its fork; an exec's task is an
+            // exec copy of the old (task_policy_create) that inherits its
+            // role (proc_inherit_task_role).
+            policy: match spawn {
+                Some(s) if s.flags & super::spawn::flag::SETEXEC == 0 => old.policy,
+                _ => {
+                    let mut p = super::taskpolicy::TaskPolicy::create(&old.policy, true);
+                    p.requested.role = old.policy.requested.role;
+                    p.update(false);
+                    p
+                }
+            },
             said: old.said,
             ..Default::default()
         };
@@ -466,6 +477,11 @@ impl Kernel {
             }
             if sp.flags & super::spawn::flag::SETSIGDEF != 0 {
                 self.darwin_sigdefault(sp.sigdefault);
+            }
+            // exec_handle_spawnattr_policy.
+            let (apptype, clamp, role) = sp.policy;
+            if apptype != super::taskpolicy::apptype::NONE || clamp != super::workq::qos::UNSPECIFIED || role != super::taskpolicy::role::UNSPECIFIED {
+                self.dtask.policy.spawnpolicy(apptype, clamp, role);
             }
         }
     }

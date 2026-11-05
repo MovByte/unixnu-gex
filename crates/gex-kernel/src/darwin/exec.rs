@@ -426,6 +426,12 @@ impl Kernel {
     /// `strings` is the exec's area; the run's first program has its
     /// path and vectors from the kernel.
     pub fn darwin_start(&mut self, strings: Option<Strings>, l: &Loaded, user_stack: u64) -> Result<MainStack, Errno> {
+        // task_set_main_thread_qos, for an exec's, a spawn's and the first
+        // image's main thread alike.
+        let q = self.darwin_main_thread_qos();
+        let main = self.darwin_me();
+        main.policy.qos = q;
+        main.policy.relpri = 0;
         let mut s = match strings {
             Some(s) => s,
             None => {

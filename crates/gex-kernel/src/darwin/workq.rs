@@ -629,20 +629,23 @@ impl Kernel {
         self.dtask.threads.map.get(&tid).map_or((qos::UNSPECIFIED, 0), |t| (t.policy.qos, t.policy.relpri))
     }
 
-    /// A thread's base priority: its QoS's, else a workqueue thread's set
-    /// priority, else the task's (`BASEPRI_DEFAULT`) with its precedence
-    /// importance, within 0 to `MAXPRI_USER`.
+    /// A thread's base priority (`thread_recompute_priority`): from its
+    /// effective QoS (its requested QoS and overrides under its task's
+    /// clamp and ceiling), else a workqueue thread's set priority, else its
+    /// precedence importance on the task's priority; within the task's
+    /// range.
     pub(crate) fn darwin_thread_base_pri(&self, tid: i32) -> u8 {
-        const BASEPRI_DEFAULT: i32 = 31;
-        const MAXPRI_USER: i32 = 63;
-        let Some(t) = self.dtask.threads.map.get(&tid) else { return BASEPRI_DEFAULT as u8 };
-        if t.policy.qos != qos::UNSPECIFIED {
-            return (i32::from(qos_pri(t.policy.qos)) + t.policy.relpri).clamp(0, MAXPRI_USER) as u8;
+        use super::taskpolicy::{pri, thread_base_priority, thread_effective_qos};
+        let tp = &self.dtask.policy;
+        let Some(t) = self.dtask.threads.map.get(&tid) else { return tp.priority as u8 };
+        let overrides = t.overrides.iter().map(|o| o.qos).max().unwrap_or(qos::UNSPECIFIED);
+        let (q, relpri, urgent, terminated) = thread_effective_qos(t.policy.qos, t.policy.relpri, overrides, &tp.effective);
+        if q == qos::UNSPECIFIED {
+            if let Some(w) = &t.wq {
+                return (i32::from(w.sched_pri)).min(tp.max_priority).max(pri::MAXPRI_THROTTLE) as u8;
+            }
         }
-        if let Some(w) = &t.wq {
-            return w.sched_pri;
-        }
-        (BASEPRI_DEFAULT + t.policy.importance.unwrap_or(0)).clamp(0, MAXPRI_USER) as u8
+        thread_base_priority(q, relpri, urgent, terminated, t.policy.importance.unwrap_or(0), tp) as u8
     }
 
     // -- idle threads -----------------------------------------------------------
@@ -1297,17 +1300,9 @@ impl Kernel {
         if primordial == qos::LEGACY { qos::USER_INITIATED } else { primordial }
     }
 
-    /// `task_compute_main_thread_qos`: by the task's app type (none is set
-    /// for a process launchd did not spawn), at least user-initiated for
-    /// pid 1.
+    /// `task_compute_main_thread_qos`.
     pub(crate) fn darwin_main_thread_qos(&self) -> u8 {
-        let mut q = match self.dtask.apptype {
-            AppType::None => qos::UNSPECIFIED,
-        };
-        if self.pid == 1 {
-            q = q.max(qos::USER_INITIATED);
-        }
-        q
+        self.dtask.policy.main_thread_qos(self.pid == 1)
     }
 
     /// `workq_kernreturn(options, item, affinity, prio)`.
@@ -2713,13 +2708,6 @@ pub struct QosOverride {
     pub rtype: i32,
     pub count: u32,
     pub qos: u8,
-}
-
-/// A task's app type (`trp_apptype`), set by the spawner.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum AppType {
-    #[default]
-    None,
 }
 
 /// `bsdthread_get_max_parallelism`.

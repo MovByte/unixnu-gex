@@ -126,6 +126,8 @@ impl Attr {
 pub struct After {
     /// The spawn's flags (POSIX_SPAWN_SETEXEC: this process's own exec).
     pub flags: u16,
+    /// Its app type, QoS clamp and role, read as the policy takes them.
+    pub policy: (u8, u8, u8),
     pub sigmask: u32,
     pub sigdefault: u32,
     pub inherit: Vec<i32>,
@@ -157,8 +159,9 @@ impl Scratch {
 
 impl Kernel {
     /// `forkproc` of this process's Darwin state: what a child takes (its
-    /// signal actions, limits, libpthread's registration and the dispatch
-    /// queue offsets); the rest is the new task's own.
+    /// signal actions, limits, libpthread's registration, the dispatch
+    /// queue offsets and what task_policy_create inherits); the rest is the
+    /// new task's own.
     pub(crate) fn darwin_fork_task(&self) -> super::Task {
         let t = &self.dtask;
         super::Task {
@@ -168,6 +171,9 @@ impl Kernel {
             rlimits: t.rlimits,
             dispatchqueue_serialno_offset: t.dispatchqueue_serialno_offset,
             dispatchqueue_label_offset: t.dispatchqueue_label_offset,
+            // task_policy_create: the parent's app type, throttles and
+            // clamp.
+            policy: super::taskpolicy::TaskPolicy::create(&t.policy, false),
             ..super::Task::new_process()
         }
     }
@@ -347,7 +353,8 @@ impl Kernel {
     #[allow(clippy::too_many_arguments)]
     fn darwin_spawn_child(&mut self, m: &GuestMem<'_>, child: &mut Kernel, attr: Option<&Attr>, file_actions: Option<&[u8]>, path: u64, argv: u64, envv: u64) -> Result<(), Errno> {
         let flags = attr.map_or(0, |a| a.flags);
-        let mut after = After { flags, sigmask: attr.map_or(0, |a| a.sigmask), sigdefault: attr.map_or(0, |a| a.sigdefault), inherit: Vec::new() };
+        let policy = attr.map_or((0, 0, 0), |a| super::taskpolicy::spawn_attrs(a.apptype, a.qos_clamp, a.darwin_role));
+        let mut after = After { flags, policy, sigmask: attr.map_or(0, |a| a.sigmask), sigdefault: attr.map_or(0, |a| a.sigdefault), inherit: Vec::new() };
         if let Some(fa) = file_actions {
             after.inherit = child.darwin_file_actions(fa, flags)?;
         }
@@ -378,7 +385,7 @@ impl Kernel {
         let mut copy = self.fork_kernel();
         copy.pid = self.pid;
         copy.tid = self.tid;
-        let mut after = After { flags: at.flags, sigmask: at.sigmask, sigdefault: at.sigdefault, inherit: Vec::new() };
+        let mut after = After { flags: at.flags, policy: super::taskpolicy::spawn_attrs(at.apptype, at.qos_clamp, at.darwin_role), sigmask: at.sigmask, sigdefault: at.sigdefault, inherit: Vec::new() };
         let activated = (|| {
             if let Some(fa) = file_actions {
                 after.inherit = copy.darwin_file_actions(fa, at.flags)?;
@@ -423,9 +430,6 @@ impl Kernel {
         }
         if at.cpumonitor_percent != 0 && at.cpumonitor_percent < u64::from(u8::MAX) {
             return no(self, "CPU usage monitor");
-        }
-        if at.apptype & PROC_TYPE_MASK != 0 || at.qos_clamp != 0 || at.darwin_role != 0 {
-            return no(self, "app type, QoS clamp or Darwin role (the task policy's spawn policy)");
         }
         if at.thread_limit > 0 {
             return no(self, "thread limit");
