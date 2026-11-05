@@ -414,7 +414,39 @@ pub struct Kevents {
     closed: Arc<Mutex<Vec<KqId>>>,
     /// Threads to wake when the call settles.
     wake: Vec<(i32, WaitResult)>,
+    /// Each thread in poll: its pollfd array, and where it is.
+    poll: HashMap<i32, (u64, Vec<PollFd>)>,
 }
+
+/// `struct pollfd`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PollFd {
+    pub fd: i32,
+    pub events: i16,
+    pub revents: i16,
+}
+
+/// `POLL*` (`bsd/sys/poll.h`).
+mod pollev {
+    pub const IN: i16 = 0x0001;
+    pub const PRI: i16 = 0x0002;
+    pub const OUT: i16 = 0x0004;
+    pub const ERR: i16 = 0x0008;
+    pub const HUP: i16 = 0x0010;
+    pub const NVAL: i16 = 0x0020;
+    pub const RDNORM: i16 = 0x0040;
+    pub const WRNORM: i16 = OUT;
+    pub const RDBAND: i16 = 0x0080;
+    pub const WRBAND: i16 = 0x0100;
+    pub const EXTEND: i16 = 0x0200;
+    pub const ATTRIB: i16 = 0x0400;
+    pub const NLINK: i16 = 0x0800;
+    pub const WRITE: i16 = 0x1000;
+}
+
+/// `EV_POLL` and `EV_OOBAND` (EV_FLAG0, EV_FLAG1).
+const EV_POLL: u16 = 0x1000;
+const EV_OOBAND: u16 = 0x2000;
 
 /// `kevent_ctx_s`: a call's data buffer and scan.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -439,6 +471,8 @@ pub enum Cont {
     /// `filt_wlwait_continue`: a workloop's synchronous waiter
     /// (`struct _kevent_register`).
     WlWait { kqwl: KqId, kev: Kev, eventout: i32, ueventlist: u64 },
+    /// poll's kqueue_scan on its own kqueue `kq`.
+    Poll { kq: KqId, ctx: Ctx },
 }
 
 /// The output format (`kevent_legacy_callback`, `kevent_modern_callback`).
@@ -446,6 +480,8 @@ pub enum Cont {
 enum Out {
     Legacy,
     Modern,
+    /// `poll_callback`: into the polling thread's pollfd array.
+    Poll,
 }
 
 /// `KQWL_UTQ_*`.
@@ -1271,6 +1307,15 @@ impl Kernel {
         match out {
             Out::Legacy => kevent_legacy_copyout(m, kev, &mut ctx.process_eventlist, ctx.process_flags)?,
             Out::Modern => kevent_modern_copyout(m, kev, &mut ctx.process_eventlist)?,
+            Out::Poll => {
+                let tid = self.tid;
+                if let Some(fd) = self.kev().poll.get_mut(&tid).and_then(|p| p.1.get_mut(kev.udata as usize)) {
+                    if poll_callback(kev, fd) {
+                        ctx.process_noutputs += 1;
+                    }
+                }
+                return Ok(());
+            }
         }
         ctx.process_noutputs += 1;
         if ctx.process_noutputs == ctx.process_nevents {
@@ -1352,7 +1397,8 @@ impl Kernel {
         let q = self.kq(kqid);
         q.state |= kq::SLEEP;
         q.sleepers.push(tid);
-        let wait = Wait { deadline: ctx.deadline, cont: super::thread::Finish::Kevent(Cont::Scan { kq: kqid, ctx: *ctx }) };
+        let cont = if out == Out::Poll { Cont::Poll { kq: kqid, ctx: *ctx } } else { Cont::Scan { kq: kqid, ctx: *ctx } };
+        let wait = Wait { deadline: ctx.deadline, cont: super::thread::Finish::Kevent(cont) };
         self.darwin_kevent_settle(m);
         Ok(Some(self.darwin_block(m, wait)))
     }
@@ -1893,6 +1939,7 @@ impl Kernel {
             let copied = match out {
                 Out::Legacy => kevent_legacy_copyin(m, &mut changelist, flags),
                 Out::Modern => kevent_modern_copyin(m, &mut changelist),
+                Out::Poll => unreachable!("poll registers its own changes"),
             };
             let mut kev = match copied {
                 Ok(k) => k,
@@ -1922,6 +1969,7 @@ impl Kernel {
                 let r = match out {
                     Out::Legacy => kevent_legacy_copyout(m, &kev, &mut ueventlist, flags),
                     Out::Modern => kevent_modern_copyout(m, &kev, &mut ueventlist),
+                    Out::Poll => unreachable!("poll registers its own changes"),
                 };
                 match r {
                     Ok(()) => noutputs += 1,
@@ -2246,6 +2294,24 @@ impl Kernel {
                 super::thread::bsd_result(m, self.ctx_addr, r, false);
                 None
             }
+            Cont::Poll { kq: kqid, mut ctx } => {
+                let tid = self.tid;
+                if let Some(q) = self.kev().kqs.get_mut(&kqid) {
+                    q.sleepers.retain(|&t| t != tid);
+                }
+                let r = match res {
+                    WaitResult::Awakened => match self.kqueue_scan(m, kqid, ctx.process_flags, &mut ctx, Out::Poll) {
+                        Ok(Some(block)) => return Some(block),
+                        Ok(None) => Ok(()),
+                        Err(e) => Err(e),
+                    },
+                    WaitResult::TimedOut => Ok(()),
+                    // poll is not restarted after signals.
+                    WaitResult::Interrupted | WaitResult::Restart => Err(Errno::EINTR),
+                };
+                self.poll_finish(m, kqid, r, ctx.process_noutputs);
+                None
+            }
             Cont::WlWait { kqwl, mut kev, mut eventout, mut ueventlist } => {
                 // filt_wlwait_continue, then kevent_register_wait_return.
                 match res {
@@ -2453,5 +2519,177 @@ mod tests {
         assert_eq!(pp::qos(pp_combine(ut, qos::USER_INITIATED)), qos::USER_INITIATED);
         assert_eq!(pp_combine(ut, qos::BACKGROUND), ut);
         assert_eq!(pp_combine(pp::EVENT_MANAGER_FLAG, qos::USER_INITIATED), pp::EVENT_MANAGER_FLAG);
+    }
+}
+
+/// `poll_callback`: an event's revents in its pollfd; whether the pollfd
+/// has revents for the first time.
+fn poll_callback(kev: &Kev, fd: &mut PollFd) -> bool {
+    use pollev::*;
+    let prev = fd.revents;
+    if kev.flags & ev::EOF != 0 {
+        fd.revents |= HUP;
+    }
+    if kev.flags & ev::ERROR != 0 {
+        fd.revents |= ERR;
+    }
+    match kev.filter {
+        evfilt::READ => {
+            let mask = if fd.revents & HUP != 0 {
+                IN | RDNORM | PRI | RDBAND
+            } else if kev.flags & EV_OOBAND != 0 {
+                IN | RDNORM | PRI | RDBAND
+            } else {
+                IN | RDNORM
+            };
+            fd.revents |= fd.events & mask;
+        }
+        evfilt::WRITE => {
+            if fd.revents & HUP == 0 {
+                fd.revents |= fd.events & (OUT | WRNORM | WRBAND);
+            }
+        }
+        evfilt::VNODE => {
+            for (note, ev) in [(0x4u32, EXTEND), (0x8, ATTRIB), (0x10, NLINK), (0x2, WRITE)] {
+                if kev.fflags & note != 0 {
+                    fd.revents |= fd.events & ev;
+                }
+            }
+        }
+        _ => {}
+    }
+    fd.revents != 0 && prev == 0
+}
+
+impl Kernel {
+    /// `poll(fds, nfds, timeout)` and `poll_nocancel`: a kqueue of its own,
+    /// a one-shot EV_POLL knote for each kind of event each descriptor asks
+    /// for (one that cannot be made is POLLNVAL), then kqueue_scan with
+    /// poll_callback until something is ready or the timeout (milliseconds;
+    /// -1 waits for ever) passes.
+    pub(crate) fn darwin_poll(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> SyscallOutcome {
+        const OPEN_MAX: u64 = 10240;
+        const FD_SETSIZE: u64 = 1024;
+        let (ufds, nfds, timeout) = (a[0], a[1] as u32 as u64, a[2] as i32);
+        let nofile = self.dtask.rlimits.cur(super::rlimit::res::NOFILE);
+        // proc_suser: the superuser may pass more than its descriptor limit.
+        if nfds > OPEN_MAX || (nfds > nofile && (self.creds.uid() != 0 || nfds > FD_SETSIZE)) {
+            super::thread::bsd_result(m, self.ctx_addr, Err(Errno::EINVAL), false);
+            return SyscallOutcome::Continue;
+        }
+        let kqid = self.kq_new(0, 1, 1);
+        let mut fds = Vec::with_capacity(nfds as usize);
+        if nfds != 0 {
+            let raw = match m.read(ufds, nfds as usize * 8) {
+                Ok(b) => b.to_vec(),
+                Err(e) => {
+                    self.kqueue_free(kqid);
+                    super::thread::bsd_result(m, self.ctx_addr, Err(e), false);
+                    return SyscallOutcome::Continue;
+                }
+            };
+            for c in raw.chunks_exact(8) {
+                fds.push(PollFd { fd: i32::from_le_bytes([c[0], c[1], c[2], c[3]]), events: i16::from_le_bytes([c[4], c[5]]), revents: i16::from_le_bytes([c[6], c[7]]) });
+            }
+        }
+        use pollev::*;
+        let mut rfds = 0i32;
+        for i in 0..fds.len() {
+            let PollFd { fd, events, .. } = fds[i];
+            if fd < 0 {
+                fds[i].revents = 0;
+                continue;
+            }
+            let mut kev = Kev { ident: fd as u64, flags: ev::ADD | ev::ONESHOT | EV_POLL, udata: i as u64, ..Kev::default() };
+            if events & (IN | RDNORM | PRI | RDBAND | HUP) != 0 {
+                kev.filter = evfilt::READ;
+                if events & (PRI | RDBAND) != 0 {
+                    kev.flags |= EV_OOBAND;
+                }
+                self.kevent_register(m, kqid, &mut kev);
+            }
+            if kev.flags & ev::ERROR == 0 && events & (OUT | WRNORM | WRBAND) != 0 {
+                kev.filter = evfilt::WRITE;
+                self.kevent_register(m, kqid, &mut kev);
+            }
+            if kev.flags & ev::ERROR == 0 && events & (EXTEND | ATTRIB | NLINK | WRITE) != 0 {
+                kev.filter = evfilt::VNODE;
+                kev.fflags = 0;
+                for (ev, note) in [(EXTEND, 0x4u32), (ATTRIB, 0x8), (NLINK, 0x10), (WRITE, 0x2)] {
+                    if events & ev != 0 {
+                        kev.fflags |= note;
+                    }
+                }
+                self.kevent_register(m, kqid, &mut kev);
+            }
+            if kev.flags & ev::ERROR != 0 {
+                fds[i].revents = NVAL;
+                rfds += 1;
+            } else {
+                fds[i].revents = 0;
+            }
+        }
+        let tid = self.tid;
+        let all_bad = nfds != 0 && rfds as u64 == nfds;
+        self.kev().poll.insert(tid, (ufds, fds));
+        if all_bad {
+            self.poll_finish(m, kqid, Ok(()), rfds);
+            return SyscallOutcome::Continue;
+        }
+        let mut ctx = Ctx { process_noutputs: rfds, process_flags: kf::POLL, ..Ctx::default() };
+        if rfds != 0 {
+            ctx.process_flags |= kf::IMMEDIATE;
+        } else if timeout != -1 {
+            // clock_interval_to_deadline of the timeout as an unsigned count
+            // of milliseconds.
+            let ns = (timeout as i64 as u64).wrapping_mul(1_000_000);
+            ctx.deadline = Instant::now().checked_add(std::time::Duration::from_nanos(ns));
+        }
+        let flags = ctx.process_flags;
+        match self.kqueue_scan(m, kqid, flags, &mut ctx, Out::Poll) {
+            Ok(Some(block)) => block,
+            Ok(None) => {
+                self.poll_finish(m, kqid, Ok(()), ctx.process_noutputs);
+                SyscallOutcome::Continue
+            }
+            Err(e) => {
+                self.poll_finish(m, kqid, Err(e), 0);
+                SyscallOutcome::Continue
+            }
+        }
+    }
+
+    /// The end of a poll: the pollfds copied out and the count of those
+    /// with revents returned, its kqueue freed.
+    fn poll_finish(&mut self, m: &mut GuestMem<'_>, kqid: KqId, r: Result<(), Errno>, noutputs: i32) {
+        let tid = self.tid;
+        let (ufds, fds) = self.kev().poll.remove(&tid).unwrap_or_default();
+        let r = r.and_then(|()| {
+            let mut b = Vec::with_capacity(fds.len() * 8);
+            for f in &fds {
+                b.extend_from_slice(&f.fd.to_le_bytes());
+                b.extend_from_slice(&f.events.to_le_bytes());
+                b.extend_from_slice(&f.revents.to_le_bytes());
+            }
+            if !b.is_empty() {
+                m.write(ufds, &b)?;
+            }
+            Ok(noutputs as u32 as u64)
+        });
+        self.kqueue_free(kqid);
+        self.darwin_kevent_settle(m);
+        super::thread::bsd_result(m, self.ctx_addr, r, false);
+    }
+
+    /// `kqueue_dealloc` of a kqueue no descriptor names: its knotes
+    /// dropped, then it.
+    fn kqueue_free(&mut self, kqid: KqId) {
+        let mine: Vec<KnId> = self.kev().knotes.iter().filter(|(_, k)| k.kq == kqid).map(|(&n, _)| n).collect();
+        for n in mine {
+            if self.knote_exists(n) {
+                self.knote_drop(n);
+            }
+        }
+        self.kev().kqs.remove(&kqid);
     }
 }
