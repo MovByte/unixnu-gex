@@ -939,6 +939,56 @@ impl Ipc {
         kr::SUCCESS
     }
 
+    /// `ipc_space_terminate`: every entry's right ended as
+    /// `ipc_right_terminate` ends it, in index order, and the space left
+    /// empty. Its notifications are owed to the ports that asked for them
+    /// (one whose receiver has gone takes the message no further).
+    pub fn space_terminate(&mut self) {
+        let names: Vec<(u32, space::Entry)> = self.space.names().map(|(n, e)| (n, *e)).collect();
+        self.space = Space::new();
+        for (name, e) in names {
+            self.right_terminate(name, &e);
+        }
+    }
+
+    /// `ipc_right_terminate`.
+    fn right_terminate(&mut self, name: u32, e: &space::Entry) {
+        let t = e.ty();
+        match t {
+            ty::DEAD_NAME => {}
+            ty::PORT_SET => self.pset_destroy(e.object.expect("a set")),
+            ty::SEND | ty::RECEIVE | ty::SEND_RECEIVE | ty::SEND_ONCE => {
+                let port = e.object.expect("a port");
+                if !self.port(port).active {
+                    self.release(port);
+                    return;
+                }
+                let request = if e.request != 0 { self.port_request_cancel(port, e.request) } else { None };
+                let mut ns = None;
+                if t & ty::SEND != 0 {
+                    let p = self.port_mut(port);
+                    p.srights -= 1;
+                    if p.srights == 0 {
+                        ns = self.no_senders_prepare_pub(port);
+                    }
+                }
+                if t & ty::RECEIVE != 0 {
+                    self.port_destroy(port);
+                } else if t & ty::SEND_ONCE != 0 {
+                    self.port_mut(port).reply_context = 0;
+                    self.send_once_notify(port);
+                } else {
+                    self.release(port);
+                }
+                self.no_senders_emit(ns);
+                if let Some(to) = request {
+                    self.outbox.push(Notify::PortDeleted { to, name });
+                }
+            }
+            _ => panic!("ipc_right_terminate: strange type {t:#x}"),
+        }
+    }
+
     /// `ipc_right_dealloc`: one user reference of `name`'s right gone.
     pub fn right_dealloc(&mut self, name: u32) -> u64 {
         let e = *self.space.lookup(name).expect("deallocated name in use");

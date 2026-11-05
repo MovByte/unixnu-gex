@@ -306,8 +306,9 @@ pub struct Loaded<'a> {
     pub dylinker: Option<&'a str>,
     /// `LC_MAIN`'s `stacksize` (0: the default).
     pub stacksize: u64,
-    /// The executable as the guest names it.
+    /// The executable as the guest names it, and where its slice starts.
     pub exe_path: &'a str,
+    pub file_start: u64,
     /// Its `LC_CODE_SIGNATURE` blob.
     pub code_signature: Option<&'a [u8]>,
     /// `_POSIX_SPAWN_NANO_ALLOCATOR` among a spawn's flags.
@@ -458,7 +459,7 @@ impl Kernel {
         if let Some(blob) = l.code_signature {
             let abs = self.vfs.absolute(l.exe_path);
             let ino = self.vfs.metadata(&abs)?.ino;
-            super::codesign::register_blob((self.vfs.mount_id_of(&abs), ino), 0, blob)?;
+            super::codesign::register_blob((self.vfs.mount_id_of(&abs), ino), l.file_start as i64, blob)?;
         }
         self.darwin_apple_strings(&mut s, l, [user_stack, stack_size, alloc, alloc_size])?;
         let (mut sp, mut bytes) = s.copyout(user_stack)?;

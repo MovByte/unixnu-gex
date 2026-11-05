@@ -675,6 +675,25 @@ pub fn process_gone(pid: i32) {
     }
 }
 
+/// A process execs: `fg_transfer_filelocks` moves its POSIX locks on the
+/// files it keeps open (`keep`) to the new image, and the old image's end
+/// releases the rest; the other threads' requests are gone with them.
+pub fn exec_keep(pid: i32, keep: &[Vnode]) {
+    let vnodes: Vec<Vnode> = {
+        let t = table().lock().unwrap_or_else(|e| e.into_inner());
+        t.locks.values().filter(|l| l.id == Id::Proc(pid) && l.waker.is_none() && !keep.contains(&l.vnode)).map(|l| l.vnode).collect()
+    };
+    for v in vnodes {
+        unlock_all(v, Id::Proc(pid), lf::F_POSIX);
+    }
+    let mut t = table().lock().unwrap_or_else(|e| e.into_inner());
+    let asleep: Vec<u64> = t.locks.iter().filter(|(_, l)| l.waker.as_ref().is_some_and(|k| k.pid == pid)).map(|(&k, _)| k).collect();
+    let asleep: Vec<u64> = asleep.into_iter().filter(|r| !t.lists.get(&t.locks[r].vnode).is_some_and(|l| l.contains(r))).collect();
+    for r in asleep {
+        let _ = t.setlock_resume(r, Some(Errno::EINTR));
+    }
+}
+
 /// An open file's last close (`vn_closefile`): its flock and OFD locks.
 pub fn last_close(file: &OpenFile) {
     use std::sync::atomic::Ordering;
@@ -987,6 +1006,16 @@ impl Kernel {
     /// The open file at address `fg` among the process's descriptors.
     fn fds_by_ptr(&self, fg: usize) -> Result<Arc<OpenFile>, Errno> {
         self.fds.list().into_iter().find_map(|(fd, _)| self.fds.get(fd).ok().filter(|f| Arc::as_ptr(f) as usize == fg)).ok_or(Errno::EBADF)
+    }
+
+    /// The vnodes the process's descriptors reach, for an exec's
+    /// [`exec_keep`].
+    pub(crate) fn darwin_lock_vnodes_open(&mut self) -> Vec<Vnode> {
+        let files: Vec<Arc<OpenFile>> = self.fds.entries().into_iter().map(|(_, f, _)| f).collect();
+        files.iter().filter_map(|f| match self.darwin_lock_target(f) {
+            Target::Lockf(v) => Some(v),
+            _ => None,
+        }).collect()
     }
 
     /// A descriptor of this process is about to close: its POSIX locks on

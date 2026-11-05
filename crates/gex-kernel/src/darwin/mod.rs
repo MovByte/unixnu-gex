@@ -20,6 +20,7 @@ pub mod codesign;
 pub mod commpage;
 pub mod errno;
 pub mod exec;
+pub mod execve;
 pub mod fsops;
 pub mod ioctl;
 pub mod ipc;

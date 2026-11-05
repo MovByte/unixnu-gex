@@ -694,6 +694,9 @@ pub struct Kernel {
     /// A parked write to a Darwin pipe: whether its EPIPE sends the process
     /// SIGPIPE (the open file has no `FG_NOSIGPIPE`).
     pub darwin_pipe_sigpipe: Option<bool>,
+    /// An exec's activated image, for the host to load
+    /// ([`crate::darwin::execve`]).
+    pub darwin_exec: Option<Box<crate::darwin::execve::Image>>,
     /// Set by a syscall that may have made a descriptor readable or
     /// writable for someone else (a write, a read that freed room, a close,
     /// a signal); the host takes it after the call and wakes threads parked
@@ -8980,6 +8983,7 @@ impl Kernel {
             darwin_user_stack: 0,
             darwin_finish: None,
             darwin_pipe_sigpipe: None,
+            darwin_exec: None,
             fd_activity: false,
             wasm32: false,
             sigreturn_legacy: false,
@@ -9373,6 +9377,7 @@ impl Kernel {
             darwin_user_stack: 0,
             darwin_finish: None,
             darwin_pipe_sigpipe: None,
+            darwin_exec: None,
             fd_activity: false,
             wasm32: self.wasm32,
             sigreturn_legacy: false,

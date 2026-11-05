@@ -335,6 +335,8 @@ impl Kernel {
                 Some(SyscallOutcome::Blocking(crate::syscalls::BlockOp::SigSuspend { restore_mask }))
             }
             sys::SIGRETURN => Some(self.darwin_sigreturn(m, a)),
+            sys::EXECVE => Some(self.darwin_execve(m, a, false)),
+            sys::MAC_EXECVE => Some(self.darwin_execve(m, a, true)),
             sys::FCNTL | sys::FCNTL_NOCANCEL if super::lockf::is_lock_cmd(a[1]) => Some(self.darwin_fcntl_lock(m, a)),
             sys::FLOCK => Some(self.darwin_flock(m, a)),
             // open1's O_EXLOCK and O_SHLOCK: the open, then the lock.

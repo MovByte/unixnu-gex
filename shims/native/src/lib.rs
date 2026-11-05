@@ -3160,6 +3160,9 @@ fn exec_program(
     if let Some(exit) = host_exec(&req, &kernel)? {
         return Ok((exit, Stats::default()));
     }
+    if let Some(img) = kernel.darwin_exec.take() {
+        return exec_darwin(img, req, opts, xlate, kernel, proc_state, wayland);
+    }
     // The file comes from the guest's namespace, not the host's, so a sysroot
     // is honoured and `/bin/sh` means the guest's.
     let bytes = kernel
@@ -3372,6 +3375,75 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option
 fn wait_for_process_end(cx: &SpawnContext) {
     while !cx.stopping.load(std::sync::atomic::Ordering::Acquire) {
         std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+/// The kernel could not start a Darwin image (`create_unix_stack`, the
+/// signature, the strings): after an exec, XNU's `badtoolate`.
+#[derive(Debug)]
+struct DarwinStartFailed(String);
+
+impl std::fmt::Display for DarwinStartFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DarwinStartFailed {}
+
+/// A Darwin process's `execve`, its image activated
+/// (`gex_kernel::darwin::execve`): the new image loaded, the process
+/// switched over to it, and run. Past activation there is no image to go
+/// back to, so a load that fails kills the process with SIGKILL, as XNU's
+/// `badtoolate` does.
+fn exec_darwin(
+    img: Box<gex_kernel::darwin::execve::Image>,
+    req: ExecRequest,
+    opts: &RunOptions,
+    xlate: &Options,
+    mut kernel: Kernel,
+    proc_state: Arc<ProcCell>,
+    wayland: Option<wayland::Wayland>,
+) -> Result<(Exit, Stats)> {
+    let killed = |why: String| -> Result<(Exit, Stats)> {
+        Ok((Exit::Signal { signal: 9, pc: 0, detail: format!("killed by signal 9 (exec: {why})"), internal: false }, Stats::default()))
+    };
+    let Some(bytes) = kernel.read_file(&img.path) else { return killed(format!("cannot read {}", img.path)) };
+    let Some(slice) = bytes.get(img.arch_offset as usize..(img.arch_offset + img.arch_size) as usize) else {
+        return killed(format!("{}'s slice is past its end", img.path));
+    };
+    let loaded = {
+        let read = |p: &str| kernel.read_file(p).ok_or_else(|| anyhow!("cannot read {p}"));
+        match crate::darwin_image::load(slice, &img.path, &read) {
+            Ok(l) => l,
+            Err(e) => return killed(format!("{e:#}")),
+        }
+    };
+    note_exec(kernel.pid, &img.path, &req.argv);
+    // The other threads are gone, and the signal actions are the new
+    // image's; then what the process keeps of its task.
+    let tid = if kernel.sig_tid != 0 { kernel.sig_tid } else { kernel.tid };
+    kernel.exec_signals(tid);
+    kernel.exe_path = img.path.clone();
+    kernel.darwin_exec_switch();
+    let path = img.path.clone();
+    // Its string area, for the new stack (`darwin_start`).
+    kernel.darwin_exec = Some(img);
+    let opts = RunOptions {
+        args: req.argv,
+        env: req.envp,
+        exe: Some(path),
+        darwin: true,
+        darwin_platform: loaded.platform,
+        darwin_code_signature: loaded.code_signature,
+        darwin_stacksize: loaded.stacksize,
+        darwin_dylinker: loaded.dylinker,
+        darwin_dyld_infos: loaded.dyld_infos,
+        ..opts.clone()
+    };
+    match run_program_with(&loaded.program, &opts, xlate, Some(Inherited { kernel, proc_state, wayland })) {
+        Err(e) if e.downcast_ref::<DarwinStartFailed>().is_some() => killed(e.to_string()),
+        r => r,
     }
 }
 
@@ -4144,18 +4216,23 @@ fn place_image(
     let layout = if opts.darwin {
         let header = image.segments.iter().map(|s| s.vaddr).min().unwrap_or(0);
         let path = opts.exe.clone().or_else(|| opts.args.first().cloned()).unwrap_or_default();
-        let loaded = gex_kernel::darwin::exec::Loaded {
-            mach_header: header,
-            dylinker: opts.darwin_dylinker.as_deref().filter(|_| program.interp.is_some()),
-            stacksize: opts.darwin_stacksize,
-            exe_path: &path,
-            code_signature: opts.darwin_code_signature.as_deref(),
-            nano: false,
-        };
         let st = store
             .data_mut()
-            .with_kernel(|k| k.darwin_start(None, &loaded, gex_abi::STACK_TOP))
-            .map_err(|e| anyhow!("starting {path}: errno {}", e.0))?;
+            .with_kernel(|k| {
+                // An exec's activated strings, or the run's first program's.
+                let exec = k.darwin_exec.take();
+                let loaded = gex_kernel::darwin::exec::Loaded {
+                    mach_header: header,
+                    dylinker: opts.darwin_dylinker.as_deref().filter(|_| program.interp.is_some()),
+                    stacksize: opts.darwin_stacksize,
+                    exe_path: &path,
+                    file_start: exec.as_ref().map_or(0, |i| i.arch_offset),
+                    code_signature: opts.darwin_code_signature.as_deref(),
+                    nano: false,
+                };
+                k.darwin_start(exec.map(|i| i.strings), &loaded, gex_abi::STACK_TOP)
+            })
+            .map_err(|e| anyhow::Error::new(DarwinStartFailed(format!("starting {path}: errno {}", e.0))))?;
         let layout = gex_ld::stack::StackLayout { sp: st.sp, low: st.sp, bytes: st.bytes };
         darwin_stack = Some((st.alloc, st.size, st.guard));
         layout

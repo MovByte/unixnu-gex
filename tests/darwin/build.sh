@@ -23,7 +23,7 @@ for p in hello-static bsd-carry commpage exclusive-pair aes; do
         -o "$OUT/$p" "$HERE/src/$p.c"
 done
 
-for p in hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple xpc-anon; do
+for p in hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec xpc-anon; do
     cc -O2 -o "$OUT/$p" "$HERE/src/$p.c"
 done
 cc -O2 -framework CoreFoundation -o "$OUT/cfrunloop" "$HERE/src/cfrunloop.c"
@@ -32,5 +32,9 @@ cc -O2 -framework CoreFoundation -o "$OUT/cfrunloop" "$HERE/src/cfrunloop.c"
 codesign -s - -f "$OUT/codesig" 2>/dev/null
 # apple checks the cdhash exec hands it: signed as every iOS program is.
 codesign -s - -f "$OUT/apple" 2>/dev/null
+# exec's images: an arm64e slice (no pointer authentication on this CPU),
+# and a fat file of it and the arm64 one exec picks.
+xcrun -sdk iphoneos clang -target arm64e-apple-ios17.0 -O2 -o "$OUT/hello-arm64e" "$HERE/src/hello.c"
+lipo -create "$OUT/hello" "$OUT/hello-arm64e" -output "$OUT/hello-fat"
 
 echo "built: $(cd "$OUT" && ls | tr '\n' ' ')"

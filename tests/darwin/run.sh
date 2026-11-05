@@ -76,6 +76,15 @@ run() {
     codesig) check_root codesig "codesig ok" 0 ;;
     rlimit) check_root rlimit "rlimit ok" 0 ;;
     apple) check_root apple "apple ok" 0 ;;
+    exec)
+        if [ -n "${GEX_DARWIN_ROOT:-}" ]; then
+            mkdir -p "$GEX_DARWIN_ROOT/var/tmp"
+            cp "$HERE/bin/hello-fat" "$GEX_DARWIN_ROOT/var/tmp/gex-exec-fat"
+            cp "$HERE/bin/hello-arm64e" "$GEX_DARWIN_ROOT/var/tmp/gex-exec-arm64e"
+        fi
+        check_root exec "exec ok
+hello from /var/tmp/gex-exec-fat with 1 argument" 0
+        ;;
     cfrunloop) check_root cfrunloop "cfrunloop 3 1" 0 ;;
     xpc-anon) check_root xpc-anon "xpc-anon 42" 0 ;;
     *)
@@ -90,7 +99,7 @@ if [ "$named" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple cfrunloop xpc-anon; do
+    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec cfrunloop xpc-anon; do
         run "$p"
     done
 fi

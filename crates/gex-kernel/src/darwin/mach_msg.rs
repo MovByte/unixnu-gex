@@ -1421,15 +1421,7 @@ impl Kernel {
     /// After an IPC operation: owed notifications sent, woken threads
     /// woken, guard exceptions raised.
     pub(crate) fn darwin_ipc_settle(&mut self, m: &mut GuestMem<'_>) {
-        loop {
-            let outbox = std::mem::take(&mut self.dtask.ipc.outbox);
-            if outbox.is_empty() {
-                break;
-            }
-            for n in outbox {
-                self.send_notification(n);
-            }
-        }
+        self.darwin_ipc_notify_drain();
         for t in std::mem::take(&mut self.dtask.ipc.queues.wake) {
             self.darwin_wake(m, t, WaitResult::Awakened);
         }
@@ -1440,6 +1432,19 @@ impl Kernel {
         // their kqueues wake; then the thread requests they made.
         self.darwin_kevent_owed(m);
         self.darwin_workq_settle(m);
+    }
+
+    /// The notifications owed, sent, with those their sending owes.
+    pub(crate) fn darwin_ipc_notify_drain(&mut self) {
+        loop {
+            let outbox = std::mem::take(&mut self.dtask.ipc.outbox);
+            if outbox.is_empty() {
+                break;
+            }
+            for n in outbox {
+                self.send_notification(n);
+            }
+        }
     }
 
     /// `mach_port_guard_exception` for a task without exception-guard

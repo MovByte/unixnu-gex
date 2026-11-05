@@ -433,6 +433,37 @@ impl Kernel {
         }
     }
 
+    /// `execsigs`: the new image's signal state. A caught signal's action
+    /// goes back to the default (its mask and flags stay); one whose
+    /// default is to ignore it is ignored from now on (SIGCONT aside) and
+    /// what is pending of it dropped. The signal stack is the user stack.
+    pub(crate) fn darwin_execsigs(&mut self) {
+        for d in 1..NSIG as u32 {
+            let h = self.dtask.sigacts.handler[d as usize];
+            if h == SIG_DFL || h == SIG_IGN {
+                continue;
+            }
+            self.dtask.sigacts.handler[d as usize] = SIG_DFL;
+            if SIGPROP[d as usize] & prop::IGNORE != 0 {
+                if d != dsig::SIGCONT {
+                    self.dtask.sigacts.sigignore |= sigmask(d);
+                }
+                self.darwin_sig_discard(d);
+            }
+        }
+        let ps = &mut self.dtask.sigacts;
+        ps.sigreturn_validation = validation::DEFAULT;
+        ps.sigonstack = 0;
+        for d in 1..NSIG as u32 {
+            self.darwin_sig_mirror(d);
+        }
+        let s = self.darwin_sig();
+        s.ss_flags = saf::DISABLE;
+        s.ss_size = 0;
+        s.ss_sp = 0;
+        s.altstack = false;
+    }
+
     /// `sigaltstack(nss, oss)`.
     pub(crate) fn darwin_sigaltstack(&mut self, m: &mut GuestMem<'_>, nss: u64, oss: u64) -> Result<u64, Errno> {
         let s = self.darwin_sig();
