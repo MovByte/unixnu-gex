@@ -4,7 +4,7 @@
 //! receiver already waiting.
 
 use super::right::{msgt, Carried};
-use super::{Ipc, Object, ObjId, Receiver};
+use super::{Ipc, Object, ObjId, Receiver, Waiter};
 use std::collections::{HashMap, VecDeque};
 
 /// `mach_msg_return_t`s.
@@ -222,19 +222,19 @@ pub struct RcvWait {
 pub struct Queues {
     /// Threads waiting to receive, by object (a port or a set), in the
     /// order they came.
-    pub receivers: HashMap<ObjId, VecDeque<i32>>,
-    pub rcv_wait: HashMap<i32, RcvWait>,
+    pub receivers: HashMap<ObjId, VecDeque<Waiter>>,
+    pub rcv_wait: HashMap<Waiter, RcvWait>,
     /// Threads waiting for room on a full port, in the order they came.
-    pub senders: HashMap<ObjId, VecDeque<i32>>,
+    pub senders: HashMap<ObjId, VecDeque<Waiter>>,
     /// Receives that have ended, waiting for their thread to take them.
-    pub received: HashMap<i32, Received>,
+    pub received: HashMap<Waiter, Received>,
     /// Sends a receiver made room for: the waiter's reservation is held.
-    pub send_ready: HashMap<i32, bool>,
+    pub send_ready: HashMap<Waiter, bool>,
     /// For each set, its members with messages in the order they got
     /// them (`waitq_set` preposts).
     pub preposts: HashMap<ObjId, VecDeque<ObjId>>,
     /// Threads woken by a queue operation, for the kernel to wake.
-    pub wake: Vec<i32>,
+    pub wake: Vec<Waiter>,
     /// Ports with knotes whose queue gained its first message, or whose
     /// head message's QoS rose (`KNOTE(&port->ip_klist, 0)`), for kevent.
     pub knotes: Vec<ObjId>,
@@ -284,12 +284,12 @@ impl Ipc {
     }
 
     /// Wait for room on `port` (the sending thread `tid`).
-    pub fn mqueue_wait_room(&mut self, port: ObjId, tid: i32) {
+    pub fn mqueue_wait_room(&mut self, port: ObjId, tid: Waiter) {
         self.queues.senders.entry(port).or_default().push_back(tid);
     }
 
     /// A room wait that ended without room (timed out, interrupted).
-    pub fn mqueue_cancel_room(&mut self, port: ObjId, tid: i32) {
+    pub fn mqueue_cancel_room(&mut self, port: ObjId, tid: Waiter) {
         if let Some(q) = self.queues.senders.get_mut(&port) {
             q.retain(|&t| t != tid);
         }
@@ -343,7 +343,7 @@ impl Ipc {
 
     /// The thread that should get a message posted to `port`: one waiting
     /// on the port itself, then one waiting on a set it is in.
-    fn identify_receiver(&mut self, port: ObjId, skip: &[i32]) -> Option<(i32, ObjId)> {
+    fn identify_receiver(&mut self, port: ObjId, skip: &[Waiter]) -> Option<(Waiter, ObjId)> {
         let waiter = |q: &Queues, o: ObjId| q.receivers.get(&o).and_then(|q| q.iter().copied().find(|t| !skip.contains(t)));
         if let Some(t) = waiter(&self.queues, port) {
             return Some((t, port));
@@ -480,7 +480,7 @@ impl Ipc {
     }
 
     /// A waiting receiver's wait ends with `r`.
-    fn receiver_done(&mut self, t: i32, obj: ObjId, r: Received) {
+    fn receiver_done(&mut self, t: Waiter, obj: ObjId, r: Received) {
         if let Some(q) = self.queues.receivers.get_mut(&obj) {
             q.retain(|&x| x != t);
         }
@@ -536,7 +536,7 @@ impl Ipc {
 
     /// Receive on `object` now or wait. `Some` when the receive has ended
     /// (a message, or a timeout of zero); `None` when the thread waits.
-    pub fn mqueue_receive(&mut self, tid: i32, object: ObjId, w: RcvWait, timeout_zero: bool, msize_of: &dyn Fn(&Kmsg) -> u32) -> Option<Received> {
+    pub fn mqueue_receive(&mut self, tid: Waiter, object: ObjId, w: RcvWait, timeout_zero: bool, msize_of: &dyn Fn(&Kmsg) -> u32) -> Option<Received> {
         if let Some(port) = self.ready_port(object) {
             return Some(self.select(port, &w, msize_of));
         }
@@ -557,7 +557,7 @@ impl Ipc {
 
     /// A receive wait that ended without a message (timed out,
     /// interrupted): the thread leaves the queue.
-    pub fn mqueue_cancel_receive(&mut self, tid: i32) {
+    pub fn mqueue_cancel_receive(&mut self, tid: Waiter) {
         if let Some(w) = self.queues.rcv_wait.remove(&tid) {
             if let Some(q) = self.queues.receivers.get_mut(&w.object) {
                 q.retain(|&t| t != tid);
@@ -575,7 +575,7 @@ impl Ipc {
         if has_knotes {
             self.queues.vanish.push(object);
         }
-        let waiters: Vec<i32> = self.queues.receivers.remove(&object).map(|q| q.into_iter().collect()).unwrap_or_default();
+        let waiters: Vec<Waiter> = self.queues.receivers.remove(&object).map(|q| q.into_iter().collect()).unwrap_or_default();
         for t in waiters {
             self.queues.rcv_wait.remove(&t);
             self.queues.received.insert(t, Received { state: mr::RCV_PORT_CHANGED, kmsg: None, seqno: 0, msize: 0, asize: 0, receiver_name: 0 });
@@ -586,7 +586,7 @@ impl Ipc {
     /// Senders waiting on a port that died wake to find it gone
     /// (`THREAD_RESTART`: `MACH_SEND_INVALID_DEST`).
     pub fn mqueue_senders_restart(&mut self, port: ObjId) {
-        let waiters: Vec<i32> = self.queues.senders.remove(&port).map(|q| q.into_iter().collect()).unwrap_or_default();
+        let waiters: Vec<Waiter> = self.queues.senders.remove(&port).map(|q| q.into_iter().collect()).unwrap_or_default();
         for t in waiters {
             self.queues.send_ready.insert(t, false);
             self.queues.wake.push(t);

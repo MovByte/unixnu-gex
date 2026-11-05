@@ -88,6 +88,9 @@ pub struct Task {
     /// Reached through [`crate::syscalls::Kernel::ipc`], which takes the
     /// system's IPC table for the call.
     pub ipc_raw: ipc::Ipc,
+    /// The send rights the next child task inherits (`ipc_task_init`):
+    /// its special ports by kind, and its registered ports.
+    pub child_ports: std::sync::Mutex<Option<(std::collections::HashMap<i32, ipc::ObjId>, [Option<ipc::ObjId>; 3])>>,
     /// The kernel objects' ports.
     pub kports: kobject::Kports,
     pub semas: sema::Semas,
@@ -161,8 +164,17 @@ impl crate::syscalls::Kernel {
         let ipc = &mut self.dtask.ipc_raw;
         if !ipc.held {
             ipc.check_out(&self.procs.darwin_ipc);
+            // Other tasks reach this one through its link: its mailbox, and
+            // the bell of its thread calls, which empty it.
+            let bell = self.dtask.timers.bell();
+            let ipc = &mut self.dtask.ipc_raw;
+            if !ipc.link.as_ref().is_some_and(|l| std::sync::Arc::ptr_eq(&l.bell, &bell)) {
+                let link = std::sync::Arc::new(ipc::TaskLink { mailbox: Default::default(), bell });
+                ipc.links.insert(ipc.task, std::sync::Arc::clone(&link));
+                ipc.link = Some(link);
+            }
         }
-        ipc
+        &mut self.dtask.ipc_raw
     }
 
     /// The kernel call is done with IPC: the system's table goes back for

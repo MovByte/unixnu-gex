@@ -85,7 +85,9 @@ impl Ipc {
         if !claimed {
             return Err(kr::NAME_EXISTS);
         }
-        let id = self.new_object(Object::Port(super::Port::new(Receiver::Space(name))));
+        let mut p = super::Port::new(Receiver::Space(name));
+        p.owner = self.task;
+        let id = self.new_object(Object::Port(p));
         let e = self.space.lookup_mut_any(name);
         e.object = Some(id);
         e.bits |= ty::RECEIVE;
@@ -98,7 +100,7 @@ impl Ipc {
         if !claimed {
             return Err(kr::NAME_EXISTS);
         }
-        let id = self.new_object(Object::Pset(super::Pset { active: true, name, members: Vec::new(), refs: 1, knotes: 0 }));
+        let id = self.new_object(Object::Pset(super::Pset { active: true, owner: self.task, name, members: Vec::new(), refs: 1, knotes: 0 }));
         let e = self.space.lookup_mut_any(name);
         e.object = Some(id);
         e.bits |= ty::PORT_SET;

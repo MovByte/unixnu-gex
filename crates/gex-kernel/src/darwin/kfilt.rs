@@ -1046,7 +1046,8 @@ impl Kernel {
         let w = RcvWait { object, options, rcv_size: max_size, aux_size: 0 };
         let size_of = |k: &super::ipc::msg::Kmsg| k.size;
         let tid = self.tid;
-        let Some(rcv) = self.ipc().mqueue_receive(tid, object, w, true, &size_of) else {
+        let me = self.ipc().waiter(tid);
+        let Some(rcv) = self.ipc().mqueue_receive(me, object, w, true, &size_of) else {
             unreachable!("a receive with a zero timeout ends at once")
         };
         if rcv.state == super::ipc::msg::mr::RCV_TIMED_OUT || rcv.state == super::ipc::msg::mr::RCV_PORT_CHANGED {

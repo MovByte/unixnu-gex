@@ -381,8 +381,11 @@ impl Ipc {
     /// `ipc_right_reverse`: the name this space already has for `port`'s
     /// receive right or a send right to it.
     fn right_reverse(&self, port: ObjId) -> Option<u32> {
-        if let Receiver::Space(n) = self.port(port).receiver {
-            return Some(n);
+        let p = self.port(port);
+        if let Receiver::Space(n) = p.receiver {
+            if p.owner == self.task {
+                return Some(n);
+            }
         }
         self.space.hash_lookup(port)
     }
@@ -413,8 +416,10 @@ impl Ipc {
                 self.space.lookup_mut_any(name).bits = (b | ty::SEND) + 1;
             }
             msgt::PORT_RECEIVE => {
+                let task = self.task;
                 let p = self.port_mut(port);
                 p.receiver = Receiver::Space(name);
+                p.owner = task;
                 if let Some((gf, ctx, recv_addr)) = guard {
                     if *gf & guard_flags::IMMOVABLE_RECEIVE != 0 {
                         p.guarded = true;
@@ -506,8 +511,9 @@ impl Ipc {
     /// `ipc_object_copyout_dest`: a received message's destination right,
     /// consumed; the receive right's name if it is in this space.
     pub fn object_copyout_dest(&mut self, port: ObjId, t: u32) -> u32 {
-        let in_space = match self.port(port).receiver {
-            Receiver::Space(n) => Some(n),
+        let p = self.port(port);
+        let in_space = match p.receiver {
+            Receiver::Space(n) if p.owner == self.task => Some(n),
             _ => None,
         };
         match t {

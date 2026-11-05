@@ -164,7 +164,9 @@ impl Kernel {
     /// table); the rest is the new task's own.
     pub(crate) fn darwin_fork_task(&self) -> super::Task {
         let t = &self.dtask;
+        let (special, registered) = t.child_ports.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
         super::Task {
+            kports: super::kobject::Kports { special, registered, ..Default::default() },
             strict: t.strict,
             pthread: t.pthread,
             sigacts: t.sigacts.clone(),
@@ -180,10 +182,7 @@ impl Kernel {
     /// state `fork_kernel` gives it. This side returns the child's pid with
     /// x1 clear; the child's x0 is its own pid and x1 is 1.
     pub(crate) fn darwin_fork(&mut self, m: &mut GuestMem<'_>) -> SyscallOutcome {
-        if let Err(e) = self.darwin_child_ports() {
-            let _ = super::set_result(m, self.ctx_addr, e.as_return());
-            return SyscallOutcome::Continue;
-        }
+        self.darwin_child_ports();
         let pid = self.procs.spawn(self.pid);
         crate::procnote::post(self.pid, crate::procnote::note::FORK | pid as u32);
         let _ = super::set_result(m, self.ctx_addr, pid as u64);
@@ -191,19 +190,26 @@ impl Kernel {
         SyscallOutcome::SpawnProcess { pid, child_stack: 0, tls: None, vfork: false }
     }
 
-    /// `ipc_task_init`'s inheritance: a child task gets send rights to its
-    /// parent's registered ports and its bootstrap and task access ports
-    /// (not the debug control or resource notify ones), rights in its space
-    /// that are the parent's ports. Refused while there are any.
-    fn darwin_child_ports(&mut self) -> Result<(), Errno> {
+    /// `ipc_task_init`'s inheritance: the child task the next
+    /// `fork_kernel` makes gets copies of this task's send rights to its
+    /// registered ports and its bootstrap and task access ports (its host
+    /// port follows from its identity, and it has no exception ports to
+    /// take, since none can be set).
+    fn darwin_child_ports(&mut self) {
         const TASK_BOOTSTRAP_PORT: i32 = 4;
         const TASK_ACCESS_PORT: i32 = 9;
         let k = &self.dtask.kports;
-        if k.registered.iter().any(Option::is_some) || k.special.contains_key(&TASK_BOOTSTRAP_PORT) || k.special.contains_key(&TASK_ACCESS_PORT) {
-            self.darwin_unimplemented("a child task inheriting its parent's bootstrap, task access or registered ports (a right in another task's space)".into());
-            return Err(Errno::EINVAL);
+        let special: Vec<(i32, super::ipc::ObjId)> = [TASK_BOOTSTRAP_PORT, TASK_ACCESS_PORT].into_iter().filter_map(|w| k.special.get(&w).map(|&p| (w, p))).collect();
+        let registered = k.registered;
+        let ipc = self.ipc();
+        for &(_, p) in &special {
+            ipc.copy_send(p);
         }
-        Ok(())
+        for p in registered.into_iter().flatten() {
+            ipc.copy_send(p);
+        }
+        let old = self.dtask.child_ports.lock().unwrap_or_else(|e| e.into_inner()).replace((special.into_iter().collect(), registered));
+        debug_assert!(old.is_none(), "a child's ports not taken");
     }
 
     /// `posix_spawn(pid, path, adesc, argv, envp)`.
@@ -325,7 +331,7 @@ impl Kernel {
             }
         }
         // fork1(PROC_CREATE_SPAWN): a new process of this one's, no memory.
-        self.darwin_child_ports()?;
+        self.darwin_child_ports();
         let mut child = self.fork_kernel();
         let pid = self.procs.spawn(self.pid);
         // The spawner's NOTE_FORK, whatever becomes of the child.
@@ -333,11 +339,15 @@ impl Kernel {
         child.pid = pid;
         child.tid = pid;
         child.forget_own_pidfds();
-        child.dtask = self.darwin_fork_task();
         match self.darwin_spawn_child(m, &mut child, attr.as_ref(), file_actions.as_deref(), path, argv, envv) {
             Ok(()) => Ok(Spawned::Child(Box::new(child))),
             Err(e) => {
-                // exit1 with P_LIST_DEADPARENT: gone, unseen by its parent.
+                // exit1 with P_LIST_DEADPARENT: gone, unseen by its parent,
+                // and the rights it inherited with it.
+                let k = std::mem::take(&mut child.dtask.kports);
+                for p in k.special.into_values().chain(k.registered.into_iter().flatten()) {
+                    self.ipc().release_send(p);
+                }
                 child.close_all_fds();
                 self.procs.reap(pid);
                 Err(e)

@@ -289,6 +289,9 @@ pub struct Request {
 pub struct Port {
     pub active: bool,
     pub receiver: Receiver,
+    /// The task whose space holds the receive right, or whose kernel
+    /// serves the object: where its waiters and knotes are.
+    pub owner: TaskKey,
     pub kobject: Option<Kobject>,
     pub mscount: u32,
     pub srights: u32,
@@ -351,6 +354,7 @@ impl Port {
         Port {
             active: true,
             receiver,
+            owner: 0,
             kobject: None,
             mscount: 0,
             srights: 0,
@@ -393,6 +397,8 @@ impl Port {
 #[derive(Clone, Debug, Default)]
 pub struct Pset {
     pub active: bool,
+    /// The task whose space it is in (a set never leaves it).
+    pub owner: TaskKey,
     pub name: u32,
     pub members: Vec<ObjId>,
     pub refs: u32,
@@ -485,6 +491,13 @@ pub struct Ipc {
     pub held: bool,
     /// The table's task key counter while this task holds it.
     next_task_hint: TaskKey,
+    /// Every task's link, while this task holds the table.
+    pub links: HashMap<TaskKey, Arc<TaskLink>>,
+    /// This task's own link, kept for emptying its mailbox.
+    pub link: Option<Arc<TaskLink>>,
+    /// The kernel's own objects every task names alike (the host, host
+    /// privilege and clock ports), while this task holds the table.
+    globals: Vec<(Kobject, ObjId)>,
     /// Notifications owed, oldest first.
     pub outbox: Vec<Notify>,
     /// Guard exceptions raised, for the kernel to deliver.
@@ -507,6 +520,38 @@ impl Drop for Ipc {
 /// A task's key among the system's spaces.
 pub type TaskKey = u64;
 
+/// A thread waiting on a queue, as every task names it: its task's key
+/// and its thread id.
+pub type Waiter = u64;
+
+/// The task of waiter `w`.
+pub fn waiter_task(w: Waiter) -> TaskKey {
+    w >> 32
+}
+
+/// The thread id of waiter `w`.
+pub fn waiter_tid(w: Waiter) -> i32 {
+    w as u32 as i32
+}
+
+/// What a task is told of another task's IPC, for its own kernel to act
+/// on: a thread of its own a queue woke, or a port or set of its own whose
+/// knotes have work.
+#[derive(Clone, Copy, Debug)]
+pub enum Remote {
+    Wake(i32),
+    Knote(ObjId),
+    PsetKnote(ObjId, ObjId),
+}
+
+/// How other tasks reach a task: its mailbox, and the bell of the thread
+/// that empties it.
+#[derive(Debug)]
+pub struct TaskLink {
+    pub mailbox: Mutex<Vec<Remote>>,
+    pub bell: Arc<super::timer::Bell>,
+}
+
 /// What every task shares: the ports and sets (XNU's are kernel objects,
 /// named from any space), and the spaces of tasks not running a call.
 #[derive(Debug, Default)]
@@ -516,6 +561,9 @@ pub struct IpcShared {
     timestamp: u32,
     spaces: HashMap<TaskKey, Space>,
     next_task: TaskKey,
+    queues: msg::Queues,
+    links: HashMap<TaskKey, Arc<TaskLink>>,
+    globals: Vec<(Kobject, ObjId)>,
 }
 
 /// The system's IPC table, taken by one task at a time for the length of a
@@ -591,6 +639,9 @@ impl Ipc {
             self.space = sp;
         }
         self.others = std::mem::take(&mut s.spaces);
+        self.queues = std::mem::take(&mut s.queues);
+        self.links = std::mem::take(&mut s.links);
+        self.globals = std::mem::take(&mut s.globals);
         self.held = true;
         // What stays in `s` is its key counter.
         self.next_task_hint = s.next_task;
@@ -604,7 +655,7 @@ impl Ipc {
         let cell = Arc::clone(self.cell.as_ref().expect("a held table has its cell"));
         let mut spaces = std::mem::take(&mut self.others);
         spaces.insert(self.task, std::mem::take(&mut self.space));
-        let s = IpcShared { objects: std::mem::take(&mut self.objects), next_id: self.next_id, timestamp: self.timestamp, spaces, next_task: self.next_task_hint };
+        let s = IpcShared { objects: std::mem::take(&mut self.objects), next_id: self.next_id, timestamp: self.timestamp, spaces, next_task: self.next_task_hint, queues: std::mem::take(&mut self.queues), links: std::mem::take(&mut self.links), globals: std::mem::take(&mut self.globals) };
         self.held = false;
         cell.put(s);
     }
@@ -613,14 +664,30 @@ impl Ipc {
     /// task gives up its key.
     pub fn space_leave(&mut self) {
         debug_assert!(self.held);
+        self.links.remove(&self.task);
+        self.link = None;
         self.space = Space::new();
         self.task = 0;
         let cell = self.cell.take();
         self.held = false;
         if let Some(cell) = cell {
             let spaces = std::mem::take(&mut self.others);
-            let s = IpcShared { objects: std::mem::take(&mut self.objects), next_id: self.next_id, timestamp: self.timestamp, spaces, next_task: self.next_task_hint };
+            let s = IpcShared { objects: std::mem::take(&mut self.objects), next_id: self.next_id, timestamp: self.timestamp, spaces, next_task: self.next_task_hint, queues: std::mem::take(&mut self.queues), links: std::mem::take(&mut self.links), globals: std::mem::take(&mut self.globals) };
             cell.put(s);
+        }
+    }
+
+    /// The calling task's thread `tid` as a waiter.
+    pub fn waiter(&self, tid: i32) -> Waiter {
+        (self.task << 32) | u64::from(tid as u32)
+    }
+
+    /// Tell task `task` of `r`, and ring the bell of its thread that acts
+    /// on it (a task that has ended hears nothing).
+    pub fn remote(&self, task: TaskKey, r: Remote) {
+        if let Some(l) = self.links.get(&task) {
+            l.mailbox.lock().unwrap_or_else(|e| e.into_inner()).push(r);
+            l.bell.ring();
         }
     }
 
@@ -692,10 +759,23 @@ impl Ipc {
         }
     }
 
+    /// The port of the kernel's object `k`, one for every task (made on
+    /// first use; owned by no task, so any task's kernel serves it).
+    pub fn global_port(&mut self, k: Kobject) -> ObjId {
+        if let Some(&(_, p)) = self.globals.iter().find(|(g, _)| *g == k) {
+            return p;
+        }
+        let p = self.kobject_port(k.clone());
+        self.port_mut(p).owner = 0;
+        self.globals.push((k, p));
+        p
+    }
+
     /// A new port whose receive right is the kernel's (a kernel object).
     pub fn kobject_port(&mut self, k: Kobject) -> ObjId {
         let id = self.new_id();
         let mut p = Port::new(Receiver::Kernel);
+        p.owner = self.task;
         p.kobject = Some(k);
         p.qlimit = QLIMIT_KERNEL;
         self.objects.insert(id, Object::Port(p));
@@ -708,6 +788,7 @@ impl Ipc {
         let id = self.new_id();
         let name = self.space.alloc(Some(id)).ok_or(kr::NO_SPACE)?;
         let mut p = Port::new(Receiver::Space(name));
+        p.owner = self.task;
         let mut t = ty::RECEIVE;
         if make_send {
             p.srights = 1;
@@ -724,7 +805,7 @@ impl Ipc {
     pub fn pset_alloc(&mut self) -> Result<(u32, ObjId), u64> {
         let id = self.new_id();
         let name = self.space.alloc(Some(id)).ok_or(kr::NO_SPACE)?;
-        self.objects.insert(id, Object::Pset(Pset { active: true, name, members: Vec::new(), refs: 1, knotes: 0 }));
+        self.objects.insert(id, Object::Pset(Pset { active: true, owner: self.task, name, members: Vec::new(), refs: 1, knotes: 0 }));
         self.space.lookup_mut_any(name).bits |= ty::PORT_SET;
         Ok((name, id))
     }

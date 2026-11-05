@@ -22,9 +22,6 @@ pub struct Kports {
     /// `itk_task_ports[TASK_FLAVOR_CONTROL]` and `itk_self`.
     pub task: Option<(ObjId, ObjId)>,
     pub task_name: Option<ObjId>,
-    pub host: Option<ObjId>,
-    pub host_priv: Option<ObjId>,
-    pub clock: Option<ObjId>,
     /// Each thread's control port and self port.
     pub threads: HashMap<i32, (ObjId, ObjId)>,
     /// Each thread's special reply port (`ith_special_reply_port`).
@@ -44,15 +41,6 @@ pub const MIG_NO_REPLY: i32 = -305;
 pub const MIG_BAD_ID: i32 = -303;
 
 impl Kernel {
-    fn kport(&mut self, f: fn(&mut Kports) -> &mut Option<ObjId>, k: Kobject) -> ObjId {
-        if let Some(p) = *f(&mut self.dtask.kports) {
-            return p;
-        }
-        let p = self.ipc().kobject_port(k);
-        *f(&mut self.dtask.kports) = Some(p);
-        p
-    }
-
     /// The task's control port and self port, made with the task.
     fn task_ports(&mut self) -> (ObjId, ObjId) {
         if let Some(t) = self.dtask.kports.task {
@@ -81,12 +69,12 @@ impl Kernel {
 
     /// The host port (`realhost.special[HOST_PORT]`).
     pub(crate) fn darwin_host_port(&mut self) -> ObjId {
-        self.kport(|k| &mut k.host, Kobject::Host)
+        self.ipc().global_port(Kobject::Host)
     }
 
     /// The host privilege port.
     pub(crate) fn darwin_host_priv_port(&mut self) -> ObjId {
-        self.kport(|k| &mut k.host_priv, Kobject::HostPriv)
+        self.ipc().global_port(Kobject::HostPriv)
     }
 
     /// The task's host port (`itk_host`), as `set_security_token` sets it
@@ -99,7 +87,7 @@ impl Kernel {
 
     /// The system clock's port.
     pub(crate) fn darwin_clock_port(&mut self) -> ObjId {
-        self.kport(|k| &mut k.clock, Kobject::Clock)
+        self.ipc().global_port(Kobject::Clock)
     }
 
     /// Thread `tid`'s control port and self port (`ipc_thread_init`),
@@ -160,10 +148,18 @@ impl Kernel {
         if !super::ipc::name_valid(name) {
             return false;
         }
-        match self.ipc().translate_send(name) {
-            Ok(p) => self.ipc().port(p).active && self.ipc().port(p).kobject == Some(Kobject::Task),
-            Err(_) => false,
+        let Ok(p) = self.ipc().translate_send(name) else { return false };
+        let ipc = self.ipc();
+        let port = ipc.port(p);
+        if !port.active || port.kobject != Some(Kobject::Task) {
+            return false;
         }
+        if port.owner != ipc.task {
+            let owner = port.owner;
+            self.darwin_unimplemented(format!("a call on another task's IPC space (task key {owner})"));
+            return false;
+        }
+        true
     }
 
     /// `ipc_thread_disable` and `ipc_thread_terminate`: a thread's ports
@@ -184,7 +180,7 @@ impl Kernel {
     /// semaphores destroyed (`semaphore_destroy_all`), its threads' sends
     /// still waiting for room abandoned, its threads' and its own ports
     /// dead (`ipc_thread_terminate`, `ipc_task_terminate`), the send
-    /// rights it held (host, special, registered) released, and its space
+    /// rights it held (special, registered) released, and its space
     /// ended (`ipc_space_terminate`), every right in it with the
     /// notifications that owes; then its space leaves the system's table.
     pub fn darwin_task_terminate(&mut self) {
@@ -199,7 +195,8 @@ impl Kernel {
         for (tid, kmsg) in waiting {
             let ipc = self.ipc();
             let port = kmsg.dest;
-            ipc.mqueue_cancel_room(port, tid);
+            let me = ipc.waiter(tid);
+            ipc.mqueue_cancel_room(port, me);
             ipc.release(port);
             ipc.kmsg_destroy(kmsg, true);
         }
@@ -209,7 +206,7 @@ impl Kernel {
         }
         let k = std::mem::take(&mut self.dtask.kports);
         let task_ports: Vec<ObjId> = k.task.map(|(a, b)| vec![a, b]).unwrap_or_default().into_iter().chain(k.task_name).chain(k.resume).collect();
-        let sends: Vec<ObjId> = [k.host, k.host_priv, k.clock].into_iter().flatten().chain(k.special.values().copied()).chain(k.registered.into_iter().flatten()).collect();
+        let sends: Vec<ObjId> = k.special.values().copied().chain(k.registered.into_iter().flatten()).collect();
         let ipc = self.ipc();
         for p in task_ports {
             ipc.port_mut(p).kobject = None;

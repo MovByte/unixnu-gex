@@ -123,6 +123,8 @@ impl Kernel {
 
     /// Fire every thread call that is due; the next deadline.
     fn darwin_thread_calls_body(&mut self, m: &mut GuestMem<'_>) -> Option<Instant> {
+        // Other tasks' IPC with this one's threads and ports.
+        self.darwin_ipc_remote(m);
         // Signals posted, and pipes changed, from outside a call: their
         // knotes are told.
         if self.darwin_signal_knotes() | self.darwin_pipe_knotes() | self.darwin_vnode_knotes() | self.darwin_proc_knotes() {

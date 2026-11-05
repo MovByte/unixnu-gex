@@ -392,7 +392,8 @@ impl Kernel {
             Err(SendWait::Room(port)) => {
                 let deadline = (options & opt::SEND_TIMEOUT != 0).then(|| Instant::now() + Duration::from_millis(u64::from(timeout)));
                 let tid = self.tid;
-                self.ipc().mqueue_wait_room(port, tid);
+                let me = self.ipc().waiter(tid);
+                self.ipc().mqueue_wait_room(port, me);
                 self.dtask.pending_send_buf.insert(self.tid, (u.msg_addr, u.msg_size));
                 self.darwin_ipc_settle(m);
                 return self.darwin_block(m, Wait { deadline, cont: super::thread::Finish::MachMsg(Cont::Send { port, then }) });
@@ -889,6 +890,16 @@ impl Kernel {
             return Ok(());
         }
         if ipc.port(port).receiver == Receiver::Kernel {
+            let owner = ipc.port(port).owner;
+            if owner != 0 && owner != ipc.task {
+                // ipc_kobject_server runs for any task; here another task's
+                // kernel holds the object's state.
+                ipc.release(port);
+                ipc.kmsg_destroy(kmsg, true);
+                self.darwin_unimplemented(format!("a request to another task's kernel object (task key {owner})"));
+                return Err(SendWait::Failed(mr::SEND_INVALID_DEST, None));
+            }
+            let ipc = &mut self.ipc();
             ipc.port_mut(port).seqno = ipc.port(port).seqno.wrapping_add(1);
             let Some(reply) = self.kobject_server(port, kmsg) else { return Ok(()) };
             let rport = reply.dest;
@@ -939,7 +950,8 @@ impl Kernel {
         let w = RcvWait { object, options: r.options, rcv_size: r.bufs.msg_size, aux_size: r.bufs.aux_size };
         let size_of = |k: &Kmsg| k.size;
         let tid = self.tid;
-        match self.ipc().mqueue_receive(tid, object, w, r.timeout_ms == 0, &size_of) {
+        let me = self.ipc().waiter(tid);
+        match self.ipc().mqueue_receive(me, object, w, r.timeout_ms == 0, &size_of) {
             Some(rcv) => {
                 let res = self.receive_results(m, object, rcv, r.bufs, r.options);
                 self.mach_result(m, res)
@@ -954,11 +966,12 @@ impl Kernel {
 
     /// A blocked `mach_msg` has woken.
     pub(crate) fn darwin_mach_msg_wait_done(&mut self, m: &mut GuestMem<'_>, c: Cont, res: WaitResult) -> Option<SyscallOutcome> {
-        let me = self.tid;
+        let tid = self.tid;
+        let me = self.ipc().waiter(tid);
         match c {
             Cont::Send { port, then } => {
                 let ready = self.ipc().queues.send_ready.remove(&me);
-                let kmsg = self.dtask.pending_send.remove(&me).expect("a waiting send keeps its message");
+                let kmsg = self.dtask.pending_send.remove(&tid).expect("a waiting send keeps its message");
                 let r = match (res, ready) {
                     (WaitResult::Awakened, Some(true)) => {
                         let size = kmsg.size;
@@ -975,11 +988,11 @@ impl Kernel {
                     (WaitResult::TimedOut | WaitResult::Interrupted, _) => {
                         self.ipc().mqueue_cancel_room(port, me);
                         let r = if res == WaitResult::TimedOut { mr::SEND_TIMED_OUT } else { mr::SEND_INTERRUPTED };
-                        let (addr, size) = self.dtask.pending_send_buf.remove(&me).expect("a waiting send keeps its buffer");
+                        let (addr, size) = self.dtask.pending_send_buf.remove(&tid).expect("a waiting send keeps its buffer");
                         r | self.pseudo_receive(m, kmsg, addr, size)
                     }
                 };
-                self.dtask.pending_send_buf.remove(&me);
+                self.dtask.pending_send_buf.remove(&tid);
                 if r == mr::SUCCESS {
                     if let Some(rcv) = then {
                         self.darwin_ipc_settle(m);
@@ -1287,11 +1300,13 @@ impl Kernel {
                 // ipc_kmsg_copyout_reply_object: the send-once right goes;
                 // the receive right's name stands for it.
                 let ipc = &mut self.ipc();
+                let task = ipc.task;
                 let name = if !ipc.port(p).active {
                     super::ipc::PORT_DEAD
                 } else {
+                    // ipc_right_reverse: its receive right in this space.
                     match ipc.port(p).receiver {
-                        Receiver::Space(n) => {
+                        Receiver::Space(n) if ipc.port(p).owner == task => {
                             reply_type = msgt::MAKE_SEND_ONCE;
                             n
                         }
@@ -1424,8 +1439,31 @@ impl Kernel {
     /// woken, guard exceptions raised.
     pub(crate) fn darwin_ipc_settle(&mut self, m: &mut GuestMem<'_>) {
         self.darwin_ipc_notify_drain();
-        for t in std::mem::take(&mut self.ipc().queues.wake) {
-            self.darwin_wake(m, t, WaitResult::Awakened);
+        // Threads and knotes of other tasks are theirs to act on: their
+        // kernels hear of them (`Remote`).
+        let me = self.ipc().task;
+        for w in std::mem::take(&mut self.ipc().queues.wake) {
+            let (task, tid) = (super::ipc::waiter_task(w), super::ipc::waiter_tid(w));
+            if task == me {
+                self.darwin_wake(m, tid, WaitResult::Awakened);
+            } else {
+                self.ipc().remote(task, super::ipc::Remote::Wake(tid));
+            }
+        }
+        let ipc = self.ipc();
+        let knotes = std::mem::take(&mut ipc.queues.knotes);
+        for p in knotes {
+            match ipc.port(p).owner {
+                o if o == me => ipc.queues.knotes.push(p),
+                o => ipc.remote(o, super::ipc::Remote::Knote(p)),
+            }
+        }
+        let psets = std::mem::take(&mut ipc.queues.pset_knotes);
+        for (s, p) in psets {
+            match ipc.pset(s).owner {
+                o if o == me => ipc.queues.pset_knotes.push((s, p)),
+                o => ipc.remote(o, super::ipc::Remote::PsetKnote(s, p)),
+            }
         }
         for (name, g, portguard) in std::mem::take(&mut self.ipc().guards) {
             self.darwin_guard_exception(name, g, portguard);
@@ -1434,6 +1472,28 @@ impl Kernel {
         // their kqueues wake; then the thread requests they made.
         self.darwin_kevent_owed(m);
         self.darwin_workq_settle(m);
+    }
+
+    /// What other tasks' calls left for this task ([`super::ipc::Remote`]):
+    /// its threads woken, its ports' and sets' knotes told.
+    pub(crate) fn darwin_ipc_remote(&mut self, m: &mut GuestMem<'_>) {
+        let Some(link) = self.dtask.ipc_raw.link.clone() else { return };
+        let got = std::mem::take(&mut *link.mailbox.lock().unwrap_or_else(|e| e.into_inner()));
+        if got.is_empty() {
+            return;
+        }
+        let ipc = self.ipc();
+        for r in got {
+            match r {
+                super::ipc::Remote::Wake(tid) => {
+                    let w = ipc.waiter(tid);
+                    ipc.queues.wake.push(w);
+                }
+                super::ipc::Remote::Knote(p) => ipc.queues.knotes.push(p),
+                super::ipc::Remote::PsetKnote(s, p) => ipc.queues.pset_knotes.push((s, p)),
+            }
+        }
+        self.darwin_ipc_settle(m);
     }
 
     /// The notifications owed, sent, with those their sending owes.
