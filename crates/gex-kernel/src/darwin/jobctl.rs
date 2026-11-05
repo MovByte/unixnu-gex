@@ -21,6 +21,17 @@ use crate::syscalls::Kernel;
 /// `stopsigmask`.
 const STOPSIGMASK: u32 = sigmask(dsig::SIGSTOP) | sigmask(dsig::SIGTSTP) | sigmask(dsig::SIGTTIN) | sigmask(dsig::SIGTTOU);
 
+/// `TASK_HOLD_*`: what kind of hold a suspension places or releases.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HoldMode {
+    /// A kernel suspension (a stop, task_suspend2).
+    Normal,
+    /// task_suspend's, counted apart (`legacy_stop_count`).
+    Legacy,
+    /// Every legacy hold left (the resume port's no-senders).
+    LegacyAll,
+}
+
 /// What a thread on its way back to user space does next.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hold {
@@ -173,9 +184,48 @@ impl Kernel {
     /// `task_resume_internal`: one hold fewer (none to release is no
     /// error), and the held threads let go at none.
     fn darwin_task_resume(&mut self) {
-        self.darwin_job_with(|j| j.holds = j.holds.saturating_sub(1));
+        let _ = self.darwin_release_task_hold(HoldMode::Normal);
+    }
+
+    /// `place_task_hold`: one more user stop (a legacy one counted too);
+    /// whether the task was running (and its threads must now be waited
+    /// for, task_wait_locked).
+    pub(crate) fn darwin_place_task_hold(&mut self, mode: HoldMode) -> bool {
+        self.darwin_job_with(|j| {
+            if mode == HoldMode::Legacy {
+                j.legacy += 1;
+            }
+            j.holds += 1;
+            j.holds == 1
+        })
+    }
+
+    /// `release_task_hold`: KERN_FAILURE (`false`) with no hold to
+    /// release; a legacy release takes a legacy hold, and LegacyAll takes
+    /// all of them.
+    pub(crate) fn darwin_release_task_hold(&mut self, mode: HoldMode) -> bool {
+        let ok = self.darwin_job_with(|j| {
+            if j.holds == 0 {
+                return false;
+            }
+            if mode == HoldMode::LegacyAll {
+                if j.legacy >= j.holds {
+                    j.holds = 0;
+                } else {
+                    j.holds -= j.legacy;
+                }
+                j.legacy = 0;
+            } else {
+                if mode == HoldMode::Legacy && j.legacy > 0 {
+                    j.legacy -= 1;
+                }
+                j.holds -= 1;
+            }
+            true
+        });
         // Held threads wait on the host's readiness wake.
         self.fd_activity = true;
+        ok
     }
 
     /// `thread_abort`: a held thread is let go to take its signals.

@@ -288,6 +288,73 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         // task_restartable_ranges_synchronize(task).
         (Kobject::Task, 8000) => restartable_register(k, req),
         (Kobject::Task, 8001) => Reply::ok(Vec::new()),
+        // task_suspend(task): a legacy hold, the caller given a send right
+        // to the task's resume port (whose no-senders releases the legacy
+        // holds left), then a wait for the other threads to stop.
+        (Kobject::Task, 3407) => {
+            let first = k.darwin_place_task_hold(super::jobctl::HoldMode::Legacy);
+            let port = match k.dtask.kports.resume {
+                Some(p) => p,
+                None => {
+                    let p = k.dtask.ipc.kobject_port(Kobject::TaskResume);
+                    k.dtask.kports.resume = Some(p);
+                    p
+                }
+            };
+            // ipc_kobject_make_send_nsrequest, then the right moved out.
+            k.dtask.ipc.port_mut(port).nsrequest_kobject = true;
+            k.dtask.ipc.make_send(port);
+            k.darwin_copyout_send(port);
+            let mut r = Reply::ok(Vec::new());
+            if first {
+                r.defer = Some((k.tid, super::kobject::Deferred::TaskWait { token: None }));
+            }
+            r
+        }
+        // task_resume(task): a legacy hold released, and a send right to
+        // the resume port in the caller's space given up (all of them if
+        // the release failed).
+        (Kobject::Task, 3408) => {
+            let ok = k.darwin_release_task_hold(super::jobctl::HoldMode::Legacy);
+            if let Some(name) = k.dtask.kports.resume.and_then(|p| k.dtask.ipc.space.hash_lookup(p)) {
+                if ok {
+                    k.dtask.ipc.right_dealloc(name);
+                } else {
+                    k.dtask.ipc.right_destroy(name, false, 0);
+                }
+            }
+            Reply::err(if ok { 0 } else { KERN_FAILURE })
+        }
+        // task_suspend2(task) -> suspension token: a hold, answered once the
+        // other threads stop with a send-once right to the resume port
+        // (destroyed unused, it resumes the task).
+        (Kobject::Task, 3436) => {
+            let first = k.darwin_place_task_hold(super::jobctl::HoldMode::Normal);
+            let port = match k.dtask.kports.resume {
+                Some(p) => p,
+                None => {
+                    let p = k.dtask.ipc.kobject_port(Kobject::TaskResume);
+                    k.dtask.kports.resume = Some(p);
+                    p
+                }
+            };
+            k.dtask.ipc.make_sonce(port);
+            if first {
+                let mut r = Reply::ok(Vec::new());
+                r.defer = Some((k.tid, super::kobject::Deferred::TaskWait { token: Some(port) }));
+                return r;
+            }
+            let mut r = Reply::ok(Vec::new());
+            r.ports.push(super::kobject::PortOut::Right(Carried::Port(port), super::ipc::right::msgt::PORT_SEND_ONCE));
+            r
+        }
+        // task_resume2(token), sent to the token itself: its hold
+        // released; the token, the request's destination, is consumed
+        // with it (task_suspension_token_deallocate), unnotified.
+        (Kobject::TaskResume, 3437) => {
+            let ok = k.darwin_release_task_hold(super::jobctl::HoldMode::Normal);
+            Reply::err(if ok { 0 } else { KERN_FAILURE })
+        }
         // thread_get_state(thread, flavor, &old_stateCnt) -> old_state[]
         // (at most THREAD_STATE_MAX, 1296 words).
         (Kobject::Thread(t), 3603) => match (arg(req, 0), arg(req, 1)) {

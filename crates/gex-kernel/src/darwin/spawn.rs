@@ -422,7 +422,7 @@ impl Kernel {
     /// The attributes whose subsystems this kernel does not have yet, each
     /// refused when it asks for something.
     fn darwin_spawn_unported(&mut self, at: &Attr) -> Result<(), Errno> {
-        let mut no = |k: &mut Kernel, what: &str| {
+        let no = |k: &mut Kernel, what: &str| {
             k.darwin_unimplemented(format!("posix_spawn's {what}"));
             Err(Errno::EINVAL)
         };

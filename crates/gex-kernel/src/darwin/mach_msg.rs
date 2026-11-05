@@ -1484,6 +1484,10 @@ impl Kernel {
                 self.mk_timer_port_destroy(port);
                 return;
             }
+            Notify::KobjectSendOnce { port } => {
+                self.kobject_send_once(port);
+                return;
+            }
         };
         let complex = if descs.is_empty() { 0 } else { bits::COMPLEX };
         let k = Kmsg { bits: bits::set(msgt::PORT_SEND_ONCE, 0, 0, complex), size: HEADER + body.len() as u32, dest: to, reply: None, voucher: None, voucher_raw: 0, id: msgid, body, descs, sender: Sender::KERNEL, aux: Vec::new(), keep_alive: false, ppriority: 0, qos_override: 0 };

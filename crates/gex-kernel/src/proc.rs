@@ -197,6 +197,8 @@ pub struct Job {
     /// The task's `user_stop_count`: its threads are held while it is not
     /// zero (`task_suspend_internal`, `task_resume_internal`).
     pub holds: u32,
+    /// The task's `legacy_stop_count`: task_suspend's holds among them.
+    pub legacy: u32,
 }
 
 /// One process, as the table sees it.

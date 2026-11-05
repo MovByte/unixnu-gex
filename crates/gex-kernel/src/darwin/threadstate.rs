@@ -56,7 +56,7 @@ fn words(b: &[u8]) -> Vec<u32> {
 impl Kernel {
     /// `machine_thread_get_state` for a 64-bit thread whose context is at
     /// `c`: the words and the count it answers, or the error.
-    fn machine_thread_get_state(&self, m: &GuestMem<'_>, tid: i32, c: u64, fl: i32, count: u32) -> Result<Vec<u32>, i32> {
+    fn machine_thread_get_state(&self, m: &GuestMem<'_>, c: u64, fl: i32, count: u32) -> Result<Vec<u32>, i32> {
         let need = |n: u32| if count < n { Err(KERN_INVALID_ARGUMENT) } else { Ok(()) };
         let rd = |o: usize| m.read_u64(c + o as u64).unwrap_or(0);
         let state64 = || -> Vec<u32> {
@@ -163,7 +163,7 @@ impl Kernel {
     fn machine_thread_set_state(&mut self, m: &mut GuestMem<'_>, tid: i32, c: u64, fl: i32, w: &[u32]) -> i32 {
         let n = w.len() as u32;
         let u64_at = |i: usize| u64::from(w[i]) | (u64::from(w[i + 1]) << 32);
-        let mut set_state64 = |k: &mut Kernel, m: &mut GuestMem<'_>, s: &[u32]| {
+        let set_state64 = |k: &mut Kernel, m: &mut GuestMem<'_>, s: &[u32]| {
             let at = |i: usize| u64::from(s[i]) | (u64::from(s[i + 1]) << 32);
             for i in 0..29u8 {
                 let _ = m.write_u64(c + ctx::x(i) as u64, at(2 * i as usize));
@@ -277,6 +277,9 @@ impl Kernel {
     /// The state read or written, the thread stopped.
     pub(crate) fn darwin_thread_state_now(&mut self, m: &mut GuestMem<'_>, tid: i32, fl: i32, count: u32, set: Option<Vec<u32>>) -> super::kobject::Reply {
         use super::kobject::Reply;
+        if !self.darwin_thread_alive(tid) {
+            return Reply::err(KERN_TERMINATED);
+        }
         let Some(c) = self.dtask.threads.map.get(&tid).map(|t| t.ctx_addr).filter(|&c| c != 0) else {
             let mut r = Reply::err(KERN_INVALID_ARGUMENT);
             r.unimplemented = Some(format!("thread_get_state of thread {tid}, whose register context is not known"));
@@ -284,7 +287,7 @@ impl Kernel {
         };
         match set {
             Some(w) => Reply::err(self.machine_thread_set_state(m, tid, c, fl, &w)),
-            None => match self.machine_thread_get_state(m, tid, c, fl, count) {
+            None => match self.machine_thread_get_state(m, c, fl, count) {
                 Ok(w) => {
                     let mut out = (w.len() as u32).to_le_bytes().to_vec();
                     for x in w {

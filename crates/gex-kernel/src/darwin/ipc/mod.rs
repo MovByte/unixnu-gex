@@ -231,6 +231,8 @@ pub enum Kobject {
     Semaphore,
     Timer,
     Voucher(super::voucher::VoucherId),
+    /// IKOT_TASK_RESUME: the task's resume port (`itk_resume`).
+    TaskResume,
 }
 
 /// A port's reply semantics (`ip_reply_port_semantics`).
@@ -422,6 +424,10 @@ pub enum Notify {
     KobjectNoSenders { port: ObjId, mscount: u32 },
     /// `MACH_NOTIFY_SEND_ONCE`: a send-once right was destroyed unused.
     SendOnce { to: ObjId },
+    /// A send-once right to a kernel object's port destroyed unused
+    /// (`ipc_kobject_notify_send_once_and_unlock`); the port's reference
+    /// goes with it.
+    KobjectSendOnce { port: ObjId },
     /// `MACH_NOTIFY_DEAD_NAME` for `name`.
     DeadName { to: ObjId, name: u32 },
 }
@@ -699,6 +705,10 @@ impl Ipc {
     fn send_once_notify(&mut self, port: ObjId) {
         let p = self.port_mut(port);
         p.sorights -= 1;
+        if p.active && p.receiver == Receiver::Kernel && p.kobject.is_some() {
+            self.outbox.push(Notify::KobjectSendOnce { port });
+            return;
+        }
         if p.active && p.receiver != Receiver::Kernel {
             self.outbox.push(Notify::SendOnce { to: port });
         }

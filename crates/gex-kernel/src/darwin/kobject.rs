@@ -5,6 +5,7 @@
 use super::ipc::msg::{bits, Desc, Kmsg, Sender};
 use super::ipc::right::{msgt, Carried};
 use super::ipc::{Kobject, ObjId, Receiver};
+use super::jobctl::HoldMode;
 use crate::syscalls::Kernel;
 use std::collections::HashMap;
 
@@ -32,6 +33,8 @@ pub struct Kports {
     pub special: HashMap<i32, ObjId>,
     /// `itk_registered`: `mach_ports_register`'s ports (send rights held).
     pub registered: [Option<ObjId>; 3],
+    /// `itk_resume`: the task's resume port, once a suspension made it.
+    pub resume: Option<ObjId>,
     /// `task_restartable_ranges_register`'s ranges.
     pub restartable: Vec<(u64, u16, u16, u32)>,
 }
@@ -244,13 +247,33 @@ impl Kernel {
         Some(Box::new(k))
     }
 
+    /// `ipc_kobject_notify_send_once_and_unlock`: a send-once right to a
+    /// kernel port destroyed unused; the resume port's releases the hold
+    /// it stood for (`task_suspension_send_once`).
+    pub(crate) fn kobject_send_once(&mut self, port: ObjId) {
+        if self.dtask.ipc.port(port).kobject == Some(Kobject::TaskResume) {
+            self.darwin_release_task_hold(HoldMode::Normal);
+        }
+        self.dtask.ipc.release(port);
+    }
+
     /// `ipc_kobject_notify_no_senders`: a kernel port's last send right went
     /// (the kernel armed the request for its object).
     pub(crate) fn kobject_no_senders(&mut self, port: ObjId, mscount: u32) {
         let k = self.dtask.ipc.port(port).kobject.clone();
-        let _ = mscount;
         match k {
             Some(Kobject::Semaphore) => self.semaphore_no_senders(port),
+            // task_suspension_no_senders: with no new send right made since
+            // (ipc_kobject_nsrequest fails), every legacy hold left goes;
+            // else the request is armed again.
+            Some(Kobject::TaskResume) => {
+                let p = self.dtask.ipc.port_mut(port);
+                if p.srights == 0 && p.mscount == mscount {
+                    self.darwin_release_task_hold(HoldMode::LegacyAll);
+                } else {
+                    p.nsrequest_kobject = true;
+                }
+            }
             Some(Kobject::Voucher(v)) => self.ipc_voucher_no_senders(v),
             other => self.darwin_unimplemented(format!("no-senders for kernel object {other:?}")),
         }
@@ -263,6 +286,10 @@ pub enum Deferred {
     /// `thread_suspend`'s `thread_wait`: success, once the thread is off
     /// its CPU.
     ThreadWait,
+    /// `task_suspend`'s and `task_suspend2`'s `task_wait_locked`: once
+    /// every thread but the caller is off its CPU (`token`: task_suspend2's
+    /// send-once right to the resume port, answered with the reply).
+    TaskWait { token: Option<ObjId> },
     /// `thread_get_state` and `thread_set_state` of a thread held to stop.
     /// (`held`: a stop hold was put on it for this.)
     GetState { flavor: i32, count: u32, held: bool },
@@ -291,16 +318,35 @@ impl Kernel {
         }
     }
 
-    /// The replies waiting for thread `tid` (off its CPU, or gone).
-    pub(crate) fn darwin_pending_replies(&mut self, m: &mut crate::GuestMem<'_>, tid: i32) {
-        if !self.dtask.pending_replies.iter().any(|p| p.target == tid) {
-            return;
+    /// The replies waiting for thread `tid`: those ready now sent.
+    pub(crate) fn darwin_pending_replies(&mut self, m: &mut crate::GuestMem<'_>, _tid: i32) {
+        self.darwin_pending_ready(m);
+    }
+
+    /// Whether a deferred reply can be answered: its thread off its CPU or
+    /// gone (or the caller itself, on its call's way out); for a task wait,
+    /// every other thread.
+    fn pending_is_ready(&self, p: &PendingReply) -> bool {
+        match p.op {
+            Deferred::TaskWait { .. } => self.thread_signals.tids_in_order().into_iter().filter(|&t| t != p.target).all(|t| self.darwin_offcpu(t)),
+            _ => p.target == self.tid || !self.darwin_thread_alive(p.target) || self.darwin_offcpu(p.target),
         }
-        let (mine, rest): (Vec<PendingReply>, Vec<PendingReply>) = std::mem::take(&mut self.dtask.pending_replies).into_iter().partition(|p| p.target == tid);
+    }
+
+    /// Answer the deferred replies that are ready.
+    fn darwin_pending_answer(&mut self, m: &mut crate::GuestMem<'_>) -> bool {
+        let pending = std::mem::take(&mut self.dtask.pending_replies);
+        let (ready, rest): (Vec<PendingReply>, Vec<PendingReply>) = pending.into_iter().partition(|p| self.pending_is_ready(p));
         self.dtask.pending_replies = rest;
-        for p in mine {
+        if ready.is_empty() {
+            return false;
+        }
+        for p in ready {
+            let tid = p.target;
             let reply = match p.op {
                 Deferred::ThreadWait => Reply::ok(Vec::new()),
+                Deferred::TaskWait { token: None } => Reply::ok(Vec::new()),
+                Deferred::TaskWait { token: Some(port) } => Reply { ret: 0, defer: None, out: Vec::new(), ports: vec![PortOut::Right(Carried::Port(port), msgt::PORT_SEND_ONCE)], unimplemented: None },
                 Deferred::GetState { flavor, count, .. } => self.darwin_thread_state_now(m, tid, flavor, count, None),
                 Deferred::SetState { flavor, ref state, .. } => self.darwin_thread_state_now(m, tid, flavor, 0, Some(state.clone())),
             };
@@ -318,15 +364,14 @@ impl Kernel {
             self.darwin_kernel_send(Box::new(k));
         }
         self.darwin_ipc_settle(m);
+        true
     }
 
     /// The replies whose thread is off its CPU now, or is the caller: what
     /// a call that made them answers on its way out.
     pub(crate) fn darwin_pending_ready(&mut self, m: &mut crate::GuestMem<'_>) {
-        let me = self.tid;
-        let ready: Vec<i32> = self.dtask.pending_replies.iter().map(|p| p.target).filter(|&t| t == me || self.darwin_offcpu(t)).collect();
-        for t in ready {
-            self.darwin_pending_replies(m, t);
+        if !self.dtask.pending_replies.is_empty() {
+            self.darwin_pending_answer(m);
         }
     }
 
