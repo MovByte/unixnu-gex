@@ -18,6 +18,7 @@ pub mod aot_only;
 pub mod libprov;
 pub(crate) mod elfprov;
 pub mod aot_share;
+pub mod darwin_image;
 pub mod gl;
 pub mod profile;
 pub mod pe_units;

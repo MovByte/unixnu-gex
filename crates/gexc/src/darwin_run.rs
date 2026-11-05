@@ -7,25 +7,11 @@
 
 use crate::{choose_mem, report_exit, set_wasm_libs, RunArgs};
 use anyhow::{bail, Context, Result};
-use gex_ld::Program;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 
-/// dyld goes above the program, on a 16 MiB boundary.
-fn dyld_base(exe: &gex_ld::Image) -> u64 {
-    const ALIGN: u64 = 16 << 20;
-    (exe.brk + ALIGN + ALIGN - 1) & !(ALIGN - 1)
-}
-
 pub fn run(mut ra: RunArgs, bytes: &[u8]) -> Result<ExitCode> {
-    let (m, exe) = gex_ld::macho::load(bytes, gex_ld::macho::PIE_BASE).with_context(|| format!("loading {}", ra.path))?;
-    ra.opts.darwin_platform = (m.platform.unwrap_or(0), m.sdk.unwrap_or(0));
-    if let Some(gex_ld::macho::Entry::Main { stacksize, .. }) = &m.entry {
-        ra.opts.darwin_stacksize = *stacksize;
-    }
-    ra.opts.darwin_dylinker = m.dylinker.clone();
-    ra.opts.darwin_code_signature = m.code_signature.and_then(|(o, n)| bytes.get(o as usize..(o as usize).checked_add(n as usize)?)).map(<[u8]>::to_vec);
     let root = ra.opts.sysroot.clone();
     // The program's path as the guest sees it: inside the root when there
     // is one.
@@ -33,31 +19,32 @@ pub fn run(mut ra: RunArgs, bytes: &[u8]) -> Result<ExitCode> {
         Some(r) => Path::new(&ra.path).strip_prefix(r).map(|p| format!("/{}", p.display())).unwrap_or_else(|_| ra.path.clone()),
         None => ra.path.clone(),
     };
-    let interp = match &m.dylinker {
-        None => None,
-        Some(dyld) => {
-            let Some(root) = &root else {
-                bail!("{} is a dynamic Darwin program (it names {dyld}); give the Darwin root with --sysroot", ra.path);
-            };
-            let host = root.join(dyld.trim_start_matches('/'));
-            let dbytes = std::fs::read(&host).with_context(|| format!("reading {}", host.display()))?;
-            let (dm, di) = gex_ld::macho::load(&dbytes, dyld_base(&exe)).with_context(|| format!("loading {}", host.display()))?;
-            // dyld's image list, which the kernel names at exec.
-            if let Some(s) = dm.section("__DATA_DIRTY", "__all_image_info").or_else(|| dm.section("__DATA", "__all_image_info")) {
-                ra.opts.darwin_dyld_infos = s.addr.wrapping_add(di.bias);
-            }
-            let cache = match std::env::var_os("GEX_DARWIN_CACHE") {
-                Some(p) => PathBuf::from(p),
-                None => root.join(gex_kernel::darwin::CACHE_PATH.trim_start_matches('/')),
-            };
-            if !cache.exists() {
-                bail!("no shared cache at {} (set GEX_DARWIN_CACHE)", cache.display());
-            }
-            ra.opts.darwin_cache = Some(cache);
-            Some(di)
-        }
+    // dyld, from the Darwin root.
+    let read = |p: &str| -> Result<Vec<u8>> {
+        let Some(root) = &root else {
+            bail!("{} is a dynamic Darwin program (it names {p}); give the Darwin root with --sysroot", ra.path);
+        };
+        let host = root.join(p.trim_start_matches('/'));
+        std::fs::read(&host).with_context(|| format!("reading {}", host.display()))
     };
-    let program = Program { exe, interp, direct: None };
+    let img = gex_native::darwin_image::load(bytes, &ra.path, &read)?;
+    ra.opts.darwin_platform = img.platform;
+    ra.opts.darwin_code_signature = img.code_signature;
+    ra.opts.darwin_stacksize = img.stacksize;
+    ra.opts.darwin_dylinker = img.dylinker;
+    ra.opts.darwin_dyld_infos = img.dyld_infos;
+    if img.program.interp.is_some() {
+        let root = root.as_ref().expect("a root for dyld");
+        let cache = match std::env::var_os("GEX_DARWIN_CACHE") {
+            Some(p) => PathBuf::from(p),
+            None => root.join(gex_kernel::darwin::CACHE_PATH.trim_start_matches('/')),
+        };
+        if !cache.exists() {
+            bail!("no shared cache at {} (set GEX_DARWIN_CACHE)", cache.display());
+        }
+        ra.opts.darwin_cache = Some(cache);
+    }
+    let program = img.program;
     let mut argv = vec![ra.argv0.clone().unwrap_or_else(|| guest_path.clone())];
     argv.append(&mut ra.guest_args);
     ra.opts.args = argv;
