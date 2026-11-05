@@ -892,13 +892,23 @@ impl Kernel {
         if ipc.port(port).receiver == Receiver::Kernel {
             let owner = ipc.port(port).owner;
             if owner != 0 && owner != ipc.task {
-                // ipc_kobject_server runs for any task; here another task's
-                // kernel holds the object's state.
-                ipc.release(port);
-                ipc.kmsg_destroy(kmsg, true);
-                self.darwin_unimplemented(format!("a request to another task's kernel object (task key {owner})"));
-                return Err(SendWait::Failed(mr::SEND_INVALID_DEST, None));
+                // ipc_kobject_server, for another task's object: its kernel
+                // holds the object's state, and serves the request.
+                let caller = ipc.task;
+                if !ipc.remote(owner, super::ipc::Remote::Kobject { kmsg, options, caller }) {
+                    unreachable!("an active kernel port's task has its link");
+                }
+                return Ok(());
             }
+            return self.kobject_send(port, kmsg, options, timeout_zero);
+        }
+        self.mqueue_send(kmsg, options, timeout_zero)
+    }
+
+    /// `ipc_kobject_server` for a request to this task's (or the kernel's)
+    /// object `port`, and the reply sent.
+    pub(crate) fn kobject_send(&mut self, port: ObjId, kmsg: Box<Kmsg>, options: u64, timeout_zero: bool) -> Result<(), SendWait> {
+        {
             let ipc = &mut self.ipc();
             ipc.port_mut(port).seqno = ipc.port(port).seqno.wrapping_add(1);
             let Some(reply) = self.kobject_server(port, kmsg) else { return Ok(()) };
@@ -910,7 +920,7 @@ impl Kernel {
                 return Ok(());
             }
             // A kernel reply that cannot be queued is destroyed.
-            return match self.mqueue_send(reply, options | opt::SEND_ALWAYS, timeout_zero) {
+            match self.mqueue_send(reply, options | opt::SEND_ALWAYS, timeout_zero) {
                 Err(SendWait::Failed(_, Some(k))) => {
                     let ipc = &mut self.ipc();
                     ipc.release(k.dest);
@@ -918,9 +928,8 @@ impl Kernel {
                     Ok(())
                 }
                 _ => Ok(()),
-            };
+            }
         }
-        self.mqueue_send(kmsg, options, timeout_zero)
     }
 
     /// `ipc_mqueue_send_locked` and the post.
@@ -1455,14 +1464,18 @@ impl Kernel {
         for p in knotes {
             match ipc.port(p).owner {
                 o if o == me => ipc.queues.knotes.push(p),
-                o => ipc.remote(o, super::ipc::Remote::Knote(p)),
+                o => {
+                    ipc.remote(o, super::ipc::Remote::Knote(p));
+                }
             }
         }
         let psets = std::mem::take(&mut ipc.queues.pset_knotes);
         for (s, p) in psets {
             match ipc.pset(s).owner {
                 o if o == me => ipc.queues.pset_knotes.push((s, p)),
-                o => ipc.remote(o, super::ipc::Remote::PsetKnote(s, p)),
+                o => {
+                    ipc.remote(o, super::ipc::Remote::PsetKnote(s, p));
+                }
             }
         }
         for (name, g, portguard) in std::mem::take(&mut self.ipc().guards) {
@@ -1482,8 +1495,8 @@ impl Kernel {
         if got.is_empty() {
             return;
         }
-        let ipc = self.ipc();
         for r in got {
+            let ipc = self.ipc();
             match r {
                 super::ipc::Remote::Wake(tid) => {
                     let w = ipc.waiter(tid);
@@ -1491,8 +1504,21 @@ impl Kernel {
                 }
                 super::ipc::Remote::Knote(p) => ipc.queues.knotes.push(p),
                 super::ipc::Remote::PsetKnote(s, p) => ipc.queues.pset_knotes.push((s, p)),
+                // Served as from no thread of this task, for the caller.
+                super::ipc::Remote::Kobject { kmsg, options, caller } => {
+                    let (tid, kcaller) = (self.tid, self.dtask.kcaller);
+                    self.tid = 0;
+                    self.dtask.kcaller = caller;
+                    let port = kmsg.dest;
+                    if let Err(SendWait::Failed(_, Some(k))) = self.kobject_send(port, kmsg, options, false) {
+                        self.ipc().kmsg_destroy(k, false);
+                    }
+                    self.tid = tid;
+                    self.dtask.kcaller = kcaller;
+                }
             }
         }
+        self.darwin_pending_ready(m);
         self.darwin_ipc_settle(m);
     }
 

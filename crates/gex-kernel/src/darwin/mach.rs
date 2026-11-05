@@ -462,12 +462,22 @@ impl Kernel {
             }
             trap::PID_FOR_TASK => {
                 // port_name_to_task_name: any flavor of this task's ports.
-                let ok = super::ipc::name_valid(w(0))
-                    && self.ipc().translate_send(w(0)).is_ok_and(|p| {
+                let owner = if super::ipc::name_valid(w(0)) {
+                    self.ipc().translate_send(w(0)).ok().and_then(|p| {
                         let p = self.ipc().port(p);
-                        p.active && matches!(p.kobject, Some(super::ipc::Kobject::Task | super::ipc::Kobject::TaskName))
-                    });
-                let (pid, r) = if ok { (self.pid, kr::SUCCESS) } else { (-1, kr::FAILURE) };
+                        (p.active && matches!(p.kobject, Some(super::ipc::Kobject::Task | super::ipc::Kobject::TaskName))).then_some(p.owner)
+                    })
+                } else {
+                    None
+                };
+                // The pid of the task the port is, this one's or another's.
+                let my_pid = self.pid;
+                let ipc = self.ipc();
+                let pid = owner.and_then(|o| if o == ipc.task { Some(my_pid) } else { ipc.links.get(&o).map(|l| l.pid) });
+                let (pid, r) = match pid {
+                    Some(pid) => (pid, kr::SUCCESS),
+                    None => (-1, kr::FAILURE),
+                };
                 let _ = m.write_u32(a[1], pid as u32);
                 r
             }
@@ -510,8 +520,8 @@ impl Kernel {
             }
             trap::HOST_CREATE_MACH_VOUCHER => self.host_create_mach_voucher_trap(m, w(0), a[1], a[2] as i32, a[3]),
             trap::MACH_VOUCHER_EXTRACT_ATTR_RECIPE => self.mach_voucher_extract_attr_recipe_trap(m, w(0), w(1), a[2], a[3]),
+            trap::TASK_NAME_FOR_PID => self.task_name_for_pid(m, w(0), a[1] as i32, a[2]),
             trap::CLOCK_SLEEP
-            | trap::TASK_NAME_FOR_PID
             | trap::TASK_FOR_PID
             | trap::DEBUG_CONTROL_PORT_FOR_PID
             | trap::IOKIT_USER_CLIENT => {
@@ -520,6 +530,48 @@ impl Kernel {
             }
             _ => return None,
         })
+    }
+
+    /// `task_name_for_pid(target_tport, pid, t)` (vm_unix.c): a send right
+    /// to process `pid`'s task name port, for a caller holding some task's
+    /// control port, when the process is live and is the caller, or the
+    /// caller is root, or both have the same uid (and real uid: a process
+    /// has one uid here), or the caller has the
+    /// com.apple.system-task-ports.name.safe entitlement; else null and
+    /// KERN_FAILURE.
+    fn task_name_for_pid(&mut self, m: &mut GuestMem<'_>, target: u32, pid: i32, at: u64) -> u64 {
+        let ipc = self.ipc();
+        // port_name_to_task: any task's control port.
+        let is_task = super::ipc::name_valid(target)
+            && ipc.translate_send(target).is_ok_and(|p| {
+                let p = ipc.port(p);
+                p.active && p.kobject == Some(super::ipc::Kobject::Task)
+            });
+        if !is_task {
+            let _ = m.write_u32(at, 0);
+            return kr::FAILURE;
+        }
+        let me = self.pid;
+        let uid = self.creds.uid();
+        let allowed = self.procs.live_nice(pid).is_some_and(|(tuid, _)| pid == me || uid == 0 || tuid == uid || self.darwin_task_entitled("com.apple.system-task-ports.name.safe"));
+        if !allowed {
+            let _ = m.write_u32(at, 0);
+            return kr::FAILURE;
+        }
+        // proc_task: the process's task, if it has one here.
+        let ipc = self.ipc();
+        let task = if pid == me { Some(ipc.task) } else { ipc.links.iter().find(|(_, l)| l.pid == pid).map(|(&t, _)| t) };
+        let port = task.and_then(|t| ipc.task_name_port(t));
+        // convert_task_name_to_port, ipc_port_copyout_send.
+        let name = match port {
+            Some(p) => {
+                self.ipc().make_send(p);
+                self.darwin_copyout_send(p)
+            }
+            None => 0,
+        };
+        let _ = m.write_u32(at, name);
+        kr::SUCCESS
     }
 
     /// A `_kernelrpc` trap on the task's space, after the target check.

@@ -448,17 +448,19 @@ impl Ipc {
             self.object_destroy(c, t);
             return Err(kr::INVALID_CAPABILITY);
         }
-        // ipc_kobject_label_check: a labeled control port is substituted
-        // by its immovable equivalent, the space being its task's; any
-        // right but a send right to it is refused.
+        // ipc_kobject_label_check: any right but a send right to a labeled
+        // control port is refused; a send right is substituted by the
+        // immovable equivalent when the space is the object's task's.
         if let Some(alt) = self.port(port).subst {
             if t != msgt::PORT_SEND {
                 self.object_destroy(c, t);
                 return Err(kr::INVALID_CAPABILITY);
             }
-            self.release_send(port);
-            self.make_send(alt);
-            port = alt;
+            if self.port(port).owner == self.task {
+                self.release_send(port);
+                self.make_send(alt);
+                port = alt;
+            }
         }
         let name = match (t != msgt::PORT_SEND_ONCE).then(|| self.right_reverse(port)).flatten() {
             Some(n) => n,

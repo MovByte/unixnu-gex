@@ -21,7 +21,6 @@ use std::collections::HashMap;
 pub struct Kports {
     /// `itk_task_ports[TASK_FLAVOR_CONTROL]` and `itk_self`.
     pub task: Option<(ObjId, ObjId)>,
-    pub task_name: Option<ObjId>,
     /// Each thread's control port and self port.
     pub threads: HashMap<i32, (ObjId, ObjId)>,
     /// Each thread's special reply port (`ith_special_reply_port`).
@@ -154,12 +153,9 @@ impl Kernel {
         if !port.active || port.kobject != Some(Kobject::Task) {
             return false;
         }
-        if port.owner != ipc.task {
-            let owner = port.owner;
-            self.darwin_unimplemented(format!("a call on another task's IPC space (task key {owner})"));
-            return false;
-        }
-        true
+        // port_name_to_current_task_noref: a trap acts on the calling task
+        // only (libsystem sends another task's request as a message).
+        port.owner == ipc.task
     }
 
     /// `ipc_thread_disable` and `ipc_thread_terminate`: a thread's ports
@@ -205,7 +201,8 @@ impl Kernel {
             self.darwin_thread_ports_terminate(t);
         }
         let k = std::mem::take(&mut self.dtask.kports);
-        let task_ports: Vec<ObjId> = k.task.map(|(a, b)| vec![a, b]).unwrap_or_default().into_iter().chain(k.task_name).chain(k.resume).collect();
+        let name = self.ipc().task_name_port_take();
+        let task_ports: Vec<ObjId> = k.task.map(|(a, b)| vec![a, b]).unwrap_or_default().into_iter().chain(name).chain(k.resume).collect();
         let sends: Vec<ObjId> = k.special.values().copied().chain(k.registered.into_iter().flatten()).collect();
         let ipc = self.ipc();
         for p in task_ports {

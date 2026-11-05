@@ -537,11 +537,13 @@ pub fn waiter_tid(w: Waiter) -> i32 {
 /// What a task is told of another task's IPC, for its own kernel to act
 /// on: a thread of its own a queue woke, or a port or set of its own whose
 /// knotes have work.
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub enum Remote {
     Wake(i32),
     Knote(ObjId),
     PsetKnote(ObjId, ObjId),
+    /// A request to one of its kernel objects, from task `caller`.
+    Kobject { kmsg: Box<msg::Kmsg>, options: u64, caller: TaskKey },
 }
 
 /// How other tasks reach a task: its mailbox, and the bell of the thread
@@ -550,6 +552,10 @@ pub enum Remote {
 pub struct TaskLink {
     pub mailbox: Mutex<Vec<Remote>>,
     pub bell: Arc<super::timer::Bell>,
+    /// The task's process.
+    pub pid: i32,
+    /// Its name port (`itk_task_ports[TASK_FLAVOR_NAME]`), once made.
+    pub name_port: Mutex<Option<ObjId>>,
 }
 
 /// What every task shares: the ports and sets (XNU's are kernel objects,
@@ -684,11 +690,44 @@ impl Ipc {
 
     /// Tell task `task` of `r`, and ring the bell of its thread that acts
     /// on it (a task that has ended hears nothing).
-    pub fn remote(&self, task: TaskKey, r: Remote) {
-        if let Some(l) = self.links.get(&task) {
-            l.mailbox.lock().unwrap_or_else(|e| e.into_inner()).push(r);
-            l.bell.ring();
+    pub fn remote(&self, task: TaskKey, r: Remote) -> bool {
+        let Some(l) = self.links.get(&task) else { return false };
+        l.mailbox.lock().unwrap_or_else(|e| e.into_inner()).push(r);
+        l.bell.ring();
+        true
+    }
+
+    /// Task `task`'s name port, made (as that task's object) if it has
+    /// none yet.
+    pub fn task_name_port(&mut self, task: TaskKey) -> Option<ObjId> {
+        let link = Arc::clone(self.links.get(&task)?);
+        let mut slot = link.name_port.lock().unwrap_or_else(|e| e.into_inner());
+        Some(*slot.get_or_insert_with(|| {
+            let p = self.kobject_port(Kobject::TaskName);
+            self.port_mut(p).owner = task;
+            p
+        }))
+    }
+
+    /// This task's name port taken from its link, for its end.
+    pub fn task_name_port_take(&mut self) -> Option<ObjId> {
+        self.link.as_ref()?.name_port.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    /// Run `f` on task `task`'s space, as if it were this task's (this
+    /// task's own for its own key).
+    pub fn with_space<R>(&mut self, task: TaskKey, f: impl FnOnce(&mut Ipc) -> R) -> Option<R> {
+        if task == 0 || task == self.task {
+            return Some(f(self));
         }
+        let space = self.others.remove(&task)?;
+        let own = std::mem::replace(&mut self.space, space);
+        let me = std::mem::replace(&mut self.task, task);
+        let r = f(self);
+        self.task = me;
+        let space = std::mem::replace(&mut self.space, own);
+        self.others.insert(task, space);
+        Some(r)
     }
 
     pub(crate) fn new_id_pub(&mut self) -> ObjId {

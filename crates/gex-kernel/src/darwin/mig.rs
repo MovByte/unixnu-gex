@@ -252,8 +252,11 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             o.extend_from_slice(&(t.subsec_nanos() as i32).to_le_bytes());
             Reply::ok(o)
         }
-        // task_info(task, flavor, out, &count)
-        (Kobject::Task, 3405) => match (arg(req, 0), arg(req, 1)) {
+        // task_info(task_name, flavor, out, &count): task_info_from_user
+        // takes any flavor of port, but TASK_DYLD_INFO needs the read port
+        // at least (a name port gives TASK_NULL).
+        (Kobject::Task | Kobject::TaskName, 3405) => match (arg(req, 0), arg(req, 1)) {
+            (Some(17), Some(_)) if matches!(obj, Kobject::TaskName) => Reply::err(KERN_INVALID_ARGUMENT),
             (Some(flavor), Some(count)) => task_info(flavor, count as u32, k.darwin_dyld_infos, k.darwin_audit_token()),
             _ => bad(),
         },
@@ -305,10 +308,14 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
                     p
                 }
             };
-            // ipc_kobject_make_send_nsrequest, then the right moved out.
+            // ipc_kobject_make_send_nsrequest, then the right moved out
+            // into the caller's space.
             k.ipc().port_mut(port).nsrequest_kobject = true;
             k.ipc().make_send(port);
-            k.darwin_copyout_send(port);
+            let caller = k.dtask.kcaller;
+            k.ipc().with_space(caller, |ipc| {
+                let _ = ipc.object_copyout(Carried::Port(port), super::ipc::right::msgt::PORT_SEND, None);
+            });
             let mut r = Reply::ok(Vec::new());
             if first {
                 r.defer = Some((k.tid, super::kobject::Deferred::TaskWait { token: None }));
@@ -320,13 +327,17 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         // the release failed).
         (Kobject::Task, 3408) => {
             let ok = k.darwin_release_task_hold(super::jobctl::HoldMode::Legacy);
-            if let Some(name) = k.dtask.kports.resume.and_then(|p| k.ipc().space.hash_lookup(p)) {
-                if ok {
-                    k.ipc().right_dealloc(name);
-                } else {
-                    k.ipc().right_destroy(name, false, 0);
+            // The right is the caller's, in the caller's space.
+            let (resume, caller) = (k.dtask.kports.resume, k.dtask.kcaller);
+            k.ipc().with_space(caller, |ipc| {
+                if let Some(name) = resume.and_then(|p| ipc.space.hash_lookup(p)) {
+                    if ok {
+                        ipc.right_dealloc(name);
+                    } else {
+                        ipc.right_destroy(name, false, 0);
+                    }
                 }
-            }
+            });
             Reply::err(if ok { 0 } else { KERN_FAILURE })
         }
         // task_suspend2(task) -> suspension token: a hold, answered once the
@@ -563,14 +574,9 @@ fn task_get_special_port(k: &mut Kernel, which: i32) -> Reply {
             Reply::port(Carried::Port(p))
         }
         TASK_NAME_PORT => {
-            let p = match k.dtask.kports.task_name {
-                Some(p) => p,
-                None => {
-                    let p = k.ipc().kobject_port(Kobject::TaskName);
-                    k.dtask.kports.task_name = Some(p);
-                    p
-                }
-            };
+            let ipc = k.ipc();
+            let me = ipc.task;
+            let p = ipc.task_name_port(me).expect("a task holding the table has its link");
             k.ipc().make_send(p);
             Reply::port(Carried::Port(p))
         }

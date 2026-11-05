@@ -429,8 +429,9 @@ impl Kernel {
         for t in tids {
             self.darwin_thread_ports_terminate(t);
         }
+        let name = self.ipc().task_name_port_take();
         let k = &mut self.dtask.kports;
-        let task_ports: Vec<_> = k.task.take().map(|(a, b)| vec![a, b]).unwrap_or_default().into_iter().chain(k.task_name.take()).collect();
+        let task_ports: Vec<_> = k.task.take().map(|(a, b)| vec![a, b]).unwrap_or_default().into_iter().chain(name).collect();
         let ipc = &mut self.ipc();
         for p in task_ports {
             ipc.port_mut(p).kobject = None;

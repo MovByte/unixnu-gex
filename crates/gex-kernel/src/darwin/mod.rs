@@ -88,6 +88,9 @@ pub struct Task {
     /// Reached through [`crate::syscalls::Kernel::ipc`], which takes the
     /// system's IPC table for the call.
     pub ipc_raw: ipc::Ipc,
+    /// The task whose request to one of this task's kernel objects is
+    /// being served (0: this task's own).
+    pub kcaller: ipc::TaskKey,
     /// The send rights the next child task inherits (`ipc_task_init`):
     /// its special ports by kind, and its registered ports.
     pub child_ports: std::sync::Mutex<Option<(std::collections::HashMap<i32, ipc::ObjId>, [Option<ipc::ObjId>; 3])>>,
@@ -169,8 +172,18 @@ impl crate::syscalls::Kernel {
             let bell = self.dtask.timers.bell();
             let ipc = &mut self.dtask.ipc_raw;
             if !ipc.link.as_ref().is_some_and(|l| std::sync::Arc::ptr_eq(&l.bell, &bell)) {
-                let link = std::sync::Arc::new(ipc::TaskLink { mailbox: Default::default(), bell });
+                // What other tasks left for the link it replaces (an exec's
+                // new task has a new bell) goes on to the new one, with a
+                // name port made since the exec ended the old task's.
+                let old = ipc.link.take();
+                let pending = old.as_ref().map(|l| std::mem::take(&mut *l.mailbox.lock().unwrap_or_else(|e| e.into_inner()))).unwrap_or_default();
+                let name_port = old.and_then(|l| l.name_port.lock().unwrap_or_else(|e| e.into_inner()).take());
+                let ring = !pending.is_empty();
+                let link = std::sync::Arc::new(ipc::TaskLink { mailbox: std::sync::Mutex::new(pending), bell, pid: self.pid, name_port: std::sync::Mutex::new(name_port) });
                 ipc.links.insert(ipc.task, std::sync::Arc::clone(&link));
+                if ring {
+                    link.bell.ring();
+                }
                 ipc.link = Some(link);
             }
         }
