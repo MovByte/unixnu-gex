@@ -2901,6 +2901,11 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         fork_dl_tls: Mutex::new(crate::dylink::fork_tls(store.as_context().data())),
     });
     note_live_process(&child_cx);
+    // A Darwin child's thread calls (its timers, its knotes' and its
+    // workqueue's) are its own, as a new image's are.
+    if child_cx.kernel.lock().unwrap_or_else(|e| e.into_inner()).darwin {
+        start_darwin_thread_calls(Arc::downgrade(&child_cx.kernel), child_cx.memory.clone());
+    }
     let status = {
         let k = cx.kernel.lock().unwrap_or_else(|e| e.into_inner());
         k.procs

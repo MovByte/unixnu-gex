@@ -2,8 +2,9 @@
 // zero (its x1 set) with this process as its parent; the child has the
 // descriptors but not the kqueue (FG_CONFINED), a task of its own whose
 // ports work (libSystem's fork handlers set them up again in its new
-// space), and its end is the parent's to collect; the parent's EVFILT_PROC
-// knote on itself hears NOTE_FORK.
+// space) and thread calls (a kqueue timer fires in it), and its end is the
+// parent's to collect; the parent's EVFILT_PROC knote on itself hears
+// NOTE_FORK.
 
 #include <errno.h>
 #include <fcntl.h>
@@ -37,6 +38,11 @@ int main(void) {
         else {
             int who = -1;
             if (pid_for_task(mach_task_self(), &who) != KERN_SUCCESS || who != getpid()) say = "child: its task port";
+            int kq2 = kqueue();
+            struct kevent t;
+            EV_SET(&t, 1, EVFILT_TIMER, EV_ADD | EV_ONESHOT, 0, 50, 0);
+            struct timespec two = {2, 0};
+            if (kevent(kq2, &t, 1, &t, 1, &two) != 1 || t.filter != EVFILT_TIMER) say = "child: a timer";
         }
         write(p[1], say, strlen(say));
         _exit(5);
