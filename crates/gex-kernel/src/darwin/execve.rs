@@ -456,8 +456,8 @@ impl Kernel {
         self.darwin_finish = None;
         self.darwin_pipe_sigpipe = None;
         self.darwin_execsigs();
-        // An exec's NOTE_EXEC (a spawn's came in its spawner's call).
-        if spawn.is_none() {
+        // An exec's NOTE_EXEC (a new process's came in its spawner's call).
+        if spawn.is_none_or(|s| s.flags & super::spawn::flag::SETEXEC != 0) {
             crate::procnote::post(self.pid, crate::procnote::note::EXEC);
         }
         if let Some(sp) = spawn {

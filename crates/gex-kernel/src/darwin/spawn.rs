@@ -124,10 +124,19 @@ impl Attr {
 /// `POSIX_SPAWN_CLOEXEC_DEFAULT` lets through (`UF_INHERIT`).
 #[derive(Clone, Debug, Default)]
 pub struct After {
+    /// The spawn's flags (POSIX_SPAWN_SETEXEC: this process's own exec).
     pub flags: u16,
     pub sigmask: u32,
     pub sigdefault: u32,
     pub inherit: Vec<i32>,
+}
+
+/// What a spawn made.
+enum Spawned {
+    /// A new process, to be started.
+    Child(Box<Kernel>),
+    /// This process's own exec (POSIX_SPAWN_SETEXEC).
+    Exec(Box<Image>),
 }
 
 /// A small memory holding a path, for the calls that read one from the
@@ -197,10 +206,20 @@ impl Kernel {
     /// `posix_spawn(pid, path, adesc, argv, envp)`.
     pub(crate) fn darwin_posix_spawn(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> SyscallOutcome {
         match self.darwin_spawn(m, a) {
-            Ok(child) => {
-                self.darwin_spawned = Some(Box::new(child));
+            Ok(Spawned::Child(child)) => {
+                self.darwin_spawned = Some(child);
                 let _ = super::set_result(m, self.ctx_addr, 0);
                 SyscallOutcome::DarwinSpawn { pid_addr: a[0] }
+            }
+            // POSIX_SPAWN_SETEXEC: this process's exec, as execve's, with no
+            // pid to give.
+            Ok(Spawned::Exec(img)) => {
+                self.map_io().flush_all_shared(m);
+                let lossy = |v: Vec<&[u8]>| v.into_iter().map(|s| String::from_utf8_lossy(s).into_owned()).collect::<Vec<_>>();
+                let (argv, envp) = (lossy(img.strings.args()), lossy(img.strings.envs()));
+                let path = img.path.clone();
+                self.darwin_exec = Some(img);
+                SyscallOutcome::Exec { path, argv, envp }
             }
             Err(e) => {
                 let _ = super::set_result(m, self.ctx_addr, e.as_return());
@@ -209,7 +228,7 @@ impl Kernel {
         }
     }
 
-    fn darwin_spawn(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<Kernel, Errno> {
+    fn darwin_spawn(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<Spawned, Errno> {
         let (path, adesc, argv, envv) = (a[1], a[2], a[3], a[4]);
         let mut attr = None;
         let mut file_actions = None;
@@ -293,15 +312,14 @@ impl Kernel {
             if at.apptype & PROC_TYPE_MASK == PROC_TYPE_DRIVER && !self.dtask.codesign.as_ref().is_some_and(|c| c.entitled("com.apple.private.spawn-driver")) {
                 return Err(Errno::EPERM);
             }
-            if at.flags & flag::SETEXEC != 0 {
-                self.darwin_unimplemented("posix_spawn with POSIX_SPAWN_SETEXEC".into());
-                return Err(Errno::EINVAL);
-            }
-            if coal_info != 0 {
+            if coal_info != 0 && at.flags & flag::SETEXEC == 0 {
                 self.darwin_unimplemented("posix_spawn into coalitions".into());
                 return Err(Errno::EINVAL);
             }
             self.darwin_spawn_unported(at)?;
+            if at.flags & flag::SETEXEC != 0 {
+                return self.darwin_spawn_setexec(m, at, file_actions.as_deref(), path, argv, envv).map(Spawned::Exec);
+            }
         }
         // fork1(PROC_CREATE_SPAWN): a new process of this one's, no memory.
         self.darwin_child_ports()?;
@@ -314,7 +332,7 @@ impl Kernel {
         child.forget_own_pidfds();
         child.dtask = self.darwin_fork_task();
         match self.darwin_spawn_child(m, &mut child, attr.as_ref(), file_actions.as_deref(), path, argv, envv) {
-            Ok(()) => Ok(child),
+            Ok(()) => Ok(Spawned::Child(Box::new(child))),
             Err(e) => {
                 // exit1 with P_LIST_DEADPARENT: gone, unseen by its parent.
                 child.close_all_fds();
@@ -336,8 +354,9 @@ impl Kernel {
         let binprefs = attr.filter(|a| a.binprefs[0].0 != 0).map(|a| a.binprefs);
         let mut img: Image = child.darwin_exec_activate_with(m, path, argv, envv, binprefs)?;
         if let Some(at) = attr {
+            // setpgid() and setsid_internal() as the child calls them.
             if at.flags & flag::SETPGROUP != 0 {
-                child.procs.setpgid(child.pid, child.pid, at.pgroup)?;
+                child.procs.darwin_setpgid(child.pid, child.pid, at.pgroup)?;
             }
             if at.flags & flag::SETSID != 0 {
                 child.procs.setsid(child.pid)?;
@@ -346,6 +365,47 @@ impl Kernel {
         img.spawn = Some(after);
         child.darwin_exec = Some(Box::new(img));
         Ok(())
+    }
+
+    /// POSIX_SPAWN_SETEXEC: `execve` with options (cloneproc's
+    /// CLONEPROC_EXEC). The file actions act on a copy of this process's
+    /// descriptors and directory, and the image is activated there, so a
+    /// failure leaves this process as it was; on success the copy becomes
+    /// its own and its group and session are set, as the spawn sets them
+    /// after its switch of tasks (an error there reaches only the old
+    /// image's thread, which ends: the new image runs).
+    fn darwin_spawn_setexec(&mut self, m: &GuestMem<'_>, at: &Attr, file_actions: Option<&[u8]>, path: u64, argv: u64, envv: u64) -> Result<Box<Image>, Errno> {
+        let mut copy = self.fork_kernel();
+        copy.pid = self.pid;
+        copy.tid = self.tid;
+        let mut after = After { flags: at.flags, sigmask: at.sigmask, sigdefault: at.sigdefault, inherit: Vec::new() };
+        let activated = (|| {
+            if let Some(fa) = file_actions {
+                after.inherit = copy.darwin_file_actions(fa, at.flags)?;
+            }
+            let binprefs = Some(at.binprefs).filter(|b| b[0].0 != 0);
+            copy.darwin_exec_activate_with(m, path, argv, envv, binprefs)
+        })();
+        // On a failure, what the actions opened goes with the copy (never
+        // its close_all_fds, which would end this process's locks).
+        let mut img = activated?;
+        self.fds = std::sync::Arc::clone(&copy.fds);
+        // The directory the actions left the copy in, made this process's
+        // as a chdir makes it.
+        let cwd = copy.caller_cwd();
+        if cwd != self.caller_cwd() {
+            let mut s = Scratch::path(cwd.as_bytes());
+            let mut gm = GuestMem::new(&mut s.0);
+            self.canonical(&mut gm, nr::CHDIR, [Scratch::AT, 0, 0, 0, 0, 0])?;
+        }
+        if at.flags & flag::SETPGROUP != 0 {
+            let _ = self.procs.darwin_setpgid(self.pid, self.pid, at.pgroup);
+        }
+        if at.flags & flag::SETSID != 0 {
+            let _ = self.procs.setsid(self.pid);
+        }
+        img.spawn = Some(after);
+        Ok(Box::new(img))
     }
 
     /// The attributes whose subsystems this kernel does not have yet, each
