@@ -3371,7 +3371,9 @@ impl PathIo<'_> {
                 return Err(Errno::ELOOP);
             }
             // A directory opens for reading only: each filesystem's `open`
-            // says `EISDIR`, without a lookup of its own here.
+            // says `EISDIR`, without a lookup of its own here. What it
+            // creates has the mode under the process's umask.
+            let mode = if flags & oflags::O_CREAT != 0 { mode & !self.fs.umask() } else { mode };
             let h = self.ns.open(&p, flags, mode)?;
             // O_DIRECTORY on what is not one: ENOTDIR (mv's and find's test
             // of whether a name is a directory)

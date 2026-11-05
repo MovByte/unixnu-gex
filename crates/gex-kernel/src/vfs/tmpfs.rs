@@ -1588,7 +1588,7 @@ impl FileHandle for TmpHandle {
 }
 
 impl FileSystem for TmpFs {
-    fn open(&self, path: &str, flags: u64, _mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+    fn open(&self, path: &str, flags: u64, mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
         let path = path.to_string();
         let mut dir = None;
         let mut wrote = false;
@@ -1650,6 +1650,9 @@ impl FileSystem for TmpFs {
                     wrote = true;
                     created = true;
                     inner.nodes.insert(path.clone(), Node::File(Arc::clone(&f)));
+                    // Created with the mode asked for (the umask applied by
+                    // the caller).
+                    let _ = inner.chmod(&path, mode);
                     Some(f)
                 }
             }
