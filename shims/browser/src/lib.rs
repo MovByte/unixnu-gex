@@ -8605,6 +8605,8 @@ fn syscall_entry(ctx: i32, pc: i64) {
                 killed(signal as i32, at)
             }
             SyscallOutcome::SpawnThread { ctx_addr, tid } => thread_made(tid, ctx_addr, pc as u64),
+            // Darwin processes do not run here yet; nothing makes one.
+            SyscallOutcome::DarwinSpawn { .. } => panic!("gex: a Darwin posix_spawn in the browser, which runs no Darwin process"),
             SyscallOutcome::ThreadExit => {
                 h.threads[cur()].run().waiting = Waiting::Exited;
                 end_if_all_exited();

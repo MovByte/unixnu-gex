@@ -202,7 +202,7 @@ pub fn default_action(l: u32) -> DefaultAction {
 
 /// A process's `sigacts` and the `p_sigignore` and `P_NOCLD*` bits beside
 /// it, indexed by Darwin signal.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Sigacts {
     pub handler: [u64; NSIG],
     pub tramp: [u64; NSIG],
@@ -462,6 +462,22 @@ impl Kernel {
         s.ss_size = 0;
         s.ss_sp = 0;
         s.altstack = false;
+    }
+
+    /// A spawn's `POSIX_SPAWN_SETSIGMASK`: the thread's mask, less what
+    /// cannot be masked.
+    pub(crate) fn darwin_set_sigmask(&mut self, mask: u32) {
+        self.signals.set_blocked(super::kern::mask_to_linux(mask & !CANTMASK));
+    }
+
+    /// A spawn's `POSIX_SPAWN_SETSIGDEF`: `setsigvec` to the default, with
+    /// no mask or flags, for each signal in `set`.
+    pub(crate) fn darwin_sigdefault(&mut self, set: u32) {
+        for d in 1..NSIG as u32 {
+            if set & sigmask(d) != 0 {
+                self.darwin_setsigvec(d, &NewAction { handler: SIG_DFL, tramp: 0, mask: 0, flags: 0 });
+            }
+        }
     }
 
     /// `sigaltstack(nss, oss)`.

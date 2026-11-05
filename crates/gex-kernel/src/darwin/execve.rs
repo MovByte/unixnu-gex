@@ -57,6 +57,8 @@ pub struct Image {
     pub cputype: u32,
     pub cpusubtype: u32,
     pub strings: Strings,
+    /// A spawn's, what the child takes after its switch.
+    pub spawn: Option<super::spawn::After>,
 }
 
 /// An activator's answer: `-1`, `-2`, `-3`, or the image claimed.
@@ -79,6 +81,8 @@ struct Imgp {
     arch_size: u64,
     path: String,
     size: u64,
+    /// A spawn's `psa_binprefs` and `psa_subcpuprefs`.
+    binprefs: Option<[(u32, u32); 4]>,
 }
 
 fn be32(b: &[u8], o: usize) -> u32 {
@@ -147,6 +151,12 @@ fn fat_validate(h: &[u8], file_size: u64) -> Result<(), Errno> {
 /// graded slice for the host's CPU type, ignoring the architecture bits.
 /// `(cputype, cpusubtype, offset, size)`.
 fn fat_best(h: &[u8]) -> Result<(u32, u32, u32, u32), Errno> {
+    fat_getarch(h, cpu::TYPE_ARM64, cpu::ARCH_MASK, cpu::SUBTYPE_ANY)
+}
+
+/// `fatfile_getarch`: the best graded slice that matches the type asked
+/// for, ignoring `mask`'s bits of it.
+fn fat_getarch(h: &[u8], req_cpu: u32, mask: u32, req_sub: u32) -> Result<(u32, u32, u32, u32), Errno> {
     let n = be32(h, 4) as usize;
     if n > (h.len() - 8) / 20 {
         return Err(ebadmacho());
@@ -156,7 +166,7 @@ fn fat_best(h: &[u8]) -> Result<(u32, u32, u32, u32), Errno> {
     for i in 0..n {
         let o = 8 + 20 * i;
         let (ty, sub) = (be32(h, o), be32(h, o + 4));
-        if !binary_match(cpu::ARCH_MASK, cpu::TYPE_ARM64, cpu::SUBTYPE_ANY, ty, sub & !cpu::SUBTYPE_MASK) {
+        if !binary_match(mask, req_cpu, req_sub, ty, sub & !cpu::SUBTYPE_MASK) {
             continue;
         }
         let grade = grade_binary(ty, sub & !cpu::SUBTYPE_MASK);
@@ -208,9 +218,14 @@ impl Kernel {
 
     /// `exec_activate_image`.
     pub(crate) fn darwin_exec_activate(&mut self, m: &GuestMem<'_>, fname: u64, argv: u64, envv: u64) -> Result<Image, Errno> {
+        self.darwin_exec_activate_with(m, fname, argv, envv, None)
+    }
+
+    /// `exec_activate_image` with a spawn's preferred CPU types.
+    pub(crate) fn darwin_exec_activate_with(&mut self, m: &GuestMem<'_>, fname: u64, argv: u64, envv: u64, binprefs: Option<[(u32, u32); 4]>) -> Result<Image, Errno> {
         let mut strings = Strings::new();
         strings.save_user_path(m, fname)?;
-        let mut img = Imgp { strings, vdata: Vec::new(), interpret: false, interp_buffer: Vec::new(), origcputype: 0, origcpusubtype: 0, arch_offset: 0, arch_size: 0, path: String::new(), size: 0 };
+        let mut img = Imgp { strings, vdata: Vec::new(), interpret: false, interp_buffer: Vec::new(), origcputype: 0, origcpusubtype: 0, arch_offset: 0, arch_size: 0, path: String::new(), size: 0, binprefs };
         let mut itercount = 0;
         'again: loop {
             self.darwin_exec_lookup(&mut img)?;
@@ -235,7 +250,7 @@ impl Kernel {
                 }
             }
         }
-        Ok(Image { path: img.path, arch_offset: img.arch_offset, arch_size: img.arch_size, cputype: img.origcputype, cpusubtype: img.origcpusubtype, strings: img.strings })
+        Ok(Image { path: img.path, arch_offset: img.arch_offset, arch_size: img.arch_size, cputype: img.origcputype, cpusubtype: img.origcpusubtype, strings: img.strings, spawn: None })
     }
 
     /// `namei` of the saved path, links followed, then
@@ -307,6 +322,21 @@ impl Kernel {
             img.origcputype = cputype;
             img.origcpusubtype = cpusubtype;
         }
+        if let Some(prefs) = img.binprefs {
+            let mut ok = false;
+            for &(pref, subpref) in &prefs {
+                if pref == 0 {
+                    return Err(ebadarch());
+                }
+                if super::spawn::is_any(pref) || binary_match(cpu::ARCH_MASK, pref, subpref, img.origcputype, img.origcpusubtype) {
+                    ok = true;
+                    break;
+                }
+            }
+            if !ok {
+                return Err(ebadarch());
+            }
+        }
         if grade_binary(img.origcputype, img.origcpusubtype & !cpu::SUBTYPE_MASK) == 0 {
             return Err(ebadarch());
         }
@@ -321,7 +351,32 @@ impl Kernel {
             return Ok(Act::NotMine);
         }
         fat_validate(&img.vdata, img.size)?;
-        let (ty, sub, offset, size) = fat_best(&img.vdata)?;
+        let chosen = match img.binprefs {
+            // A spawn's preferences in order: each an exact type, or any
+            // for the usual grading.
+            Some(prefs) => {
+                let mut chosen = None;
+                for &(pref, subpref) in &prefs {
+                    if pref == 0 {
+                        return Err(ebadarch());
+                    }
+                    if super::spawn::is_any(pref) {
+                        break;
+                    }
+                    if let Ok(c) = fat_getarch(&img.vdata, pref, 0, subpref) {
+                        chosen = Some(c);
+                        break;
+                    }
+                }
+                match chosen {
+                    Some(c) => c,
+                    None if prefs.iter().any(|&(p, _)| super::spawn::is_any(p)) => fat_best(&img.vdata)?,
+                    None => return Err(super::errno::EBADEXEC),
+                }
+            }
+            None => fat_best(&img.vdata)?,
+        };
+        let (ty, sub, offset, size) = chosen;
         img.vdata = self.darwin_exec_read_page(&img.path, u64::from(offset))?;
         img.arch_offset = u64::from(offset);
         img.arch_size = u64::from(size);
@@ -340,7 +395,7 @@ impl Kernel {
     /// its notifications; the new task keeps the host and special ports
     /// the old one held, its signal actions as execsigs leaves them, its
     /// limits, app type and dispatch queue offsets.
-    pub fn darwin_exec_switch(&mut self) {
+    pub fn darwin_exec_switch(&mut self, spawn: Option<&super::spawn::After>) {
         // knotes_dealloc, then the descriptors and the kqueues they held.
         let all: Vec<_> = self.dtask.kevents.knotes.keys().copied().collect();
         for n in all {
@@ -349,6 +404,15 @@ impl Kernel {
             }
         }
         self.fds.close_on_exec();
+        // POSIX_SPAWN_CLOEXEC_DEFAULT: only what the file actions made or
+        // named stays.
+        if let Some(sp) = spawn.filter(|s| s.flags & super::spawn::flag::CLOEXEC_DEFAULT != 0) {
+            for (fd, _, _) in self.fds.entries() {
+                if !sp.inherit.contains(&fd) {
+                    let _ = self.fds.close(fd);
+                }
+            }
+        }
         self.darwin_kqueue_reap();
         let keep = self.darwin_lock_vnodes_open();
         super::lockf::exec_keep(self.pid, &keep);
@@ -388,6 +452,14 @@ impl Kernel {
         self.darwin_finish = None;
         self.darwin_pipe_sigpipe = None;
         self.darwin_execsigs();
+        if let Some(sp) = spawn {
+            if sp.flags & super::spawn::flag::SETSIGMASK != 0 {
+                self.darwin_set_sigmask(sp.sigmask);
+            }
+            if sp.flags & super::spawn::flag::SETSIGDEF != 0 {
+                self.darwin_sigdefault(sp.sigdefault);
+            }
+        }
     }
 }
 
@@ -464,7 +536,7 @@ mod tests {
     fn script(line: &[u8]) -> Imgp {
         let mut vdata = vec![0u8; PAGE_SIZE as usize];
         vdata[..line.len()].copy_from_slice(line);
-        Imgp { strings: Strings::new(), vdata, interpret: false, interp_buffer: Vec::new(), origcputype: 0, origcpusubtype: 0, arch_offset: 0, arch_size: 0, path: String::new(), size: 0 }
+        Imgp { strings: Strings::new(), vdata, interpret: false, interp_buffer: Vec::new(), origcputype: 0, origcpusubtype: 0, arch_offset: 0, arch_size: 0, path: String::new(), size: 0, binprefs: None }
     }
 
     #[test]

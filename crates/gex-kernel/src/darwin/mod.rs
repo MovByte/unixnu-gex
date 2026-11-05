@@ -41,6 +41,7 @@ pub mod sema;
 pub mod shm;
 pub mod signal;
 pub mod sockaddr;
+pub mod spawn;
 pub mod sysctl;
 pub mod sysno;
 pub mod thread;

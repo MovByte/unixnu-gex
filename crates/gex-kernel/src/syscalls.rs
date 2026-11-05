@@ -257,6 +257,11 @@ pub enum SyscallOutcome {
     /// the child from the same instruction with `x0` zero. Nothing about the
     /// child's memory can be prepared here, because the kernel can only see
     /// the parent's.
+    /// A Darwin `posix_spawn` made its child (`Kernel::darwin_spawned`):
+    /// the host loads its image and starts it, and on success writes the
+    /// child's pid to `pid_addr` (when not null). A load that fails is the
+    /// call's error instead, and the child goes.
+    DarwinSpawn { pid_addr: u64 },
     SpawnProcess {
         pid: i32,
         /// The stack the child must start on, or zero to keep the parent's.
@@ -697,6 +702,9 @@ pub struct Kernel {
     /// An exec's activated image, for the host to load
     /// ([`crate::darwin::execve`]).
     pub darwin_exec: Option<Box<crate::darwin::execve::Image>>,
+    /// A `posix_spawn`'s child, made and activated, for the host to start
+    /// ([`crate::darwin::spawn`]).
+    pub darwin_spawned: Option<Box<Kernel>>,
     /// Set by a syscall that may have made a descriptor readable or
     /// writable for someone else (a write, a read that freed room, a close,
     /// a signal); the host takes it after the call and wakes threads parked
@@ -8986,6 +8994,7 @@ impl Kernel {
             darwin_finish: None,
             darwin_pipe_sigpipe: None,
             darwin_exec: None,
+            darwin_spawned: None,
             fd_activity: false,
             wasm32: false,
             sigreturn_legacy: false,
@@ -9380,6 +9389,7 @@ impl Kernel {
             darwin_finish: None,
             darwin_pipe_sigpipe: None,
             darwin_exec: None,
+            darwin_spawned: None,
             fd_activity: false,
             wasm32: self.wasm32,
             sigreturn_legacy: false,

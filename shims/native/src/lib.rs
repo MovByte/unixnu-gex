@@ -3405,33 +3405,59 @@ fn exec_darwin(
     proc_state: Arc<ProcCell>,
     wayland: Option<wayland::Wayland>,
 ) -> Result<(Exit, Stats)> {
-    let killed = |why: String| -> Result<(Exit, Stats)> {
-        Ok((Exit::Signal { signal: 9, pc: 0, detail: format!("killed by signal 9 (exec: {why})"), internal: false }, Stats::default()))
-    };
-    let Some(bytes) = kernel.read_file(&img.path) else { return killed(format!("cannot read {}", img.path)) };
-    let Some(slice) = bytes.get(img.arch_offset as usize..(img.arch_offset + img.arch_size) as usize) else {
-        return killed(format!("{}'s slice is past its end", img.path));
-    };
-    let loaded = {
-        let read = |p: &str| kernel.read_file(p).ok_or_else(|| anyhow!("cannot read {p}"));
-        match crate::darwin_image::load(slice, &img.path, &read) {
-            Ok(l) => l,
-            Err(e) => return killed(format!("{e:#}")),
-        }
+    let loaded = match load_darwin_image(&kernel, &img) {
+        Ok(l) => l,
+        Err(why) => return darwin_killed(why),
     };
     note_exec(kernel.pid, &img.path, &req.argv);
+    run_darwin_image(img, loaded, req.argv, req.envp, opts, xlate, kernel, proc_state, wayland)
+}
+
+/// The process ends with SIGKILL, for an image it could not start.
+fn darwin_killed(why: String) -> Result<(Exit, Stats)> {
+    Ok((Exit::Signal { signal: 9, pc: 0, detail: format!("killed by signal 9 (exec: {why})"), internal: false }, Stats::default()))
+}
+
+/// The activated image's file read, its slice loaded with dyld, and its
+/// signature checked as `load_code_signature` checks it.
+fn load_darwin_image(kernel: &Kernel, img: &gex_kernel::darwin::execve::Image) -> std::result::Result<crate::darwin_image::DarwinImage, String> {
+    let Some(bytes) = kernel.read_file(&img.path) else { return Err(format!("cannot read {}", img.path)) };
+    let Some(slice) = bytes.get(img.arch_offset as usize..(img.arch_offset + img.arch_size) as usize) else {
+        return Err(format!("{}'s slice is past its end", img.path));
+    };
+    let read = |p: &str| kernel.read_file(p).ok_or_else(|| anyhow!("cannot read {p}"));
+    let loaded = crate::darwin_image::load(slice, &img.path, &read).map_err(|e| format!("{e:#}"))?;
+    if let Some(cs) = &loaded.code_signature {
+        gex_kernel::darwin::codesign::validate_csblob(cs).map_err(|_| format!("{}'s code signature is not valid", img.path))?;
+    }
+    Ok(loaded)
+}
+
+/// The process switched over to a loaded image and run.
+#[allow(clippy::too_many_arguments)]
+fn run_darwin_image(
+    img: Box<gex_kernel::darwin::execve::Image>,
+    loaded: crate::darwin_image::DarwinImage,
+    argv: Vec<String>,
+    envp: Vec<String>,
+    opts: &RunOptions,
+    xlate: &Options,
+    mut kernel: Kernel,
+    proc_state: Arc<ProcCell>,
+    wayland: Option<wayland::Wayland>,
+) -> Result<(Exit, Stats)> {
     // The other threads are gone, and the signal actions are the new
     // image's; then what the process keeps of its task.
     let tid = if kernel.sig_tid != 0 { kernel.sig_tid } else { kernel.tid };
     kernel.exec_signals(tid);
     kernel.exe_path = img.path.clone();
-    kernel.darwin_exec_switch();
+    kernel.darwin_exec_switch(img.spawn.as_ref());
     let path = img.path.clone();
     // Its string area, for the new stack (`darwin_start`).
     kernel.darwin_exec = Some(img);
     let opts = RunOptions {
-        args: req.argv,
-        env: req.envp,
+        args: argv,
+        env: envp,
         exe: Some(path),
         darwin: true,
         darwin_platform: loaded.platform,
@@ -3442,8 +3468,74 @@ fn exec_darwin(
         ..opts.clone()
     };
     match run_program_with(&loaded.program, &opts, xlate, Some(Inherited { kernel, proc_state, wayland })) {
-        Err(e) if e.downcast_ref::<DarwinStartFailed>().is_some() => killed(e.to_string()),
+        Err(e) if e.downcast_ref::<DarwinStartFailed>().is_some() => darwin_killed(e.to_string()),
         r => r,
+    }
+}
+
+/// A Darwin `posix_spawn`'s child (`Kernel::darwin_spawned`), started:
+/// its image loaded here, in its parent's call, so that a load that fails
+/// is that call's error (EBADMACHO, EBADEXEC for a bad signature, EIO for
+/// a file that cannot be read) and the child goes unseen; then run on a
+/// thread of its own, its end recorded for its parent's `wait4`.
+fn start_darwin_spawn(cx: &SpawnContext, mut child: Kernel) -> std::result::Result<i32, gex_kernel::errno::Errno> {
+    use gex_kernel::errno::Errno;
+    let pid = child.pid;
+    let procs = Arc::clone(&child.procs);
+    let img = child.darwin_exec.take().expect("a spawned child's image");
+    let fail = |child: &mut Kernel, e: Errno| {
+        child.close_all_fds();
+        procs.reap(pid);
+        Err(e)
+    };
+    let loaded = match load_darwin_image(&child, &img) {
+        Ok(l) => l,
+        Err(why) => {
+            if std::env::var_os("GEX_TRACE_EXIT").is_some() {
+                eprintln!("[gex:{pid}] posix_spawn: {why}");
+            }
+            let e = if child.read_file(&img.path).is_none() {
+                Errno::EIO
+            } else if why.contains("code signature") {
+                gex_kernel::darwin::errno::EBADEXEC
+            } else {
+                gex_kernel::darwin::errno::native(88)
+            };
+            return fail(&mut child, e);
+        }
+    };
+    let child_proc = Arc::new(ProcCell::default());
+    child.vfs.mount("/proc", Arc::new(ProcFs::new(Arc::new(KernelProcSource(Arc::clone(&child_proc))))));
+    let Some((status, done)) = procs.handle(pid).map(|c| (Arc::clone(&c.status), Arc::clone(&c.done))) else {
+        return fail(&mut child, Errno::ESRCH);
+    };
+    let (argv, envp) = {
+        let lossy = |v: Vec<&[u8]>| v.into_iter().map(|s| String::from_utf8_lossy(s).into_owned()).collect::<Vec<_>>();
+        (lossy(img.strings.args()), lossy(img.strings.envs()))
+    };
+    note_exec(pid, &img.path, &argv);
+    let (opts, xlate, wayland) = (cx.opts.clone(), cx.xlate.clone(), cx.wayland.clone());
+    let started = std::thread::Builder::new()
+        .name(format!("gex-pid-{pid}"))
+        .stack_size(guest_thread_stack())
+        .spawn(move || {
+            let wstatus = match run_darwin_image(img, loaded, argv, envp, &opts, &xlate, child, child_proc, wayland) {
+                Ok((exit, _)) => {
+                    say_killed(pid, &exit);
+                    exit.wait_status()
+                }
+                Err(e) => {
+                    eprintln!("gexc: child {pid} failed: {e:#}");
+                    127 << 8
+                }
+            };
+            procs.exit(pid, wstatus);
+            *status.lock().unwrap_or_else(|e| e.into_inner()) = Some(wstatus);
+            done.notify_all();
+        });
+    match started {
+        Ok(_) => Ok(pid),
+        Err(_) => Err(Errno::EAGAIN),
     }
 }
 
@@ -4228,7 +4320,7 @@ fn place_image(
                     exe_path: &path,
                     file_start: exec.as_ref().map_or(0, |i| i.arch_offset),
                     code_signature: opts.darwin_code_signature.as_deref(),
-                    nano: false,
+                    nano: exec.as_ref().and_then(|i| i.spawn.as_ref()).is_some_and(|sp| sp.flags & gex_kernel::darwin::spawn::flag::NANO_ALLOCATOR != 0),
                 };
                 k.darwin_start(exec.map(|i| i.strings), &loaded, gex_abi::STACK_TOP)
             })
@@ -4747,6 +4839,23 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                             .unwrap_or(0),
                     );
                     Err(StopExecution.into())
+                }
+                SyscallOutcome::DarwinSpawn { pid_addr } => {
+                    let cx = state.spawn.clone().ok_or_else(|| anyhow!("posix_spawn with no spawn context"))?;
+                    let child = state.with_kernel(|k| k.darwin_spawned.take()).ok_or_else(|| anyhow!("posix_spawn with no child"))?;
+                    let ctx_addr = state.thread.ctx_addr;
+                    let mut gm = GuestMem::new(memory.bytes());
+                    match start_darwin_spawn(&cx, *child) {
+                        Ok(pid) => {
+                            if pid_addr != 0 {
+                                let _ = gm.write(pid_addr, &(pid as u32).to_le_bytes());
+                            }
+                        }
+                        Err(e) => {
+                            let _ = gex_kernel::darwin::set_result(&mut gm, ctx_addr, e.as_return());
+                        }
+                    }
+                    Ok(())
                 }
                 SyscallOutcome::SpawnThread { ctx_addr, tid } => {
                     // Started here, and the caller carries on (the child
