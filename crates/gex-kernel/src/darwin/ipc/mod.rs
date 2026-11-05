@@ -1253,10 +1253,13 @@ impl Ipc {
         let mut request = None;
         if b & ty::SEND != 0 {
             if self.port(port).pdrequest.is_some() {
+                // The send right stays named, with a reference of its own:
+                // port_destroy consumes the one the receive right had.
                 b &= !ty::RECEIVE;
                 b |= ty::EX_RECEIVE;
                 self.space.hash_insert(port, name);
                 self.space.lookup_mut(name).expect("in use").bits = b;
+                self.reference(port);
             } else {
                 b &= !bits::TYPE_MASK;
                 b |= ty::DEAD_NAME | ty::EX_RECEIVE;

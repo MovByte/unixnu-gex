@@ -214,9 +214,12 @@ impl Ipc {
                 }
                 let mut request = None;
                 if b & ty::SEND != 0 {
+                    // The entry keeps its send right and its reference; the
+                    // receive right in flight takes one of its own.
                     let entry = self.space.lookup_mut(name).expect("in use");
                     entry.bits = (b & !ty::RECEIVE) | ty::EX_RECEIVE;
                     self.space.hash_insert(port, name);
+                    self.reference(port);
                 } else {
                     request = self.right_request_cancel_pub(port, name);
                     self.space.dealloc(name);

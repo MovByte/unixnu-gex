@@ -106,6 +106,7 @@ hello from /var/tmp/gex-exec-fat with 1 argument" 0
     threadsuspend) check_root threadsuspend "threadsuspend ok" 0 ;;
     threadstate) check_root threadstate "threadstate ok" 0 ;;
     tasksuspend) check_root tasksuspend "tasksuspend ok" 0 ;;
+    portrefs) check_root portrefs "portrefs ok" 0 ;;
     cfrunloop) check_root cfrunloop "cfrunloop 3 1" 0 ;;
     xpc-anon) check_root xpc-anon "xpc-anon 42" 0 ;;
     *)
@@ -120,7 +121,7 @@ if [ "$named" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend cfrunloop xpc-anon; do
+    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs cfrunloop xpc-anon; do
         run "$p"
     done
 fi
