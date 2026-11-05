@@ -22,6 +22,7 @@ const KERN_FAILURE: i32 = 5;
 const KERN_RESOURCE_SHORTAGE: i32 = 6;
 const KERN_NO_ACCESS: i32 = 8;
 const KERN_INVALID_RIGHT: i32 = 17;
+const KERN_INVALID_VALUE: i32 = 18;
 const KERN_NOT_SUPPORTED: i32 = 46;
 /// `MIG_BAD_ARGUMENTS`: a request without the routine's shape.
 const MIG_BAD_ARGUMENTS: i32 = -304;
@@ -147,6 +148,23 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         }
         // mach_voucher_debug_info(task, voucher_name, out recipes): only in
         // DEVELOPMENT and DEBUG kernels.
+        // mach_port_allocate_name(task, right, name): mach_port_allocate_full
+        // with the name asked for; a dead name takes any.
+        (Kobject::Task, 3203) => match (arg(req, 0), arg(req, 1)) {
+            (Some(right), Some(name)) => {
+                let name = name as u32;
+                if !super::ipc::name_valid(name) {
+                    return Reply::err(KERN_INVALID_VALUE);
+                }
+                let r = right as u32;
+                let named = (r != super::ipc::port_right::DEAD_NAME).then_some(name);
+                match k.dtask.ipc.mach_port_allocate(r, named) {
+                    Ok(_) => Reply::ok(Vec::new()),
+                    Err(e) => Reply::err(e as i32),
+                }
+            }
+            _ => bad(),
+        },
         (Kobject::Task, 5404) => Reply::err(KERN_NOT_SUPPORTED),
         // clock_get_time(clock) -> mach_timespec_t
         (Kobject::Clock, 1000) => {
