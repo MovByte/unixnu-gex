@@ -223,6 +223,14 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             }
             _ => bad(),
         },
+        // mach_port_get_refs(task, name, right) -> refs
+        (Kobject::Task, 3207) => match (arg(req, 0), arg(req, 1)) {
+            (Some(name), Some(right)) => match k.dtask.ipc.mach_port_get_refs(name as u32, right as u32) {
+                Ok(n) => Reply::ok(n.to_le_bytes().to_vec()),
+                Err(e) => Reply::err(e as i32),
+            },
+            _ => bad(),
+        },
         // mach_port_allocate_name(task, right, name): mach_port_allocate_full
         // with the name asked for; a dead name takes any.
         (Kobject::Task, 3203) => match (arg(req, 0), arg(req, 1)) {
