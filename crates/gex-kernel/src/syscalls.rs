@@ -447,6 +447,9 @@ pub struct WaitidOut {
     pub nowait: bool,
     /// A 32-bit caller's `siginfo_t` (its union at 12, not 16).
     pub compat: bool,
+    /// A Darwin caller's: its `siginfo_t`, signal numbers and the
+    /// untouched answer for no child yet ([`crate::darwin::exit`]).
+    pub darwin: bool,
 }
 
 impl WaitidOut {
@@ -456,6 +459,9 @@ impl WaitidOut {
     pub fn report(&self, m: &mut GuestMem<'_>, pid: i32, word: u32) -> Result<u64, Errno> {
         if self.info == 0 {
             return Ok(0);
+        }
+        if self.darwin {
+            return crate::darwin::exit::waitid_report(m, self.info, pid, word);
         }
         let u = if self.compat { 12 } else { 16 };
         for off in (0..u + 12).step_by(4) {
@@ -699,6 +705,9 @@ pub struct Kernel {
     /// A parked write to a Darwin pipe: whether its EPIPE sends the process
     /// SIGPIPE (the open file has no `FG_NOSIGPIPE`).
     pub darwin_pipe_sigpipe: Option<bool>,
+    /// A parked Darwin `wait4`'s status address, for its status in Darwin's
+    /// encoding ([`crate::darwin::exit`]).
+    pub darwin_wait4: Option<u64>,
     /// An exec's activated image, for the host to load
     /// ([`crate::darwin::execve`]).
     pub darwin_exec: Option<Box<crate::darwin::execve::Image>>,
@@ -6220,7 +6229,7 @@ fn waitid_child(procs: &Arc<ProcTable>, fds: &FdTable, pid: i32, mut a: [u64; 6]
     };
     let mut op = wait_child(procs, pid, [want as u64, 0, options & WNOHANG, 0, 0, 0]);
     if let BlockOp::WaitChild { waitid, nohang, .. } = &mut op {
-        *waitid = Some(WaitidOut { info: a[2], nowait: options & WNOWAIT != 0, compat });
+        *waitid = Some(WaitidOut { info: a[2], nowait: options & WNOWAIT != 0, compat, darwin: false });
         // Only exits are ever waited for here: without WEXITED a wait would
         // never end, so it reports none (zero, or ECHILD with no children).
         if options & WEXITED == 0 {
@@ -8772,6 +8781,8 @@ pub struct PendingCall {
     /// A parked write to a Darwin pipe: whether its EPIPE sends the process
     /// SIGPIPE (the open file has no `FG_NOSIGPIPE`).
     pub darwin_pipe_sigpipe: Option<bool>,
+    /// A parked Darwin `wait4`: where its status goes.
+    pub darwin_wait4: Option<u64>,
 }
 
 /// A thread the kernel has prepared and the host must start.
@@ -8833,6 +8844,7 @@ impl Kernel {
             block_pc: std::mem::take(&mut self.block_pc),
             darwin_finish: self.darwin_finish.take(),
             darwin_pipe_sigpipe: self.darwin_pipe_sigpipe.take(),
+            darwin_wait4: self.darwin_wait4.take(),
         };
         if call != PendingCall::default() {
             self.thread_calls.insert(self.sig_tid, call);
@@ -8848,6 +8860,7 @@ impl Kernel {
         self.block_pc = call.block_pc;
         self.darwin_finish = call.darwin_finish;
         self.darwin_pipe_sigpipe = call.darwin_pipe_sigpipe;
+        self.darwin_wait4 = call.darwin_wait4;
         let blocked = self.signals.blocked();
         let next = self
             .thread_signals
@@ -8993,6 +9006,7 @@ impl Kernel {
             darwin_user_stack: 0,
             darwin_finish: None,
             darwin_pipe_sigpipe: None,
+            darwin_wait4: None,
             darwin_exec: None,
             darwin_spawned: None,
             fd_activity: false,
@@ -9388,6 +9402,7 @@ impl Kernel {
             darwin_user_stack: 0,
             darwin_finish: None,
             darwin_pipe_sigpipe: None,
+            darwin_wait4: None,
             darwin_exec: None,
             darwin_spawned: None,
             fd_activity: false,
@@ -10334,6 +10349,9 @@ impl Kernel {
         let suspended = self.restore_sigmask.take();
         if self.darwin_pipe_sigpipe.take() == Some(true) && r == Err(Errno::EPIPE) {
             self.darwin_send_sigpipe();
+        }
+        if let Some(status) = self.darwin_wait4.take() {
+            self.darwin_wait4_done(m, status, &r);
         }
         if std::mem::take(&mut self.write_blocked) && r == Err(Errno::EPIPE) {
             self.signals.raise_from(
@@ -13943,7 +13961,7 @@ mod tests {
         // waitid parks the same, with its siginfo and WNOWAIT; no wait kind
         // is EINVAL, with and without the kernel.
         set_args(&mut m, main.ctx_addr, nr::WAITID, &[1, 7, 0x32000, 4 | 1 | 0x0100_0000]);
-        let info = WaitidOut { info: 0x32000, nowait: true, compat: false };
+        let info = WaitidOut { info: 0x32000, nowait: true, compat: false, darwin: false };
         assert!(matches!(
             free(&k, &mut m, main.ctx_addr),
             FreeOutcome::Blocking(BlockOp::WaitChild { ppid, want: 7, nohang: true, waitid: Some(w), .. }, None) if ppid == pid && w == info
@@ -13986,7 +14004,7 @@ mod tests {
     fn waitid_reports_a_siginfo() {
         let mut buf = vec![0xaau8; 0x100];
         let mut m = GuestMem::new(&mut buf);
-        let w = WaitidOut { info: 0x10, nowait: false, compat: false };
+        let w = WaitidOut { info: 0x10, nowait: false, compat: false, darwin: false };
         assert_eq!(w.report(&mut m, 42, 3 << 8), Ok(0));
         let rd = |m: &GuestMem<'_>, o: u64| m.read_u32(0x10 + o).unwrap();
         assert_eq!([rd(&m, 0), rd(&m, 4), rd(&m, 8), rd(&m, 16), rd(&m, 20), rd(&m, 24)], [17, 0, 1, 42, 0, 3]);
