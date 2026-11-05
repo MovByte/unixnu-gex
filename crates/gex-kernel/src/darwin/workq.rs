@@ -2129,9 +2129,11 @@ impl Kernel {
     }
 
     /// The quantum's check (the scheduler's at quantum expiry): an expired
-    /// quantum is delivered (`kevent_ast`'s
+    /// quantum (`runtime > deadline`, thread_evaluate_workqueue_quantum_
+    /// expiry) is delivered (`kevent_ast`'s
     /// `workq_kern_quantum_expiry_reevaluate`), an unexpired one checked
-    /// again when it could next expire.
+    /// again when it could next expire, once the thread has run past the
+    /// deadline.
     fn workq_quantum_check(&mut self, m: &mut GuestMem<'_>, tid: i32) {
         if !self.darwin_is_wq_thread(tid) {
             return;
@@ -2143,7 +2145,7 @@ impl Kernel {
         }
         let Some(runtime) = thread_runtime(tid) else { return };
         if runtime <= deadline {
-            let left = deadline - runtime;
+            let left = deadline - runtime + 1;
             let key = self.dtask.timers.arm(Instant::now() + Duration::from_nanos(abs_to_ns(left)), super::timer::Action::Workq(Call::Quantum(tid)));
             self.wqt(tid).quantum_call = Some(key);
             return;
