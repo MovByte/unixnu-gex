@@ -241,6 +241,7 @@ impl Kernel {
         let (path, adesc, argv, envv) = (a[1], a[2], a[3], a[4]);
         let mut attr = None;
         let mut file_actions = None;
+        let mut port_actions: Option<Vec<u8>> = None;
         let mut coal_info = 0;
         if adesc != 0 {
             let d = m.read(adesc, ARGS_DESC_SIZE)?.to_vec();
@@ -277,10 +278,7 @@ impl Kernel {
                 if PORT_HDR + PORT_ACTION_SIZE * u64::from(le32(b, 4)) != pa_size {
                     return Err(Errno::EINVAL);
                 }
-                // The special, exception and registered ports name rights of
-                // this task for the child's: a port in two tasks' spaces.
-                self.darwin_unimplemented("posix_spawn port actions (a right passed to another task's space)".into());
-                return Err(Errno::EINVAL);
+                port_actions = Some(b.to_vec());
             }
             if persona_size != 0 && persona != 0 {
                 if persona_size != PERSONA_INFO_SIZE {
@@ -327,6 +325,10 @@ impl Kernel {
             }
             self.darwin_spawn_unported(at)?;
             if at.flags & flag::SETEXEC != 0 {
+                if port_actions.is_some() {
+                    self.darwin_unimplemented("posix_spawn port actions with POSIX_SPAWN_SETEXEC (on the task the exec makes)".into());
+                    return Err(Errno::EINVAL);
+                }
                 return self.darwin_spawn_setexec(m, at, file_actions.as_deref(), path, argv, envv).map(Spawned::Exec);
             }
         }
@@ -339,7 +341,7 @@ impl Kernel {
         child.pid = pid;
         child.tid = pid;
         child.forget_own_pidfds();
-        match self.darwin_spawn_child(m, &mut child, attr.as_ref(), file_actions.as_deref(), path, argv, envv) {
+        match self.darwin_spawn_child(m, &mut child, attr.as_ref(), file_actions.as_deref(), port_actions.as_deref(), path, argv, envv) {
             Ok(()) => Ok(Spawned::Child(Box::new(child))),
             Err(e) => {
                 // exit1 with P_LIST_DEADPARENT: gone, unseen by its parent,
@@ -358,22 +360,45 @@ impl Kernel {
     /// The child's half: file actions, activation, then the attributes the
     /// spawner applies.
     #[allow(clippy::too_many_arguments)]
-    fn darwin_spawn_child(&mut self, m: &GuestMem<'_>, child: &mut Kernel, attr: Option<&Attr>, file_actions: Option<&[u8]>, path: u64, argv: u64, envv: u64) -> Result<(), Errno> {
+    #[allow(clippy::too_many_arguments)]
+    fn darwin_spawn_child(&mut self, m: &GuestMem<'_>, child: &mut Kernel, attr: Option<&Attr>, file_actions: Option<&[u8]>, port_actions: Option<&[u8]>, path: u64, argv: u64, envv: u64) -> Result<(), Errno> {
         let flags = attr.map_or(0, |a| a.flags);
         let policy = attr.map_or((0, 0, 0), |a| super::taskpolicy::spawn_attrs(a.apptype, a.qos_clamp, a.darwin_role));
         let mut after = After { flags, policy, sigmask: attr.map_or(0, |a| a.sigmask), sigdefault: attr.map_or(0, |a| a.sigdefault), inherit: Vec::new() };
         if let Some(fa) = file_actions {
             after.inherit = child.darwin_file_actions(fa, flags)?;
         }
+        let registered = match port_actions {
+            Some(pa) => self.darwin_spawn_port_actions(child, pa)?,
+            None => Vec::new(),
+        };
         let binprefs = attr.filter(|a| a.binprefs[0].0 != 0).map(|a| a.binprefs);
-        let mut img: Image = child.darwin_exec_activate_with(m, path, argv, envv, binprefs)?;
+        let mut img: Image = match child.darwin_exec_activate_with(m, path, argv, envv, binprefs) {
+            Ok(img) => img,
+            Err(e) => {
+                // exec_port_actions_destroy.
+                for p in registered.into_iter().flatten() {
+                    self.ipc().release_send(p);
+                }
+                return Err(e);
+            }
+        };
         if let Some(at) = attr {
             // setpgid() and setsid_internal() as the child calls them.
-            if at.flags & flag::SETPGROUP != 0 {
-                child.procs.darwin_setpgid(child.pid, child.pid, at.pgroup)?;
-            }
-            if at.flags & flag::SETSID != 0 {
-                child.procs.setsid(child.pid)?;
+            let r = (|| {
+                if at.flags & flag::SETPGROUP != 0 {
+                    child.procs.darwin_setpgid(child.pid, child.pid, at.pgroup)?;
+                }
+                if at.flags & flag::SETSID != 0 {
+                    child.procs.setsid(child.pid)?;
+                }
+                Ok(())
+            })();
+            if let Err(e) = r {
+                for p in registered.into_iter().flatten() {
+                    self.ipc().release_send(p);
+                }
+                return Err(e);
             }
         }
         // exec_handle_spawnattr_policy, in the spawner's call.
@@ -383,9 +408,109 @@ impl Kernel {
                 p.lock().unwrap_or_else(|e| e.into_inner()).spawnpolicy(apptype, clamp, role);
             }
         }
+        // _kernelrpc_mach_ports_register3 with the registered ports held.
+        if !registered.is_empty() {
+            let mut ports = [None; 3];
+            for (slot, p) in ports.iter_mut().zip(registered) {
+                *slot = p;
+            }
+            if super::mig::ports_register(&mut child.dtask.kports, self.ipc(), ports) != 0 {
+                return Err(Errno::EINVAL);
+            }
+        }
         img.spawn = Some(after);
         child.darwin_exec = Some(Box::new(img));
         Ok(())
+    }
+
+    /// `exec_handle_port_actions`: the actions checked (EINVAL for one of
+    /// no known kind, or for more exception, watch or registered ports than
+    /// a task has), then each named right copied in from this task's space
+    /// (COPY_SEND, an immovable send right allowed) and acted on for the
+    /// child: its special port set, a registered port held for the end of
+    /// the spawn (returned), a pointer authentication task port consumed
+    /// (there is no pointer authentication here). An action that fails
+    /// releases its right and ends the spawn with EINVAL.
+    fn darwin_spawn_port_actions(&mut self, child: &mut Kernel, pa: &[u8]) -> Result<Vec<Option<super::ipc::ObjId>>, Errno> {
+        use super::ipc::right::{msgt, Carried, CopyinFlags};
+        const PSPA_SPECIAL: u32 = 0;
+        const PSPA_EXCEPTION: u32 = 1;
+        const PSPA_AU_SESSION: u32 = 2;
+        const PSPA_IMP_WATCHPORTS: u32 = 3;
+        const PSPA_REGISTERED_PORTS: u32 = 4;
+        const PSPA_PTRAUTH_TASK_PORT: u32 = 5;
+        // EXC_TYPES_COUNT, TASK_MAX_WATCHPORT_COUNT, TASK_PORT_REGISTER_MAX.
+        const MAX_EXCEPTION: u32 = 14;
+        const MAX_WATCHPORT: u32 = 128;
+        const MAX_REGISTERED: u32 = 3;
+        let count = le32(pa, 4) as usize;
+        let action = |i: usize| {
+            let a = &pa[PORT_HDR as usize + i * PORT_ACTION_SIZE as usize..];
+            (le32(a, 0), le32(a, 8), le32(a, 20) as i32)
+        };
+        let (mut exc, mut watch, mut reg, mut ptrauth) = (0, 0, 0, 0);
+        for i in 0..count {
+            let n = match action(i).0 {
+                PSPA_SPECIAL | PSPA_AU_SESSION => continue,
+                PSPA_EXCEPTION => { exc += 1; (exc, MAX_EXCEPTION) }
+                PSPA_IMP_WATCHPORTS => { watch += 1; (watch, MAX_WATCHPORT) }
+                PSPA_REGISTERED_PORTS => { reg += 1; (reg, MAX_REGISTERED) }
+                PSPA_PTRAUTH_TASK_PORT => { ptrauth += 1; (ptrauth, 1) }
+                _ => return Err(Errno::EINVAL),
+            };
+            if n.0 > n.1 {
+                return Err(Errno::EINVAL);
+            }
+        }
+        // Exception ports (task_set_exception_ports), audit sessions and
+        // importance watch ports are not here.
+        for i in 0..count {
+            let what = match action(i).0 {
+                PSPA_EXCEPTION => "a posix_spawn exception port action (task exception ports)",
+                PSPA_AU_SESSION => "a posix_spawn audit session port action (audit sessions)",
+                PSPA_IMP_WATCHPORTS => "a posix_spawn watch port action (importance watch ports)",
+                _ => continue,
+            };
+            self.darwin_unimplemented(what.into());
+            return Err(Errno::EINVAL);
+        }
+        let mut registered = Vec::new();
+        let fail = |k: &mut Kernel, registered: Vec<Option<super::ipc::ObjId>>| {
+            for p in registered.into_iter().flatten() {
+                k.ipc().release_send(p);
+            }
+            Err(Errno::EINVAL)
+        };
+        for i in 0..count {
+            let (kind, name, which) = action(i);
+            let port = if super::ipc::name_valid(name) {
+                let flags = CopyinFlags { allow_immovable_send: true, ..Default::default() };
+                match self.ipc().object_copyin(name, msgt::COPY_SEND, flags, 0, None) {
+                    Ok(Carried::Port(p)) => Some(p),
+                    Ok(Carried::Dead) => None,
+                    Err(_) => return fail(self, registered),
+                }
+            } else {
+                None
+            };
+            match kind {
+                PSPA_SPECIAL => {
+                    if super::mig::set_special_port(&mut child.dtask.kports, self.ipc(), which, port) != 0 {
+                        if let Some(p) = port {
+                            self.ipc().release_send(p);
+                        }
+                        return fail(self, registered);
+                    }
+                }
+                PSPA_REGISTERED_PORTS => registered.push(port),
+                _ => {
+                    if let Some(p) = port {
+                        self.ipc().release_send(p);
+                    }
+                }
+            }
+        }
+        Ok(registered)
     }
 
     /// POSIX_SPAWN_SETEXEC: `execve` with options (cloneproc's

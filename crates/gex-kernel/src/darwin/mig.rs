@@ -160,14 +160,10 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
                     _ => return bad(),
                 }
             }
-            if ports.iter().flatten().any(|&p| k.ipc().port(p).immovable_send) {
-                return Reply::err(KERN_INVALID_RIGHT);
-            }
-            let old = std::mem::replace(&mut k.dtask.kports.registered, ports);
-            for p in old.into_iter().flatten() {
-                k.ipc().release_send(p);
-            }
-            Reply::ok(Vec::new())
+            let mut kports = std::mem::take(&mut k.dtask.kports);
+            let r = ports_register(&mut kports, k.ipc(), ports);
+            k.dtask.kports = kports;
+            Reply::err(r)
         }
         // _kernelrpc_mach_ports_lookup3(task) -> port1, port2, port3: a copy
         // of each stashed right (a dead name for a port that died).
@@ -644,38 +640,62 @@ fn host_get_special_port(k: &mut Kernel, obj: &Kobject, port: super::ipc::ObjId,
 /// `task_set_special_port`: KERNEL and HOST are refused (no CSR on iOS);
 /// the rest replace what was set, the old send right released.
 fn task_set_special_port(k: &mut Kernel, which: i32, right: Option<Carried>) -> Reply {
+    let port = match right {
+        Some(Carried::Port(p)) => Some(p),
+        _ => None,
+    };
+    let mut kports = std::mem::take(&mut k.dtask.kports);
+    let r = set_special_port(&mut kports, k.ipc(), which, port);
+    k.dtask.kports = kports;
+    Reply::err(r)
+}
+
+/// `task_set_special_port` (the kernel's, which `posix_spawn`'s port
+/// actions call too) on the task whose ports are `kports`: the send right
+/// `port` stored as its special port `which`, the old one released.
+pub(crate) fn set_special_port(kports: &mut super::kobject::Kports, ipc: &mut super::ipc::Ipc, which: i32, port: Option<super::ipc::ObjId>) -> i32 {
     const TASK_KERNEL_PORT: i32 = 1;
     const TASK_HOST_PORT: i32 = 2;
     const TASK_BOOTSTRAP_PORT: i32 = 4;
     const TASK_ACCESS_PORT: i32 = 9;
     const TASK_DEBUG_CONTROL_PORT: i32 = 10;
     const TASK_RESOURCE_NOTIFY_PORT: i32 = 11;
-    let port = match right {
-        Some(Carried::Port(p)) => Some(p),
-        _ => None,
-    };
     if let Some(p) = port {
-        if k.ipc().port(p).immovable_send {
-            return Reply::err(KERN_INVALID_RIGHT);
+        if ipc.port(p).immovable_send {
+            return KERN_INVALID_RIGHT;
         }
     }
     match which {
-        TASK_KERNEL_PORT | TASK_HOST_PORT => Reply::err(KERN_NO_ACCESS),
+        TASK_KERNEL_PORT | TASK_HOST_PORT => KERN_NO_ACCESS,
         TASK_BOOTSTRAP_PORT | TASK_DEBUG_CONTROL_PORT | TASK_RESOURCE_NOTIFY_PORT | TASK_ACCESS_PORT => {
-            if which == TASK_ACCESS_PORT && k.dtask.kports.special.get(&which).copied().is_some_and(|p| k.ipc().port(p).active) {
-                return Reply::err(KERN_NO_ACCESS);
+            if which == TASK_ACCESS_PORT && kports.special.get(&which).copied().is_some_and(|p| ipc.port(p).active) {
+                return KERN_NO_ACCESS;
             }
             let old = match port {
-                Some(p) => k.dtask.kports.special.insert(which, p),
-                None => k.dtask.kports.special.remove(&which),
+                Some(p) => kports.special.insert(which, p),
+                None => kports.special.remove(&which),
             };
             if let Some(o) = old {
-                k.ipc().release_send(o);
+                ipc.release_send(o);
             }
-            Reply::ok(Vec::new())
+            0
         }
-        _ => Reply::err(KERN_INVALID_ARGUMENT),
+        _ => KERN_INVALID_ARGUMENT,
     }
+}
+
+/// `mach_ports_register` on the task whose ports are `kports`: the send
+/// rights `ports` registered (an immovable one refused), the old ones
+/// released.
+pub(crate) fn ports_register(kports: &mut super::kobject::Kports, ipc: &mut super::ipc::Ipc, ports: [Option<super::ipc::ObjId>; 3]) -> i32 {
+    if ports.iter().flatten().any(|&p| ipc.port(p).immovable_send) {
+        return KERN_INVALID_RIGHT;
+    }
+    let old = std::mem::replace(&mut kports.registered, ports);
+    for p in old.into_iter().flatten() {
+        ipc.release_send(p);
+    }
+    0
 }
 
 /// `task_restartable_ranges_register(task, ranges, count)`
