@@ -1,6 +1,7 @@
 // Signal handlers on Darwin's frame: a SA_SIGINFO handler's siginfo and
-// mask, the old action sigaction reports, SA_RESETHAND, an alternate stack,
-// and the interrupted code's registers back after sigreturn.
+// mask and exception state, the old action sigaction reports, SA_RESETHAND,
+// an alternate stack, and the interrupted code's registers back after
+// sigreturn.
 
 #include <signal.h>
 #include <stdio.h>
@@ -18,6 +19,11 @@ static void with_info(int sig, siginfo_t *si, void *uc) {
     sigprocmask(SIG_BLOCK, NULL, &now);
     if (sig != SIGUSR1 || si->si_signo != SIGUSR1 || !sigismember(&now, SIGUSR1) || !sigismember(&now, SIGUSR2) || sigismember(&u->uc_sigmask, SIGUSR1)) {
         bad = 1;
+    }
+    // Taken on kill's way back: the frame's exception state is that
+    // call's svc #0x80, with no fault address.
+    if (u->uc_mcontext->__es.__esr != 0x56000080 || u->uc_mcontext->__es.__far) {
+        bad = 3;
     }
     from = si->si_pid;
     hits++;

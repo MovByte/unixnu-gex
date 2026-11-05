@@ -318,11 +318,11 @@ impl Kernel {
         &mut self.darwin_me().sig
     }
 
-    /// A Darwin call was made with `svc #imm` (the instruction before `pc`):
+    /// A Darwin call was made with `svc #imm` (the instruction at `pc`):
     /// what its exception state says (`fleh_synchronous` saves ESR and FAR,
     /// and `sleh_synchronous` clears a FAR that an SVC leaves unknown).
     pub(crate) fn darwin_note_svc(&mut self, m: &GuestMem<'_>, pc: u64) {
-        let insn = m.read_u32(pc.wrapping_sub(4)).unwrap_or(0);
+        let insn = m.read_u32(pc).unwrap_or(0);
         let s = self.darwin_sig();
         s.esr = esr_svc(insn >> 5);
         s.far = 0;
