@@ -2262,7 +2262,11 @@ fn darwin_return_to_user(state: &mut HostState, data: &mut [u8], in_gate: bool) 
     let mut resume = None;
     loop {
         let seen = ready::seq();
-        match state.with_kernel(|k| k.darwin_hold(tid)) {
+        let held = {
+            let mut gm = GuestMem::new(&mut *data);
+            state.with_kernel(|k| k.darwin_hold(&mut gm, tid))
+        };
+        match held {
             Hold::Run => return resume.map_or(ToUser::Run, ToUser::Resume),
             Hold::Deliver => {
                 let mut gm = GuestMem::new(data);

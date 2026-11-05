@@ -9596,6 +9596,8 @@ impl Kernel {
         }
         if self.darwin && matches!(out, SyscallOutcome::Blocking(_)) {
             self.darwin_workq_sched_block();
+            let tid = self.tid;
+            self.darwin_set_offcpu(m, tid, true);
         }
         if self.darwin {
             if let Some(out) = self.darwin_guard_kill() {
@@ -10308,10 +10310,14 @@ impl Kernel {
         // it runs again, and blocks again if the call goes on waiting.
         if self.darwin {
             self.darwin_workq_sched_unblock();
+            let tid = self.tid;
+            self.darwin_set_offcpu(m, tid, false);
         }
         let out = self.finish_blocking_inner(m, r);
         if self.darwin && matches!(out, SyscallOutcome::Blocking(_)) {
             self.darwin_workq_sched_block();
+            let tid = self.tid;
+            self.darwin_set_offcpu(m, tid, true);
         }
         out
     }

@@ -19,6 +19,7 @@ pub const NDR_RECORD: [u8; 8] = [0, 0, 0, 0, 1, 0, 0, 0];
 const KERN_SUCCESS: i32 = 0;
 const KERN_INVALID_ARGUMENT: i32 = 4;
 const KERN_FAILURE: i32 = 5;
+const KERN_TERMINATED: i32 = 37;
 const KERN_RESOURCE_SHORTAGE: i32 = 6;
 const KERN_NO_ACCESS: i32 = 8;
 const KERN_INVALID_RIGHT: i32 = 17;
@@ -318,23 +319,30 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             },
             _ => bad(),
         },
-        // thread_suspend(thread) (`thread_act.defs`): one more user stop. A
-        // thread made suspended has not run, so nothing waits for it to
-        // stop; one that runs would have to be stopped where it is.
+        // thread_suspend(thread) (`thread_act.defs`): one more user stop
+        // (thread_hold at the first), then, for another thread, its caller
+        // waits for it to be off its CPU (thread_wait): held at its next
+        // return to user space, or waiting in a call.
         (Kobject::Thread(t), 3605) => {
-            let th = k.dtask.threads.map.entry(*t).or_default();
-            if th.unstarted.is_none() {
-                let mut r = Reply::err(KERN_FAILURE);
-                r.unimplemented = Some("thread_suspend of a running thread".into());
-                return r;
+            let t = *t;
+            if !k.darwin_thread_alive(t) {
+                return Reply::err(KERN_TERMINATED);
             }
-            th.suspend += 1;
-            Reply::ok(Vec::new())
+            k.dtask.threads.map.entry(t).or_default().suspend += 1;
+            let mut r = Reply::ok(Vec::new());
+            if t != k.tid && !k.darwin_offcpu(t) {
+                r.defer = Some((t, super::kobject::Deferred::ThreadWait));
+            }
+            r
         }
-        // thread_resume(thread): one user stop fewer; at none, a thread that
-        // has never run starts.
+        // thread_resume(thread): one user stop fewer (KERN_FAILURE with
+        // none); at none, the thread is let go (one made suspended starts).
         (Kobject::Thread(t), 3606) => {
-            let th = k.dtask.threads.map.entry(*t).or_default();
+            let t = *t;
+            if !k.darwin_thread_alive(t) {
+                return Reply::err(KERN_TERMINATED);
+            }
+            let th = k.dtask.threads.map.entry(t).or_default();
             if th.suspend == 0 {
                 return Reply::err(KERN_FAILURE);
             }
@@ -485,8 +493,8 @@ fn task_get_special_port(k: &mut Kernel, which: i32) -> Reply {
                 k.dtask.ipc.copy_send(p);
                 Reply::port(Carried::Port(p))
             }
-            Some(_) => Reply { ret: KERN_SUCCESS, out: Vec::new(), ports: Vec::new(), unimplemented: None }.with_null_port(super::ipc::PORT_DEAD),
-            None => Reply { ret: KERN_SUCCESS, out: Vec::new(), ports: Vec::new(), unimplemented: None }.with_null_port(0),
+            Some(_) => Reply { ret: KERN_SUCCESS, defer: None, out: Vec::new(), ports: Vec::new(), unimplemented: None }.with_null_port(super::ipc::PORT_DEAD),
+            None => Reply { ret: KERN_SUCCESS, defer: None, out: Vec::new(), ports: Vec::new(), unimplemented: None }.with_null_port(0),
         },
         TASK_INSPECT_PORT | TASK_READ_PORT => {
             let mut r = Reply::err(KERN_INVALID_ARGUMENT);

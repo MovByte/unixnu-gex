@@ -64,6 +64,8 @@ pub struct Task {
     /// Its job control state, its cell in the process table, once asked.
     pub job: Option<std::sync::Arc<std::sync::Mutex<crate::proc::Job>>>,
     pub pthread: thread::Registration,
+    /// Kernel replies waiting for a thread to go off its CPU.
+    pub pending_replies: Vec<kobject::PendingReply>,
     /// The real interval timer, and the virtual and profiling ones.
     pub realtimer: itimer::RealTimer,
     pub vtimers: [itimer::Itimerval; 2],

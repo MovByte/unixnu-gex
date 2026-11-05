@@ -181,21 +181,27 @@ impl Kernel {
         self.fd_activity = true;
     }
 
-    /// Whether thread `tid`, on its way back to user space, is held, with
-    /// the signals posted since it last asked acted on first.
-    pub fn darwin_hold(&mut self, tid: i32) -> Hold {
+    /// Whether thread `tid`, on its way back to user space, is held (its
+    /// task stopped, or itself suspended), with the signals posted since
+    /// it last asked acted on first.
+    pub fn darwin_hold(&mut self, m: &mut crate::GuestMem<'_>, tid: i32) -> Hold {
         if !self.darwin || self.procs.halt_code().is_some() {
             return Hold::Run;
         }
         self.collect_signals();
         self.darwin_assign_signals();
-        if self.darwin_job_with(|j| j.holds) == 0 {
+        // thread_hold: the task's, or the thread's own (thread_suspend).
+        let thread_held = self.dtask.threads.map.get(&tid).is_some_and(|t| t.suspend > 0);
+        if self.darwin_job_with(|j| j.holds) == 0 && !thread_held {
+            self.darwin_set_offcpu(m, tid, false);
             return Hold::Run;
         }
         let me = self.dtask.threads.map.entry(tid).or_default();
         if std::mem::take(&mut me.job_abort) {
+            self.darwin_set_offcpu(m, tid, false);
             return Hold::Deliver;
         }
+        self.darwin_set_offcpu(m, tid, true);
         Hold::Park
     }
 

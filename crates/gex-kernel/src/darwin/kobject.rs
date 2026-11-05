@@ -199,6 +199,19 @@ impl Kernel {
             let u = u.clone();
             self.darwin_unimplemented(u);
         }
+        // A reply that waits for a thread to stop (thread_wait): its port
+        // kept for it.
+        if let Some((target, op)) = reply.defer {
+            match req.reply {
+                Some(Carried::Port(rport)) => {
+                    let pending = PendingReply { id: req.id, rport, rtype: bits::local(req.bits), target, op };
+                    self.dtask.pending_replies.push(pending);
+                }
+                Some(r) => self.dtask.ipc.object_destroy(r, bits::local(req.bits)),
+                None => {}
+            }
+            return None;
+        }
         let ipc = &mut self.dtask.ipc;
         let status = reply.ret;
         if status != 0 && status != MIG_NO_REPLY {
@@ -244,6 +257,68 @@ impl Kernel {
     }
 }
 
+/// What a deferred reply waits to answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Deferred {
+    /// `thread_suspend`'s `thread_wait`: success, once the thread is off
+    /// its CPU.
+    ThreadWait,
+}
+
+/// A request answered once a thread is off its CPU.
+#[derive(Clone, Debug)]
+pub struct PendingReply {
+    pub id: i32,
+    pub rport: ObjId,
+    pub rtype: u32,
+    pub target: i32,
+    pub op: Deferred,
+}
+
+impl Kernel {
+    /// Thread `tid` going off its CPU (`off`), or back on: the replies
+    /// waiting for it sent.
+    pub(crate) fn darwin_set_offcpu(&mut self, m: &mut crate::GuestMem<'_>, tid: i32, off: bool) {
+        if let Some(t) = self.dtask.threads.map.get_mut(&tid) {
+            t.offcpu = off;
+        }
+        if off {
+            self.darwin_pending_replies(m, tid);
+        }
+    }
+
+    /// The replies waiting for thread `tid` (off its CPU, or gone).
+    pub(crate) fn darwin_pending_replies(&mut self, m: &mut crate::GuestMem<'_>, tid: i32) {
+        if !self.dtask.pending_replies.iter().any(|p| p.target == tid) {
+            return;
+        }
+        let (mine, rest): (Vec<PendingReply>, Vec<PendingReply>) = std::mem::take(&mut self.dtask.pending_replies).into_iter().partition(|p| p.target == tid);
+        self.dtask.pending_replies = rest;
+        for p in mine {
+            let reply = match p.op {
+                Deferred::ThreadWait => Reply::ok(Vec::new()),
+            };
+            let k = reply.message(p.id, p.rport, p.rtype);
+            self.darwin_kernel_send(Box::new(k));
+        }
+        self.darwin_ipc_settle(m);
+    }
+
+    /// Whether thread `tid` is still there (`thread->active`).
+    pub(crate) fn darwin_thread_alive(&self, tid: i32) -> bool {
+        self.dtask.threads.map.contains_key(&tid) || self.thread_signals.contains(tid)
+    }
+
+    /// Whether thread `tid` is off its CPU: not started, parked, waiting
+    /// in a call, or gone.
+    pub(crate) fn darwin_offcpu(&self, tid: i32) -> bool {
+        match self.dtask.threads.map.get(&tid) {
+            Some(t) => t.offcpu || t.unstarted.is_some(),
+            None => !self.thread_signals.contains(tid),
+        }
+    }
+}
+
 /// A right a reply returns, or a name carried as it is.
 #[derive(Clone, Copy, Debug)]
 pub enum PortOut {
@@ -255,6 +330,8 @@ pub enum PortOut {
 /// it hands back (a complex reply).
 pub struct Reply {
     pub ret: i32,
+    /// Answered later, once thread `.0` is off its CPU.
+    pub defer: Option<(i32, Deferred)>,
     pub out: Vec<u8>,
     /// Rights returned, each with the type it goes as, or a name carried
     /// as it is (null, dead).
@@ -264,15 +341,15 @@ pub struct Reply {
 
 impl Reply {
     pub fn ok(out: Vec<u8>) -> Reply {
-        Reply { ret: 0, out, ports: Vec::new(), unimplemented: None }
+        Reply { ret: 0, defer: None, out, ports: Vec::new(), unimplemented: None }
     }
 
     pub fn err(ret: i32) -> Reply {
-        Reply { ret, out: Vec::new(), ports: Vec::new(), unimplemented: None }
+        Reply { ret, defer: None, out: Vec::new(), ports: Vec::new(), unimplemented: None }
     }
 
     pub fn port(c: Carried) -> Reply {
-        Reply { ret: 0, out: Vec::new(), ports: vec![PortOut::Right(c, msgt::PORT_SEND)], unimplemented: None }
+        Reply { ret: 0, defer: None, out: Vec::new(), ports: vec![PortOut::Right(c, msgt::PORT_SEND)], unimplemented: None }
     }
 
     /// A reply returning a name that is not a right (null, dead).

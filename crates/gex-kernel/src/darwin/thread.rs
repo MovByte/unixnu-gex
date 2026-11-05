@@ -197,6 +197,9 @@ pub struct DThread {
     pub realtime: Option<super::threadpolicy::Realtime>,
     /// `thread_abort` of it while its task is held: it takes its signals.
     pub job_abort: bool,
+    /// Off its CPU: parked by a hold, or waiting in a call (what
+    /// `thread_wait` waits for).
+    pub offcpu: bool,
     /// The thread, made but not started (created suspended).
     pub unstarted: Option<SpawnRequest>,
     /// A workqueue thread's state (`THREAD_TAG_WORKQUEUE`).
@@ -621,6 +624,9 @@ impl Kernel {
         self.darwin_workq_settle(m);
         self.dtask.threads.map.remove(&self.tid);
         self.dtask.waits.forget(self.tid);
+        // Gone, so off its CPU: thread_wait on it ends.
+        let tid = self.tid;
+        self.darwin_pending_replies(m, tid);
     }
 
     /// `ulock_wait2(operation, addr, value, timeout_ns, value2)`
