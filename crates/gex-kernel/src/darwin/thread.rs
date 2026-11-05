@@ -143,8 +143,14 @@ pub struct Policy {
     /// importance, once set.
     pub timeshare: Option<bool>,
     pub importance: Option<i32>,
-    /// `thrp_int_darwinbg`: PRIO_DARWIN_THREAD's background.
+    /// `thrp_int_darwinbg` (PRIO_DARWIN_THREAD's, or THREAD_BACKGROUND_
+    /// POLICY's from the thread itself) and `thrp_ext_darwinbg` (from
+    /// another of its task's threads).
     pub int_darwinbg: bool,
+    pub ext_darwinbg: bool,
+    /// `thrp_latency_qos` and `thrp_through_qos`, `QOS_EXTRACT`ed.
+    pub latency_qos: u8,
+    pub through_qos: u8,
 }
 
 /// A thread's cancellation state: XNU's `UT_CANCEL*` bits of `uu_flag`.
@@ -187,6 +193,8 @@ pub struct DThread {
     /// `thread_suspend` count. A thread made with `PTHREAD_START_SUSPENDED`
     /// starts at 1, not yet run.
     pub suspend: u32,
+    /// TH_MODE_REALTIME's time constraints, while it is in that mode.
+    pub realtime: Option<super::threadpolicy::Realtime>,
     /// `thread_abort` of it while its task is held: it takes its signals.
     pub job_abort: bool,
     /// The thread, made but not started (created suspended).

@@ -287,6 +287,37 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         // task_restartable_ranges_synchronize(task).
         (Kobject::Task, 8000) => restartable_register(k, req),
         (Kobject::Task, 8001) => Reply::ok(Vec::new()),
+        // thread_policy_set(thread, flavor, policy_info[policy_infoCnt]): at
+        // most THREAD_POLICY_INFO_MAX (16) words.
+        (Kobject::Thread(t), 3617) => match (arg(req, 0), arg(req, 1)) {
+            (Some(flavor), Some(cnt)) if (cnt as u32) <= 16 => {
+                let info: Option<Vec<i32>> = (0..cnt as usize).map(|i| arg(req, 2 + i)).collect();
+                let caller = k.tid;
+                match info {
+                    Some(info) => Reply::err(k.darwin_thread_policy_set(*t, caller, flavor, &info)),
+                    None => bad(),
+                }
+            }
+            _ => bad(),
+        },
+        // thread_policy_get(thread, flavor, &policy_infoCnt, &get_default)
+        // -> policy_info[policy_infoCnt], get_default.
+        (Kobject::Thread(t), 3618) => match (arg(req, 0), arg(req, 1), arg(req, 2)) {
+            (Some(flavor), Some(cnt), Some(get_default)) => match k.darwin_thread_policy_get(*t, flavor, (cnt as u32).min(16), get_default != 0) {
+                Some(Ok((w, def))) => {
+                    let mut out = words(&w.iter().map(|&x| x as u32).collect::<Vec<u32>>());
+                    out.extend_from_slice(&u32::from(def).to_le_bytes());
+                    Reply::ok(out)
+                }
+                Some(Err(e)) => Reply::err(e),
+                None => {
+                    let mut r = Reply::err(KERN_FAILURE);
+                    r.unimplemented = Some(format!("thread_policy_get flavor {flavor} (the thread's policy bitfields and override counts)"));
+                    r
+                }
+            },
+            _ => bad(),
+        },
         // thread_suspend(thread) (`thread_act.defs`): one more user stop. A
         // thread made suspended has not run, so nothing waits for it to
         // stop; one that runs would have to be stopped where it is.

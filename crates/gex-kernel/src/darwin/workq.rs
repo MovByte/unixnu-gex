@@ -429,6 +429,11 @@ fn limits() -> Limits {
     }
 }
 
+/// A duration in absolute time (`clock_interval_to_absolutetime_interval`).
+pub(crate) fn abs_time(d: Duration) -> u64 {
+    abs(d)
+}
+
 fn abs(d: Duration) -> u64 {
     (d.as_nanos() * u128::from(super::mach::TIMEBASE.1) / u128::from(super::mach::TIMEBASE.0)) as u64
 }
@@ -638,8 +643,12 @@ impl Kernel {
         use super::taskpolicy::{pri, thread_base_priority, thread_effective_qos};
         let tp = &self.darwin_policy();
         let Some(t) = self.dtask.threads.map.get(&tid) else { return tp.priority as u8 };
+        // TH_MODE_REALTIME.
+        if let Some(rt) = t.realtime {
+            return (super::threadpolicy::BASEPRI_RTQUEUES + i32::from(rt.priority_offset)) as u8;
+        }
         let overrides = t.overrides.iter().map(|o| o.qos).max().unwrap_or(qos::UNSPECIFIED);
-        let (q, relpri, urgent, terminated) = thread_effective_qos(t.policy.qos, t.policy.relpri, overrides, t.policy.int_darwinbg, &tp.effective);
+        let (q, relpri, urgent, terminated) = thread_effective_qos(t.policy.qos, t.policy.relpri, overrides, t.policy.int_darwinbg || t.policy.ext_darwinbg, &tp.effective);
         if q == qos::UNSPECIFIED {
             if let Some(w) = &t.wq {
                 return (i32::from(w.sched_pri)).min(tp.max_priority).max(pri::MAXPRI_THROTTLE) as u8;

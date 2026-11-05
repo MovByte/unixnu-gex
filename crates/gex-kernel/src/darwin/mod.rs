@@ -48,6 +48,7 @@ pub mod spawn;
 pub mod sysctl;
 pub mod sysno;
 pub mod taskpolicy;
+pub mod threadpolicy;
 pub mod thread;
 pub mod timer;
 pub mod vm;
