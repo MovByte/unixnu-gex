@@ -436,6 +436,7 @@ impl Kernel {
         // to hear of their ports.
         self.darwin_ipc_notify_drain();
         let old = std::mem::take(&mut self.dtask);
+        let (realtimer, vtimers) = (old.realtimer, old.vtimers);
         let kp = old.kports;
         self.dtask = super::Task {
             ipc: old.ipc,
@@ -464,6 +465,7 @@ impl Kernel {
                 *p = n;
             });
         }
+        self.darwin_inherit_itimers(realtimer, vtimers);
         self.darwin_finish = None;
         self.darwin_pipe_sigpipe = None;
         self.darwin_execsigs();

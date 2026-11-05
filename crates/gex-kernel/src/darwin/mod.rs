@@ -24,6 +24,7 @@ pub mod exit;
 pub mod execve;
 pub mod fsops;
 pub mod ioctl;
+pub mod itimer;
 pub mod jobctl;
 pub mod ipc;
 pub mod kern;
@@ -63,6 +64,9 @@ pub struct Task {
     /// Its job control state, its cell in the process table, once asked.
     pub job: Option<std::sync::Arc<std::sync::Mutex<crate::proc::Job>>>,
     pub pthread: thread::Registration,
+    /// The real interval timer, and the virtual and profiling ones.
+    pub realtimer: itimer::RealTimer,
+    pub vtimers: [itimer::Itimerval; 2],
     pub threads: thread::Threads,
     pub waits: wait::Waits,
     pub ulocks: thread::Ulocks,

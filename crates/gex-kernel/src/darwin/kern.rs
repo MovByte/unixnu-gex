@@ -354,6 +354,8 @@ impl Kernel {
                     None => neg(Errno::ESRCH),
                 }
             }
+            sys::SETITIMER => res(self.darwin_setitimer(m, a[0] as u32, a[1], a[2])),
+            sys::GETITIMER => res(self.darwin_getitimer(m, a[0] as u32, a[1])),
             sys::PIPE => res(self.darwin_pipe(m)),
             sys::SIGPENDING => res(self.darwin_sigpending(m, a[0])),
             // Process groups and sessions: the same rules as Linux's, but

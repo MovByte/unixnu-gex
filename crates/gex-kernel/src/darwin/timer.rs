@@ -22,6 +22,8 @@ pub enum Action {
     /// An `EVFILT_TIMER` knote's thread call (`filt_timerexpire`), armed
     /// in the timer state given.
     Knote(super::kevent::KnId, u32),
+    /// The real interval timer's (`realitexpire`).
+    RealTimer,
 }
 
 /// How the thread-call thread learns that an earlier deadline was armed, or
@@ -129,6 +131,7 @@ impl Kernel {
             match self.dtask.timers.armed.remove(&key).expect("first key") {
                 Action::MkTimer(port) => self.mk_timer_expire(m, port, key),
                 Action::Workq(c) => self.darwin_workq_call(m, c),
+                Action::RealTimer => self.darwin_realitexpire(),
                 Action::Knote(n, state) => {
                     self.filt_timerexpire(n, state);
                     self.darwin_kevent_settle(m);

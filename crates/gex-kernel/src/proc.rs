@@ -1012,6 +1012,22 @@ impl ProcTable {
         }
     }
 
+    /// A signal the kernel posts to `pid` (no sender): pending for it, and
+    /// its waiters woken.
+    pub fn post_kernel(&self, pid: i32, signo: u32) {
+        {
+            let mut t = self.lock();
+            let Some(p) = t.procs.iter_mut().find(|p| p.pid == pid) else { return };
+            if let Some(v) = &mut p.posts {
+                v.push(signo);
+            }
+            p.pending.fetch_or(1u64 << (signo - 1), Ordering::AcqRel);
+            SIGNAL_SEQ.fetch_add(1, Ordering::Release);
+            p.queue.notify();
+        }
+        post_signal(&[pid], signo);
+    }
+
     /// psignal's stop of `pid` told to its parent: unless the parent has
     /// `P_NOCLDSTOP`, its record of the stop (`si_status` as given) and a
     /// SIGCHLD the kernel posts.
