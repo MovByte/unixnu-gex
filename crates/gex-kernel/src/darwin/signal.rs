@@ -266,6 +266,8 @@ pub struct ThreadSig {
     pub pending_sigreturn: u32,
     pub far: u64,
     pub esr: u32,
+    /// The last trap was a fault whose ESR this kernel cannot give.
+    pub esr_unknown: bool,
 }
 
 /// The process's record of a signal's origin (`p->si_*`).
@@ -326,6 +328,7 @@ impl Kernel {
         let s = self.darwin_sig();
         s.esr = esr_svc(insn >> 5);
         s.far = 0;
+        s.esr_unknown = false;
     }
 
     /// The Linux side of signal `d`'s disposition, from `sigacts`.
@@ -725,6 +728,7 @@ impl Kernel {
         let s = self.darwin_sig();
         s.far = fault_address;
         s.esr = 0;
+        s.esr_unknown = true;
         self.signals.clear_pending(l);
         self.darwin_postsig(m, d, handler, None)
     }

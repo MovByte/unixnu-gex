@@ -4,8 +4,9 @@
 // own; the flavor list; too short a count, or a 32-bit flavor, is
 // KERN_INVALID_ARGUMENT; the NEON state read and written back; the debug
 // state zeros, set with nothing enabled, refused with a context ID
-// (KERN_PROTECTION_FAILURE); and a thread waiting in a call, its pc set,
-// goes on there once its call is done.
+// (KERN_PROTECTION_FAILURE); a thread waiting in a call has that call's
+// trap as its exception state, and, its pc set, goes on there once its
+// call is done.
 
 #include <mach/mach.h>
 #include <pthread.h>
@@ -95,6 +96,12 @@ int main(void) {
     usleep(100000);
     th = pthread_mach_thread_np(t);
     thread_suspend(th);
+    // Its exception state: the svc #0x80 it trapped with (EC 0x15, IL),
+    // with no fault address.
+    arm_exception_state64_t es;
+    memset(&es, 0x55, sizeof es);
+    n = ARM_EXCEPTION_STATE64_COUNT;
+    if ((kr = thread_get_state(th, ARM_EXCEPTION_STATE64, (thread_state_t)&es, &n)) || es.__esr != 0x56000080 || es.__far) return bad("the exception state of a thread in a call", kr ? kr : es.__esr, 0x56000080);
     n = ARM_THREAD_STATE64_COUNT;
     thread_get_state(th, ARM_THREAD_STATE64, (thread_state_t)&ts, &n);
     arm_thread_state64_set_pc_fptr(ts, land);

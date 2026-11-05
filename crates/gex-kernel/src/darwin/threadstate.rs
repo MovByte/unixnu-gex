@@ -56,7 +56,7 @@ fn words(b: &[u8]) -> Vec<u32> {
 impl Kernel {
     /// `machine_thread_get_state` for a 64-bit thread whose context is at
     /// `c`: the words and the count it answers, or the error.
-    fn machine_thread_get_state(&self, m: &GuestMem<'_>, c: u64, fl: i32, count: u32) -> Result<Vec<u32>, i32> {
+    fn machine_thread_get_state(&self, m: &GuestMem<'_>, tid: i32, c: u64, fl: i32, count: u32) -> Result<Vec<u32>, i32> {
         let need = |n: u32| if count < n { Err(KERN_INVALID_ARGUMENT) } else { Ok(()) };
         let rd = |o: usize| m.read_u64(c + o as u64).unwrap_or(0);
         let state64 = || -> Vec<u32> {
@@ -115,6 +115,16 @@ impl Kernel {
                 state64()
             }
             flavor::ARM_THREAD_STATE32 | flavor::ARM_NEON_STATE => return Err(KERN_INVALID_ARGUMENT),
+            // The last synchronous trap's far and esr (an interrupt, here a
+            // safepoint, saves neither); arm64 never writes `exception`.
+            flavor::ARM_EXCEPTION_STATE64 => {
+                need(4)?;
+                let s = self.dtask.threads.map.get(&tid).map(|t| t.sig).unwrap_or_default();
+                if s.esr_unknown {
+                    return Err(-1);
+                }
+                vec![s.far as u32, (s.far >> 32) as u32, s.esr, 0]
+            }
             flavor::ARM_EXCEPTION_STATE => {
                 need(3)?;
                 return Err(KERN_INVALID_ARGUMENT);
@@ -257,11 +267,6 @@ impl Kernel {
         if !self.darwin_thread_alive(tid) {
             return Reply::err(KERN_TERMINATED);
         }
-        if fl == flavor::ARM_EXCEPTION_STATE64 && set.is_none() && count >= 4 {
-            let mut r = Reply::err(KERN_INVALID_ARGUMENT);
-            r.unimplemented = Some("thread_get_state(ARM_EXCEPTION_STATE64) (the saved exception's esr and far)".into());
-            return r;
-        }
         let held = tid != self.tid && !self.darwin_offcpu(tid);
         if held {
             self.dtask.threads.map.entry(tid).or_default().stop_holds += 1;
@@ -287,13 +292,19 @@ impl Kernel {
         };
         match set {
             Some(w) => Reply::err(self.machine_thread_set_state(m, tid, c, fl, &w)),
-            None => match self.machine_thread_get_state(m, c, fl, count) {
+            None => match self.machine_thread_get_state(m, tid, c, fl, count) {
                 Ok(w) => {
                     let mut out = (w.len() as u32).to_le_bytes().to_vec();
                     for x in w {
                         out.extend_from_slice(&x.to_le_bytes());
                     }
                     Reply::ok(out)
+                }
+                // A fault's exception state, whose ESR is not known here.
+                Err(-1) => {
+                    let mut r = Reply::err(KERN_INVALID_ARGUMENT);
+                    r.unimplemented = Some("thread_get_state(ARM_EXCEPTION_STATE64) after a fault (the fault's ESR)".into());
+                    r
                 }
                 Err(e) => Reply::err(e),
             },
