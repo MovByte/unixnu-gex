@@ -2120,12 +2120,13 @@ fn perform_block(
                     let mut st = c.status.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(code) = if nowait { *st } else { st.take() } {
                         if let Some(w) = waitid {
+                            let xhighbits = procs.xhighbits(c.pid);
                             if !nowait {
                                 c.reaped.store(true, std::sync::atomic::Ordering::Release);
                                 procs.reap(c.pid);
                             }
                             let mut mem = GuestMem::new(data);
-                            return w.report(&mut mem, c.pid, code as u32);
+                            return w.report_with(&mut mem, c.pid, code as u32, xhighbits);
                         }
                         c.reaped.store(true, std::sync::atomic::Ordering::Release);
                         // Collected, so the table can forget it. Without this
@@ -3515,6 +3516,7 @@ fn start_darwin_spawn(cx: &SpawnContext, mut child: Kernel) -> std::result::Resu
     };
     note_exec(pid, &img.path, &argv);
     let (opts, xlate, wayland) = (cx.opts.clone(), cx.xlate.clone(), cx.wayland.clone());
+    let creds = Arc::clone(&child.creds);
     let started = std::thread::Builder::new()
         .name(format!("gex-pid-{pid}"))
         .stack_size(guest_thread_stack())
@@ -3529,6 +3531,7 @@ fn start_darwin_spawn(cx: &SpawnContext, mut child: Kernel) -> std::result::Resu
                     127 << 8
                 }
             };
+            procs.set_uid(pid, creds.uid());
             procs.exit(pid, wstatus);
             *status.lock().unwrap_or_else(|e| e.into_inner()) = Some(wstatus);
             done.notify_all();

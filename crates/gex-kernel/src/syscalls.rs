@@ -457,11 +457,17 @@ impl WaitidOut {
     /// encoding), or for no child yet (`pid` 0: Linux zeroes it, and callers
     /// read `si_pid` to tell). The call's own answer is zero either way.
     pub fn report(&self, m: &mut GuestMem<'_>, pid: i32, word: u32) -> Result<u64, Errno> {
+        self.report_with(m, pid, word, 0)
+    }
+
+    /// [`WaitidOut::report`], with the top byte of a Darwin child's exit
+    /// value still its own (`p_xhighbits`, kept for pid 1's children).
+    pub fn report_with(&self, m: &mut GuestMem<'_>, pid: i32, word: u32, xhighbits: u8) -> Result<u64, Errno> {
         if self.info == 0 {
             return Ok(0);
         }
         if self.darwin {
-            return crate::darwin::exit::waitid_report(m, self.info, pid, word);
+            return crate::darwin::exit::waitid_report(m, self.info, pid, word, xhighbits);
         }
         let u = if self.compat { 12 } else { 16 };
         for off in (0..u + 12).step_by(4) {
@@ -9657,6 +9663,8 @@ impl Kernel {
             };
             if raw == crate::darwin::sysno::EXIT {
                 self.darwin_workq_mark_exiting();
+                // exit(): the top byte of the value, for the parent's record.
+                self.procs.set_end(self.pid, (a[0] as u32 >> 24) as u8, self.creds.uid());
             }
             if crate::darwin::thread::CANCEL_POINTS.contains(&raw) && self.darwin_testcancel(true) {
                 let _ = crate::darwin::set_result(m, self.ctx_addr, Errno::EINTR.as_return());

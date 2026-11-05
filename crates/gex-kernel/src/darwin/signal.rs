@@ -216,9 +216,10 @@ pub struct Sigacts {
     pub nocldstop: bool,
     pub nocldwait: bool,
     pub sigreturn_validation: u32,
-    /// `p->si_pid` and `p->si_uid`: who posted the last signal that was
-    /// caught and not held when posted, until a handler frame takes it.
-    pub si: Option<(i32, u32)>,
+    /// `p->si_pid`, `si_uid`, `si_status`, `si_code` and `p_xhighbits`:
+    /// who posted the last signal that was caught and not held when posted,
+    /// or the last child that ended, until a handler frame takes it.
+    pub si: Option<Si>,
 }
 
 impl Default for Sigacts {
@@ -263,6 +264,23 @@ pub struct ThreadSig {
     pub far: u64,
     pub esr: u32,
 }
+
+/// The process's record of a signal's origin (`p->si_*`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Si {
+    pub pid: i32,
+    pub uid: u32,
+    /// A wait status in Darwin's encoding: `W_EXITCODE(signum, 0)` for a
+    /// posted signal, the child's for its end.
+    pub status: u32,
+    pub code: u32,
+    pub xhighbits: u8,
+}
+
+/// `CLD_EXITED`, `CLD_KILLED`, `CLD_DUMPED`.
+const CLD_EXITED: u32 = 1;
+const CLD_KILLED: u32 = 2;
+const CLD_DUMPED: u32 = 3;
 
 /// `__sigaction`, as a 64-bit process passes it.
 struct NewAction {
@@ -599,6 +617,9 @@ impl Kernel {
             let Some(tid) = tid else { continue };
             let Some(ts) = self.thread_signals.get(tid) else { continue };
             let Some(source) = self.signals.process().take_shared(l) else { continue };
+            if l == crate::signal::sig::SIGCHLD {
+                self.darwin_note_child_end();
+            }
             if ts.blocked() & bit == 0 {
                 self.darwin_note_sender(l, source);
             }
@@ -616,12 +637,21 @@ impl Kernel {
         if !caught || d == dsig::SIGCHLD {
             return;
         }
-        let who = match source {
+        let (pid, uid) = match source {
             Some(src) => (src.pid, src.uid),
             None if d == dsig::SIGALRM => (0, 0),
             None => (self.pid, self.creds.uid()),
         };
-        self.dtask.sigacts.si = Some(who);
+        self.dtask.sigacts.si = Some(Si { pid, uid, status: d << 8, code: 0, xhighbits: 0 });
+    }
+
+    /// `proc_exit`'s record in the parent of a child that ended (its pid,
+    /// status, real uid and the top byte of its exit value), as CLD_EXITED.
+    pub(crate) fn darwin_note_child_end(&mut self) {
+        if let Some(end) = self.procs.take_child_end(self.pid) {
+            let status = super::exit::status_from_linux(end.status as u32) & 0xffff;
+            self.dtask.sigacts.si = Some(Si { pid: end.pid, uid: end.uid, status, code: CLD_EXITED, xhighbits: end.xhighbits });
+        }
     }
 
     /// `sigpending(osv)`: the calling thread's own list.
@@ -749,18 +779,25 @@ impl Kernel {
                 put32(&mut info, 8, SEGV_ACCERR);
             }
             _ => {
-                if d == dsig::SIGCHLD {
-                    self.darwin_unimplemented("SIGCHLD's siginfo (the child's CLD_* code and status)".into());
-                }
-                // psignal's record (p->si_*), taken: who sent the last
-                // caught signal, a code of 0 and the signal for its status;
-                // zeros once a frame took it.
+                // The record (p->si_*), taken: a child's end gets its
+                // CLD_* code from its status, and the status shifted out to
+                // the child's exit code or signal; zeros once a frame took
+                // it.
                 let _ = source;
-                if let Some((pid, uid)) = self.dtask.sigacts.si.take() {
-                    put32(&mut info, 12, pid as u32);
-                    put32(&mut info, 16, uid);
-                    put32(&mut info, 20, d);
+                let si = self.dtask.sigacts.si.take().unwrap_or_default();
+                let (mut code, mut status) = (si.code, si.status);
+                if code == CLD_EXITED {
+                    let (exited, signaled) = (status & 0x7f == 0, status & 0x7f != 0x7f && status & 0x7f != 0);
+                    if !exited && signaled {
+                        code = if status & 0x80 != 0 { CLD_DUMPED } else { CLD_KILLED };
+                        // W_EXITCODE(status, status)
+                        status = (status << 8) | status;
+                    }
                 }
+                put32(&mut info, 8, code);
+                put32(&mut info, 12, si.pid as u32);
+                put32(&mut info, 16, si.uid);
+                put32(&mut info, 20, ((status >> 8) & 0xff) | (u32::from(si.xhighbits) << 24));
             }
         }
 

@@ -45,18 +45,19 @@ pub fn status_from_linux(w: u32) -> u32 {
 /// `waitid`'s siginfo for child `pid` that ended with `word` (the host's
 /// encoding): cleared, then SIGCHLD, the pid, CLD_EXITED and the exit
 /// code, or CLD_KILLED (CLD_DUMPED with a core) and the signal. For no
-/// child yet (`pid` 0) it is left as it was.
-pub fn waitid_report(m: &mut GuestMem<'_>, info: u64, pid: i32, word: u32) -> Result<u64, Errno> {
+/// child yet (`pid` 0) it is left as it was. The status carries the top
+/// byte of the exit value where the child still has it.
+pub fn waitid_report(m: &mut GuestMem<'_>, info: u64, pid: i32, word: u32, xhighbits: u8) -> Result<u64, Errno> {
     if pid <= 0 {
         return Ok(0);
     }
     let w = status_from_linux(word);
     let (code, status) = if w & 0x7f == 0 {
-        (CLD_EXITED, (w >> 8) & 0xff)
+        (CLD_EXITED, ((w >> 8) & 0xff) | u32::from(xhighbits) << 24)
     } else if w & 0x80 != 0 {
-        (CLD_DUMPED, w & 0x7f)
+        (CLD_DUMPED, (w & 0x7f) | u32::from(xhighbits) << 24)
     } else {
-        (CLD_KILLED, w & 0x7f)
+        (CLD_KILLED, (w & 0x7f) | u32::from(xhighbits) << 24)
     };
     let mut b = [0u8; SIGINFO_SIZE];
     b[0..4].copy_from_slice(&super::signal::dsig::SIGCHLD.to_le_bytes());

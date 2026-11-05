@@ -166,6 +166,16 @@ pub fn decode_entries(mut b: &[u8]) -> Vec<ProcEntry> {
     out
 }
 
+/// A child's end, as its parent's record holds it (XNU's `proc_exit`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChildEnd {
+    pub pid: i32,
+    /// Its wait status, in the table's (Linux's) encoding.
+    pub status: i32,
+    pub uid: u32,
+    pub xhighbits: u8,
+}
+
 /// One process, as the table sees it.
 struct Proc {
     pid: i32,
@@ -194,6 +204,13 @@ struct Proc {
     /// ([`ProcTable::record_posts`]): Darwin's knotes count each post.
     /// Under the table's lock.
     posts: Option<Vec<u32>>,
+    /// Darwin's `p_xhighbits`, the top byte of the value it exited with,
+    /// and the real uid it ended with: for its parent's record of its end.
+    xhighbits: u8,
+    uid: u32,
+    /// Darwin's `si_pid`, `si_status`, `si_uid` and `p_xhighbits` record of
+    /// the last child that ended, for its SIGCHLD ([`ProcTable::take_child_end`]).
+    child_end: Option<ChildEnd>,
     /// Signals `tgkill` sent to one thread of this process from another
     /// process: (tid, signo, sender), in the order sent. Thread ids are the
     /// process's own, so the table cannot check one; a thread that is gone
@@ -305,6 +322,9 @@ impl ProcTable {
                     killed: 0,
                     senders: [0; 64],
                     posts: None,
+                    xhighbits: 0,
+                    uid: 0,
+                    child_end: None,
                     to_threads: Vec::new(),
                     queue: crate::wait::Queue::new(),
                     info: Vec::new(),
@@ -345,6 +365,9 @@ impl ProcTable {
             killed: 0,
             senders: [0; 64],
             posts: None,
+            xhighbits: 0,
+            uid: 0,
+            child_end: None,
             to_threads: Vec::new(),
             queue: crate::wait::Queue::new(),
             info: Vec::new(),
@@ -570,13 +593,25 @@ impl ProcTable {
                     }
                     None => 0,
                 },
-                _ => match ppid.and_then(|ppid| t.procs.iter().find(|p| p.pid == ppid)) {
-                Some(parent) => {
+                _ => match ppid {
+                Some(ppid) if t.procs.iter().any(|p| p.pid == ppid) => {
+                    // proc_exit: the parent's record of this end, the top
+                    // byte of the exit value moved to it but for pid 1's.
+                    let (uid, xhighbits) = t.procs.iter().find(|p| p.pid == pid).map_or((0, 0), |p| (p.uid, p.xhighbits));
+                    if ppid != INIT_PID {
+                        if let Some(c) = t.procs.iter_mut().find(|p| p.pid == pid) {
+                            c.xhighbits = 0;
+                        }
+                    }
+                    let parent = t.procs.iter_mut().find(|p| p.pid == ppid).expect("the parent");
+                    if ppid != INIT_PID {
+                        parent.child_end = Some(ChildEnd { pid, status, uid, xhighbits });
+                    }
                     parent.pending.fetch_or(1u64 << (SIGCHLD - 1), Ordering::AcqRel);
                     SIGNAL_SEQ.fetch_add(1, Ordering::Release);
                     parent.queue.id()
                 }
-                None => 0,
+                _ => 0,
                 },
             }
         };
@@ -862,6 +897,46 @@ impl ProcTable {
     }
 
     /// Take everything sent to `pid` since the last call.
+    /// What a Darwin process ending will say of itself: the top byte of
+    /// its exit value (`p_xhighbits`) and its real uid.
+    pub fn set_end(&self, pid: i32, xhighbits: u8, uid: u32) {
+        if self.remote.is_some() {
+            return;
+        }
+        if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
+            p.xhighbits = xhighbits;
+            p.uid = uid;
+        }
+    }
+
+    /// The record of `pid`'s last child to end, taken.
+    pub fn take_child_end(&self, pid: i32) -> Option<ChildEnd> {
+        if self.remote.is_some() {
+            return None;
+        }
+        self.lock().procs.iter_mut().find(|p| p.pid == pid).and_then(|p| p.child_end.take())
+    }
+
+    /// The top byte of `pid`'s exit value still its own, taken: what
+    /// `waitid` reports of a child whose parent did not take it (pid 1's),
+    /// and once only.
+    pub fn xhighbits(&self, pid: i32) -> u8 {
+        if self.remote.is_some() {
+            return 0;
+        }
+        self.lock().procs.iter_mut().find(|p| p.pid == pid).map_or(0, |p| std::mem::take(&mut p.xhighbits))
+    }
+
+    /// The real uid `pid` ended with, for its parent's record.
+    pub fn set_uid(&self, pid: i32, uid: u32) {
+        if self.remote.is_some() {
+            return;
+        }
+        if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
+            p.uid = uid;
+        }
+    }
+
     /// Keep a list of every signal posted to `pid` from now on
     /// ([`ProcTable::take_posts`]).
     pub fn record_posts(&self, pid: i32) {
