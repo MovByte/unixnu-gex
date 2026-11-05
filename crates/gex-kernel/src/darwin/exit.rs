@@ -19,10 +19,15 @@ const P_PGID: u64 = 2;
 
 /// `sizeof(user64_siginfo_t)`.
 const SIGINFO_SIZE: usize = 104;
-/// `CLD_EXITED`, `CLD_KILLED`, `CLD_DUMPED`.
+/// `CLD_EXITED`, `CLD_KILLED`, `CLD_DUMPED`, `CLD_STOPPED`, `CLD_CONTINUED`.
 const CLD_EXITED: u32 = 1;
 const CLD_KILLED: u32 = 2;
 const CLD_DUMPED: u32 = 3;
+pub const CLD_STOPPED: u32 = 5;
+pub const CLD_CONTINUED: u32 = 6;
+
+/// `wait4` options a Darwin wait reports stops and continues for.
+const WUNTRACED: i32 = 0x2;
 
 /// `WAIT_ANY`.
 const WAIT_ANY: i32 = -1;
@@ -59,6 +64,12 @@ pub fn waitid_report(m: &mut GuestMem<'_>, info: u64, pid: i32, word: u32, xhigh
     } else {
         (CLD_KILLED, (w & 0x7f) | u32::from(xhighbits) << 24)
     };
+    waitid_job_report(m, info, pid, code, status)
+}
+
+/// `waitid`'s siginfo, zeroed but for SIGCHLD, `code`, `pid` and `status`
+/// (a stop's or a continue's: the signal number in `p_xstat`).
+pub fn waitid_job_report(m: &mut GuestMem<'_>, info: u64, pid: i32, code: u32, status: u32) -> Result<u64, Errno> {
     let mut b = [0u8; SIGINFO_SIZE];
     b[0..4].copy_from_slice(&super::signal::dsig::SIGCHLD.to_le_bytes());
     b[8..12].copy_from_slice(&code.to_le_bytes());
@@ -69,8 +80,10 @@ pub fn waitid_report(m: &mut GuestMem<'_>, info: u64, pid: i32, word: u32, xhigh
 }
 
 impl Kernel {
-    /// `waitid(idtype, id, infop, options)` and `waitid_nocancel`. Only an
-    /// end can be waited for here: no child stops or continues yet.
+    /// `waitid(idtype, id, infop, options)` and `waitid_nocancel`: a child's
+    /// end (`WEXITED`), its stop not yet reported (`WSTOPPED`) or its
+    /// continue (`WCONTINUED`), each left to be reported again under
+    /// `WNOWAIT`.
     pub(crate) fn darwin_waitid(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> SyscallOutcome {
         let fail = |k: &mut Kernel, m: &mut GuestMem<'_>, e: Errno| {
             let _ = super::set_result(m, k.ctx_addr, e.as_return());
@@ -97,14 +110,6 @@ impl Kernel {
         if children.is_empty() {
             return fail(self, m, Errno::ECHILD);
         }
-        if options & WEXITED == 0 {
-            if options & WNOHANG != 0 {
-                let _ = super::set_result(m, self.ctx_addr, 0);
-                return SyscallOutcome::Continue;
-            }
-            self.darwin_unimplemented("waitid for a stop or a continue only (stopped and continued children)".into());
-            return fail(self, m, Errno::EINVAL);
-        }
         SyscallOutcome::Blocking(BlockOp::WaitChild {
             children,
             procs: std::sync::Arc::clone(&self.procs),
@@ -113,6 +118,7 @@ impl Kernel {
             wstatus: 0,
             nohang: options & WNOHANG != 0,
             waitid: Some(crate::syscalls::WaitidOut { info, nowait: options & WNOWAIT != 0, compat: false, darwin: true }),
+            jobs: Some(crate::syscalls::JobWait { exits: options & WEXITED != 0, stops: options & WSTOPPED != 0, continues: options & WCONTINUED != 0 }),
         })
     }
 
@@ -156,6 +162,7 @@ impl Kernel {
             wstatus: status,
             nohang: options & WNOHANG != 0,
             waitid: None,
+            jobs: Some(crate::syscalls::JobWait { exits: true, stops: options & WUNTRACED != 0, continues: options & WCONTINUED != 0 }),
         })
     }
 

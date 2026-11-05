@@ -177,6 +177,10 @@ pub struct ProcSig {
     /// The part of `posted` this process raised itself (the rest came
     /// through the process table, which told of them as it posted them).
     local_posted: Mutex<Vec<u32>>,
+    /// `posted` again, for the kernel's own work at each post (Darwin's
+    /// `psignal`: a thread chosen, a stop or a continue acted on), in
+    /// order where the pending set keeps one bit a signal.
+    to_assign: Mutex<Vec<u32>>,
     post_hook: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// What each signal does with no handler, for a personality whose
     /// defaults are not Linux's ([`default_action`] when unset).
@@ -203,6 +207,7 @@ impl ProcSig {
             timer_next: AtomicU64::new(NO_TIMER),
             posted: Mutex::new(Vec::new()),
             local_posted: Mutex::new(Vec::new()),
+            to_assign: Mutex::new(Vec::new()),
             post_hook: std::sync::OnceLock::new(),
             defaults: std::sync::OnceLock::new(),
         }
@@ -249,6 +254,12 @@ impl ProcSig {
         std::mem::take(&mut *self.local_posted.lock())
     }
 
+    /// The posts since the last take, in order, for the kernel's own work
+    /// at each.
+    pub fn take_to_assign(&self) -> Vec<u32> {
+        std::mem::take(&mut *self.to_assign.lock())
+    }
+
     /// Mark a process-directed signal pending: whichever thread does not
     /// block it takes it.
     pub fn raise(&self, signal: u32, source: Option<Source>) {
@@ -257,6 +268,7 @@ impl ProcSig {
             if let Some(hook) = self.post_hook.get() {
                 self.posted.lock().push(signal);
                 self.local_posted.lock().push(signal);
+                self.to_assign.lock().push(signal);
                 hook();
             }
         }
@@ -417,6 +429,7 @@ impl ProcSig {
             }
         }
         if let Some(hook) = self.post_hook.get() {
+            self.to_assign.lock().extend(posts.iter().copied());
             self.posted.lock().extend(posts);
             hook();
         }
@@ -584,6 +597,11 @@ impl ThreadSig {
 
     pub fn pending(&self) -> u64 {
         self.pending.load(Ordering::Acquire)
+    }
+
+    /// Drop the signals in `mask` from this thread's own pending set.
+    pub fn discard_mask(&self, mask: u64) {
+        self.pending.fetch_and(!mask, Ordering::AcqRel);
     }
 
     pub fn blocked(&self) -> u64 {

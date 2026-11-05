@@ -435,7 +435,21 @@ pub enum BlockOp {
         /// `waitid`'s answer instead of `wait4`'s: a `siginfo_t` and zero.
         /// (`si_uid` is left zero.)
         waitid: Option<WaitidOut>,
+        /// A Darwin wait's: which of a child's ends, stops and continues it
+        /// reports (`None`: ends only).
+        jobs: Option<JobWait>,
     },
+}
+
+/// What a Darwin `wait4` or `waitid` reports of a child (kern_exit.c).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JobWait {
+    /// An end (`WEXITED`; always, for `wait4`).
+    pub exits: bool,
+    /// A stop not yet reported (`WUNTRACED`, `WSTOPPED`).
+    pub stops: bool,
+    /// A continue (`WCONTINUED`).
+    pub continues: bool,
 }
 
 /// Where and how `waitid` reports the child it found ([`waitid_child`]).
@@ -463,11 +477,12 @@ impl WaitidOut {
     /// [`WaitidOut::report`], with the top byte of a Darwin child's exit
     /// value still its own (`p_xhighbits`, kept for pid 1's children).
     pub fn report_with(&self, m: &mut GuestMem<'_>, pid: i32, word: u32, xhighbits: u8) -> Result<u64, Errno> {
-        if self.info == 0 {
-            return Ok(0);
-        }
+        // Darwin's copyoutsiginfo has no null to skip: EFAULT.
         if self.darwin {
             return crate::darwin::exit::waitid_report(m, self.info, pid, word, xhighbits);
+        }
+        if self.info == 0 {
+            return Ok(0);
         }
         let u = if self.compat { 12 } else { 16 };
         for off in (0..u + 12).step_by(4) {
@@ -6196,6 +6211,7 @@ fn wait_child(procs: &Arc<ProcTable>, pid: i32, a: [u64; 6]) -> BlockOp {
         wstatus: a[1],
         nohang: a[2] & 1 != 0,
         waitid: None,
+        jobs: None,
     }
 }
 
@@ -8737,6 +8753,9 @@ pub struct Child {
     /// Set once a `wait4` has collected this child, so a second one reports
     /// `ECHILD` rather than blocking forever.
     pub reaped: Arc<std::sync::atomic::AtomicBool>,
+    /// A Darwin process's stops and continues (`done` is signalled with
+    /// each).
+    pub job: Arc<Mutex<crate::proc::Job>>,
 }
 
 impl Child {
@@ -8746,6 +8765,7 @@ impl Child {
             status: Arc::new(Mutex::new(None)),
             done: Arc::new(std::sync::Condvar::new()),
             reaped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            job: Arc::new(Mutex::new(crate::proc::Job::default())),
         }
     }
 
@@ -8756,6 +8776,7 @@ impl Child {
             status: Arc::clone(&self.status),
             done: Arc::clone(&self.done),
             reaped: Arc::clone(&self.reaped),
+            job: Arc::clone(&self.job),
         }
     }
 }
@@ -8767,6 +8788,7 @@ pub struct ChildHandle {
     pub status: Arc<Mutex<Option<i32>>>,
     pub done: Arc<std::sync::Condvar>,
     pub reaped: Arc<std::sync::atomic::AtomicBool>,
+    pub job: Arc<Mutex<crate::proc::Job>>,
 }
 
 /// A blocking call's state that waits in the kernel for the host to finish
@@ -8936,6 +8958,12 @@ impl Kernel {
     pub fn signal_pending_for(&mut self, tid: i32) -> bool {
         self.collect_signals();
         self.check_timers();
+        // Darwin's psignal acts at the post: a thread chosen, a stop or a
+        // continue done, an ignored signal forgotten (a stop does not end a
+        // sleep).
+        if self.darwin {
+            self.darwin_assign_signals();
+        }
         if tid == self.sig_tid {
             return self.signals.would_deliver();
         }
@@ -9342,6 +9370,10 @@ impl Kernel {
         let cwd = child.proc_fs.get();
         if cwd != child.vfs.cwd {
             child.vfs.put_cwd(cwd);
+        }
+        // forkproc keeps neither P_NOCLDSTOP nor P_NOCLDWAIT.
+        if self.darwin {
+            child.darwin_fork_signals();
         }
         // fdt_fork: a Darwin kqueue is FG_CONFINED, its process's alone.
         if self.darwin {

@@ -96,6 +96,7 @@ hello from /var/tmp/gex-exec-fat with 1 argument" 0
     sigchld) check_root sigchld "sigchld ok" 0 ;;
     procknote) check_root procknote "procknote ok" 0 ;;
     fork) check_root fork "fork ok" 0 ;;
+    jobctl) check_root jobctl "jobctl ok" 0 ;;
     cfrunloop) check_root cfrunloop "cfrunloop 3 1" 0 ;;
     xpc-anon) check_root xpc-anon "xpc-anon 42" 0 ;;
     *)
@@ -110,7 +111,7 @@ if [ "$named" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork cfrunloop xpc-anon; do
+    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl cfrunloop xpc-anon; do
         run "$p"
     done
 fi

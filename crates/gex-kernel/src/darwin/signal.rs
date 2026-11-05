@@ -28,7 +28,10 @@ pub mod dsig {
     pub const SIGBUS: u32 = 10;
     pub const SIGSEGV: u32 = 11;
     pub const SIGSTOP: u32 = 17;
+    pub const SIGTSTP: u32 = 18;
     pub const SIGCONT: u32 = 19;
+    pub const SIGTTIN: u32 = 21;
+    pub const SIGTTOU: u32 = 22;
     pub const SIGCHLD: u32 = 20;
     pub const SIGALRM: u32 = 14;
     pub const SIGVTALRM: u32 = 26;
@@ -51,7 +54,7 @@ mod saf {
 }
 
 /// `sigprop` bits (`bsd/sys/signalvar.h`).
-mod prop {
+pub(super) mod prop {
     pub const KILL: u8 = 0x01;
     pub const CORE: u8 = 0x02;
     pub const STOP: u8 = 0x04;
@@ -61,7 +64,7 @@ mod prop {
 }
 
 /// `sigprop[NSIG]`: what each signal does by default.
-const SIGPROP: [u8; NSIG] = {
+pub(super) const SIGPROP: [u8; NSIG] = {
     use prop::*;
     [
         0,
@@ -100,7 +103,7 @@ const SIGPROP: [u8; NSIG] = {
 };
 
 /// `sigmask(sig)`.
-const fn sigmask(d: u32) -> u32 {
+pub(super) const fn sigmask(d: u32) -> u32 {
     1 << (d - 1)
 }
 
@@ -281,6 +284,7 @@ pub struct Si {
 const CLD_EXITED: u32 = 1;
 const CLD_KILLED: u32 = 2;
 const CLD_DUMPED: u32 = 3;
+const CLD_STOPPED: u32 = 5;
 
 /// `__sigaction`, as a 64-bit process passes it.
 struct NewAction {
@@ -298,6 +302,14 @@ impl Kernel {
         self.procs.record_posts(self.pid);
         let bell = self.darwin_timer_bell();
         self.signals.process().set_post_hook(Box::new(move || bell.ring()));
+    }
+
+    /// A new process's SIGCHLD flags: forkproc copies no P_NOCLDSTOP or
+    /// P_NOCLDWAIT into the child's p_flag.
+    pub(crate) fn darwin_fork_signals(&mut self) {
+        self.dtask.sigacts.nocldstop = false;
+        self.dtask.sigacts.nocldwait = false;
+        self.darwin_sig_mirror(dsig::SIGCHLD);
     }
 
     fn darwin_sig(&mut self) -> &mut ThreadSig {
@@ -431,6 +443,8 @@ impl Kernel {
         if d == dsig::SIGCHLD {
             ps.nocldstop = v.flags & saf::NOCLDSTOP != 0;
             ps.nocldwait = v.flags & saf::NOCLDWAIT != 0 || v.handler == SIG_IGN;
+            let nocldstop = ps.nocldstop;
+            self.procs.set_nocldstop(self.pid, nocldstop);
         }
         let ignored = v.handler == SIG_IGN || (SIGPROP[d as usize] & prop::IGNORE != 0 && v.handler == SIG_DFL);
         if ignored {
@@ -574,7 +588,7 @@ impl Kernel {
             if handler == SIG_DFL {
                 let p = SIGPROP[d as usize];
                 if p & prop::STOP != 0 {
-                    self.darwin_unimplemented(format!("stopping the process for Darwin signal {d} (no job control)"));
+                    self.darwin_issignal_stop(d);
                     continue;
                 }
                 if p & prop::IGNORE != 0 {
@@ -597,14 +611,28 @@ impl Kernel {
     /// its own list (`uu_siglist`). A signal caught and not held there is
     /// psignal's record of who sent it.
     pub(crate) fn darwin_assign_signals(&mut self) {
-        let mut bits = self.signals.process().shared();
-        if bits == 0 {
+        // Each post in order (the pending set keeps one bit a signal, and a
+        // stop then a continue is not a continue then a stop), then any
+        // signal pending with no post recorded.
+        let mut order = self.signals.process().take_to_assign();
+        let mut rest = self.signals.process().shared();
+        for &l in &order {
+            if (1..=64).contains(&l) {
+                rest &= !(1u64 << (l - 1));
+            }
+        }
+        while rest != 0 {
+            order.push(rest.trailing_zeros() + 1);
+            rest &= rest - 1;
+        }
+        if order.is_empty() {
             return;
         }
         let tids = self.thread_signals.tids_in_order();
-        while bits != 0 {
-            let l = bits.trailing_zeros() + 1;
-            bits &= bits - 1;
+        for l in order {
+            if !(1..=64).contains(&l) {
+                continue;
+            }
             let bit = 1u64 << (l - 1);
             let willing = |k: &Kernel, t: i32, skip_wq: bool| {
                 let d = k.dtask.threads.map.get(&t);
@@ -616,14 +644,22 @@ impl Kernel {
             let tid = tids.iter().copied().find(|&t| willing(self, t, true)).or_else(|| tids.iter().copied().find(|&t| willing(self, t, false))).or_else(|| tids.first().copied());
             let Some(tid) = tid else { continue };
             let Some(ts) = self.thread_signals.get(tid) else { continue };
-            let Some(source) = self.signals.process().take_shared(l) else { continue };
-            if l == crate::signal::sig::SIGCHLD {
-                self.darwin_note_child_end();
+            match self.signals.process().take_shared(l) {
+                Some(source) => {
+                    if l == crate::signal::sig::SIGCHLD {
+                        self.darwin_note_child_end();
+                    }
+                    if ts.blocked() & bit == 0 {
+                        self.darwin_note_sender(l, source);
+                    }
+                    ts.raise(l, source);
+                }
+                // A second post of one already moved: pending again where
+                // the work at the first took it away (a stop, a continue).
+                None if ts.pending() & bit == 0 => ts.raise(l, None),
+                None => {}
             }
-            if ts.blocked() & bit == 0 {
-                self.darwin_note_sender(l, source);
-            }
-            ts.raise(l, source);
+            self.darwin_psignal(tid, l, false);
         }
     }
 
@@ -649,6 +685,10 @@ impl Kernel {
     /// status, real uid and the top byte of its exit value), as CLD_EXITED.
     pub(crate) fn darwin_note_child_end(&mut self) {
         if let Some(end) = self.procs.take_child_end(self.pid) {
+            if end.stopped {
+                self.dtask.sigacts.si = Some(Si { pid: end.pid, uid: end.uid, status: end.status as u32, code: CLD_STOPPED, xhighbits: 0 });
+                return;
+            }
             let status = super::exit::status_from_linux(end.status as u32) & 0xffff;
             self.dtask.sigacts.si = Some(Si { pid: end.pid, uid: end.uid, status, code: CLD_EXITED, xhighbits: end.xhighbits });
         }

@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 /// The signal a parent is owed when a child ends.
 const SIGCHLD: u32 = crate::signal::sig::SIGCHLD;
+const SIGHUP: u32 = crate::signal::sig::SIGHUP;
+const SIGCONT: u32 = crate::signal::sig::SIGCONT;
 use std::sync::{Arc, Mutex};
 
 use crate::errno::Errno;
@@ -166,14 +168,35 @@ pub fn decode_entries(mut b: &[u8]) -> Vec<ProcEntry> {
     out
 }
 
-/// A child's end, as its parent's record holds it (XNU's `proc_exit`).
+/// A child's end, as its parent's record holds it (XNU's `proc_exit`), or
+/// its stop (`psignal`'s and `issignal`'s `CLD_STOPPED` record).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChildEnd {
     pub pid: i32,
-    /// Its wait status, in the table's (Linux's) encoding.
+    /// Its wait status, in the table's (Linux's) encoding; for a stop, the
+    /// `si_status` XNU records, in Darwin's.
     pub status: i32,
     pub uid: u32,
     pub xhighbits: u8,
+    pub stopped: bool,
+}
+
+/// A Darwin process's job control state, beside its exit status.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Job {
+    /// `p_stat == SSTOP`.
+    pub stopped: bool,
+    /// `p_xstat`: the Darwin signal that stopped it, or SIGCONT once a
+    /// default SIGCONT continued it.
+    pub xstat: u32,
+    /// `P_LWAITED`: a wait has reported the stop.
+    pub waited: bool,
+    /// `P_CONTINUED`, and `p_contproc`.
+    pub continued: bool,
+    pub contproc: i32,
+    /// The task's `user_stop_count`: its threads are held while it is not
+    /// zero (`task_suspend_internal`, `task_resume_internal`).
+    pub holds: u32,
 }
 
 /// One process, as the table sees it.
@@ -209,8 +232,13 @@ struct Proc {
     xhighbits: u8,
     uid: u32,
     /// Darwin's `si_pid`, `si_status`, `si_uid` and `p_xhighbits` record of
-    /// the last child that ended, for its SIGCHLD ([`ProcTable::take_child_end`]).
+    /// the last child that ended or stopped, for its SIGCHLD
+    /// ([`ProcTable::take_child_end`]).
     child_end: Option<ChildEnd>,
+    /// Darwin's `P_EXEC` (it has exec'd since its fork) and `P_NOCLDSTOP`
+    /// (its SIGCHLD action has SA_NOCLDSTOP).
+    execed: bool,
+    nocldstop: bool,
     /// Signals `tgkill` sent to one thread of this process from another
     /// process: (tid, signo, sender), in the order sent. Thread ids are the
     /// process's own, so the table cannot check one; a thread that is gone
@@ -253,6 +281,67 @@ struct Table {
     procs: Vec<Proc>,
     /// Each live thread that is not its process's first, and its process.
     threads: std::collections::HashMap<i32, i32>,
+    /// Each process group's `pg_jobc`: how many of its members have a
+    /// parent in another group of its session (`fixjobc`).
+    jobc: std::collections::HashMap<i32, i32>,
+}
+
+impl Table {
+    /// `fixjobc(p, pgrp, entering)`: process `pid` entering or leaving group
+    /// `pgid` of session `sess`. Its parent qualifies it for its group when
+    /// in another group of the session, and it qualifies each child in
+    /// another group of the session (a zombie still counts, as
+    /// `proc_childrenwalk` walks it); each count that reaches zero on the
+    /// way down is a group made orphaned, for `orphanpg`.
+    fn fixjobc(&mut self, pid: i32, pgid: i32, sess: i32, entering: bool, orphaned: &mut Vec<i32>) {
+        let ppid = self.procs.iter().find(|p| p.pid == pid).map(|p| p.ppid);
+        let parent = ppid.and_then(|pp| self.procs.iter().find(|p| p.pid == pp)).map(|p| (p.pgid, p.sid));
+        let mut qualified = Vec::new();
+        if let Some((hispg, hissess)) = parent {
+            if hispg != pgid && hissess == sess {
+                qualified.push(pgid);
+            }
+        }
+        for c in self.procs.iter().filter(|c| c.ppid == pid && c.pid != pid) {
+            if c.pgid != pgid && c.sid == sess {
+                qualified.push(c.pgid);
+            }
+        }
+        for g in qualified {
+            let n = self.jobc.entry(g).or_insert(0);
+            if entering {
+                *n += 1;
+            } else {
+                *n -= 1;
+                if *n == 0 {
+                    orphaned.push(g);
+                }
+            }
+        }
+    }
+
+    /// `enterpgrp(p, pgid, mksess)` after its checks: a group that does not
+    /// exist is made (in a new session for `setsid`), with a count of
+    /// zero; the counts are fixed up, entering first, then the process
+    /// moves. Joining its own group again does nothing.
+    fn enterpgrp(&mut self, pid: i32, pgid: i32, mksess: bool, orphaned: &mut Vec<i32>) {
+        let Some((mypgid, mysid)) = self.procs.iter().find(|p| p.pid == pid).map(|p| (p.pgid, p.sid)) else { return };
+        let existing = self.procs.iter().find(|p| p.pgid == pgid).map(|p| p.sid);
+        let sess = match existing {
+            Some(_) if pgid == mypgid => return,
+            Some(s) => s,
+            None => {
+                self.jobc.insert(pgid, 0);
+                if mksess { pid } else { mysid }
+            }
+        };
+        self.fixjobc(pid, pgid, sess, true, orphaned);
+        self.fixjobc(pid, mypgid, mysid, false, orphaned);
+        if let Some(p) = self.procs.iter_mut().find(|p| p.pid == pid) {
+            p.pgid = pgid;
+            p.sid = sess;
+        }
+    }
 }
 
 /// Moved after every signal left in a process's inbox (`kill`, a group's
@@ -312,6 +401,7 @@ impl ProcTable {
             inner: Mutex::new(Table {
                 next_pid: INIT_PID + 1,
                 threads: std::collections::HashMap::new(),
+                jobc: std::collections::HashMap::new(),
                 procs: vec![Proc {
                     pid: INIT_PID,
                     ppid: 0,
@@ -325,6 +415,8 @@ impl ProcTable {
                     xhighbits: 0,
                     uid: 0,
                     child_end: None,
+                    execed: false,
+                    nocldstop: false,
                     to_threads: Vec::new(),
                     queue: crate::wait::Queue::new(),
                     info: Vec::new(),
@@ -368,6 +460,8 @@ impl ProcTable {
             xhighbits: 0,
             uid: 0,
             child_end: None,
+            execed: false,
+            nocldstop: false,
             to_threads: Vec::new(),
             queue: crate::wait::Queue::new(),
             info: Vec::new(),
@@ -531,9 +625,14 @@ impl ProcTable {
             return (r.exit)(pid, status);
         }
         let virtual_init = self.virtual_init.load(Ordering::Acquire);
+        let mut jobc_orphaned = Vec::new();
         let (cell, done, was_ppid, own_q, orphans) = {
             let mut t = self.lock();
             let ppid = t.procs.iter().find(|p| p.pid == pid).map(|p| p.ppid);
+            // proc_exit's fixjobc, before its children go to init.
+            if let Some((pgid, sid)) = t.procs.iter().find(|p| p.pid == pid).map(|p| (p.pgid, p.sid)) {
+                t.fixjobc(pid, pgid, sid, false, &mut jobc_orphaned);
+            }
             let mut orphans = Vec::new();
             for p in t.procs.iter_mut() {
                 if p.ppid == pid {
@@ -567,6 +666,7 @@ impl ProcTable {
         // Published outside the table lock: a waiter wakes on `done` then wants
         // the table, so holding both here in the other order deadlocks.
         *cell.lock().unwrap_or_else(|e| e.into_inner()) = Some(status);
+        self.orphanpg(pid, &jobc_orphaned);
         done.notify_all();
         // proc_exit's NOTE_EXIT, with the low half of the status as Darwin
         // encodes it.
@@ -608,7 +708,7 @@ impl ProcTable {
                     }
                     let parent = t.procs.iter_mut().find(|p| p.pid == ppid).expect("the parent");
                     if ppid != INIT_PID {
-                        parent.child_end = Some(ChildEnd { pid, status, uid, xhighbits });
+                        parent.child_end = Some(ChildEnd { pid, status, uid, xhighbits, stopped: false });
                     }
                     parent.pending.fetch_or(1u64 << (SIGCHLD - 1), Ordering::AcqRel);
                     SIGNAL_SEQ.fetch_add(1, Ordering::Release);
@@ -693,14 +793,14 @@ impl ProcTable {
         if t.procs.iter().any(|p| p.pgid == pid) {
             return Err(Errno::EPERM);
         }
-        match t.procs.iter_mut().find(|p| p.pid == pid) {
-            Some(p) => {
-                p.sid = pid;
-                p.pgid = pid;
-                Ok(pid)
-            }
-            None => Err(Errno::ESRCH),
+        if !t.procs.iter().any(|p| p.pid == pid) {
+            return Err(Errno::ESRCH);
         }
+        let mut orphaned = Vec::new();
+        t.enterpgrp(pid, pid, true, &mut orphaned);
+        drop(t);
+        self.orphanpg(pid, &orphaned);
+        Ok(pid)
     }
 
     /// `setpgid(target, pgid)`, either zero meaning the caller. You may move
@@ -735,10 +835,140 @@ impl ProcTable {
                 None => return Err(Errno::EPERM),
             }
         }
-        if let Some(p) = t.procs.iter_mut().find(|p| p.pid == target) {
-            p.pgid = pgid;
-        }
+        let mut orphaned = Vec::new();
+        t.enterpgrp(target, pgid, false, &mut orphaned);
+        drop(t);
+        self.orphanpg(caller, &orphaned);
         Ok(())
+    }
+
+    /// Darwin's `setpgid(pid, pgid)` (kern_prot.c): the caller or one of its
+    /// descendants (`inferior`) that is in its session and has not exec'd
+    /// (EACCES); never a session leader; a group joined must exist in the
+    /// caller's session.
+    pub fn darwin_setpgid(&self, caller: i32, pid: i32, pgid: i32) -> Result<(), Errno> {
+        let mut t = self.lock();
+        let alive = |t: &Table, pid: i32| t.procs.iter().find(|p| p.pid == pid && p.child.status.lock().map(|s| s.is_none()).unwrap_or(false)).map(|p| (p.pid, p.ppid, p.pgid, p.sid, p.execed));
+        let Some(cur) = alive(&t, caller) else { return Err(Errno::ESRCH) };
+        let targ = if pid != 0 && pid != caller {
+            let Some(targ) = alive(&t, pid) else { return Err(Errno::ESRCH) };
+            // inferior(): up its parents to the caller, failing at the top.
+            let mut p = targ.0;
+            while p != caller {
+                match t.procs.iter().find(|q| q.pid == p) {
+                    Some(q) if q.pid != 0 && q.ppid != 0 => p = q.ppid,
+                    _ => return Err(Errno::ESRCH),
+                }
+            }
+            if targ.3 != cur.3 {
+                return Err(Errno::EPERM);
+            }
+            if targ.4 {
+                return Err(Errno::EACCES);
+            }
+            targ
+        } else {
+            cur
+        };
+        if targ.3 == targ.0 {
+            return Err(Errno::EPERM);
+        }
+        if pgid < 0 {
+            return Err(Errno::EINVAL);
+        }
+        let pgid = if pgid == 0 { targ.0 } else { pgid };
+        if pgid != targ.0 {
+            match t.procs.iter().find(|p| p.pgid == pgid) {
+                Some(p) if p.sid == cur.3 => {}
+                _ => return Err(Errno::EPERM),
+            }
+        }
+        let mut orphaned = Vec::new();
+        t.enterpgrp(targ.0, pgid, false, &mut orphaned);
+        drop(t);
+        self.orphanpg(caller, &orphaned);
+        Ok(())
+    }
+
+    /// `orphanpg` for each group in `pgids` (made orphaned by `by`): if any
+    /// member is stopped, every live member is sent SIGHUP, then SIGCONT.
+    fn orphanpg(&self, by: i32, pgids: &[i32]) {
+        for &g in pgids {
+            let members: Vec<(i32, Arc<Mutex<Option<i32>>>, Arc<Mutex<Job>>)> = self
+                .lock()
+                .procs
+                .iter()
+                .filter(|p| p.pgid == g)
+                .map(|p| (p.pid, Arc::clone(&p.child.status), Arc::clone(&p.child.job)))
+                .collect();
+            let live = |st: &Arc<Mutex<Option<i32>>>| st.lock().map(|s| s.is_none()).unwrap_or(false);
+            if !members.iter().any(|(_, st, job)| live(st) && job.lock().is_ok_and(|j| j.stopped)) {
+                continue;
+            }
+            for (pid, st, _) in &members {
+                if live(st) {
+                    let _ = self.kill(by, *pid, SIGHUP);
+                    let _ = self.kill(by, *pid, SIGCONT);
+                }
+            }
+        }
+    }
+
+    /// Mark `pid` as having exec'd (`P_EXEC`).
+    pub fn set_execed(&self, pid: i32) {
+        if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
+            p.execed = true;
+        }
+    }
+
+    /// `pid`'s `P_NOCLDSTOP`, kept from its SIGCHLD action.
+    pub fn set_nocldstop(&self, pid: i32, on: bool) {
+        if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
+            p.nocldstop = on;
+        }
+    }
+
+    /// Whether `pid`'s group is orphaned (`pg_jobc == 0`).
+    pub fn orphaned(&self, pid: i32) -> bool {
+        let t = self.lock();
+        t.procs.iter().find(|p| p.pid == pid).is_some_and(|p| t.jobc.get(&p.pgid).copied().unwrap_or(0) == 0)
+    }
+
+    /// `pid`'s job control state, as its waiting parent sees it.
+    pub fn job(&self, pid: i32) -> Option<Arc<Mutex<Job>>> {
+        self.lock().procs.iter().find(|p| p.pid == pid).map(|p| Arc::clone(&p.child.job))
+    }
+
+    /// A stop's or a continue's news for `pid`'s waiting parent: its wait
+    /// woken (`stop`'s `wakeup(parent)`).
+    pub fn job_changed(&self, pid: i32) {
+        let t = self.lock();
+        if let Some(p) = t.procs.iter().find(|p| p.pid == pid) {
+            p.child.done.notify_all();
+            if let Some(pp) = t.procs.iter().find(|q| q.pid == p.ppid) {
+                pp.queue.notify();
+            }
+        }
+    }
+
+    /// psignal's stop of `pid` told to its parent: unless the parent has
+    /// `P_NOCLDSTOP`, its record of the stop (`si_status` as given) and a
+    /// SIGCHLD the kernel posts.
+    pub fn stopped_to_parent(&self, pid: i32, si_status: i32, uid: u32) {
+        let ppid = {
+            let mut t = self.lock();
+            let Some(ppid) = t.procs.iter().find(|p| p.pid == pid).map(|p| p.ppid) else { return };
+            let Some(parent) = t.procs.iter_mut().find(|p| p.pid == ppid) else { return };
+            if parent.nocldstop {
+                return;
+            }
+            parent.child_end = Some(ChildEnd { pid, status: si_status, uid, xhighbits: 0, stopped: true });
+            parent.pending.fetch_or(1u64 << (SIGCHLD - 1), Ordering::AcqRel);
+            SIGNAL_SEQ.fetch_add(1, Ordering::Release);
+            parent.queue.notify();
+            ppid
+        };
+        post_signal(&[ppid], SIGCHLD);
     }
 
     /// Every live process in group `pgid`, for `kill(-pgid, sig)`.

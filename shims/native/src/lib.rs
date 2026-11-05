@@ -2103,6 +2103,7 @@ fn perform_block(
             wstatus,
             nohang,
             waitid,
+            jobs,
             // The children list passed in is already this process's, so ppid
             // is redundant here.
             ppid: _,
@@ -2115,10 +2116,24 @@ fn perform_block(
             if candidates.is_empty() {
                 return Err(Errno::ECHILD);
             }
+            // A Darwin wait finds a continue at its next look, as it finds
+            // an end or a stop. (XNU's parent, asleep, is woken by an end or a
+            // stop only; a continue here is acted on in the child, after the
+            // sender's kill has returned, so a wait begun after that kill must
+            // still find it.)
             loop {
                 for c in &candidates {
-                    let mut st = c.status.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(code) = if nowait { *st } else { st.take() } {
+                    // The end to collect; else whether the child has ended
+                    // (an end the call did not ask for).
+                    let ended: std::result::Result<i32, bool> = {
+                        let mut st = c.status.lock().unwrap_or_else(|e| e.into_inner());
+                        if st.is_some() && jobs.is_some_and(|j| !j.exits) {
+                            Err(true)
+                        } else {
+                            (if nowait { *st } else { st.take() }).ok_or(false)
+                        }
+                    };
+                    if let Ok(code) = ended {
                         if let Some(w) = waitid {
                             let xhighbits = procs.xhighbits(c.pid);
                             if !nowait {
@@ -2140,6 +2155,53 @@ fn perform_block(
                             mem.write_u32(wstatus, code as u32)?;
                         }
                         return Ok(c.pid as u64);
+                    }
+                    let (Some(j), Err(false)) = (jobs, ended) else { continue };
+                    let mut job = c.job.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut mem = GuestMem::new(data);
+                    match waitid {
+                        // waitid: by p_stat, a stop not reported, else a
+                        // continue, each kept under WNOWAIT.
+                        Some(w) => {
+                            if job.stopped {
+                                if j.stops && !job.waited {
+                                    if !nowait {
+                                        job.waited = true;
+                                    }
+                                    let (pid, xstat) = (c.pid, job.xstat);
+                                    drop(job);
+                                    return gex_kernel::darwin::exit::waitid_job_report(&mut mem, w.info, pid, gex_kernel::darwin::exit::CLD_STOPPED, xstat);
+                                }
+                            } else if j.continues && job.continued {
+                                if !nowait {
+                                    job.continued = false;
+                                }
+                                let (pid, xstat) = (job.contproc, job.xstat);
+                                drop(job);
+                                return gex_kernel::darwin::exit::waitid_job_report(&mut mem, w.info, pid, gex_kernel::darwin::exit::CLD_CONTINUED, xstat);
+                            }
+                        }
+                        // wait4: a stop not reported (WUNTRACED), then a
+                        // continue (WCONTINUED), in the host's encoding.
+                        None => {
+                            if job.stopped && !job.waited && j.stops {
+                                job.waited = true;
+                                let l = gex_kernel::darwin::kern::signal_to_linux(job.xstat);
+                                drop(job);
+                                if wstatus != 0 {
+                                    mem.write_u32(wstatus, 0x7f | (l << 8))?;
+                                }
+                                return Ok(c.pid as u64);
+                            }
+                            if j.continues && job.continued {
+                                job.continued = false;
+                                drop(job);
+                                if wstatus != 0 {
+                                    mem.write_u32(wstatus, 0xffff)?;
+                                }
+                                return Ok(c.pid as u64);
+                            }
+                        }
                     }
                 }
                 if nohang {
@@ -2167,6 +2229,63 @@ fn perform_block(
                     .done
                     .wait_timeout(guard, std::time::Duration::from_millis(20));
             }
+        }
+    }
+}
+
+/// How a thread's way back to user space ended ([`darwin_return_to_user`]).
+enum ToUser {
+    /// It runs on where it was.
+    Run,
+    /// A handler frame was set up while it was held: it runs that.
+    Resume(u64),
+    /// The process ended while it was held.
+    Exit(Exit),
+}
+
+/// `thread_apc_ast` for a Darwin thread on its way back to user space: while
+/// its task is held (stopped) it waits, the signals posted meanwhile acted on
+/// as they come, and an abort lets it take its signals (`bsd_ast` comes
+/// first) before it asks again. `in_gate`: it is inside a fork's gate (in
+/// translated code), which it leaves while it waits.
+fn darwin_return_to_user(state: &mut HostState, data: &mut [u8], in_gate: bool) -> ToUser {
+    use gex_kernel::darwin::jobctl::Hold;
+    let tid = state.thread.tid;
+    let mut resume = None;
+    loop {
+        let seen = ready::seq();
+        match state.with_kernel(|k| k.darwin_hold(tid)) {
+            Hold::Run => return resume.map_or(ToUser::Run, ToUser::Resume),
+            Hold::Deliver => {
+                let mut gm = GuestMem::new(data);
+                match state.with_kernel(|k| k.deliver_pending(&mut gm)) {
+                    gex_kernel::signal::Delivery::None => {}
+                    gex_kernel::signal::Delivery::Resume(t) => resume = Some(t),
+                    gex_kernel::signal::Delivery::Terminate { signal, core } => {
+                        let pc = gm.read_u64(state.thread.ctx_addr + gex_abi::ctx::PC as u64).unwrap_or(0);
+                        return ToUser::Exit(Exit::Signal {
+                            signal: signal as i32,
+                            pc,
+                            detail: format!("killed by signal {signal}{}", if core { " (core dumped)" } else { "" }),
+                            internal: false,
+                        });
+                    }
+                }
+                continue;
+            }
+            Hold::Park => {}
+        }
+        // The process ending in another thread lets it go, to end too.
+        if state.spawn.as_ref().is_some_and(|s| s.stopping.load(std::sync::atomic::Ordering::Acquire)) {
+            return ToUser::Exit(Exit::Status(0));
+        }
+        let gate = state.spawn.as_ref().map(|s| Arc::clone(&s.gate)).filter(|_| in_gate);
+        if let Some(g) = &gate {
+            g.leave();
+        }
+        ready::wait(seen, std::time::Duration::from_millis(20));
+        if let Some(g) = &gate {
+            g.enter();
         }
     }
 }
@@ -2210,7 +2329,17 @@ fn run_thread_loop(
     }
     let mut pc = entry;
     let gate = store.data().spawn.as_ref().map(|s| Arc::clone(&s.gate));
+    let memory = store.data().memory.clone();
     loop {
+        // A Darwin thread made, or about to resume, while its task is held
+        // waits first (thread_create's thread_hold, thread_apc_ast).
+        if let Some(mem) = &memory {
+            match darwin_return_to_user(store.data_mut(), mem.bytes(), false) {
+                ToUser::Run => {}
+                ToUser::Resume(t) => pc = t,
+                ToUser::Exit(x) => return Ok(Stopped::Exited(x)),
+            }
+        }
         if let Some(g) = &gate {
             g.enter();
         }
@@ -2663,6 +2792,11 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         child.pid = pid;
         child.tid = pid;
         child.forget_own_pidfds();
+        // A Darwin child's signal layer is Darwin's too (its defaults, its
+        // knotes told of posts), as a new image's is.
+        if child.darwin {
+            child.darwin_signals_init();
+        }
         (child, regions, store.as_context().data().thread.ctx_addr)
     };
 
@@ -3512,7 +3646,9 @@ fn start_darwin_spawn(cx: &SpawnContext, mut child: Kernel) -> std::result::Resu
             return fail(&mut child, e);
         }
     };
-    // posix_spawn's NOTE_EXEC for the child, before the call returns.
+    // exec_mach_imgact's P_EXEC and posix_spawn's NOTE_EXEC for the child,
+    // before the call returns.
+    procs.set_execed(pid);
     gex_kernel::procnote::post(pid, gex_kernel::procnote::note::EXEC);
     let child_proc = Arc::new(ProcCell::default());
     child.vfs.mount("/proc", Arc::new(ProcFs::new(Arc::new(KernelProcSource(Arc::clone(&child_proc))))));
@@ -4901,6 +5037,23 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 }
             }
         })();
+        // A held Darwin thread waits before it goes back to user space.
+        let r = r.and_then(|()| {
+            let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+            match darwin_return_to_user(caller.data_mut(), memory.bytes(), true) {
+                ToUser::Run => Ok(()),
+                ToUser::Resume(t) => {
+                    let state = caller.data_mut();
+                    state.resume_cause = Some("signal while held".into());
+                    state.resume_at = Some(t);
+                    Err(StopExecution.into())
+                }
+                ToUser::Exit(x) => {
+                    caller.data_mut().exit = Some(x);
+                    Err(StopExecution.into())
+                }
+            }
+        });
         // and a library another thread has `dlopen`ed since is in this
         // thread's table before it goes on (`dylink::sync`)
         crate::host(r.and_then(|()| crate::dylink::sync(&mut caller))) },
@@ -5557,7 +5710,20 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             if let Some(s) = &state.spawn {
                 s.gate.pause_point();
             }
-            match state.with_kernel(|k| k.deliver_pending(&mut gm)) {
+            let delivery = match state.with_kernel(|k| k.deliver_pending(&mut gm)) {
+                // A held Darwin thread waits here (its handler, if one was
+                // set up meanwhile, runs once it is let go).
+                gex_kernel::signal::Delivery::None => match darwin_return_to_user(state, memory.bytes(), true) {
+                    ToUser::Run => gex_kernel::signal::Delivery::None,
+                    ToUser::Resume(t) => gex_kernel::signal::Delivery::Resume(t),
+                    ToUser::Exit(x) => {
+                        state.exit = Some(x);
+                        return Err(StopExecution.into());
+                    }
+                },
+                d => d,
+            };
+            match delivery {
                 gex_kernel::signal::Delivery::None => Ok(()),
                 gex_kernel::signal::Delivery::Resume(target) => {
                     if run_signal_frames(&mut caller, pc as u64)? {

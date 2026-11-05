@@ -24,6 +24,7 @@ pub mod exit;
 pub mod execve;
 pub mod fsops;
 pub mod ioctl;
+pub mod jobctl;
 pub mod ipc;
 pub mod kern;
 pub mod kevent;
@@ -56,6 +57,8 @@ pub mod workq;
 /// what they wait on.
 #[derive(Debug, Default)]
 pub struct Task {
+    /// Its job control state, its cell in the process table, once asked.
+    pub job: Option<std::sync::Arc<std::sync::Mutex<crate::proc::Job>>>,
     pub pthread: thread::Registration,
     pub threads: thread::Threads,
     pub waits: wait::Waits,

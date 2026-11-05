@@ -2,7 +2,9 @@
 // with its pid, real uid and exit code, the top byte of the value it exited
 // with above it (moved from the child to the parent's record, so waitid no
 // longer sees it), and a death by signal is CLD_KILLED with the signal. A
-// signal posted by kill has code 0, the sender and the signal.
+// signal posted by kill to a thread that takes it has code 0, the sender
+// and the signal; one posted while held carries no record of its sender
+// (psignal records it only for a signal caught at its post).
 
 #include <errno.h>
 #include <mach-o/dyld.h>
@@ -80,9 +82,17 @@ int main(int argc, char **argv) {
     if (got.si_code != CLD_KILLED || got.si_pid != pid || got.si_status != SIGUSR1) return bad("a death by signal's siginfo", got.si_status);
     waitpid(pid, &st, 0);
 
+    sigset_t usr2;
+    sigemptyset(&usr2);
+    sigaddset(&usr2, SIGUSR2);
+    sigprocmask(SIG_UNBLOCK, &usr2, NULL);
     kill(getpid(), SIGUSR2);
     await_count(3);
-    if (got.si_signo != SIGUSR2 || got.si_code != 0 || got.si_pid != getpid() || got.si_status != SIGUSR2) return bad("a kill's siginfo", got.si_code);
+    if (got.si_signo != SIGUSR2 || got.si_code != 0 || got.si_pid != getpid() || got.si_status != SIGUSR2) return bad("a kill's siginfo", got.si_pid);
+    sigprocmask(SIG_BLOCK, &usr2, NULL);
+    kill(getpid(), SIGUSR2);
+    await_count(4);
+    if (got.si_signo != SIGUSR2 || got.si_code != 0 || got.si_pid != 0 || got.si_status != 0) return bad("a held kill's siginfo", got.si_pid);
     printf("sigchld ok\n");
     return 0;
 }

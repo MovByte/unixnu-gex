@@ -14476,7 +14476,13 @@ fn finish_parked(
             wstatus,
             nohang,
             waitid,
+            jobs,
         } => {
+            // Only a Darwin wait asks for stops and continues, and the page
+            // runs no Darwin process.
+            if jobs.is_some() {
+                panic!("a Darwin wait in the page, which has no Darwin personality");
+            }
             let nowait = waitid.is_some_and(|w| w.nowait);
             // A shared table already holds the status in the form `wait4`
             // reports it, because the child's own Worker published it there

@@ -346,6 +346,9 @@ impl Kernel {
                         if r.is_ok() && self.thread_signals.get(tid).is_some_and(|t| t.blocked() & (1u64 << (sig - 1)) == 0) {
                             self.darwin_note_sender(sig, Some(crate::signal::Source { code: 0, pid: self.pid, uid: self.creds.uid() }));
                         }
+                        if r.is_ok() {
+                            self.darwin_psignal(tid, sig, true);
+                        }
                         res(r)
                     }
                     None => neg(Errno::ESRCH),
@@ -354,21 +357,13 @@ impl Kernel {
             sys::PIPE => res(self.darwin_pipe(m)),
             sys::SIGPENDING => res(self.darwin_sigpending(m, a[0])),
             // Process groups and sessions: the same rules as Linux's, but
-            // setpgid's target may be any descendant (inferior()), where
-            // Linux's must be a child.
+            // setpgid's target may be any descendant (inferior()) that has
+            // not exec'd, where Linux's must be a child.
             sys::GETPGRP => res(self.canonical(m, nr::GETPGID, [0, 0, 0, 0, 0, 0])),
             sys::GETPGID => res(self.canonical(m, nr::GETPGID, [a[0] as i32 as i64 as u64, 0, 0, 0, 0, 0])),
             sys::GETSID => res(self.canonical(m, nr::GETSID, [a[0] as i32 as i64 as u64, 0, 0, 0, 0, 0])),
             sys::SETSID => res(self.canonical(m, nr::SETSID, [0; 6])),
-            sys::SETPGID => {
-                let pid = a[0] as i32;
-                if pid != 0 && pid != self.pid {
-                    self.darwin_unimplemented("setpgid of another process (a descendant, as inferior() allows)".into());
-                    neg(Errno::ESRCH)
-                } else {
-                    res(self.canonical(m, nr::SETPGID, [0, a[1] as i32 as i64 as u64, 0, 0, 0, 0]))
-                }
-            }
+            sys::SETPGID => res(self.procs.darwin_setpgid(self.pid, a[0] as i32, a[1] as i32).map(|()| 0)),
             // unlink(path) and unlinkat(fd, path, flag): Linux's unlinkat,
             // but a directory is EPERM (vn_authorize_unlink), and
             // AT_REMOVEDIR is rmdirat_internal.

@@ -396,6 +396,8 @@ impl Kernel {
     /// the old one held, its signal actions as execsigs leaves them, its
     /// limits, app type and dispatch queue offsets.
     pub fn darwin_exec_switch(&mut self, spawn: Option<&super::spawn::After>) {
+        // exec_mach_imgact: P_EXEC.
+        self.procs.set_execed(self.pid);
         // knotes_dealloc, then the descriptors and the kqueues they held.
         let all: Vec<_> = self.dtask.kevents.knotes.keys().copied().collect();
         for n in all {
