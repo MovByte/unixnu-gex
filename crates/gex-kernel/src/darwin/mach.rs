@@ -309,16 +309,16 @@ impl Kernel {
                 if !self.darwin_name_is_task(w(0)) {
                     return Some(kr2::SEND_INVALID_DEST);
                 }
-                match self.dtask.ipc.mach_port_allocate(w(1), None) {
+                match self.ipc().mach_port_allocate(w(1), None) {
                     Ok(name) => copyout32(m, a[2], name),
                     Err(e) => e,
                 }
             }
-            trap::MACH_PORT_DEALLOCATE => self.task_op(w(0), |k| k.dtask.ipc.mach_port_deallocate(w(1))),
-            trap::MACH_PORT_MOD_REFS => self.task_op(w(0), |k| k.dtask.ipc.mach_port_mod_refs(w(1), w(2), w(3) as i32)),
-            trap::MACH_PORT_MOVE_MEMBER => self.task_op(w(0), |k| k.dtask.ipc.mach_port_move_member(w(1), w(2))),
-            trap::MACH_PORT_INSERT_MEMBER => self.task_op(w(0), |k| k.dtask.ipc.mach_port_insert_member(w(1), w(2))),
-            trap::MACH_PORT_EXTRACT_MEMBER => self.task_op(w(0), |k| k.dtask.ipc.mach_port_extract_member(w(1), w(2))),
+            trap::MACH_PORT_DEALLOCATE => self.task_op(w(0), |k| k.ipc().mach_port_deallocate(w(1))),
+            trap::MACH_PORT_MOD_REFS => self.task_op(w(0), |k| k.ipc().mach_port_mod_refs(w(1), w(2), w(3) as i32)),
+            trap::MACH_PORT_MOVE_MEMBER => self.task_op(w(0), |k| k.ipc().mach_port_move_member(w(1), w(2))),
+            trap::MACH_PORT_INSERT_MEMBER => self.task_op(w(0), |k| k.ipc().mach_port_insert_member(w(1), w(2))),
+            trap::MACH_PORT_EXTRACT_MEMBER => self.task_op(w(0), |k| k.ipc().mach_port_extract_member(w(1), w(2))),
             trap::MACH_PORT_INSERT_RIGHT => {
                 if !self.darwin_name_is_task(w(0)) {
                     return Some(kr2::SEND_INVALID_DEST);
@@ -335,7 +335,7 @@ impl Kernel {
                 let Ok(opts) = m.read(a[1], 8).map(|b| b.to_vec()) else { return Some(kr2::MEMORY_ERROR) };
                 let (flags, qlimit) = (u32::from_le_bytes(opts[0..4].try_into().unwrap()), u32::from_le_bytes(opts[4..8].try_into().unwrap()));
                 let hardened = self.darwin_hardened();
-                match self.dtask.ipc.mach_port_construct(flags, qlimit, a[2], hardened) {
+                match self.ipc().mach_port_construct(flags, qlimit, a[2], hardened) {
                     Ok(name) => copyout32(m, a[3], name),
                     Err(kr::UNIMPLEMENTED_SERVICE_PORT) => {
                         self.darwin_unimplemented("mach_port_construct of a service or connection port".into());
@@ -344,14 +344,14 @@ impl Kernel {
                     Err(e) => e,
                 }
             }
-            trap::MACH_PORT_DESTRUCT => self.task_op(w(0), |k| k.dtask.ipc.mach_port_destruct(w(1), w(2) as i32, a[3])),
-            trap::MACH_PORT_GUARD => self.task_op(w(0), |k| k.dtask.ipc.mach_port_guard(w(1), a[2], u64::from(w(3) != 0))),
-            trap::MACH_PORT_UNGUARD => self.task_op(w(0), |k| k.dtask.ipc.mach_port_unguard(w(1), a[2])),
+            trap::MACH_PORT_DESTRUCT => self.task_op(w(0), |k| k.ipc().mach_port_destruct(w(1), w(2) as i32, a[3])),
+            trap::MACH_PORT_GUARD => self.task_op(w(0), |k| k.ipc().mach_port_guard(w(1), a[2], u64::from(w(3) != 0))),
+            trap::MACH_PORT_UNGUARD => self.task_op(w(0), |k| k.ipc().mach_port_unguard(w(1), a[2])),
             trap::MACH_PORT_TYPE => {
                 if !self.darwin_name_is_task(w(0)) {
                     return Some(kr2::SEND_INVALID_DEST);
                 }
-                match self.dtask.ipc.mach_port_type(w(1)) {
+                match self.ipc().mach_port_type(w(1)) {
                     Ok(ty) => copyout32(m, a[2], ty),
                     Err(e) => e,
                 }
@@ -366,7 +366,7 @@ impl Kernel {
                 }
                 let Ok(count) = m.read_u32(a[4]) else { return Some(kr2::MEMORY_ERROR) };
                 let count = count.min(MAX_COUNT);
-                match self.dtask.ipc.mach_port_get_attributes(w(1), w(2) as i32, count) {
+                match self.ipc().mach_port_get_attributes(w(1), w(2) as i32, count) {
                     Ok(info) => {
                         if m.write_u32(a[4], info.len() as u32).is_err() {
                             return Some(kr2::MEMORY_ERROR);
@@ -396,7 +396,7 @@ impl Kernel {
                 if !super::ipc::name_valid(notify) {
                     return Some(kr2::SEND_INVALID_DEST);
                 }
-                let ipc = &mut self.dtask.ipc;
+                let ipc = &mut self.ipc();
                 let right = match ipc.object_copyin(notify, poly, Default::default(), 0, None) {
                     Ok(c) => c,
                     Err(e) => return Some(e),
@@ -418,7 +418,7 @@ impl Kernel {
                     }
                 }
             }
-            trap::MACH_REPLY_PORT => match self.dtask.ipc.port_alloc(false) {
+            trap::MACH_REPLY_PORT => match self.ipc().port_alloc(false) {
                 Ok((name, _)) => u64::from(name),
                 Err(_) => 0,
             },
@@ -426,12 +426,12 @@ impl Kernel {
                 let tid = self.tid;
                 // The thread's previous special reply port is unbound.
                 self.dtask.kports.special_reply.remove(&tid);
-                match self.dtask.ipc.port_alloc(true) {
+                match self.ipc().port_alloc(true) {
                     Ok((name, port)) => {
                         // IPC_PORT_INIT_SPECIAL_REPLY: a reply port in a
                         // hardened task, else a provisional one.
                         let hardened = self.darwin_hardened();
-                        let p = self.dtask.ipc.port_mut(port);
+                        let p = self.ipc().port_mut(port);
                         p.specialreply = true;
                         if hardened {
                             p.immovable_receive = true;
@@ -447,24 +447,24 @@ impl Kernel {
             }
             trap::TASK_SELF => {
                 let p = self.darwin_task_self_port();
-                self.dtask.ipc.make_send(p);
+                self.ipc().make_send(p);
                 u64::from(self.darwin_copyout_send(p))
             }
             trap::THREAD_SELF => {
                 let p = self.darwin_thread_ports(self.tid).1;
-                self.dtask.ipc.make_send(p);
+                self.ipc().make_send(p);
                 u64::from(self.darwin_copyout_send(p))
             }
             trap::HOST_SELF => {
                 let p = self.darwin_itk_host();
-                self.dtask.ipc.make_send(p);
+                self.ipc().make_send(p);
                 u64::from(self.darwin_copyout_send(p))
             }
             trap::PID_FOR_TASK => {
                 // port_name_to_task_name: any flavor of this task's ports.
                 let ok = super::ipc::name_valid(w(0))
-                    && self.dtask.ipc.translate_send(w(0)).is_ok_and(|p| {
-                        let p = self.dtask.ipc.port(p);
+                    && self.ipc().translate_send(w(0)).is_ok_and(|p| {
+                        let p = self.ipc().port(p);
                         p.active && matches!(p.kobject, Some(super::ipc::Kobject::Task | super::ipc::Kobject::TaskName))
                     });
                 let (pid, r) = if ok { (self.pid, kr::SUCCESS) } else { (-1, kr::FAILURE) };
@@ -534,7 +534,7 @@ impl Kernel {
     /// polyPoly)`.
     fn port_insert_right(&mut self, name: u32, poly: u32, poly_poly: u32) -> u64 {
         use super::ipc::right::{msgt, CopyinFlags};
-        let ipc = &mut self.dtask.ipc;
+        let ipc = &mut self.ipc();
         if name == poly && (poly_poly == msgt::MAKE_SEND || poly_poly == msgt::COPY_SEND) {
             return ipc.insert_send_right(poly, poly_poly);
         }

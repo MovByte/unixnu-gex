@@ -114,8 +114,15 @@ impl Timers {
 }
 
 impl Kernel {
-    /// Fire every thread call that is due; the next deadline.
+    /// The thread calls that are due, run; when the next one is.
     pub fn darwin_thread_calls(&mut self, m: &mut GuestMem<'_>) -> Option<Instant> {
+        let out = self.darwin_thread_calls_body(m);
+        self.darwin_ipc_leave();
+        out
+    }
+
+    /// Fire every thread call that is due; the next deadline.
+    fn darwin_thread_calls_body(&mut self, m: &mut GuestMem<'_>) -> Option<Instant> {
         // Signals posted, and pipes changed, from outside a call: their
         // knotes are told.
         if self.darwin_signal_knotes() | self.darwin_pipe_knotes() | self.darwin_vnode_knotes() | self.darwin_proc_knotes() {

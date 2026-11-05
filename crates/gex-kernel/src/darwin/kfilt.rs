@@ -892,7 +892,7 @@ impl Kernel {
         } else {
             list.insert(0, n);
         }
-        match self.dtask.ipc.objects.get_mut(&obj) {
+        match self.ipc().objects.get_mut(&obj) {
             Some(Object::Port(p)) => p.knotes += 1,
             Some(Object::Pset(s)) => s.knotes += 1,
             None => unreachable!("a linked object exists"),
@@ -913,7 +913,7 @@ impl Kernel {
         if self.dtask.kevents.port_klist.get(&obj).is_some_and(|l| l.is_empty()) {
             self.dtask.kevents.port_klist.remove(&obj);
         }
-        match self.dtask.ipc.objects.get_mut(&obj) {
+        match self.ipc().objects.get_mut(&obj) {
             Some(Object::Port(p)) => p.knotes -= 1,
             Some(Object::Pset(s)) => s.knotes -= 1,
             None => {}
@@ -927,17 +927,17 @@ impl Kernel {
     }
 
     /// `filt_pset_filter_result`: a member with messages preposted.
-    fn filt_pset_filter_result(&self, pset: ObjId) -> u32 {
-        let ipc = &self.dtask.ipc;
+    fn filt_pset_filter_result(&mut self, pset: ObjId) -> u32 {
+        let ipc = self.ipc();
         let any = ipc.queues.preposts.get(&pset).is_some_and(|q| q.iter().any(|&p| !ipc.port(p).messages.is_empty()));
         if any { filter::ACTIVE } else { 0 }
     }
 
     /// `filt_port_filter_result`.
-    fn filt_port_filter_result(&self, n: KnId, port: ObjId) -> u32 {
-        let k = &self.dtask.kevents.knotes[&n];
-        let mut result = if k.sfflags & mo::RCV_MSG != 0 { filter::RESET_EVENT_QOS } else { 0 };
-        let p = self.dtask.ipc.port(port);
+    fn filt_port_filter_result(&mut self, n: KnId, port: ObjId) -> u32 {
+        let rcv_msg = self.dtask.kevents.knotes[&n].sfflags & mo::RCV_MSG != 0;
+        let mut result = if rcv_msg { filter::RESET_EVENT_QOS } else { 0 };
+        let p = self.ipc().port(port);
         if !p.active {
             return result;
         }
@@ -945,7 +945,7 @@ impl Kernel {
         // never differs from the kqueue's.
         let Some(first) = p.messages.front() else { return result };
         result = filter::ACTIVE;
-        if k.sfflags & mo::RCV_MSG != 0 {
+        if rcv_msg {
             result |= filter::adjust_event_qos(first.qos_override);
         }
         result
@@ -957,14 +957,14 @@ impl Kernel {
         k.flags &= !ev::EOF;
         k.ext[3] = 0;
         // kqueue_alloc_turnstile: priority inheritance only.
-        let Some(e) = self.dtask.ipc.space.lookup(name).copied() else {
+        let Some(e) = self.ipc().space.lookup(name).copied() else {
             self.knote(n).set_error(Errno::ENOENT);
             return 0;
         };
         if e.bits & ty::PORT_SET != 0 {
             let pset = e.object.expect("a set's object");
             self.knote(n).filtid = filtid::MACH_PORT_SET;
-            self.dtask.ipc.reference(pset);
+            self.ipc().reference(pset);
             self.knote(n).ipc = Some(pset);
             self.filt_machport_link(pset, n);
             return self.filt_pset_filter_result(pset);
@@ -972,11 +972,11 @@ impl Kernel {
         if e.bits & ty::RECEIVE != 0 {
             let port = e.object.expect("a receive right's object");
             self.knote(n).filtid = filtid::MACH_PORT;
-            if self.dtask.ipc.port(port).specialreply {
+            if self.ipc().port(port).specialreply {
                 self.knote(n).set_error(Errno::EOPNOTSUPP);
                 return 0;
             }
-            self.dtask.ipc.reference(port);
+            self.ipc().reference(port);
             self.knote(n).ipc = Some(port);
             self.filt_machport_link(port, n);
             return self.filt_port_filter_result(n, port);
@@ -992,7 +992,7 @@ impl Kernel {
         if k.status & kn::VANISHED == 0 && k.flags & ev::EOF == 0 {
             self.filt_machport_unlink(obj, n);
         }
-        self.dtask.ipc.release(obj);
+        self.ipc().release(obj);
     }
 
     /// `filt_machporttouch`, `filt_porttouch`, `filt_psettouch`.
@@ -1045,7 +1045,8 @@ impl Kernel {
         options |= u64::from(mo::RCV_TIMEOUT);
         let w = RcvWait { object, options, rcv_size: max_size, aux_size: 0 };
         let size_of = |k: &super::ipc::msg::Kmsg| k.size;
-        let Some(rcv) = self.dtask.ipc.mqueue_receive(self.tid, object, w, true, &size_of) else {
+        let tid = self.tid;
+        let Some(rcv) = self.ipc().mqueue_receive(tid, object, w, true, &size_of) else {
             unreachable!("a receive with a zero timeout ends at once")
         };
         if rcv.state == super::ipc::msg::mr::RCV_TIMED_OUT || rcv.state == super::ipc::msg::mr::RCV_PORT_CHANGED {
@@ -1056,7 +1057,7 @@ impl Kernel {
             kev.data = i64::from(rcv.receiver_name);
             return filter::ACTIVE;
         }
-        self.dtask.ipc.reference(object);
+        self.ipc().reference(object);
         let bufs = super::mach_msg::RecvBufs { msg_addr, msg_size: max_size, aux_addr: 0, aux_size: 0 };
         let (fflags, msgr) = self.receive_results_msgr(m, object, rcv, bufs, options);
         kev.fflags = fflags;
@@ -1084,7 +1085,7 @@ impl Kernel {
     /// (`ipc_pset_prepost`), a receive right or set gone (`knote_vanish`).
     pub(crate) fn darwin_machport_knotes(&mut self) {
         loop {
-            let q = &mut self.dtask.ipc.queues;
+            let q = &mut self.ipc().queues;
             let (ports, psets, vanish) = (std::mem::take(&mut q.knotes), std::mem::take(&mut q.pset_knotes), std::mem::take(&mut q.vanish));
             if ports.is_empty() && psets.is_empty() && vanish.is_empty() {
                 return;
@@ -1092,7 +1093,7 @@ impl Kernel {
             for obj in vanish {
                 // The space is the task's own, active while it runs.
                 let list = self.dtask.kevents.port_klist.remove(&obj).unwrap_or_default();
-                match self.dtask.ipc.objects.get_mut(&obj) {
+                match self.ipc().objects.get_mut(&obj) {
                     Some(Object::Port(p)) => p.knotes = 0,
                     Some(Object::Pset(s)) => s.knotes = 0,
                     None => {}

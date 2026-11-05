@@ -41,7 +41,7 @@ impl Kernel {
     /// `mk_timer_create_trap`: the name of a new timer's receive right, or
     /// null.
     pub(crate) fn mk_timer_create(&mut self) -> u32 {
-        let ipc = &mut self.dtask.ipc;
+        let ipc = &mut self.ipc();
         let Ok((name, port)) = ipc.port_alloc(false) else { return 0 };
         let p = ipc.port_mut(port);
         p.immovable_receive = true;
@@ -54,8 +54,8 @@ impl Kernel {
     /// The timer whose receive right `name` is: `ipc_port_translate_receive`
     /// then the `IKOT_TIMER` check.
     fn mk_timer_lookup(&mut self, name: u32) -> Result<ObjId, u64> {
-        let port = self.dtask.ipc.translate_receive(name)?;
-        if self.dtask.mk_timers.map.get(&port).is_some_and(|_| self.dtask.ipc.port(port).kobject == Some(Kobject::Timer)) {
+        let port = self.ipc().translate_receive(name)?;
+        if self.dtask.mk_timers.map.contains_key(&port) && self.ipc().port(port).kobject == Some(Kobject::Timer) {
             Ok(port)
         } else {
             Err(kr::INVALID_ARGUMENT)
@@ -65,15 +65,15 @@ impl Kernel {
     /// `mk_timer_destroy_trap`.
     pub(crate) fn mk_timer_destroy(&mut self, name: u32) -> u64 {
         // ipc_right_lookup_write
-        let Some(e) = self.dtask.ipc.space.lookup(name).copied() else { return kr::INVALID_NAME };
+        let Some(e) = self.ipc().space.lookup(name).copied() else { return kr::INVALID_NAME };
         if e.bits & super::ipc::ty::RECEIVE == 0 {
             return kr::INVALID_RIGHT;
         }
         let port = e.object.expect("a receive right names a port");
-        if self.dtask.ipc.port(port).kobject != Some(Kobject::Timer) {
+        if self.ipc().port(port).kobject != Some(Kobject::Timer) {
             return kr::INVALID_ARGUMENT;
         }
-        self.dtask.ipc.right_destroy(name, true, 0)
+        self.ipc().right_destroy(name, true, 0)
     }
 
     /// `mk_timer_port_destroy`: the timer's port died.
@@ -94,7 +94,7 @@ impl Kernel {
     /// `mk_timer_unlock_and_destroy`: the timer goes, and its send right.
     fn mk_timer_free(&mut self, port: ObjId) {
         let t = self.dtask.mk_timers.map.remove(&port).expect("a timer");
-        self.dtask.ipc.release_send(t.port);
+        self.ipc().release_send(t.port);
     }
 
     /// `mk_timer_arm_trap` and `mk_timer_arm_leeway_trap`: `expire` is in
@@ -183,7 +183,7 @@ impl Kernel {
                 };
                 // kernel_mach_msg_send_kmsg: a copy of the timer's send
                 // right goes with the message.
-                self.dtask.ipc.copy_send(port);
+                self.ipc().copy_send(port);
                 self.darwin_kernel_send(Box::new(k));
             }
         }
@@ -198,8 +198,8 @@ impl Kernel {
     /// `ipc_kmsg_keep_alive_try_reusing` fails while the timer's last
     /// message is still queued or held by a receiver that has not copied it
     /// out.
-    fn mk_timer_message_in_use(&self, port: ObjId) -> bool {
-        let ipc = &self.dtask.ipc;
+    fn mk_timer_message_in_use(&mut self, port: ObjId) -> bool {
+        let ipc = self.ipc();
         ipc.port(port).messages.iter().any(|k| k.keep_alive) || ipc.queues.received.values().any(|r| r.kmsg.as_ref().is_some_and(|k| k.keep_alive && k.dest == port))
     }
 }

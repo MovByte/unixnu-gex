@@ -387,6 +387,12 @@ impl Kernel {
 }
 
 impl Kernel {
+    /// The task an exec leaves ([`Self::darwin_exec_switch_body`]).
+    pub fn darwin_exec_switch(&mut self, spawn: Option<&super::spawn::After>) {
+        self.darwin_exec_switch_body(spawn);
+        self.darwin_ipc_leave();
+    }
+
     /// The new image takes the process over, once it is loaded: what
     /// `fdt_exec`, `proc_exec_switch_task` and `execsigs` keep of the old.
     /// Its knotes go and its close-on-exec descriptors close, and its
@@ -395,7 +401,7 @@ impl Kernel {
     /// its notifications; the new task keeps the host and special ports
     /// the old one held, its signal actions as execsigs leaves them, its
     /// limits, app type and dispatch queue offsets.
-    pub fn darwin_exec_switch(&mut self, spawn: Option<&super::spawn::After>) {
+    fn darwin_exec_switch_body(&mut self, spawn: Option<&super::spawn::After>) {
         // exec_mach_imgact: P_EXEC.
         self.procs.set_execed(self.pid);
         // knotes_dealloc, then the descriptors and the kqueues they held.
@@ -425,7 +431,7 @@ impl Kernel {
         }
         let k = &mut self.dtask.kports;
         let task_ports: Vec<_> = k.task.take().map(|(a, b)| vec![a, b]).unwrap_or_default().into_iter().chain(k.task_name.take()).collect();
-        let ipc = &mut self.dtask.ipc;
+        let ipc = &mut self.ipc();
         for p in task_ports {
             ipc.port_mut(p).kobject = None;
             ipc.port_mut(p).pinned = false;
@@ -439,7 +445,7 @@ impl Kernel {
         let (realtimer, vtimers) = (old.realtimer, old.vtimers);
         let kp = old.kports;
         self.dtask = super::Task {
-            ipc: old.ipc,
+            ipc_raw: old.ipc_raw,
             kports: super::kobject::Kports { host: kp.host, host_priv: kp.host_priv, clock: kp.clock, special: kp.special, registered: kp.registered, ..Default::default() },
             strict: old.strict,
             // proc_resetregister: libpthread registers again.

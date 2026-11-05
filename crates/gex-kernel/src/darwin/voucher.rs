@@ -423,11 +423,11 @@ impl Kernel {
         }
         if let Some(port) = self.voucher(v).port.take() {
             // ipc_kobject_dealloc_port: no send right is left.
-            assert_eq!(self.dtask.ipc.port(port).srights, 0);
-            let p = self.dtask.ipc.port_mut(port);
+            assert_eq!(self.ipc().port(port).srights, 0);
+            let p = self.ipc().port_mut(port);
             p.active = false;
             p.kobject = None;
-            self.dtask.ipc.release(port);
+            self.ipc().release(port);
         }
         for i in 0..KEY_NUM as u32 {
             let vi = self.voucher(v).table[i as usize];
@@ -694,13 +694,13 @@ impl Kernel {
         if !super::ipc::name_valid(name) {
             return None;
         }
-        let port = self.dtask.ipc.translate_send(name).ok()?;
+        let port = self.ipc().translate_send(name).ok()?;
         self.convert_port_to_voucher(port)
     }
 
     /// `convert_port_to_voucher`.
     pub(crate) fn convert_port_to_voucher(&mut self, port: ObjId) -> Option<VoucherId> {
-        match self.dtask.ipc.port(port).kobject {
+        match self.ipc().port(port).kobject {
             Some(super::ipc::Kobject::Voucher(v)) => {
                 self.ipc_voucher_reference(v);
                 Some(v)
@@ -718,18 +718,18 @@ impl Kernel {
         // request when this arms it, and is dropped when one was armed.
         let (port, armed) = match self.voucher(v).port {
             Some(p) => {
-                let armed = !self.dtask.ipc.port(p).nsrequest_kobject;
+                let armed = !self.ipc().port(p).nsrequest_kobject;
                 (p, armed)
             }
             None => {
-                let p = self.dtask.ipc.kobject_port(super::ipc::Kobject::Voucher(v));
+                let p = self.ipc().kobject_port(super::ipc::Kobject::Voucher(v));
                 self.voucher(v).port = Some(p);
                 (p, true)
             }
         };
-        self.dtask.ipc.make_send(port);
+        self.ipc().make_send(port);
         if armed {
-            self.dtask.ipc.port_mut(port).nsrequest_kobject = true;
+            self.ipc().port_mut(port).nsrequest_kobject = true;
         } else {
             self.ipc_voucher_release(v);
         }
@@ -850,26 +850,26 @@ impl Kernel {
     /// `ipc_voucher_send_preprocessing`: the voucher a message carries
     /// becomes what its managers make of it on the way out.
     pub(crate) fn ipc_voucher_send_preprocessing(&mut self, voucher_port: ObjId) -> ObjId {
-        let Some(super::ipc::Kobject::Voucher(v)) = self.dtask.ipc.port(voucher_port).kobject else { unreachable!("a voucher port") };
+        let Some(super::ipc::Kobject::Voucher(v)) = self.ipc().port(voucher_port).kobject else { unreachable!("a voucher port") };
         let (recipes, need) = self.ipc_voucher_prepare_processing_recipe(v, cmd::SEND_PREPROCESS, ivam_flags::SUPPORT_SEND_PREPROCESS);
         if !need {
             return voucher_port;
         }
         let nv = self.ipc_create_mach_voucher(None, &recipes).expect("send preprocessing makes a voucher").expect("a voucher");
-        self.dtask.ipc.release_send(voucher_port);
+        self.ipc().release_send(voucher_port);
         self.convert_voucher_to_port(nv)
     }
 
     /// `ipc_voucher_receive_postprocessing`: the voucher a received message
     /// carries is redeemed by its managers (MACH_RCV_VOUCHER only).
     pub(crate) fn ipc_voucher_receive_postprocessing(&mut self, voucher_port: ObjId) -> ObjId {
-        let Some(super::ipc::Kobject::Voucher(v)) = self.dtask.ipc.port(voucher_port).kobject else { unreachable!("a voucher port") };
+        let Some(super::ipc::Kobject::Voucher(v)) = self.ipc().port(voucher_port).kobject else { unreachable!("a voucher port") };
         let (recipes, need) = self.ipc_voucher_prepare_processing_recipe(v, cmd::AUTO_REDEEM, ivam_flags::SUPPORT_RECEIVE_POSTPROCESS);
         if !need {
             return voucher_port;
         }
         let nv = self.ipc_create_mach_voucher(None, &recipes).expect("receive postprocessing makes a voucher").expect("a voucher");
-        self.dtask.ipc.release_send(voucher_port);
+        self.ipc().release_send(voucher_port);
         self.convert_voucher_to_port(nv)
     }
 
@@ -879,13 +879,13 @@ impl Kernel {
     /// donor), under the importance manager's control.
     pub(crate) fn ipc_importance_receive_voucher(&mut self, voucher_port: Option<ObjId>) -> Option<ObjId> {
         let port = voucher_port?;
-        let Some(super::ipc::Kobject::Voucher(sent)) = self.dtask.ipc.port(port).kobject else { unreachable!("a voucher port") };
+        let Some(super::ipc::Kobject::Voucher(sent)) = self.ipc().port(port).kobject else { unreachable!("a voucher port") };
         let recipes = vec![
             Recipe { key: key::ALL, command: cmd::COPY, previous: Some(sent), content: Vec::new() },
             Recipe { key: key::IMPORTANCE, command: cmd::SET_VALUE_HANDLE, previous: None, content: 0u64.to_le_bytes().to_vec() },
         ];
         let nv = self.ipc_create_mach_voucher(Some(key::IMPORTANCE), &recipes).expect("the importance voucher").expect("a voucher");
-        self.dtask.ipc.release_send(port);
+        self.ipc().release_send(port);
         Some(self.convert_voucher_to_port(nv))
     }
 
@@ -923,7 +923,7 @@ impl Kernel {
         use super::ipc::msg::mr;
         // port_name_to_host: a send right to the host or its privilege port.
         let is_host = super::ipc::name_valid(host)
-            && self.dtask.ipc.translate_send(host).is_ok_and(|p| matches!(self.dtask.ipc.port(p).kobject, Some(super::ipc::Kobject::Host | super::ipc::Kobject::HostPriv)));
+            && self.ipc().translate_send(host).is_ok_and(|p| matches!(self.ipc().port(p).kobject, Some(super::ipc::Kobject::Host | super::ipc::Kobject::HostPriv)));
         if !is_host {
             return u64::from(mr::SEND_INVALID_DEST);
         }

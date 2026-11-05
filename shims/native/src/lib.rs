@@ -548,7 +548,9 @@ impl HostState {
         let shared = Arc::clone(&self.kernel);
         let mut k = shared.lock().unwrap_or_else(|e| e.into_inner());
         k.enter_thread(&self.thread);
-        f(&mut k)
+        let r = f(&mut k);
+        k.darwin_ipc_leave();
+        r
     }
 }
 
@@ -1507,6 +1509,7 @@ fn run_program_with(
             // for it for ever).
             stop_other_threads(&spawn, false);
             let mut k = spawn.kernel.lock().unwrap_or_else(|e| e.into_inner());
+            k.darwin_task_terminate();
             k.close_all_fds();
             return Err(e);
         }
@@ -1626,7 +1629,11 @@ fn run_program_with(
     // What is left goes on a thread of its own, so the end is published
     // without waiting for it: freeing the translated code deregisters its
     // unwind tables one by one, which took a child 15 to 30 seconds.
-    spawn.kernel.lock().unwrap_or_else(|e| e.into_inner()).close_all_fds();
+    {
+        let mut k = spawn.kernel.lock().unwrap_or_else(|e| e.into_inner());
+        k.darwin_task_terminate();
+        k.close_all_fds();
+    }
     // (A thread that cannot be made drops it here, with its closure.)
     let rest = (store, linker, spawn, memory, shared);
     let _ = std::thread::Builder::new().name("gex-reap".into()).spawn(move || drop(rest));
@@ -2810,6 +2817,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         // knotes told of posts), as a new image's is.
         if child.darwin {
             child.darwin_signals_init();
+            child.darwin_ipc_leave();
         }
         (child, regions, store.as_context().data().thread.ctx_addr)
     };

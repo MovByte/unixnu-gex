@@ -522,7 +522,7 @@ impl Kernel {
         // The thread's self port, copied out and pinned; a full space is
         // EMFILE (`!MACH_PORT_VALID`).
         let pport = self.darwin_thread_ports(req.tid).1;
-        self.dtask.ipc.make_send(pport);
+        self.ipc().make_send(pport);
         let port = self.darwin_copyout_send_pinned(pport);
         if !super::ipc::name_valid(port) {
             self.darwin_unmake_thread(m, req, port);
@@ -585,7 +585,7 @@ impl Kernel {
     /// deallocated (a pinned right refuses, as on XNU), then the thread is
     /// terminated before it ever ran, its ports with it.
     fn darwin_unmake_thread(&mut self, m: &mut GuestMem<'_>, req: SpawnRequest, port: u32) {
-        let _ = self.dtask.ipc.mach_port_deallocate(port);
+        let _ = self.ipc().mach_port_deallocate(port);
         self.darwin_thread_ports_terminate(req.tid);
         self.darwin_ipc_settle(m);
         self.darwin_discard_thread(m, req);
@@ -613,13 +613,13 @@ impl Kernel {
         // ends, so its name can then be deallocated.
         let tid = self.tid;
         if let Some(&(_, pport)) = self.dtask.kports.threads.get(&tid) {
-            self.dtask.ipc.port_mut(pport).pinned = false;
+            self.ipc().port_mut(pport).pinned = false;
         }
         if sem != 0 {
             let _ = self.darwin_semaphore_signal_name(m, sem);
         }
         if kport != 0 {
-            let _ = self.dtask.ipc.mach_port_deallocate(kport);
+            let _ = self.ipc().mach_port_deallocate(kport);
         }
         self.darwin_thread_ports_terminate(tid);
         if let Some(v) = self.dtask.threads.map.get_mut(&tid).and_then(|t| t.voucher.take()) {

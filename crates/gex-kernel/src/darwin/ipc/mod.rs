@@ -135,7 +135,8 @@ impl Kernel {
 }
 
 use space::{bits, Space};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::{Arc, Condvar, Mutex};
 
 /// An object's identity in the task's object table.
 pub type ObjId = u64;
@@ -466,12 +467,24 @@ pub mod mpg_pinned {
     pub const COPYIN: u64 = 0x04 << 56;
 }
 
-/// A task's IPC state: its objects and its name space.
+/// A task's IPC state: its name space, and, while the task holds the
+/// system's table ([`IpcCell`]), every port and set and the other tasks'
+/// spaces.
 #[derive(Debug, Default)]
 pub struct Ipc {
     pub objects: BTreeMap<ObjId, Object>,
     next_id: ObjId,
     pub space: Space,
+    /// The other tasks' spaces, by task, while this task holds the table.
+    pub others: HashMap<TaskKey, Space>,
+    /// This task's key among the spaces (0: none taken yet).
+    pub task: TaskKey,
+    /// The system's table, once this task has taken it.
+    cell: Option<Arc<IpcCell>>,
+    /// Whether this task holds the table now.
+    pub held: bool,
+    /// The table's task key counter while this task holds it.
+    next_task_hint: TaskKey,
     /// Notifications owed, oldest first.
     pub outbox: Vec<Notify>,
     /// Guard exceptions raised, for the kernel to deliver.
@@ -482,6 +495,63 @@ pub struct Ipc {
     timestamp: u32,
     /// `TASK_CONTROL_PORT_PINNED_HARD`: a pinned right's misuse is fatal.
     pub pinned_hard: bool,
+}
+
+impl Drop for Ipc {
+    /// A task gone in the middle of a call leaves the table for the rest.
+    fn drop(&mut self) {
+        self.check_in();
+    }
+}
+
+/// A task's key among the system's spaces.
+pub type TaskKey = u64;
+
+/// What every task shares: the ports and sets (XNU's are kernel objects,
+/// named from any space), and the spaces of tasks not running a call.
+#[derive(Debug, Default)]
+pub struct IpcShared {
+    objects: BTreeMap<ObjId, Object>,
+    next_id: ObjId,
+    timestamp: u32,
+    spaces: HashMap<TaskKey, Space>,
+    next_task: TaskKey,
+}
+
+/// The system's IPC table, taken by one task at a time for the length of a
+/// kernel call.
+#[derive(Debug)]
+pub struct IpcCell {
+    table: Mutex<Option<IpcShared>>,
+    free: Condvar,
+}
+
+impl Default for IpcCell {
+    fn default() -> IpcCell {
+        IpcCell { table: Mutex::new(Some(IpcShared::default())), free: Condvar::new() }
+    }
+}
+
+impl IpcCell {
+    /// Take the table, waiting for the task holding it.
+    fn take(&self) -> IpcShared {
+        let mut t = self.table.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(s) = t.take() {
+                return s;
+            }
+            let (g, timeout) = self.free.wait_timeout(t, std::time::Duration::from_secs(120)).unwrap_or_else(|e| e.into_inner());
+            t = g;
+            if timeout.timed_out() && t.is_none() {
+                panic!("gex: the Darwin IPC table has been held for 120 s: a task did not give it back");
+            }
+        }
+    }
+
+    fn put(&self, s: IpcShared) {
+        *self.table.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
+        self.free.notify_one();
+    }
 }
 
 /// `ipc_port_request_table_next_size(2, osize, 16)` in entries (16-byte
@@ -504,6 +574,56 @@ fn request_table_grow(ocount: usize) -> usize {
 }
 
 impl Ipc {
+    /// Take the system's table from `cell` for this task: its space comes
+    /// out of the shared spaces (a task taking it the first time gets its
+    /// key and keeps the space it has).
+    pub fn check_out(&mut self, cell: &Arc<IpcCell>) {
+        debug_assert!(!self.held);
+        let mut s = cell.take();
+        self.cell.get_or_insert_with(|| Arc::clone(cell));
+        self.objects = std::mem::take(&mut s.objects);
+        self.next_id = s.next_id;
+        self.timestamp = s.timestamp;
+        if self.task == 0 {
+            s.next_task += 1;
+            self.task = s.next_task;
+        } else if let Some(sp) = s.spaces.remove(&self.task) {
+            self.space = sp;
+        }
+        self.others = std::mem::take(&mut s.spaces);
+        self.held = true;
+        // What stays in `s` is its key counter.
+        self.next_task_hint = s.next_task;
+    }
+
+    /// Give the table back.
+    pub fn check_in(&mut self) {
+        if !self.held {
+            return;
+        }
+        let cell = Arc::clone(self.cell.as_ref().expect("a held table has its cell"));
+        let mut spaces = std::mem::take(&mut self.others);
+        spaces.insert(self.task, std::mem::take(&mut self.space));
+        let s = IpcShared { objects: std::mem::take(&mut self.objects), next_id: self.next_id, timestamp: self.timestamp, spaces, next_task: self.next_task_hint };
+        self.held = false;
+        cell.put(s);
+    }
+
+    /// The task has ended: its (terminated) space leaves the table, and the
+    /// task gives up its key.
+    pub fn space_leave(&mut self) {
+        debug_assert!(self.held);
+        self.space = Space::new();
+        self.task = 0;
+        let cell = self.cell.take();
+        self.held = false;
+        if let Some(cell) = cell {
+            let spaces = std::mem::take(&mut self.others);
+            let s = IpcShared { objects: std::mem::take(&mut self.objects), next_id: self.next_id, timestamp: self.timestamp, spaces, next_task: self.next_task_hint };
+            cell.put(s);
+        }
+    }
+
     pub(crate) fn new_id_pub(&mut self) -> ObjId {
         self.new_id()
     }

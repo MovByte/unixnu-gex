@@ -375,6 +375,8 @@ pub struct ProcTable {
     remote: Option<Remote>,
     /// Pid 1 is the kernel's own, with no program ([`ProcTable::set_virtual_init`]).
     virtual_init: AtomicBool,
+    /// The Darwin tasks' ports and spaces, shared by every task here.
+    pub darwin_ipc: std::sync::Arc<crate::darwin::ipc::IpcCell>,
 }
 
 impl std::fmt::Debug for ProcTable {
@@ -402,6 +404,7 @@ impl ProcTable {
             halt_code: AtomicI32::new(0),
             remote: None,
             virtual_init: AtomicBool::new(false),
+            darwin_ipc: Default::default(),
             inner: Mutex::new(Table {
                 next_pid: INIT_PID + 1,
                 threads: std::collections::HashMap::new(),

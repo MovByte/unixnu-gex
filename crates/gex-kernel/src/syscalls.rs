@@ -9582,8 +9582,15 @@ impl Kernel {
             .unwrap_or(0)
     }
 
-    /// Handle one system call (`svc #0`, or `syscall`).
+    /// A guest syscall at `pc` (the trap instruction's own address).
     pub fn syscall(&mut self, m: &mut GuestMem<'_>, pc: u64) -> SyscallOutcome {
+        let out = self.syscall_body(m, pc);
+        self.darwin_ipc_leave();
+        out
+    }
+
+    /// Handle one system call (`svc #0`, or `syscall`).
+    fn syscall_body(&mut self, m: &mut GuestMem<'_>, pc: u64) -> SyscallOutcome {
         let mut out = self.syscall_cwd(m, pc);
         if self.darwin && !matches!(out, SyscallOutcome::Blocking(_)) {
             self.darwin_syscall_exit(m);
@@ -10311,7 +10318,14 @@ impl Kernel {
         std::mem::take(&mut self.fd_activity)
     }
 
+    /// A blocked call's wait has ended with `r`.
     pub fn finish_blocking(&mut self, m: &mut GuestMem<'_>, r: SysResult) -> SyscallOutcome {
+        let out = self.finish_blocking_body(m, r);
+        self.darwin_ipc_leave();
+        out
+    }
+
+    fn finish_blocking_body(&mut self, m: &mut GuestMem<'_>, r: SysResult) -> SyscallOutcome {
         // A workqueue thread's scheduler callback (`workq_sched_callback`):
         // it runs again, and blocks again if the call goes on waiting.
         if self.darwin {
@@ -10653,12 +10667,19 @@ impl Kernel {
         sigaltstack(&self.signals, m, self.compat, new, old)
     }
 
+    /// The signals pending for the thread, delivered.
+    pub fn deliver_pending(&mut self, m: &mut GuestMem<'_>) -> Delivery {
+        let out = self.deliver_pending_body(m);
+        self.darwin_ipc_leave();
+        out
+    }
+
     /// Deliver a pending signal, if any is deliverable right now.
     ///
     /// Called after every syscall and at safepoints. A `Resume` result means
     /// the caller must re-enter translated code at the returned address
     /// rather than continuing where it was.
-    pub fn deliver_pending(&mut self, m: &mut GuestMem<'_>) -> Delivery {
+    fn deliver_pending_body(&mut self, m: &mut GuestMem<'_>) -> Delivery {
         self.collect_signals();
         self.check_timers();
         if !self.signals.has_pending() {
@@ -10753,7 +10774,9 @@ impl Kernel {
         fault_address: u64,
     ) -> Delivery {
         if self.darwin {
-            return self.darwin_raise_fault(m, signo, pc, fault_address);
+            let out = self.darwin_raise_fault(m, signo, pc, fault_address);
+            self.darwin_ipc_leave();
+            return out;
         }
         let action = self.signals.action(signo);
         let blocked = self.signals.blocked() & (1u64 << (signo - 1)) != 0;
@@ -10797,8 +10820,15 @@ impl Kernel {
         }
     }
 
-    /// Restore the context a handler frame captured.
+    /// A signal handler's return.
     pub fn sigreturn(&mut self, m: &mut GuestMem<'_>) -> Result<u64, Errno> {
+        let out = self.sigreturn_body(m);
+        self.darwin_ipc_leave();
+        out
+    }
+
+    /// Restore the context a handler frame captured.
+    fn sigreturn_body(&mut self, m: &mut GuestMem<'_>) -> Result<u64, Errno> {
         let legacy = std::mem::replace(&mut self.sigreturn_legacy, false);
         signal::sigreturn(&mut self.signals, m, self.ctx_addr, self.compat, legacy)
     }

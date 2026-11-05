@@ -95,7 +95,7 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         (Kobject::Host | Kobject::HostPriv, 206) => match arg(req, 0) {
             Some(0) | Some(1) => {
                 let p = k.darwin_clock_port();
-                k.dtask.ipc.make_send(p);
+                k.ipc().make_send(p);
                 Reply::port(Carried::Port(p))
             }
             Some(_) => Reply::err(KERN_INVALID_ARGUMENT),
@@ -160,12 +160,12 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
                     _ => return bad(),
                 }
             }
-            if ports.iter().flatten().any(|&p| k.dtask.ipc.port(p).immovable_send) {
+            if ports.iter().flatten().any(|&p| k.ipc().port(p).immovable_send) {
                 return Reply::err(KERN_INVALID_RIGHT);
             }
             let old = std::mem::replace(&mut k.dtask.kports.registered, ports);
             for p in old.into_iter().flatten() {
-                k.dtask.ipc.release_send(p);
+                k.ipc().release_send(p);
             }
             Reply::ok(Vec::new())
         }
@@ -175,8 +175,8 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             let mut r = Reply::ok(Vec::new());
             for slot in k.dtask.kports.registered {
                 r = match slot {
-                    Some(p) if k.dtask.ipc.port(p).active => {
-                        k.dtask.ipc.copy_send(p);
+                    Some(p) if k.ipc().port(p).active => {
+                        k.ipc().copy_send(p);
                         r.ports.push(super::kobject::PortOut::Right(Carried::Port(p), super::ipc::right::msgt::PORT_SEND));
                         r
                     }
@@ -225,7 +225,7 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         },
         // mach_port_get_refs(task, name, right) -> refs
         (Kobject::Task, 3207) => match (arg(req, 0), arg(req, 1)) {
-            (Some(name), Some(right)) => match k.dtask.ipc.mach_port_get_refs(name as u32, right as u32) {
+            (Some(name), Some(right)) => match k.ipc().mach_port_get_refs(name as u32, right as u32) {
                 Ok(n) => Reply::ok(n.to_le_bytes().to_vec()),
                 Err(e) => Reply::err(e as i32),
             },
@@ -241,7 +241,7 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
                 }
                 let r = right as u32;
                 let named = (r != super::ipc::port_right::DEAD_NAME).then_some(name);
-                match k.dtask.ipc.mach_port_allocate(r, named) {
+                match k.ipc().mach_port_allocate(r, named) {
                     Ok(_) => Reply::ok(Vec::new()),
                     Err(e) => Reply::err(e as i32),
                 }
@@ -285,7 +285,7 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             Some((Some(Carried::Port(p)), disp)) => {
                 let r = k.semaphore_destroy(p);
                 if r == kr::SUCCESS {
-                    k.dtask.ipc.object_destroy(Carried::Port(p), disp);
+                    k.ipc().object_destroy(Carried::Port(p), disp);
                 }
                 Reply::err(r as i32)
             }
@@ -304,14 +304,14 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             let port = match k.dtask.kports.resume {
                 Some(p) => p,
                 None => {
-                    let p = k.dtask.ipc.kobject_port(Kobject::TaskResume);
+                    let p = k.ipc().kobject_port(Kobject::TaskResume);
                     k.dtask.kports.resume = Some(p);
                     p
                 }
             };
             // ipc_kobject_make_send_nsrequest, then the right moved out.
-            k.dtask.ipc.port_mut(port).nsrequest_kobject = true;
-            k.dtask.ipc.make_send(port);
+            k.ipc().port_mut(port).nsrequest_kobject = true;
+            k.ipc().make_send(port);
             k.darwin_copyout_send(port);
             let mut r = Reply::ok(Vec::new());
             if first {
@@ -324,11 +324,11 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         // the release failed).
         (Kobject::Task, 3408) => {
             let ok = k.darwin_release_task_hold(super::jobctl::HoldMode::Legacy);
-            if let Some(name) = k.dtask.kports.resume.and_then(|p| k.dtask.ipc.space.hash_lookup(p)) {
+            if let Some(name) = k.dtask.kports.resume.and_then(|p| k.ipc().space.hash_lookup(p)) {
                 if ok {
-                    k.dtask.ipc.right_dealloc(name);
+                    k.ipc().right_dealloc(name);
                 } else {
-                    k.dtask.ipc.right_destroy(name, false, 0);
+                    k.ipc().right_destroy(name, false, 0);
                 }
             }
             Reply::err(if ok { 0 } else { KERN_FAILURE })
@@ -341,12 +341,12 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             let port = match k.dtask.kports.resume {
                 Some(p) => p,
                 None => {
-                    let p = k.dtask.ipc.kobject_port(Kobject::TaskResume);
+                    let p = k.ipc().kobject_port(Kobject::TaskResume);
                     k.dtask.kports.resume = Some(p);
                     p
                 }
             };
-            k.dtask.ipc.make_sonce(port);
+            k.ipc().make_sonce(port);
             if first {
                 let mut r = Reply::ok(Vec::new());
                 r.defer = Some((k.tid, super::kobject::Deferred::TaskWait { token: Some(port) }));
@@ -558,31 +558,31 @@ fn task_get_special_port(k: &mut Kernel, which: i32) -> Reply {
     match which {
         TASK_KERNEL_PORT => {
             let p = k.darwin_task_port();
-            k.dtask.ipc.copy_send(p);
+            k.ipc().copy_send(p);
             Reply::port(Carried::Port(p))
         }
         TASK_HOST_PORT => {
             let p = k.darwin_itk_host();
-            k.dtask.ipc.copy_send(p);
+            k.ipc().copy_send(p);
             Reply::port(Carried::Port(p))
         }
         TASK_NAME_PORT => {
             let p = match k.dtask.kports.task_name {
                 Some(p) => p,
                 None => {
-                    let p = k.dtask.ipc.kobject_port(Kobject::TaskName);
+                    let p = k.ipc().kobject_port(Kobject::TaskName);
                     k.dtask.kports.task_name = Some(p);
                     p
                 }
             };
-            k.dtask.ipc.make_send(p);
+            k.ipc().make_send(p);
             Reply::port(Carried::Port(p))
         }
         // ipc_port_copy_send_mqueue: a copy of what was set; null when
         // nothing was, dead when it died.
         TASK_BOOTSTRAP_PORT | TASK_ACCESS_PORT | TASK_DEBUG_CONTROL_PORT | TASK_RESOURCE_NOTIFY_PORT => match k.dtask.kports.special.get(&which).copied() {
-            Some(p) if k.dtask.ipc.port(p).active => {
-                k.dtask.ipc.copy_send(p);
+            Some(p) if k.ipc().port(p).active => {
+                k.ipc().copy_send(p);
                 Reply::port(Carried::Port(p))
             }
             Some(_) => Reply { ret: KERN_SUCCESS, defer: None, out: Vec::new(), ports: Vec::new(), unimplemented: None }.with_null_port(super::ipc::PORT_DEAD),
@@ -637,7 +637,7 @@ fn host_get_special_port(k: &mut Kernel, obj: &Kobject, port: super::ipc::ObjId,
             return Reply::ok(Vec::new()).with_null_port(0);
         }
     };
-    k.dtask.ipc.copy_send(p);
+    k.ipc().copy_send(p);
     Reply::port(Carried::Port(p))
 }
 
@@ -655,14 +655,14 @@ fn task_set_special_port(k: &mut Kernel, which: i32, right: Option<Carried>) -> 
         _ => None,
     };
     if let Some(p) = port {
-        if k.dtask.ipc.port(p).immovable_send {
+        if k.ipc().port(p).immovable_send {
             return Reply::err(KERN_INVALID_RIGHT);
         }
     }
     match which {
         TASK_KERNEL_PORT | TASK_HOST_PORT => Reply::err(KERN_NO_ACCESS),
         TASK_BOOTSTRAP_PORT | TASK_DEBUG_CONTROL_PORT | TASK_RESOURCE_NOTIFY_PORT | TASK_ACCESS_PORT => {
-            if which == TASK_ACCESS_PORT && k.dtask.kports.special.get(&which).is_some_and(|&p| k.dtask.ipc.port(p).active) {
+            if which == TASK_ACCESS_PORT && k.dtask.kports.special.get(&which).copied().is_some_and(|p| k.ipc().port(p).active) {
                 return Reply::err(KERN_NO_ACCESS);
             }
             let old = match port {
@@ -670,7 +670,7 @@ fn task_set_special_port(k: &mut Kernel, which: i32, right: Option<Carried>) -> 
                 None => k.dtask.kports.special.remove(&which),
             };
             if let Some(o) = old {
-                k.dtask.ipc.release_send(o);
+                k.ipc().release_send(o);
             }
             Reply::ok(Vec::new())
         }

@@ -399,7 +399,7 @@ impl Kernel {
         // The main thread's port, a send right the program's libpthread
         // takes (and _bsdthread_terminate consumes).
         let port = self.darwin_thread_ports(self.tid).1;
-        self.dtask.ipc.make_send(port);
+        self.ipc().make_send(port);
         let name = self.darwin_copyout_send(port);
         s.add_apple(format!("th_port=0x{name:x}").as_bytes())?;
         let hr = self.dtask.codesign.as_ref().map_or(0, |cs| {
@@ -420,12 +420,19 @@ impl Kernel {
         Ok(())
     }
 
+    /// A new image's start ([`Self::darwin_start_body`]).
+    pub fn darwin_start(&mut self, strings: Option<Strings>, l: &Loaded, user_stack: u64) -> Result<MainStack, Errno> {
+        let out = self.darwin_start_body(strings, l, user_stack);
+        self.darwin_ipc_leave();
+        out
+    }
+
     /// The new image's main stack with its strings on it: `create_unix_stack`
     /// below `user_stack`, the `apple[]` strings, `exec_copyout_strings`,
     /// and dyld's copy of the executable's header pushed below them.
     /// `strings` is the exec's area; the run's first program has its
     /// path and vectors from the kernel.
-    pub fn darwin_start(&mut self, strings: Option<Strings>, l: &Loaded, user_stack: u64) -> Result<MainStack, Errno> {
+    fn darwin_start_body(&mut self, strings: Option<Strings>, l: &Loaded, user_stack: u64) -> Result<MainStack, Errno> {
         // task_set_main_thread_qos, for an exec's, a spawn's and the first
         // image's main thread alike.
         let q = self.darwin_main_thread_qos();

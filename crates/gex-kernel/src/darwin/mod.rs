@@ -85,7 +85,9 @@ pub struct Task {
     /// `p_sdk`).
     pub platform: (u32, u32),
     /// The task's IPC.
-    pub ipc: ipc::Ipc,
+    /// Reached through [`crate::syscalls::Kernel::ipc`], which takes the
+    /// system's IPC table for the call.
+    pub ipc_raw: ipc::Ipc,
     /// The kernel objects' ports.
     pub kports: kobject::Kports,
     pub semas: sema::Semas,
@@ -153,6 +155,22 @@ impl Task {
 }
 
 impl crate::syscalls::Kernel {
+    /// This task's IPC state, with the system's table taken for the rest
+    /// of the kernel call ([`Self::darwin_ipc_leave`] gives it back).
+    pub(crate) fn ipc(&mut self) -> &mut ipc::Ipc {
+        let ipc = &mut self.dtask.ipc_raw;
+        if !ipc.held {
+            ipc.check_out(&self.procs.darwin_ipc);
+        }
+        ipc
+    }
+
+    /// The kernel call is done with IPC: the system's table goes back for
+    /// the other tasks.
+    pub fn darwin_ipc_leave(&mut self) {
+        self.dtask.ipc_raw.check_in();
+    }
+
     /// This process's task policy, as it is now.
     pub(crate) fn darwin_policy(&self) -> taskpolicy::TaskPolicy {
         let cell = self.dtask.policy.clone().or_else(|| self.procs.task_policy(self.pid));

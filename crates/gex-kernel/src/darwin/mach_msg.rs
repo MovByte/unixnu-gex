@@ -195,7 +195,7 @@ impl Kernel {
             let cfi = options & opt::CFI_MASK & !opt::SEND_ANY;
             let ok = cfi != 0 && cfi & (cfi - 1) == 0 && !(options & (opt::SEND_MQ_CALL | opt::SEND_ANY) == 0 && options & opt::MSG_VECTOR != 0);
             if !ok {
-                self.dtask.ipc.guard_exception(0, Guard::InvalidOptions, 0);
+                self.ipc().guard_exception(0, Guard::InvalidOptions, 0);
                 return mr::SEND_INVALID_OPTIONS;
             }
         }
@@ -343,7 +343,7 @@ impl Kernel {
             let (platform, sdk) = self.dtask.platform;
             let allowed = platform == PLATFORM_IOS && sdk != 0 && sdk >> 16 <= 15 && matches!(u.id, 0xd4a | 0xd4d | 0xe13 | 0x12c4 | 0x12c8);
             if !allowed {
-                self.dtask.ipc.guard_exception(u.id as u32, Guard::InvalidOptions, 0);
+                self.ipc().guard_exception(u.id as u32, Guard::InvalidOptions, 0);
                 return self.mach_result(m, mr::KERN_NOT_SUPPORTED);
             }
             u.priority = priority;
@@ -391,7 +391,8 @@ impl Kernel {
             Ok(()) => {}
             Err(SendWait::Room(port)) => {
                 let deadline = (options & opt::SEND_TIMEOUT != 0).then(|| Instant::now() + Duration::from_millis(u64::from(timeout)));
-                self.dtask.ipc.mqueue_wait_room(port, self.tid);
+                let tid = self.tid;
+                self.ipc().mqueue_wait_room(port, tid);
                 self.dtask.pending_send_buf.insert(self.tid, (u.msg_addr, u.msg_size));
                 self.darwin_ipc_settle(m);
                 return self.darwin_block(m, Wait { deadline, cont: super::thread::Finish::MachMsg(Cont::Send { port, then }) });
@@ -490,12 +491,12 @@ impl Kernel {
         if options & MACH_MSG2 != 0 {
             let r = self.validate_dest(dest, options, reply.is_some());
             if r != mr::SUCCESS {
-                self.dtask.ipc.guard_exception(0, Guard::InvalidOptions, 0);
+                self.ipc().guard_exception(0, Guard::InvalidOptions, 0);
                 self.clean_header(dest, out_bits, reply, voucher);
                 return Err(r);
             }
         }
-        if port_count != 0 && self.dtask.ipc.port(dest).no_grant {
+        if port_count != 0 && self.ipc().port(dest).no_grant {
             self.clean_header(dest, out_bits, reply, voucher);
             return Err(0x1000_0016);
         }
@@ -504,7 +505,7 @@ impl Kernel {
         if u.bits & bits::COMPLEX != 0 {
             // A message to a dead port or to a kernel object may carry
             // immovable send rights.
-            let p = self.dtask.ipc.port(dest);
+            let p = self.ipc().port(dest);
             let allow_imm_send = !p.active || p.receiver == Receiver::Kernel;
             if let Err(r) = self.kmsg_copyin_body(m, &mut kmsg, &descs_raw, allow_imm_send) {
                 self.clean_header(dest, out_bits, reply, voucher);
@@ -515,8 +516,8 @@ impl Kernel {
     }
 
     /// `ipc_validate_kmsg_dest_from_user` on iOS.
-    fn validate_dest(&self, dest: ObjId, options: u64, has_reply: bool) -> u32 {
-        let p = self.dtask.ipc.port(dest);
+    fn validate_dest(&mut self, dest: ObjId, options: u64, has_reply: bool) -> u32 {
+        let p = self.ipc().port(dest);
         match &p.kobject {
             Some(super::ipc::Kobject::Timer) => mr::SEND_INVALID_OPTIONS,
             Some(_) => {
@@ -554,7 +555,7 @@ impl Kernel {
 
     /// Undo a header copyin (`ipc_kmsg_clean_header`).
     fn clean_header(&mut self, dest: ObjId, b: u32, reply: Option<Carried>, voucher: Option<ObjId>) {
-        let ipc = &mut self.dtask.ipc;
+        let ipc = &mut self.ipc();
         ipc.object_destroy(Carried::Port(dest), bits::remote(b));
         if let Some(r) = reply {
             ipc.object_destroy(r, bits::local(b));
@@ -577,7 +578,7 @@ impl Kernel {
         if !super::ipc::name_valid(dest_name) {
             return Err(mr::SEND_INVALID_DEST);
         }
-        let ipc = &mut self.dtask.ipc;
+        let ipc = &mut self.ipc();
         let mut voucher_name = 0;
         if voucher_type != 0 {
             voucher_name = u.voucher;
@@ -608,10 +609,10 @@ impl Kernel {
             }
             if super::ipc::name_valid(reply_name) {
                 if voucher_name == reply_name || ipc.space.lookup(reply_name).is_none() || !self.copyin_check_reply(reply_name, reply_type, dest_name) {
-                    return invalid_reply(&mut self.dtask.ipc);
+                    return invalid_reply(&mut self.ipc());
                 }
             }
-            let ipc = &mut self.dtask.ipc;
+            let ipc = &mut self.ipc();
             let (d, so) = ipc.right_copyin_two(dest_name, dest_type, voucher_type).map_err(|_| mr::SEND_INVALID_DEST)?;
             dest = d;
             sorights = vec![(so, dest_name)];
@@ -637,9 +638,9 @@ impl Kernel {
                 return Err(mr::SEND_INVALID_DEST);
             }
             if !self.copyin_check_reply(reply_name, reply_type, dest_name) {
-                return invalid_reply(&mut self.dtask.ipc);
+                return invalid_reply(&mut self.ipc());
             }
-            let ipc = &mut self.dtask.ipc;
+            let ipc = &mut self.ipc();
             let (d, so) = match ipc.right_copyin_two(dest_name, dest_type, reply_type) {
                 Ok(v) => v,
                 Err(e) if e == kr::INVALID_CAPABILITY => return invalid_reply(ipc),
@@ -656,10 +657,10 @@ impl Kernel {
             }
             if super::ipc::name_valid(reply_name) {
                 if reply_name == voucher_name || ipc.space.lookup(reply_name).is_none() || !self.copyin_check_reply(reply_name, reply_type, dest_name) {
-                    return invalid_reply(&mut self.dtask.ipc);
+                    return invalid_reply(&mut self.ipc());
                 }
             }
-            let ipc = &mut self.dtask.ipc;
+            let ipc = &mut self.ipc();
             let f = CopyinFlags { allow_immovable_send: true, allow_dead_send_once: true, ..dest_flags };
             let (d, so) = ipc.right_copyin(dest_name, dest_type, f, 0, None).map_err(|_| mr::SEND_INVALID_DEST)?;
             dest = d;
@@ -682,7 +683,7 @@ impl Kernel {
                 None
             };
         }
-        let ipc = &mut self.dtask.ipc;
+        let ipc = &mut self.ipc();
         for (so, name) in sorights {
             if let Some(to) = so {
                 ipc.outbox.push(super::ipc::Notify::PortDeleted { to, name });
@@ -716,7 +717,7 @@ impl Kernel {
 
     /// `ipc_right_copyin_check_reply`.
     fn copyin_check_reply(&mut self, reply_name: u32, reply_type: u32, dest_name: u32) -> bool {
-        let ipc = &mut self.dtask.ipc;
+        let ipc = &mut self.ipc();
         let Some(re) = ipc.space.lookup(reply_name).copied() else { return false };
         let b = re.bits;
         match reply_type {
@@ -784,7 +785,7 @@ impl Kernel {
                     match r {
                         Ok(right) => Desc::Port { off, right, raw: name, disp: msgt::copyin_type(disp) },
                         Err(e) => {
-                            self.dtask.ipc.descs_destroy(&kmsg.descs);
+                            self.ipc().descs_destroy(&kmsg.descs);
                             return Err(e);
                         }
                     }
@@ -797,7 +798,7 @@ impl Kernel {
                         match m.read(addr, len as usize) {
                             Ok(d) => d.to_vec(),
                             Err(_) => {
-                                self.dtask.ipc.descs_destroy(&kmsg.descs);
+                                self.ipc().descs_destroy(&kmsg.descs);
                                 return Err(mr::SEND_INVALID_MEMORY);
                             }
                         }
@@ -814,7 +815,7 @@ impl Kernel {
                     let names: Vec<u32> = match m.read(addr, 4 * count as usize) {
                         Ok(n) => n.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect(),
                         Err(_) => {
-                            self.dtask.ipc.descs_destroy(&kmsg.descs);
+                            self.ipc().descs_destroy(&kmsg.descs);
                             return Err(mr::SEND_INVALID_MEMORY);
                         }
                     };
@@ -829,10 +830,10 @@ impl Kernel {
                                 let rt = msgt::copyin_type(disp);
                                 for (r, _) in rights {
                                     if let Some(r) = r {
-                                        self.dtask.ipc.object_destroy(r, rt);
+                                        self.ipc().object_destroy(r, rt);
                                     }
                                 }
-                                self.dtask.ipc.descs_destroy(&kmsg.descs);
+                                self.ipc().descs_destroy(&kmsg.descs);
                                 return Err(e);
                             }
                         }
@@ -844,7 +845,7 @@ impl Kernel {
                     match self.copyin_desc_right(name, disp, context, Some(&mut gflags), flags) {
                         Ok(right) => Desc::Guarded { off, right, raw: name, disp: msgt::copyin_type(disp), flags: gflags },
                         Err(e) => {
-                            self.dtask.ipc.descs_destroy(&kmsg.descs);
+                            self.ipc().descs_destroy(&kmsg.descs);
                             return Err(e);
                         }
                     }
@@ -862,11 +863,11 @@ impl Kernel {
         if !super::ipc::name_valid(name) {
             return Ok(None);
         }
-        match self.dtask.ipc.object_copyin(name, disp, flags, context, guard) {
+        match self.ipc().object_copyin(name, disp, flags, context, guard) {
             Ok(c) => Ok(Some(c)),
             Err(e) => {
                 if e == kr::INVALID_RIGHT {
-                    self.dtask.ipc.guard_exception(name, Guard::SendInvalidRight, 0);
+                    self.ipc().guard_exception(name, Guard::SendInvalidRight, 0);
                 }
                 Err(mr::SEND_INVALID_RIGHT)
             }
@@ -881,7 +882,7 @@ impl Kernel {
             kmsg.voucher = Some(self.ipc_voucher_send_preprocessing(vp));
         }
         let port = kmsg.dest;
-        let ipc = &mut self.dtask.ipc;
+        let ipc = &mut self.ipc();
         if !ipc.port(port).active {
             ipc.release(port);
             ipc.kmsg_destroy(kmsg, true);
@@ -891,7 +892,7 @@ impl Kernel {
             ipc.port_mut(port).seqno = ipc.port(port).seqno.wrapping_add(1);
             let Some(reply) = self.kobject_server(port, kmsg) else { return Ok(()) };
             let rport = reply.dest;
-            let ipc = &mut self.dtask.ipc;
+            let ipc = &mut self.ipc();
             if !ipc.port(rport).active {
                 ipc.release(rport);
                 ipc.kmsg_destroy(reply, true);
@@ -900,7 +901,7 @@ impl Kernel {
             // A kernel reply that cannot be queued is destroyed.
             return match self.mqueue_send(reply, options | opt::SEND_ALWAYS, timeout_zero) {
                 Err(SendWait::Failed(_, Some(k))) => {
-                    let ipc = &mut self.dtask.ipc;
+                    let ipc = &mut self.ipc();
                     ipc.release(k.dest);
                     ipc.kmsg_destroy(k, true);
                     Ok(())
@@ -915,10 +916,10 @@ impl Kernel {
     fn mqueue_send(&mut self, kmsg: Box<Kmsg>, options: u64, timeout_zero: bool) -> Result<(), SendWait> {
         let port = kmsg.dest;
         let send_once = bits::remote(kmsg.bits) == msgt::PORT_SEND_ONCE;
-        match self.dtask.ipc.mqueue_reserve(port, send_once, options, timeout_zero) {
+        match self.ipc().mqueue_reserve(port, send_once, options, timeout_zero) {
             Ok(()) => {
                 let size = kmsg.size;
-                self.dtask.ipc.mqueue_post(port, kmsg, size);
+                self.ipc().mqueue_post(port, kmsg, size);
                 Ok(())
             }
             Err(Some(r)) => Err(SendWait::Failed(r, Some(kmsg))),
@@ -931,13 +932,14 @@ impl Kernel {
 
     /// `mach_msg_trap_receive`: receive on `r.rcv_name`, or wait.
     fn mach_msg_receive(&mut self, m: &mut GuestMem<'_>, r: RecvArgs) -> SyscallOutcome {
-        let object = match self.dtask.ipc.mqueue_copyin(r.rcv_name) {
+        let object = match self.ipc().mqueue_copyin(r.rcv_name) {
             Ok(o) => o,
             Err(e) => return self.mach_result(m, e),
         };
         let w = RcvWait { object, options: r.options, rcv_size: r.bufs.msg_size, aux_size: r.bufs.aux_size };
         let size_of = |k: &Kmsg| k.size;
-        match self.dtask.ipc.mqueue_receive(self.tid, object, w, r.timeout_ms == 0, &size_of) {
+        let tid = self.tid;
+        match self.ipc().mqueue_receive(tid, object, w, r.timeout_ms == 0, &size_of) {
             Some(rcv) => {
                 let res = self.receive_results(m, object, rcv, r.bufs, r.options);
                 self.mach_result(m, res)
@@ -955,23 +957,23 @@ impl Kernel {
         let me = self.tid;
         match c {
             Cont::Send { port, then } => {
-                let ready = self.dtask.ipc.queues.send_ready.remove(&me);
+                let ready = self.ipc().queues.send_ready.remove(&me);
                 let kmsg = self.dtask.pending_send.remove(&me).expect("a waiting send keeps its message");
                 let r = match (res, ready) {
                     (WaitResult::Awakened, Some(true)) => {
                         let size = kmsg.size;
-                        self.dtask.ipc.mqueue_post(port, kmsg, size);
+                        self.ipc().mqueue_post(port, kmsg, size);
                         mr::SUCCESS
                     }
                     (WaitResult::Awakened, _) | (WaitResult::Restart, _) => {
-                        self.dtask.ipc.mqueue_cancel_room(port, me);
-                        let ipc = &mut self.dtask.ipc;
+                        self.ipc().mqueue_cancel_room(port, me);
+                        let ipc = &mut self.ipc();
                         ipc.release(port);
                         ipc.kmsg_destroy(kmsg, true);
                         mr::SUCCESS
                     }
                     (WaitResult::TimedOut | WaitResult::Interrupted, _) => {
-                        self.dtask.ipc.mqueue_cancel_room(port, me);
+                        self.ipc().mqueue_cancel_room(port, me);
                         let r = if res == WaitResult::TimedOut { mr::SEND_TIMED_OUT } else { mr::SEND_INTERRUPTED };
                         let (addr, size) = self.dtask.pending_send_buf.remove(&me).expect("a waiting send keeps its buffer");
                         r | self.pseudo_receive(m, kmsg, addr, size)
@@ -990,11 +992,11 @@ impl Kernel {
                 let _ = super::set_mach_result(m, self.ctx_addr, u64::from(r));
             }
             Cont::Receive { object, bufs, options } => {
-                let got = self.dtask.ipc.queues.received.remove(&me);
+                let got = self.ipc().queues.received.remove(&me);
                 let rcv = match (got, res) {
                     (Some(r), _) => r,
                     (None, res) => {
-                        self.dtask.ipc.mqueue_cancel_receive(me);
+                        self.ipc().mqueue_cancel_receive(me);
                         let state = match res {
                             WaitResult::TimedOut => mr::RCV_TIMED_OUT,
                             WaitResult::Interrupted => mr::RCV_INTERRUPTED,
@@ -1018,7 +1020,7 @@ impl Kernel {
 
     /// `mach_msg_receive_results`, with what it put where.
     pub(crate) fn receive_results_msgr(&mut self, m: &mut GuestMem<'_>, object: ObjId, rcv: Received, bufs: RecvBufs, options: u64) -> (u32, Msgr) {
-        self.dtask.ipc.release(object);
+        self.ipc().release(object);
         let mut msgr = Msgr::default();
         let mut r = rcv.state;
         if r == mr::RCV_TOO_LARGE {
@@ -1059,7 +1061,7 @@ impl Kernel {
                 kmsg.voucher = Some(self.ipc_voucher_receive_postprocessing(vp));
             }
         }
-        let context = self.dtask.ipc.port(kmsg.dest).context;
+        let context = self.ipc().port(kmsg.dest).context;
         let (priority, qos_ovrd) = (kmsg.ppriority, kmsg.qos_override);
         let r = match self.kmsg_copyout(m, *kmsg, options) {
             Ok(out) => {
@@ -1077,7 +1079,7 @@ impl Kernel {
     #[allow(clippy::too_many_arguments)]
     fn receive_error(&mut self, m: &mut GuestMem<'_>, kmsg: Box<Kmsg>, seqno: u32, bufs: RecvBufs, options: u64, r: u32, msgr: &mut Msgr) -> u32 {
         let k = *kmsg;
-        let ipc = &mut self.dtask.ipc;
+        let ipc = &mut self.ipc();
         let dest_name = if ipc.port(k.dest).active {
             ipc.object_copyout_dest(k.dest, bits::remote(k.bits))
         } else {
@@ -1116,7 +1118,7 @@ impl Kernel {
 
     /// `ipc_kmsg_copyout`: header and body into the receiver's space.
     fn kmsg_copyout(&mut self, m: &mut GuestMem<'_>, k: Kmsg, options: u64) -> Result<Out, (Out, u32)> {
-        let ipc = &mut self.dtask.ipc;
+        let ipc = &mut self.ipc();
         let (dest_type, reply_type, voucher_type) = (bits::remote(k.bits), bits::local(k.bits), bits::voucher(k.bits));
         // ipc_kmsg_copyout_header
         ipc.spnotify(k.dest);
@@ -1251,7 +1253,7 @@ impl Kernel {
                             Err(_) => {
                                 for (r, _) in rights {
                                     if let Some(c) = r {
-                                        self.dtask.ipc.object_destroy(c, disp);
+                                        self.ipc().object_destroy(c, disp);
                                     }
                                 }
                                 err |= mr::MSG_VM_SPACE;
@@ -1281,10 +1283,10 @@ impl Kernel {
         let reply_name = match k.reply {
             None => 0,
             Some(Carried::Dead) => super::ipc::PORT_DEAD,
-            Some(Carried::Port(p)) if self.dtask.ipc.port(p).reply_semantics == super::ipc::ReplySemantics::ReplyPort => {
+            Some(Carried::Port(p)) if self.ipc().port(p).reply_semantics == super::ipc::ReplySemantics::ReplyPort => {
                 // ipc_kmsg_copyout_reply_object: the send-once right goes;
                 // the receive right's name stands for it.
-                let ipc = &mut self.dtask.ipc;
+                let ipc = &mut self.ipc();
                 let name = if !ipc.port(p).active {
                     super::ipc::PORT_DEAD
                 } else {
@@ -1339,7 +1341,7 @@ impl Kernel {
         if c == Carried::Dead {
             return super::ipc::PORT_DEAD;
         }
-        match self.dtask.ipc.object_copyout(c, t, guard) {
+        match self.ipc().object_copyout(c, t, guard) {
             Ok(n) => n,
             Err(e) if e == kr::INVALID_CAPABILITY => super::ipc::PORT_DEAD,
             Err(e) => {
@@ -1422,10 +1424,10 @@ impl Kernel {
     /// woken, guard exceptions raised.
     pub(crate) fn darwin_ipc_settle(&mut self, m: &mut GuestMem<'_>) {
         self.darwin_ipc_notify_drain();
-        for t in std::mem::take(&mut self.dtask.ipc.queues.wake) {
+        for t in std::mem::take(&mut self.ipc().queues.wake) {
             self.darwin_wake(m, t, WaitResult::Awakened);
         }
-        for (name, g, portguard) in std::mem::take(&mut self.dtask.ipc.guards) {
+        for (name, g, portguard) in std::mem::take(&mut self.ipc().guards) {
             self.darwin_guard_exception(name, g, portguard);
         }
         // The EVFILT_MACHPORT knotes of what changed, and the threads
@@ -1437,7 +1439,7 @@ impl Kernel {
     /// The notifications owed, sent, with those their sending owes.
     pub(crate) fn darwin_ipc_notify_drain(&mut self) {
         loop {
-            let outbox = std::mem::take(&mut self.dtask.ipc.outbox);
+            let outbox = std::mem::take(&mut self.ipc().outbox);
             if outbox.is_empty() {
                 break;
             }
@@ -1498,7 +1500,7 @@ impl Kernel {
     /// message the kernel sends; one that cannot be queued is destroyed.
     pub(crate) fn darwin_kernel_send(&mut self, k: Box<Kmsg>) {
         if let Err(SendWait::Failed(_, Some(k))) = self.kmsg_send(k, opt::SEND_MSG | opt::SEND_ALWAYS | opt::SEND_NOIMPORTANCE, false) {
-            self.dtask.ipc.kmsg_destroy(k, false);
+            self.ipc().kmsg_destroy(k, false);
         }
     }
 }

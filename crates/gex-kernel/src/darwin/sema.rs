@@ -69,7 +69,7 @@ impl Kernel {
         if value < 0 || policy & !SYNC_POLICY_USER_MASK != 0 {
             return Err(kr::INVALID_ARGUMENT);
         }
-        let ipc = &mut self.dtask.ipc;
+        let ipc = &mut self.ipc();
         let port = ipc.kobject_port(super::ipc::Kobject::Semaphore);
         ipc.port_mut(port).nsrequest_kobject = true;
         ipc.make_send(port);
@@ -79,7 +79,7 @@ impl Kernel {
 
     /// `semaphore_destroy_internal`: ownerless and empty; waiters wake
     /// with `THREAD_RESTART`.
-    fn semaphore_destroy_internal(&mut self, m: Option<&mut GuestMem<'_>>, port: ObjId) {
+    pub(crate) fn semaphore_destroy_internal(&mut self, m: Option<&mut GuestMem<'_>>, port: ObjId) {
         let Some(s) = self.dtask.semas.map.get_mut(&port) else { return };
         s.active = false;
         let old = s.count;
@@ -115,8 +115,8 @@ impl Kernel {
             self.semaphore_destroy_internal(None, port);
         }
         self.dtask.semas.map.remove(&port);
-        self.dtask.ipc.port_mut(port).active = false;
-        self.dtask.ipc.release(port);
+        self.ipc().port_mut(port).active = false;
+        self.ipc().release(port);
     }
 
     /// Wake the threads semaphore operations woke.
@@ -131,7 +131,7 @@ impl Kernel {
         if !super::ipc::name_valid(name) {
             return Err(kr::INVALID_NAME);
         }
-        let port = self.dtask.ipc.translate_send(name)?;
+        let port = self.ipc().translate_send(name)?;
         if self.dtask.semas.map.contains_key(&port) {
             Ok(port)
         } else {

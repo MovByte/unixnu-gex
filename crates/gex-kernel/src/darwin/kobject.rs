@@ -48,7 +48,7 @@ impl Kernel {
         if let Some(p) = *f(&mut self.dtask.kports) {
             return p;
         }
-        let p = self.dtask.ipc.kobject_port(k);
+        let p = self.ipc().kobject_port(k);
         *f(&mut self.dtask.kports) = Some(p);
         p
     }
@@ -58,7 +58,7 @@ impl Kernel {
         if let Some(t) = self.dtask.kports.task {
             return t;
         }
-        let ipc = &mut self.dtask.ipc;
+        let ipc = &mut self.ipc();
         let pport = ipc.kobject_port(Kobject::Task);
         let pp = ipc.port_mut(pport);
         pp.immovable_send = true;
@@ -111,7 +111,7 @@ impl Kernel {
             return p;
         }
         let main = tid == self.pid;
-        let ipc = &mut self.dtask.ipc;
+        let ipc = &mut self.ipc();
         let pport = ipc.kobject_port(Kobject::Thread(tid));
         let pp = ipc.port_mut(pport);
         pp.immovable_send = true;
@@ -125,7 +125,7 @@ impl Kernel {
     /// `ipc_port_copyout_send`: a send right copied out into the task's
     /// space; dead when the port has died, null when the space is full.
     pub(crate) fn darwin_copyout_send(&mut self, p: ObjId) -> u32 {
-        match self.dtask.ipc.object_copyout(Carried::Port(p), msgt::PORT_SEND, None) {
+        match self.ipc().object_copyout(Carried::Port(p), msgt::PORT_SEND, None) {
             Ok(n) => n,
             Err(e) if e == super::ipc::kr::INVALID_CAPABILITY => super::ipc::PORT_DEAD,
             Err(_) => 0,
@@ -135,7 +135,7 @@ impl Kernel {
     /// `ipc_port_copyout_send_pinned`: a thread's self port copied out and
     /// pinned (the task's ports are pinned).
     pub(crate) fn darwin_copyout_send_pinned(&mut self, p: ObjId) -> u32 {
-        self.dtask.ipc.port_mut(p).pinned = true;
+        self.ipc().port_mut(p).pinned = true;
         self.darwin_copyout_send(p)
     }
 
@@ -144,9 +144,10 @@ impl Kernel {
         if !super::ipc::name_valid(name) {
             return None;
         }
-        let p = self.dtask.ipc.translate_send(name).ok()?;
-        match self.dtask.ipc.port(p).kobject {
-            Some(Kobject::Thread(t)) if self.dtask.ipc.port(p).active => Some(t),
+        let p = self.ipc().translate_send(name).ok()?;
+        let port = self.ipc().port(p);
+        match port.kobject {
+            Some(Kobject::Thread(t)) if port.active => Some(t),
             _ => None,
         }
     }
@@ -159,8 +160,8 @@ impl Kernel {
         if !super::ipc::name_valid(name) {
             return false;
         }
-        match self.dtask.ipc.translate_send(name) {
-            Ok(p) => self.dtask.ipc.port(p).active && self.dtask.ipc.port(p).kobject == Some(Kobject::Task),
+        match self.ipc().translate_send(name) {
+            Ok(p) => self.ipc().port(p).active && self.ipc().port(p).kobject == Some(Kobject::Task),
             Err(_) => false,
         }
     }
@@ -170,7 +171,7 @@ impl Kernel {
     pub(crate) fn darwin_thread_ports_terminate(&mut self, tid: i32) {
         self.dtask.kports.special_reply.remove(&tid);
         if let Some((kport, pport)) = self.dtask.kports.threads.remove(&tid) {
-            let ipc = &mut self.dtask.ipc;
+            let ipc = &mut self.ipc();
             for p in [kport, pport] {
                 ipc.port_mut(p).kobject = None;
                 ipc.port_mut(p).pinned = false;
@@ -179,14 +180,59 @@ impl Kernel {
         }
     }
 
+    /// `task_terminate_internal`'s IPC, for a task that has ended: its
+    /// semaphores destroyed (`semaphore_destroy_all`), its threads' sends
+    /// still waiting for room abandoned, its threads' and its own ports
+    /// dead (`ipc_thread_terminate`, `ipc_task_terminate`), the send
+    /// rights it held (host, special, registered) released, and its space
+    /// ended (`ipc_space_terminate`), every right in it with the
+    /// notifications that owes; then its space leaves the system's table.
+    pub fn darwin_task_terminate(&mut self) {
+        if !self.darwin || self.dtask.ipc_raw.task == 0 {
+            return;
+        }
+        let semas: Vec<ObjId> = self.dtask.semas.map.iter().filter(|(_, s)| s.active).map(|(&p, _)| p).collect();
+        for p in semas {
+            self.semaphore_destroy_internal(None, p);
+        }
+        let waiting: Vec<(i32, Box<Kmsg>)> = self.dtask.pending_send.drain().collect();
+        for (tid, kmsg) in waiting {
+            let ipc = self.ipc();
+            let port = kmsg.dest;
+            ipc.mqueue_cancel_room(port, tid);
+            ipc.release(port);
+            ipc.kmsg_destroy(kmsg, true);
+        }
+        let tids: Vec<i32> = self.dtask.kports.threads.keys().copied().collect();
+        for t in tids {
+            self.darwin_thread_ports_terminate(t);
+        }
+        let k = std::mem::take(&mut self.dtask.kports);
+        let task_ports: Vec<ObjId> = k.task.map(|(a, b)| vec![a, b]).unwrap_or_default().into_iter().chain(k.task_name).chain(k.resume).collect();
+        let sends: Vec<ObjId> = [k.host, k.host_priv, k.clock].into_iter().flatten().chain(k.special.values().copied()).chain(k.registered.into_iter().flatten()).collect();
+        let ipc = self.ipc();
+        for p in task_ports {
+            ipc.port_mut(p).kobject = None;
+            ipc.port_mut(p).pinned = false;
+            ipc.port_destroy(p);
+        }
+        for p in sends {
+            ipc.release_send(p);
+        }
+        ipc.space_terminate();
+        self.darwin_ipc_notify_drain();
+        self.ipc().space_leave();
+        self.darwin_ipc_leave();
+    }
+
     /// `ipc_kobject_server`: answer the request `req` sent to kernel port
     /// `port`. The request's destination right is consumed; a successful
     /// routine keeps what it took of the body, a failed one has the body's
     /// rights destroyed. The reply, if any, for sending.
     pub(crate) fn kobject_server(&mut self, port: ObjId, req: Box<Kmsg>) -> Option<Box<Kmsg>> {
-        let obj = self.dtask.ipc.port(port).kobject.clone().expect("a kernel port");
+        let obj = self.ipc().port(port).kobject.clone().expect("a kernel port");
         let reply = super::mig::serve(self, &obj, &req);
-        let ipc = &mut self.dtask.ipc;
+        let ipc = &mut self.ipc();
         match bits::remote(req.bits) {
             msgt::PORT_SEND => ipc.release_send(port),
             msgt::PORT_SEND_ONCE => {
@@ -210,12 +256,12 @@ impl Kernel {
                     let pending = PendingReply { id: req.id, rport, rtype: bits::local(req.bits), target, op };
                     self.dtask.pending_replies.push(pending);
                 }
-                Some(r) => self.dtask.ipc.object_destroy(r, bits::local(req.bits)),
+                Some(r) => self.ipc().object_destroy(r, bits::local(req.bits)),
                 None => {}
             }
             return None;
         }
-        let ipc = &mut self.dtask.ipc;
+        let ipc = &mut self.ipc();
         let status = reply.ret;
         if status != 0 && status != MIG_NO_REPLY {
             ipc.descs_destroy(&req.descs);
@@ -251,23 +297,23 @@ impl Kernel {
     /// kernel port destroyed unused; the resume port's releases the hold
     /// it stood for (`task_suspension_send_once`).
     pub(crate) fn kobject_send_once(&mut self, port: ObjId) {
-        if self.dtask.ipc.port(port).kobject == Some(Kobject::TaskResume) {
+        if self.ipc().port(port).kobject == Some(Kobject::TaskResume) {
             self.darwin_release_task_hold(HoldMode::Normal);
         }
-        self.dtask.ipc.release(port);
+        self.ipc().release(port);
     }
 
     /// `ipc_kobject_notify_no_senders`: a kernel port's last send right went
     /// (the kernel armed the request for its object).
     pub(crate) fn kobject_no_senders(&mut self, port: ObjId, mscount: u32) {
-        let k = self.dtask.ipc.port(port).kobject.clone();
+        let k = self.ipc().port(port).kobject.clone();
         match k {
             Some(Kobject::Semaphore) => self.semaphore_no_senders(port),
             // task_suspension_no_senders: with no new send right made since
             // (ipc_kobject_nsrequest fails), every legacy hold left goes;
             // else the request is armed again.
             Some(Kobject::TaskResume) => {
-                let p = self.dtask.ipc.port_mut(port);
+                let p = self.ipc().port_mut(port);
                 if p.srights == 0 && p.mscount == mscount {
                     self.darwin_release_task_hold(HoldMode::LegacyAll);
                 } else {

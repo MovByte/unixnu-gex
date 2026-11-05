@@ -1969,7 +1969,7 @@ impl Kernel {
         }
         if t.thport == 0 {
             let pport = self.darwin_thread_ports(tid).1;
-            self.dtask.ipc.make_send(pport);
+            self.ipc().make_send(pport);
             let name = self.darwin_copyout_send_pinned(pport);
             self.wqt(tid).thport = name;
         }
