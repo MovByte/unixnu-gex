@@ -442,12 +442,16 @@ impl Kernel {
         // The notifications it owed, while the old task's objects are there
         // to hear of their ports.
         self.darwin_ipc_notify_drain();
+        // The old threads' exception handlers go with them.
+        for a in std::mem::take(&mut self.dtask.kports.thread_exc).into_values() {
+            super::exception::release_all(self.ipc(), &a);
+        }
         let old = std::mem::take(&mut self.dtask);
         let (realtimer, vtimers) = (old.realtimer, old.vtimers);
         let kp = old.kports;
         self.dtask = super::Task {
             ipc_raw: old.ipc_raw,
-            kports: super::kobject::Kports { special: kp.special, registered: kp.registered, ..Default::default() },
+            kports: super::kobject::Kports { special: kp.special, registered: kp.registered, exc: kp.exc, ..Default::default() },
             strict: old.strict,
             // proc_resetregister: libpthread registers again.
             pthread: super::thread::Registration { registered: false, ..old.pthread },

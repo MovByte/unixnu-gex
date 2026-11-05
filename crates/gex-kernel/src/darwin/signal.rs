@@ -599,6 +599,15 @@ impl Kernel {
                 if p & prop::IGNORE != 0 {
                     continue;
                 }
+                // proc_prepareexit: a death a core signal makes is told to
+                // the EXC_CRASH handler (or makes a corpse for the
+                // EXC_CORPSE_NOTIFY one); with none set, nothing is seen.
+                if p & prop::CORE != 0 {
+                    use super::exception as exc;
+                    if self.darwin_exc_handled(exc::EXC_CRASH) || self.darwin_exc_handled(exc::EXC_CORPSE_NOTIFY) {
+                        self.darwin_unimplemented(format!("telling the EXC_CRASH or EXC_CORPSE_NOTIFY handler of a death by Darwin signal {d} (task_exception_notify, corpses)"));
+                    }
+                }
                 return Delivery::Terminate { signal: l, core: false };
             }
             match self.darwin_postsig(m, d, handler, Some(source)) {
@@ -710,10 +719,22 @@ impl Kernel {
     }
 
     /// A fault the running instruction raised, as `ux_exception` makes it a
-    /// signal (no task or host exception port can be set here, so none is
-    /// asked first).
+    /// signal when no exception handler takes it (`exception_triage`
+    /// asks the thread's, the task's and the host's first: sending it
+    /// there is not done here, and fails loudly).
     pub(crate) fn darwin_raise_fault(&mut self, m: &mut GuestMem<'_>, l: u32, pc: u64, fault_address: u64) -> Delivery {
         let Some(d) = signal_from_linux(l) else { return Delivery::Terminate { signal: l, core: false } };
+        use super::exception as exc;
+        let ty = match d {
+            dsig::SIGSEGV | dsig::SIGBUS => Some(exc::EXC_BAD_ACCESS),
+            dsig::SIGILL => Some(exc::EXC_BAD_INSTRUCTION),
+            dsig::SIGFPE => Some(exc::EXC_ARITHMETIC),
+            dsig::SIGTRAP => Some(exc::EXC_BREAKPOINT),
+            _ => None,
+        };
+        if let Some(ty) = ty.filter(|&t| self.darwin_exc_handled(t)) {
+            self.darwin_unimplemented(format!("sending exception {ty} (Darwin signal {d}) to its exception handler (exception_triage)"));
+        }
         let blocked = self.signals.blocked() & (1u64 << (l - 1)) != 0;
         let handler = self.dtask.sigacts.handler[d as usize];
         // threadsignal of a blocked or ignored fault: the thread would take

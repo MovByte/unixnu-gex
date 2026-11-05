@@ -31,6 +31,10 @@ pub struct Kports {
     pub registered: [Option<ObjId>; 3],
     /// `itk_resume`: the task's resume port, once a suspension made it.
     pub resume: Option<ObjId>,
+    /// `exc_actions`: the task's exception handlers.
+    pub exc: super::exception::ExcActions,
+    /// Each thread's exception handlers, once set (`tro_exc_actions`).
+    pub thread_exc: HashMap<i32, super::exception::ExcActions>,
     /// `task_restartable_ranges_register`'s ranges.
     pub restartable: Vec<(u64, u16, u16, u32)>,
 }
@@ -162,6 +166,9 @@ impl Kernel {
     /// die with it, its special reply port is unbound.
     pub(crate) fn darwin_thread_ports_terminate(&mut self, tid: i32) {
         self.dtask.kports.special_reply.remove(&tid);
+        if let Some(a) = self.dtask.kports.thread_exc.remove(&tid) {
+            super::exception::release_all(self.ipc(), &a);
+        }
         if let Some((kport, pport)) = self.dtask.kports.threads.remove(&tid) {
             let ipc = &mut self.ipc();
             for p in [kport, pport] {
@@ -212,6 +219,10 @@ impl Kernel {
         }
         for p in sends {
             ipc.release_send(p);
+        }
+        super::exception::release_all(ipc, &k.exc);
+        for a in k.thread_exc.values() {
+            super::exception::release_all(ipc, a);
         }
         ipc.space_terminate();
         self.darwin_ipc_notify_drain();

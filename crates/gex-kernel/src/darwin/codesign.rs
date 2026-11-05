@@ -32,6 +32,31 @@ fn be32(b: &[u8], o: usize) -> Option<u32> {
 }
 
 impl CodeSign {
+    /// The signature of the 64-bit Mach-O `slice`: its `LC_CODE_SIGNATURE`
+    /// superblob, parsed (none when it has none).
+    pub fn of_macho(slice: &[u8]) -> Option<CodeSign> {
+        const MH_MAGIC_64: u32 = 0xfeed_facf;
+        const LC_CODE_SIGNATURE: u32 = 0x1d;
+        let le = |o: usize| slice.get(o..o + 4).map(|s| u32::from_le_bytes(s.try_into().unwrap()));
+        if le(0)? != MH_MAGIC_64 {
+            return None;
+        }
+        let ncmds = le(16)?;
+        let mut at = 32usize;
+        for _ in 0..ncmds {
+            let (cmd, size) = (le(at)?, le(at + 4)? as usize);
+            if cmd == LC_CODE_SIGNATURE {
+                let (off, len) = (le(at + 8)? as usize, le(at + 12)? as usize);
+                return Some(CodeSign::parse(slice.get(off..off + len)?));
+            }
+            if size < 8 {
+                return None;
+            }
+            at += size;
+        }
+        None
+    }
+
     /// Read an `LC_CODE_SIGNATURE` superblob; what is malformed or absent
     /// reads as no CodeDirectory and no entitlements.
     pub fn parse(blob: &[u8]) -> CodeSign {

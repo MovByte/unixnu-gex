@@ -21,6 +21,7 @@ pub mod commpage;
 pub mod errno;
 pub mod exec;
 pub mod exit;
+pub mod exception;
 pub mod execve;
 pub mod fsops;
 pub mod ioctl;
@@ -92,8 +93,9 @@ pub struct Task {
     /// being served (0: this task's own).
     pub kcaller: ipc::TaskKey,
     /// The send rights the next child task inherits (`ipc_task_init`):
-    /// its special ports by kind, and its registered ports.
-    pub child_ports: std::sync::Mutex<Option<(std::collections::HashMap<i32, ipc::ObjId>, [Option<ipc::ObjId>; 3])>>,
+    /// its special ports by kind, its registered ports, and its exception
+    /// actions.
+    pub child_ports: std::sync::Mutex<Option<(std::collections::HashMap<i32, ipc::ObjId>, [Option<ipc::ObjId>; 3], exception::ExcActions)>>,
     /// The kernel objects' ports.
     pub kports: kobject::Kports,
     pub semas: sema::Semas,
@@ -179,7 +181,7 @@ impl crate::syscalls::Kernel {
                 let pending = old.as_ref().map(|l| std::mem::take(&mut *l.mailbox.lock().unwrap_or_else(|e| e.into_inner()))).unwrap_or_default();
                 let name_port = old.and_then(|l| l.name_port.lock().unwrap_or_else(|e| e.into_inner()).take());
                 let ring = !pending.is_empty();
-                let link = std::sync::Arc::new(ipc::TaskLink { mailbox: std::sync::Mutex::new(pending), bell, pid: self.pid, name_port: std::sync::Mutex::new(name_port) });
+                let link = std::sync::Arc::new(ipc::TaskLink { mailbox: std::sync::Mutex::new(pending), bell, pid: self.pid, name_port: std::sync::Mutex::new(name_port), codesign: self.dtask.codesign.clone() });
                 ipc.links.insert(ipc.task, std::sync::Arc::clone(&link));
                 if ring {
                     link.bell.ring();

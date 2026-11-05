@@ -446,6 +446,9 @@ pub enum Guard {
     ModRefs = 2,
     InvalidOptions = 3,
     SetContext = 4,
+    /// `kGUARD_EXC_EXCEPTION_BEHAVIOR_ENFORCE`: a handler that is not
+    /// identity protected set for a hardened task.
+    ExceptionBehaviorEnforce = 6,
     Unguarded = 1 << 3,
     IncorrectGuard = 1 << 4,
     Immovable = 1 << 5,
@@ -498,6 +501,9 @@ pub struct Ipc {
     /// The kernel's own objects every task names alike (the host, host
     /// privilege and clock ports), while this task holds the table.
     globals: Vec<(Kobject, ObjId)>,
+    /// The host's exception actions (`realhost.exc_actions`), while this
+    /// task holds the table.
+    pub host_exc: super::exception::ExcActions,
     /// Notifications owed, oldest first.
     pub outbox: Vec<Notify>,
     /// Guard exceptions raised, for the kernel to deliver.
@@ -556,6 +562,8 @@ pub struct TaskLink {
     pub pid: i32,
     /// Its name port (`itk_task_ports[TASK_FLAVOR_NAME]`), once made.
     pub name_port: Mutex<Option<ObjId>>,
+    /// Its code signature, for its entitlements.
+    pub codesign: Option<super::codesign::CodeSign>,
 }
 
 /// What every task shares: the ports and sets (XNU's are kernel objects,
@@ -570,6 +578,7 @@ pub struct IpcShared {
     queues: msg::Queues,
     links: HashMap<TaskKey, Arc<TaskLink>>,
     globals: Vec<(Kobject, ObjId)>,
+    host_exc: super::exception::ExcActions,
 }
 
 /// The system's IPC table, taken by one task at a time for the length of a
@@ -648,6 +657,7 @@ impl Ipc {
         self.queues = std::mem::take(&mut s.queues);
         self.links = std::mem::take(&mut s.links);
         self.globals = std::mem::take(&mut s.globals);
+        self.host_exc = s.host_exc;
         self.held = true;
         // What stays in `s` is its key counter.
         self.next_task_hint = s.next_task;
@@ -661,7 +671,7 @@ impl Ipc {
         let cell = Arc::clone(self.cell.as_ref().expect("a held table has its cell"));
         let mut spaces = std::mem::take(&mut self.others);
         spaces.insert(self.task, std::mem::take(&mut self.space));
-        let s = IpcShared { objects: std::mem::take(&mut self.objects), next_id: self.next_id, timestamp: self.timestamp, spaces, next_task: self.next_task_hint, queues: std::mem::take(&mut self.queues), links: std::mem::take(&mut self.links), globals: std::mem::take(&mut self.globals) };
+        let s = IpcShared { objects: std::mem::take(&mut self.objects), next_id: self.next_id, timestamp: self.timestamp, spaces, next_task: self.next_task_hint, queues: std::mem::take(&mut self.queues), links: std::mem::take(&mut self.links), globals: std::mem::take(&mut self.globals), host_exc: std::mem::take(&mut self.host_exc) };
         self.held = false;
         cell.put(s);
     }
@@ -678,7 +688,7 @@ impl Ipc {
         self.held = false;
         if let Some(cell) = cell {
             let spaces = std::mem::take(&mut self.others);
-            let s = IpcShared { objects: std::mem::take(&mut self.objects), next_id: self.next_id, timestamp: self.timestamp, spaces, next_task: self.next_task_hint, queues: std::mem::take(&mut self.queues), links: std::mem::take(&mut self.links), globals: std::mem::take(&mut self.globals) };
+            let s = IpcShared { objects: std::mem::take(&mut self.objects), next_id: self.next_id, timestamp: self.timestamp, spaces, next_task: self.next_task_hint, queues: std::mem::take(&mut self.queues), links: std::mem::take(&mut self.links), globals: std::mem::take(&mut self.globals), host_exc: std::mem::take(&mut self.host_exc) };
             cell.put(s);
         }
     }

@@ -157,6 +157,27 @@ impl Scratch {
     }
 }
 
+/// The rights a spawn's port actions hold until the child's image is
+/// active (`struct exec_port_actions`): its registered ports, and its
+/// exception ports with each one's mask, behavior and flavor.
+#[derive(Default)]
+struct Held {
+    registered: Vec<Option<super::ipc::ObjId>>,
+    exc: Vec<(Option<super::ipc::right::Carried>, u32, i32, i32)>,
+}
+
+impl Held {
+    /// `exec_port_actions_destroy`.
+    fn release(self, k: &mut Kernel) {
+        for p in self.registered.into_iter().flatten() {
+            k.ipc().release_send(p);
+        }
+        for (c, ..) in self.exc {
+            super::exception::release(k.ipc(), c);
+        }
+    }
+}
+
 impl Kernel {
     /// `forkproc` of this process's Darwin state: what a child takes (its
     /// signal actions, limits, libpthread's registration and the dispatch
@@ -164,9 +185,9 @@ impl Kernel {
     /// table); the rest is the new task's own.
     pub(crate) fn darwin_fork_task(&self) -> super::Task {
         let t = &self.dtask;
-        let (special, registered) = t.child_ports.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+        let (special, registered, exc) = t.child_ports.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
         super::Task {
-            kports: super::kobject::Kports { special, registered, ..Default::default() },
+            kports: super::kobject::Kports { special, registered, exc, ..Default::default() },
             strict: t.strict,
             pthread: t.pthread,
             sigacts: t.sigacts.clone(),
@@ -192,23 +213,24 @@ impl Kernel {
 
     /// `ipc_task_init`'s inheritance: the child task the next
     /// `fork_kernel` makes gets copies of this task's send rights to its
-    /// registered ports and its bootstrap and task access ports (its host
-    /// port follows from its identity, and it has no exception ports to
-    /// take, since none can be set).
+    /// registered ports and its bootstrap and task access ports, and its
+    /// exception actions (its host port follows from its identity).
     fn darwin_child_ports(&mut self) {
         const TASK_BOOTSTRAP_PORT: i32 = 4;
         const TASK_ACCESS_PORT: i32 = 9;
         let k = &self.dtask.kports;
         let special: Vec<(i32, super::ipc::ObjId)> = [TASK_BOOTSTRAP_PORT, TASK_ACCESS_PORT].into_iter().filter_map(|w| k.special.get(&w).map(|&p| (w, p))).collect();
         let registered = k.registered;
+        let task_exc = k.exc;
         let ipc = self.ipc();
+        let exc = super::exception::copy_all(ipc, &task_exc);
         for &(_, p) in &special {
             ipc.copy_send(p);
         }
         for p in registered.into_iter().flatten() {
             ipc.copy_send(p);
         }
-        let old = self.dtask.child_ports.lock().unwrap_or_else(|e| e.into_inner()).replace((special.into_iter().collect(), registered));
+        let old = self.dtask.child_ports.lock().unwrap_or_else(|e| e.into_inner()).replace((special.into_iter().collect(), registered, exc));
         debug_assert!(old.is_none(), "a child's ports not taken");
     }
 
@@ -350,6 +372,7 @@ impl Kernel {
                 for p in k.special.into_values().chain(k.registered.into_iter().flatten()) {
                     self.ipc().release_send(p);
                 }
+                super::exception::release_all(self.ipc(), &k.exc);
                 child.close_all_fds();
                 self.procs.reap(pid);
                 Err(e)
@@ -368,18 +391,15 @@ impl Kernel {
         if let Some(fa) = file_actions {
             after.inherit = child.darwin_file_actions(fa, flags)?;
         }
-        let registered = match port_actions {
+        let mut held = match port_actions {
             Some(pa) => self.darwin_spawn_port_actions(child, pa)?,
-            None => Vec::new(),
+            None => Held::default(),
         };
         let binprefs = attr.filter(|a| a.binprefs[0].0 != 0).map(|a| a.binprefs);
         let mut img: Image = match child.darwin_exec_activate_with(m, path, argv, envv, binprefs) {
             Ok(img) => img,
             Err(e) => {
-                // exec_port_actions_destroy.
-                for p in registered.into_iter().flatten() {
-                    self.ipc().release_send(p);
-                }
+                held.release(self);
                 return Err(e);
             }
         };
@@ -395,10 +415,30 @@ impl Kernel {
                 Ok(())
             })();
             if let Err(e) = r {
-                for p in registered.into_iter().flatten() {
-                    self.ipc().release_send(p);
-                }
+                held.release(self);
                 return Err(e);
+            }
+        }
+        // The image's signature, as activation attaches it.
+        child.dtask.codesign = self.read_file(&img.path).and_then(|b| {
+            let s = b.get(img.arch_offset as usize..(img.arch_offset + img.arch_size) as usize)?;
+            super::codesign::CodeSign::of_macho(s)
+        });
+        // exec_handle_exception_port_actions: now that the child's
+        // signature is known, its exception ports as task_set_exception_ports
+        // sets them (each held right consumed when set).
+        let setter = super::exception::Setter {
+            privileged: self.creds.uid() == 0,
+            entitled: self.darwin_task_entitled("com.apple.private.set-exception-port") || self.darwin_task_entitled("com.apple.private.thread-set-state"),
+            hardened: child.darwin_hardened(),
+        };
+        while !held.exc.is_empty() {
+            let (port, mask, behavior, flavor) = held.exc.remove(0);
+            let r = super::exception::set_port(self.ipc(), &mut child.dtask.kports.exc, super::exception::Level::Task, mask, port, behavior, flavor, &setter, false);
+            super::exception::release(self.ipc(), port);
+            if r.is_err() {
+                held.release(self);
+                return Err(Errno::EINVAL);
             }
         }
         // exec_handle_spawnattr_policy, in the spawner's call.
@@ -409,9 +449,9 @@ impl Kernel {
             }
         }
         // _kernelrpc_mach_ports_register3 with the registered ports held.
-        if !registered.is_empty() {
+        if !held.registered.is_empty() {
             let mut ports = [None; 3];
-            for (slot, p) in ports.iter_mut().zip(registered) {
+            for (slot, p) in ports.iter_mut().zip(held.registered) {
                 *slot = p;
             }
             if super::mig::ports_register(&mut child.dtask.kports, self.ipc(), ports) != 0 {
@@ -431,7 +471,7 @@ impl Kernel {
     /// the spawn (returned), a pointer authentication task port consumed
     /// (there is no pointer authentication here). An action that fails
     /// releases its right and ends the spawn with EINVAL.
-    fn darwin_spawn_port_actions(&mut self, child: &mut Kernel, pa: &[u8]) -> Result<Vec<Option<super::ipc::ObjId>>, Errno> {
+    fn darwin_spawn_port_actions(&mut self, child: &mut Kernel, pa: &[u8]) -> Result<Held, Errno> {
         use super::ipc::right::{msgt, Carried, CopyinFlags};
         const PSPA_SPECIAL: u32 = 0;
         const PSPA_EXCEPTION: u32 = 1;
@@ -444,8 +484,9 @@ impl Kernel {
         const MAX_WATCHPORT: u32 = 128;
         const MAX_REGISTERED: u32 = 3;
         let count = le32(pa, 4) as usize;
+        let raw = |i: usize| &pa[PORT_HDR as usize + i * PORT_ACTION_SIZE as usize..];
         let action = |i: usize| {
-            let a = &pa[PORT_HDR as usize + i * PORT_ACTION_SIZE as usize..];
+            let a = raw(i);
             (le32(a, 0), le32(a, 8), le32(a, 20) as i32)
         };
         let (mut exc, mut watch, mut reg, mut ptrauth) = (0, 0, 0, 0);
@@ -462,11 +503,9 @@ impl Kernel {
                 return Err(Errno::EINVAL);
             }
         }
-        // Exception ports (task_set_exception_ports), audit sessions and
-        // importance watch ports are not here.
+        // Audit sessions and importance watch ports are not here.
         for i in 0..count {
             let what = match action(i).0 {
-                PSPA_EXCEPTION => "a posix_spawn exception port action (task exception ports)",
                 PSPA_AU_SESSION => "a posix_spawn audit session port action (audit sessions)",
                 PSPA_IMP_WATCHPORTS => "a posix_spawn watch port action (importance watch ports)",
                 _ => continue,
@@ -474,24 +513,28 @@ impl Kernel {
             self.darwin_unimplemented(what.into());
             return Err(Errno::EINVAL);
         }
-        let mut registered = Vec::new();
-        let fail = |k: &mut Kernel, registered: Vec<Option<super::ipc::ObjId>>| {
-            for p in registered.into_iter().flatten() {
-                k.ipc().release_send(p);
-            }
+        let mut held = Held::default();
+        let fail = |k: &mut Kernel, held: Held| {
+            held.release(k);
             Err(Errno::EINVAL)
         };
         for i in 0..count {
             let (kind, name, which) = action(i);
-            let port = if super::ipc::name_valid(name) {
+            // A null or dead name is carried as it is.
+            let carried = if super::ipc::name_valid(name) {
                 let flags = CopyinFlags { allow_immovable_send: true, ..Default::default() };
                 match self.ipc().object_copyin(name, msgt::COPY_SEND, flags, 0, None) {
-                    Ok(Carried::Port(p)) => Some(p),
-                    Ok(Carried::Dead) => None,
-                    Err(_) => return fail(self, registered),
+                    Ok(c) => Some(c),
+                    Err(_) => return fail(self, held),
                 }
+            } else if name == super::ipc::PORT_DEAD {
+                Some(Carried::Dead)
             } else {
                 None
+            };
+            let port = match carried {
+                Some(Carried::Port(p)) => Some(p),
+                _ => None,
             };
             match kind {
                 PSPA_SPECIAL => {
@@ -499,10 +542,14 @@ impl Kernel {
                         if let Some(p) = port {
                             self.ipc().release_send(p);
                         }
-                        return fail(self, registered);
+                        return fail(self, held);
                     }
                 }
-                PSPA_REGISTERED_PORTS => registered.push(port),
+                PSPA_REGISTERED_PORTS => held.registered.push(port),
+                PSPA_EXCEPTION => {
+                    let a = raw(i);
+                    held.exc.push((carried, le32(a, 4), le32(a, 12) as i32, le32(a, 16) as i32));
+                }
                 _ => {
                     if let Some(p) = port {
                         self.ipc().release_send(p);
@@ -510,7 +557,7 @@ impl Kernel {
                 }
             }
         }
-        Ok(registered)
+        Ok(held)
     }
 
     /// POSIX_SPAWN_SETEXEC: `execve` with options (cloneproc's

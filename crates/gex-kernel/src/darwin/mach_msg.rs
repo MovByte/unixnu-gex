@@ -541,13 +541,6 @@ impl Kernel {
         }
     }
 
-    /// Whether the task is a hardened binary (`task_is_hardened_binary`):
-    /// a platform binary or one with the hardened runtime, by its code
-    /// signature.
-    pub(crate) fn darwin_hardened(&self) -> bool {
-        false
-    }
-
     /// The sending task's tokens (`task_get_sec_token`,
     /// `task_get_audit_token`).
     fn darwin_sender(&self) -> Sender {
@@ -907,7 +900,7 @@ impl Kernel {
 
     /// `ipc_kobject_server` for a request to this task's (or the kernel's)
     /// object `port`, and the reply sent.
-    pub(crate) fn kobject_send(&mut self, port: ObjId, kmsg: Box<Kmsg>, options: u64, timeout_zero: bool) -> Result<(), SendWait> {
+    fn kobject_send(&mut self, port: ObjId, kmsg: Box<Kmsg>, options: u64, timeout_zero: bool) -> Result<(), SendWait> {
         {
             let ipc = &mut self.ipc();
             ipc.port_mut(port).seqno = ipc.port(port).seqno.wrapping_add(1);

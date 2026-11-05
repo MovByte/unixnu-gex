@@ -26,7 +26,7 @@ const KERN_INVALID_RIGHT: i32 = 17;
 const KERN_INVALID_VALUE: i32 = 18;
 const KERN_NOT_SUPPORTED: i32 = 46;
 /// `MIG_BAD_ARGUMENTS`: a request without the routine's shape.
-const MIG_BAD_ARGUMENTS: i32 = -304;
+pub(crate) const MIG_BAD_ARGUMENTS: i32 = -304;
 
 /// The machine the profile describes, as the host routines report it.
 pub mod machine {
@@ -61,7 +61,7 @@ fn words(w: &[u32]) -> Vec<u8> {
 }
 
 /// The `i`th in argument after the NDR record of a simple request.
-fn arg(req: &Kmsg, i: usize) -> Option<i32> {
+pub(crate) fn arg(req: &Kmsg, i: usize) -> Option<i32> {
     i32_at(&req.body, NDR + 4 * i)
 }
 
@@ -75,7 +75,7 @@ fn desc_port(req: &Kmsg, i: usize) -> Option<(Option<Carried>, u32)> {
 
 /// The `i`th in argument after a complex request's descriptors (and their
 /// NDR record).
-fn arg_after(req: &Kmsg, ndesc: usize, i: usize) -> Option<i32> {
+pub(crate) fn arg_after(req: &Kmsg, ndesc: usize, i: usize) -> Option<i32> {
     i32_at(&req.body, 4 + 12 * ndesc + NDR + 4 * i)
 }
 
@@ -219,6 +219,19 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             }
             _ => bad(),
         },
+        // task_set_exception_ports, task_get_exception_ports,
+        // task_swap_exception_ports, and the thread's and host's.
+        (Kobject::Task, 3413) => k.darwin_exc_set(super::exception::Level::Task, 0, req, false),
+        (Kobject::Task, 3414) => k.darwin_exc_get(super::exception::Level::Task, 0, req),
+        (Kobject::Task, 3415) => k.darwin_exc_set(super::exception::Level::Task, 0, req, true),
+        (Kobject::Thread(t), 3613) => k.darwin_exc_set(super::exception::Level::Thread, *t, req, false),
+        (Kobject::Thread(t), 3614) => k.darwin_exc_get(super::exception::Level::Thread, *t, req),
+        (Kobject::Thread(t), 3615) => k.darwin_exc_set(super::exception::Level::Thread, *t, req, true),
+        (Kobject::HostPriv, 414) => k.darwin_exc_set(super::exception::Level::Host, 0, req, false),
+        (Kobject::HostPriv, 415) => k.darwin_exc_get(super::exception::Level::Host, 0, req),
+        (Kobject::HostPriv, 416) => k.darwin_exc_set(super::exception::Level::Host, 0, req, true),
+        // The host port is not the privileged one: HOST_PRIV_NULL.
+        (Kobject::Host, 414..=416) => Reply::err(KERN_INVALID_ARGUMENT),
         // mach_port_get_refs(task, name, right) -> refs
         (Kobject::Task, 3207) => match (arg(req, 0), arg(req, 1)) {
             (Some(name), Some(right)) => match k.ipc().mach_port_get_refs(name as u32, right as u32) {
