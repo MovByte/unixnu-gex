@@ -437,8 +437,10 @@ impl Kernel {
         let kp = old.kports;
         self.dtask = super::Task {
             ipc: old.ipc,
-            kports: super::kobject::Kports { host: kp.host, host_priv: kp.host_priv, clock: kp.clock, special: kp.special, ..Default::default() },
+            kports: super::kobject::Kports { host: kp.host, host_priv: kp.host_priv, clock: kp.clock, special: kp.special, registered: kp.registered, ..Default::default() },
             strict: old.strict,
+            // proc_resetregister: libpthread registers again.
+            pthread: super::thread::Registration { registered: false, ..old.pthread },
             pidversion: old.pidversion,
             ladvlock: old.ladvlock,
             sigacts: old.sigacts,

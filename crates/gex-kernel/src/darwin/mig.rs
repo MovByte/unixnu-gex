@@ -148,6 +148,43 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         }
         // mach_voucher_debug_info(task, voucher_name, out recipes): only in
         // DEVELOPMENT and DEBUG kernels.
+        // _kernelrpc_mach_ports_register3(task, port1, port2, port3): the
+        // stash swapped in, an immovable right refused, the old released.
+        (Kobject::Task, 3403) => {
+            let mut ports = [None; 3];
+            for (i, slot) in ports.iter_mut().enumerate() {
+                match desc_port(req, i) {
+                    Some((Some(Carried::Port(p)), _)) => *slot = Some(p),
+                    Some((None, _)) => {}
+                    _ => return bad(),
+                }
+            }
+            if ports.iter().flatten().any(|&p| k.dtask.ipc.port(p).immovable_send) {
+                return Reply::err(KERN_INVALID_RIGHT);
+            }
+            let old = std::mem::replace(&mut k.dtask.kports.registered, ports);
+            for p in old.into_iter().flatten() {
+                k.dtask.ipc.release_send(p);
+            }
+            Reply::ok(Vec::new())
+        }
+        // _kernelrpc_mach_ports_lookup3(task) -> port1, port2, port3: a copy
+        // of each stashed right (a dead name for a port that died).
+        (Kobject::Task, 3404) => {
+            let mut r = Reply::ok(Vec::new());
+            for slot in k.dtask.kports.registered {
+                r = match slot {
+                    Some(p) if k.dtask.ipc.port(p).active => {
+                        k.dtask.ipc.copy_send(p);
+                        r.ports.push(super::kobject::PortOut::Right(Carried::Port(p), super::ipc::right::msgt::PORT_SEND));
+                        r
+                    }
+                    Some(_) => r.with_null_port(super::ipc::PORT_DEAD),
+                    None => r.with_null_port(0),
+                };
+            }
+            r
+        }
         // mach_port_allocate_name(task, right, name): mach_port_allocate_full
         // with the name asked for; a dead name takes any.
         (Kobject::Task, 3203) => match (arg(req, 0), arg(req, 1)) {

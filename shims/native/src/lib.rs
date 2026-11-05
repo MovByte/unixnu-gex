@@ -2699,9 +2699,15 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
             }
         }
         // `fork` returns zero in the child, and a clone that named a stack
-        // starts on it.
+        // starts on it. A Darwin child has its own pid in x0 and 1 in x1
+        // (`thread_set_child`).
         let mut gm = GuestMem::new(dst);
-        let _ = gex_kernel::syscalls::set_result(&mut gm, ctx_addr, 0);
+        if child_kernel.darwin {
+            let _ = gex_kernel::darwin::set_result(&mut gm, ctx_addr, pid as u64);
+            let _ = gm.write_u64(ctx_addr + ctx::x(1) as u64, 1);
+        } else {
+            let _ = gex_kernel::syscalls::set_result(&mut gm, ctx_addr, 0);
+        }
         if req.child_stack != 0 {
             let _ = gm.write_u64(ctx_addr + ctx::sp_slot(child_kernel.compat) as u64, req.child_stack);
         }
@@ -2806,6 +2812,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
             if std::env::var_os("GEX_TRACE_EXIT").is_some() {
                 eprintln!("[gex:{pid}] process finished: code {code}, wait status {wstatus:#x}");
             }
+            procs.set_uid(pid, kernel.lock().unwrap_or_else(|e| e.into_inner()).creds.uid());
             // Through the table, so this process's own children -- if any are
             // still running -- become init's rather than being lost. The table
             // publishes into the same cell `wait4` collects from, so it gets

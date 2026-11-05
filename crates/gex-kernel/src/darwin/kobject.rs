@@ -30,6 +30,8 @@ pub struct Kports {
     pub special_reply: HashMap<i32, ObjId>,
     /// `task_set_special_port`'s ports, by which (send rights held).
     pub special: HashMap<i32, ObjId>,
+    /// `itk_registered`: `mach_ports_register`'s ports (send rights held).
+    pub registered: [Option<ObjId>; 3],
     /// `task_restartable_ranges_register`'s ranges.
     pub restartable: Vec<(u64, u16, u16, u32)>,
 }

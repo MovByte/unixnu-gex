@@ -9343,6 +9343,14 @@ impl Kernel {
         if cwd != child.vfs.cwd {
             child.vfs.put_cwd(cwd);
         }
+        // fdt_fork: a Darwin kqueue is FG_CONFINED, its process's alone.
+        if self.darwin {
+            for (fd, f, _) in child.fds.entries() {
+                if std::sync::Arc::clone(&f.handle).as_kqueue().is_some() {
+                    let _ = child.fds.close(fd);
+                }
+            }
+        }
         child
     }
 
@@ -9403,7 +9411,8 @@ impl Kernel {
             darwin_region: self.darwin_region,
             darwin_dyld_infos: 0,
             // A new process takes the next pidversion (`forkproc`).
-            dtask: crate::darwin::Task::new_process(),
+            // forkproc: a Darwin process's child takes what XNU copies.
+            dtask: if self.darwin { self.darwin_fork_task() } else { crate::darwin::Task::new_process() },
             darwin_arg_base: 0,
             darwin_user_stack: 0,
             darwin_finish: None,

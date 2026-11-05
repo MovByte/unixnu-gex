@@ -185,6 +185,18 @@ impl Kernel {
     /// [`super::bsd::translate`] cannot, or `None` to leave it to that.
     /// The result is in the canonical encoding (`-errno` on failure).
     pub(crate) fn darwin_call(&mut self, m: &mut GuestMem<'_>, raw: u64, a: &[u64; 6]) -> Option<u64> {
+        // O_CLOFORK: a descriptor its process's children do not get, which
+        // the descriptor table has no flag for.
+        const O_CLOFORK: u64 = 0x0800_0000;
+        let oflags = match raw {
+            sys::OPEN | sys::OPEN_NOCANCEL => Some(a[1]),
+            sys::OPENAT | sys::OPENAT_NOCANCEL => Some(a[2]),
+            _ => None,
+        };
+        if oflags.is_some_and(|f| f & O_CLOFORK != 0) {
+            self.darwin_unimplemented("open with O_CLOFORK (a close-on-fork descriptor)".into());
+            return Some(neg(Errno::EINVAL));
+        }
         if let Some(r) = self.darwin_fs_call(m, raw, a) {
             return Some(res(r));
         }

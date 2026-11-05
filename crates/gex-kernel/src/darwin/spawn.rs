@@ -148,18 +148,50 @@ impl Scratch {
 
 impl Kernel {
     /// `forkproc` of this process's Darwin state: what a child takes (its
-    /// signal actions, limits, the pthread registration's sizes and the
-    /// dispatch queue offsets); the rest is the new task's own.
+    /// signal actions, limits, libpthread's registration and the dispatch
+    /// queue offsets); the rest is the new task's own.
     pub(crate) fn darwin_fork_task(&self) -> super::Task {
         let t = &self.dtask;
         super::Task {
             strict: t.strict,
+            pthread: t.pthread,
             sigacts: t.sigacts.clone(),
             rlimits: t.rlimits,
             dispatchqueue_serialno_offset: t.dispatchqueue_serialno_offset,
             dispatchqueue_label_offset: t.dispatchqueue_label_offset,
             ..super::Task::new_process()
         }
+    }
+
+    /// `fork()`: fork1(PROC_CREATE_FORK). The host makes the child, a copy
+    /// of this process's memory and of its calling thread, with the kernel
+    /// state `fork_kernel` gives it. This side returns the child's pid with
+    /// x1 clear; the child's x0 is its own pid and x1 is 1.
+    pub(crate) fn darwin_fork(&mut self, m: &mut GuestMem<'_>) -> SyscallOutcome {
+        if let Err(e) = self.darwin_child_ports() {
+            let _ = super::set_result(m, self.ctx_addr, e.as_return());
+            return SyscallOutcome::Continue;
+        }
+        let pid = self.procs.spawn(self.pid);
+        crate::procnote::post(self.pid, crate::procnote::note::FORK | pid as u32);
+        let _ = super::set_result(m, self.ctx_addr, pid as u64);
+        let _ = m.write_u64(self.ctx_addr + gex_abi::ctx::x(1) as u64, 0);
+        SyscallOutcome::SpawnProcess { pid, child_stack: 0, tls: None, vfork: false }
+    }
+
+    /// `ipc_task_init`'s inheritance: a child task gets send rights to its
+    /// parent's registered ports and its bootstrap and task access ports
+    /// (not the debug control or resource notify ones), rights in its space
+    /// that are the parent's ports. Refused while there are any.
+    fn darwin_child_ports(&mut self) -> Result<(), Errno> {
+        const TASK_BOOTSTRAP_PORT: i32 = 4;
+        const TASK_ACCESS_PORT: i32 = 9;
+        let k = &self.dtask.kports;
+        if k.registered.iter().any(Option::is_some) || k.special.contains_key(&TASK_BOOTSTRAP_PORT) || k.special.contains_key(&TASK_ACCESS_PORT) {
+            self.darwin_unimplemented("a child task inheriting its parent's bootstrap, task access or registered ports (a right in another task's space)".into());
+            return Err(Errno::EINVAL);
+        }
+        Ok(())
     }
 
     /// `posix_spawn(pid, path, adesc, argv, envp)`.
@@ -272,6 +304,7 @@ impl Kernel {
             self.darwin_spawn_unported(at)?;
         }
         // fork1(PROC_CREATE_SPAWN): a new process of this one's, no memory.
+        self.darwin_child_ports()?;
         let mut child = self.fork_kernel();
         let pid = self.procs.spawn(self.pid);
         // The spawner's NOTE_FORK, whatever becomes of the child.

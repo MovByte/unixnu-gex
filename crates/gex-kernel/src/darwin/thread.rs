@@ -338,6 +338,7 @@ impl Kernel {
             sys::EXECVE => Some(self.darwin_execve(m, a, false)),
             sys::MAC_EXECVE => Some(self.darwin_execve(m, a, true)),
             sys::POSIX_SPAWN => Some(self.darwin_posix_spawn(m, a)),
+            sys::FORK => Some(self.darwin_fork(m)),
             sys::WAIT4 | sys::WAIT4_NOCANCEL => Some(self.darwin_wait4(m, a)),
             sys::WAITID | sys::WAITID_NOCANCEL => Some(self.darwin_waitid(m, a)),
             sys::FCNTL | sys::FCNTL_NOCANCEL if super::lockf::is_lock_cmd(a[1]) => Some(self.darwin_fcntl_lock(m, a)),
