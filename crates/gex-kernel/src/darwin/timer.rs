@@ -116,7 +116,7 @@ impl Kernel {
     pub fn darwin_thread_calls(&mut self, m: &mut GuestMem<'_>) -> Option<Instant> {
         // Signals posted, and pipes changed, from outside a call: their
         // knotes are told.
-        if self.darwin_signal_knotes() | self.darwin_pipe_knotes() | self.darwin_vnode_knotes() {
+        if self.darwin_signal_knotes() | self.darwin_pipe_knotes() | self.darwin_vnode_knotes() | self.darwin_proc_knotes() {
             self.darwin_kevent_settle(m);
         }
         self.darwin_lock_wakes(m);

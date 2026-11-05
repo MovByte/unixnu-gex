@@ -792,7 +792,7 @@ impl Kernel {
         c.abort_safely = false;
         self.darwin_knote_fdcheck();
         self.darwin_lock_wakes(m);
-        if self.darwin_pipe_knotes() | self.darwin_vnode_knotes() {
+        if self.darwin_pipe_knotes() | self.darwin_vnode_knotes() | self.darwin_proc_knotes() {
             self.darwin_kevent_settle(m);
         }
         self.darwin_kevent_ast(m);

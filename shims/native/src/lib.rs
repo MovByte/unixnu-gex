@@ -3505,6 +3505,8 @@ fn start_darwin_spawn(cx: &SpawnContext, mut child: Kernel) -> std::result::Resu
             return fail(&mut child, e);
         }
     };
+    // posix_spawn's NOTE_EXEC for the child, before the call returns.
+    gex_kernel::procnote::post(pid, gex_kernel::procnote::note::EXEC);
     let child_proc = Arc::new(ProcCell::default());
     child.vfs.mount("/proc", Arc::new(ProcFs::new(Arc::new(KernelProcSource(Arc::clone(&child_proc))))));
     let Some((status, done)) = procs.handle(pid).map(|c| (Arc::clone(&c.status), Arc::clone(&c.done))) else {

@@ -274,6 +274,8 @@ impl Kernel {
         // fork1(PROC_CREATE_SPAWN): a new process of this one's, no memory.
         let mut child = self.fork_kernel();
         let pid = self.procs.spawn(self.pid);
+        // The spawner's NOTE_FORK, whatever becomes of the child.
+        crate::procnote::post(self.pid, crate::procnote::note::FORK | pid as u32);
         child.pid = pid;
         child.tid = pid;
         child.forget_own_pidfds();

@@ -135,6 +135,7 @@ impl Kernel {
             f if f == id(evfilt::MACHPORT) => self.filt_machportattach(n),
             f if f == id(evfilt::MEMORYSTATUS) => self.filt_memorystatusattach(n),
             f if f == id(evfilt::SIGNAL) => self.filt_sigattach(n),
+            f if f == id(evfilt::PROC) => self.filt_procattach(n),
             f if f == id(evfilt::READ) => self.filt_fileattach(n),
             f if [evfilt::WRITE, evfilt::VNODE, evfilt::SOCK, evfilt::EXCEPT, evfilt::NW_CHANNEL].iter().any(|&e| id(e) == f) => self.filt_fileattach(n),
             // bad_filtops: filt_no_attach.
@@ -144,7 +145,6 @@ impl Kernel {
             }
             f => {
                 let name = match f {
-                    f if f == id(evfilt::PROC) => "EVFILT_PROC",
                     f if f == id(evfilt::FS) => "EVFILT_FS",
                     _ => "an unknown kevent filter",
                 };
@@ -170,6 +170,11 @@ impl Kernel {
             }
             f if f == id(evfilt::MEMORYSTATUS) => self.dtask.kevents.memorystatus_klist.retain(|&x| x != n),
             f if f == id(evfilt::SIGNAL) => self.dtask.kevents.sig_klist.retain(|&x| x != n),
+            f if f == id(evfilt::PROC) => {
+                if let Some(id) = self.knote(n).vnote.take() {
+                    crate::procnote::unlisten(id);
+                }
+            }
             // filt_no_detach
             _ => {}
         }
@@ -199,6 +204,7 @@ impl Kernel {
                 }
                 u32::from(k.hook32 != 0)
             }
+            f if f == id(evfilt::PROC) => self.filt_procevent(n, hint as u32),
             f => panic!("filt_bad_event[{f}]({n}, {hint})"),
         }
     }
@@ -227,6 +233,12 @@ impl Kernel {
                 self.filt_vnode_common(n, 0, None)
             }
             f if f == id(evfilt::SIGNAL) => u32::from(self.knote(n).hook32 > 0),
+            // filt_proctouch: the new interest; what was collected stays.
+            f if f == id(evfilt::PROC) => {
+                let k = self.knote(n);
+                k.sfflags = kev.fflags;
+                u32::from(k.fflags != 0)
+            }
             f if f == id(evfilt::MEMORYSTATUS) => {
                 // filt_memorystatustouch: the knote's interest replaced; on
                 // iOS no per-limit state is kept.
@@ -256,6 +268,18 @@ impl Kernel {
             filtid::PIPE_R => self.filt_piperead_common(n, Some(kev)),
             filtid::PIPE_W => self.filt_pipewrite_common(n, Some(kev)),
             filtid::VN => self.filt_vnode_common(n, 0, Some(kev)),
+            // filt_procprocess: the collected events, the exit status as
+            // the data.
+            f if f == id(evfilt::PROC) => {
+                let k = self.knote(n);
+                if k.fflags == 0 {
+                    return 0;
+                }
+                let data = k.hook32;
+                *kev = k.fill_kevent(i64::from(data));
+                k.hook32 = 0;
+                1
+            }
             f if f == id(evfilt::SIGNAL) => {
                 let k = self.knote(n);
                 if k.hook32 == 0 {
@@ -1098,7 +1122,9 @@ impl Kernel {
     }
 
     /// `proc_knote(p, NOTE_SIGNAL | signum)` for each process-directed
-    /// signal posted since the last time; whether there were any.
+    /// signal posted since the last time, to this process's EVFILT_SIGNAL
+    /// knotes, and of those it raised itself to the EVFILT_PROC knotes on it
+    /// anywhere; whether there were any.
     pub(crate) fn darwin_signal_knotes(&mut self) -> bool {
         let posted = self.signals.process().take_posted();
         for &l in &posted {
@@ -1106,7 +1132,89 @@ impl Kernel {
             let list = self.dtask.kevents.sig_klist.clone();
             self.knote_list(&list, NOTE_SIGNAL | i64::from(d));
         }
+        // What it raised itself is told of here; what another process sent
+        // was told of as the table posted it.
+        for l in self.signals.process().take_local_posted() {
+            if let Some(d) = super::signal::signal_from_linux(l) {
+                crate::procnote::post(self.pid, crate::procnote::note::SIGNAL | d);
+            }
+        }
         !posted.is_empty()
+    }
+
+    // -- EVFILT_PROC --------------------------------------------------------------------------
+
+    /// `filt_procattach`: no tracking across forks (ENOTSUP), a process
+    /// that exists (ESRCH); EV_CLEAR, the data ignored, and on the
+    /// process's list. The exit status is anyone's to ask for who may
+    /// signal the process, which here is everyone: gex keeps one identity.
+    fn filt_procattach(&mut self, n: KnId) -> u32 {
+        use crate::procnote::note;
+        let (pid, sfflags) = {
+            let k = self.knote(n);
+            (k.ident as i32, k.sfflags)
+        };
+        if sfflags & (note::TRACK | note::TRACKERR | note::CHILD) != 0 {
+            self.knote(n).set_error(Errno::EOPNOTSUPP);
+            return 0;
+        }
+        if !self.procs.alive(pid) {
+            self.knote(n).set_error(Errno::ESRCH);
+            return 0;
+        }
+        let inbox = std::sync::Arc::clone(&self.dtask.kevents.proc_inbox);
+        let bell = self.darwin_timer_bell();
+        let id = crate::procnote::listen(
+            pid,
+            std::sync::Arc::new(move |hint: u32| {
+                inbox.lock().unwrap_or_else(|e| e.into_inner()).push((n, hint));
+                bell.ring();
+            }),
+        );
+        let k = self.knote(n);
+        k.flags |= ev::CLEAR;
+        k.sdata = 0;
+        k.vnote = Some(id);
+        0
+    }
+
+    /// `filt_procevent`: the event collected if asked for; an exit (or a
+    /// reap, for a knote that waits for one) ends the knote; the exit
+    /// status kept for the event's data with NOTE_EXITSTATUS.
+    fn filt_procevent(&mut self, n: KnId, hint: u32) -> u32 {
+        use crate::procnote::note;
+        let event = hint & !note::PDATAMASK;
+        let k = self.knote(n);
+        if k.sfflags & event != 0 {
+            k.fflags |= event;
+        }
+        if event == note::REAP || (event == note::EXIT && k.sfflags & note::REAP == 0) {
+            k.flags |= ev::EOF | ev::ONESHOT;
+        }
+        if event == note::EXIT {
+            k.hook32 = 0;
+            if k.sfflags & note::EXITSTATUS != 0 {
+                k.fflags |= note::EXITSTATUS;
+                k.hook32 |= hint & note::PDATAMASK;
+            }
+            if k.sfflags & note::EXIT_DETAIL != 0 {
+                // No jetsam, decryption or code-signing kill here to say.
+                k.fflags |= note::EXIT_DETAIL;
+            }
+        }
+        u32::from(k.fflags != 0)
+    }
+
+    /// The process notes the process's EVFILT_PROC knotes were sent: each
+    /// knote told; whether any was.
+    pub(crate) fn darwin_proc_knotes(&mut self) -> bool {
+        let notes = std::mem::take(&mut *self.dtask.kevents.proc_inbox.lock().unwrap_or_else(|e| e.into_inner()));
+        for &(n, hint) in &notes {
+            if self.knote_exists(n) {
+                self.knote_list(&[n], i64::from(hint));
+            }
+        }
+        !notes.is_empty()
     }
 
     // -- EVFILT_MEMORYSTATUS ------------------------------------------------------------------

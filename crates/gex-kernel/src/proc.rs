@@ -568,6 +568,9 @@ impl ProcTable {
         // the table, so holding both here in the other order deadlocks.
         *cell.lock().unwrap_or_else(|e| e.into_inner()) = Some(status);
         done.notify_all();
+        // proc_exit's NOTE_EXIT, with the low half of the status as Darwin
+        // encodes it.
+        crate::procnote::post(pid, crate::procnote::note::EXIT | (crate::darwin::exit::status_from_linux(status as u32) & 0xffff));
         // The parent is owed a SIGCHLD. A `wait4` parked on the condvar
         // doesn't need one, but a parent that polls `WNOHANG` and sleeps in
         // `sigsuspend` between polls has nothing else to wake it -- coreutils
@@ -617,6 +620,11 @@ impl ProcTable {
         };
         // The parent's `wait4`, and its SIGCHLD.
         crate::wait::notify(parent_q);
+        if parent_q != 0 {
+            if let Some(ppid) = self.lock().procs.iter().find(|p| p.pid == pid).map(|p| p.ppid).or(was_ppid) {
+                post_signal(&[ppid], SIGCHLD);
+            }
+        }
         // A process descriptor for it (`crate::pidfd`), wherever it is held.
         crate::wait::notify(own_q);
     }
@@ -627,8 +635,12 @@ impl ProcTable {
         if let Some(r) = self.remote {
             return (r.reap)(pid);
         }
-        let mut t = self.lock();
-        t.procs.retain(|p| p.pid != pid);
+        {
+            let mut t = self.lock();
+            t.procs.retain(|p| p.pid != pid);
+        }
+        // reap_child_locked's NOTE_REAP.
+        crate::procnote::post(pid, crate::procnote::note::REAP);
     }
 
     pub fn ppid(&self, pid: i32) -> i32 {
@@ -797,6 +809,9 @@ impl ProcTable {
             for &i in &hits {
                 t.procs[i].queue.notify();
             }
+            let pids: Vec<i32> = hits.iter().map(|&i| t.procs[i].pid).collect();
+            drop(t);
+            post_signal(&pids, signo);
         }
         Ok(hits.len())
     }
@@ -829,6 +844,9 @@ impl ProcTable {
             for &i in &hits {
                 t.procs[i].queue.notify();
             }
+            let pids: Vec<i32> = hits.iter().map(|&i| t.procs[i].pid).collect();
+            drop(t);
+            post_signal(&pids, signo);
         }
         Ok(hits.len())
     }
@@ -1133,6 +1151,15 @@ impl ProcTable {
         let packed = (r.wait)(ppid, want, nowait as i32);
         let pid = (packed >> 32) as i32;
         (pid > 0).then(|| (pid, packed as u32 as i32))
+    }
+}
+
+/// psignal's `proc_knote(p, NOTE_SIGNAL | signum)` for each process a
+/// signal was posted to, by Darwin's number.
+fn post_signal(pids: &[i32], signo: u32) {
+    let Some(d) = crate::darwin::signal::signal_from_linux(signo) else { return };
+    for &pid in pids {
+        crate::procnote::post(pid, crate::procnote::note::SIGNAL | d);
     }
 }
 

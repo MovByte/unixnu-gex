@@ -174,6 +174,9 @@ pub struct ProcSig {
     /// tells its knotes of them (Darwin's `proc_knote(NOTE_SIGNAL)`), and
     /// how it is told; empty and unset for any other.
     posted: Mutex<Vec<u32>>,
+    /// The part of `posted` this process raised itself (the rest came
+    /// through the process table, which told of them as it posted them).
+    local_posted: Mutex<Vec<u32>>,
     post_hook: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// What each signal does with no handler, for a personality whose
     /// defaults are not Linux's ([`default_action`] when unset).
@@ -199,6 +202,7 @@ impl ProcSig {
             collecting: Mutex::new(()),
             timer_next: AtomicU64::new(NO_TIMER),
             posted: Mutex::new(Vec::new()),
+            local_posted: Mutex::new(Vec::new()),
             post_hook: std::sync::OnceLock::new(),
             defaults: std::sync::OnceLock::new(),
         }
@@ -240,6 +244,11 @@ impl ProcSig {
         std::mem::take(&mut *self.posted.lock())
     }
 
+    /// Those of them the process raised itself.
+    pub fn take_local_posted(&self) -> Vec<u32> {
+        std::mem::take(&mut *self.local_posted.lock())
+    }
+
     /// Mark a process-directed signal pending: whichever thread does not
     /// block it takes it.
     pub fn raise(&self, signal: u32, source: Option<Source>) {
@@ -247,6 +256,7 @@ impl ProcSig {
             self.raise_quiet(signal, source);
             if let Some(hook) = self.post_hook.get() {
                 self.posted.lock().push(signal);
+                self.local_posted.lock().push(signal);
                 hook();
             }
         }
