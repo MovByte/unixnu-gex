@@ -8756,6 +8756,9 @@ pub struct Child {
     /// A Darwin process's stops and continues (`done` is signalled with
     /// each).
     pub job: Arc<Mutex<crate::proc::Job>>,
+    /// A Darwin process's task policy, which other processes reach too
+    /// (setpriority's).
+    pub policy: Arc<Mutex<crate::darwin::taskpolicy::TaskPolicy>>,
 }
 
 impl Child {
@@ -8766,6 +8769,7 @@ impl Child {
             done: Arc::new(std::sync::Condvar::new()),
             reaped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             job: Arc::new(Mutex::new(crate::proc::Job::default())),
+            policy: Arc::new(Mutex::new(crate::darwin::taskpolicy::TaskPolicy::default())),
         }
     }
 

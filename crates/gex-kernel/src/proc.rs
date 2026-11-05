@@ -239,6 +239,8 @@ struct Proc {
     /// (its SIGCHLD action has SA_NOCLDSTOP).
     execed: bool,
     nocldstop: bool,
+    /// `p_nice`.
+    nice: i32,
     /// Signals `tgkill` sent to one thread of this process from another
     /// process: (tid, signo, sender), in the order sent. Thread ids are the
     /// process's own, so the table cannot check one; a thread that is gone
@@ -417,6 +419,7 @@ impl ProcTable {
                     child_end: None,
                     execed: false,
                     nocldstop: false,
+                    nice: 0,
                     to_threads: Vec::new(),
                     queue: crate::wait::Queue::new(),
                     info: Vec::new(),
@@ -445,6 +448,22 @@ impl ProcTable {
             Some(p) => (p.pgid, p.sid),
             None => (pid, pid),
         };
+        // forkproc's copy of p_nice and the uid, and task_create's
+        // task_policy_create from the parent's policy, with resetpriority
+        // for a nice value the child inherits.
+        let (nice, uid, policy) = match t.procs.iter().find(|p| p.pid == ppid) {
+            Some(p) => {
+                let parent = *p.child.policy.lock().unwrap_or_else(|e| e.into_inner());
+                let mut policy = crate::darwin::taskpolicy::TaskPolicy::create(&parent, false);
+                if p.nice != 0 {
+                    policy.set_importance(-p.nice);
+                }
+                (p.nice, p.uid, policy)
+            }
+            None => (0, 0, crate::darwin::taskpolicy::TaskPolicy::default()),
+        };
+        let child = Child::new(pid);
+        *child.policy.lock().unwrap_or_else(|e| e.into_inner()) = policy;
         // The virtual init runs nothing, so a child of it is the host's.
         let host_child = ppid == INIT_PID && self.virtual_init.load(Ordering::Acquire);
         t.procs.push(Proc {
@@ -452,16 +471,17 @@ impl ProcTable {
             ppid,
             pgid,
             sid,
-            child: Child::new(pid),
+            child,
             pending: Arc::new(AtomicU64::new(0)),
             killed: 0,
             senders: [0; 64],
             posts: None,
             xhighbits: 0,
-            uid: 0,
+            uid,
             child_end: None,
             execed: false,
             nocldstop: false,
+            nice,
             to_threads: Vec::new(),
             queue: crate::wait::Queue::new(),
             info: Vec::new(),
@@ -914,6 +934,47 @@ impl ProcTable {
         }
     }
 
+    /// `pid`'s task policy, a zombie's too.
+    pub fn task_policy(&self, pid: i32) -> Option<Arc<Mutex<crate::darwin::taskpolicy::TaskPolicy>>> {
+        self.lock().procs.iter().find(|p| p.pid == pid).map(|p| Arc::clone(&p.child.policy))
+    }
+
+    /// A live process's uid and `p_nice` (`proc_find`'s: no zombie).
+    pub fn live_nice(&self, pid: i32) -> Option<(u32, i32)> {
+        let t = self.lock();
+        let p = t.procs.iter().find(|p| p.pid == pid)?;
+        let live = p.child.status.lock().map(|s| s.is_none()).unwrap_or(false);
+        live.then_some((p.uid, p.nice))
+    }
+
+    /// Set `pid`'s `p_nice`.
+    pub fn set_nice(&self, pid: i32, n: i32) {
+        if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
+            p.nice = n;
+        }
+    }
+
+    /// The members of group `pgid` (zombies too, as `PGMEMBERS_FOREACH`
+    /// walks them), or of none: (pid, uid, nice, live).
+    pub fn pgrp_members(&self, pgid: i32) -> Vec<(i32, u32, i32, bool)> {
+        self.lock()
+            .procs
+            .iter()
+            .filter(|p| p.pgid == pgid)
+            .map(|p| (p.pid, p.uid, p.nice, p.child.status.lock().map(|s| s.is_none()).unwrap_or(false)))
+            .collect()
+    }
+
+    /// Every live process (`allproc`): (pid, uid, nice).
+    pub fn all_live(&self) -> Vec<(i32, u32, i32)> {
+        self.lock()
+            .procs
+            .iter()
+            .filter(|p| p.child.status.lock().map(|s| s.is_none()).unwrap_or(false))
+            .map(|p| (p.pid, p.uid, p.nice))
+            .collect()
+    }
+
     /// Mark `pid` as having exec'd (`P_EXEC`).
     pub fn set_execed(&self, pid: i32) {
         if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
@@ -1175,7 +1236,8 @@ impl ProcTable {
         self.lock().procs.iter_mut().find(|p| p.pid == pid).map_or(0, |p| std::mem::take(&mut p.xhighbits))
     }
 
-    /// The real uid `pid` ended with, for its parent's record.
+    /// `pid`'s real uid: as it runs (for another process's checks against
+    /// it), and the one it ended with (for its parent's record).
     pub fn set_uid(&self, pid: i32, uid: u32) {
         if self.remote.is_some() {
             return;

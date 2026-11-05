@@ -147,6 +147,9 @@ pub struct TaskPolicy {
     /// `task->importance`: the nice value's part of its priority.
     pub importance: i32,
     pub imp: Importance,
+    /// `task_set_gpu_denied` and `task_set_game_mode`.
+    pub gpu_denied: bool,
+    pub game_mode: bool,
 }
 
 impl Default for TaskPolicy {
@@ -160,6 +163,8 @@ impl Default for TaskPolicy {
             max_priority: pri::MAXPRI_USER,
             importance: 0,
             imp: Importance::default(),
+            gpu_denied: false,
+            game_mode: false,
         }
     }
 }
@@ -251,6 +256,39 @@ impl TaskPolicy {
         }
         self.update(false);
         self.update_live_donor();
+    }
+
+    /// `task_importance` (the nice value's, `-p_nice`): refused for a task
+    /// whose effective role is a control application or above.
+    pub fn set_importance(&mut self, importance: i32) -> bool {
+        if self.effective.role >= role::CONTROL_APPLICATION {
+            return false;
+        }
+        self.importance = importance;
+        self.update(false);
+        true
+    }
+
+    /// `proc_set_task_policy(TASK_POLICY_DARWIN_BG)`, from the task itself
+    /// (internal) or another (external).
+    pub fn set_darwinbg(&mut self, external: bool, on: bool) {
+        if external {
+            self.requested.ext_darwinbg = on;
+        } else {
+            self.requested.int_darwinbg = on;
+        }
+        self.update(false);
+    }
+
+    /// `proc_set_task_policy(TASK_POLICY_ROLE)`.
+    pub fn set_role(&mut self, r: u8) {
+        self.requested.role = r;
+        self.update(false);
+    }
+
+    /// `task_is_app`.
+    pub fn is_app(&self) -> bool {
+        matches!(self.requested.apptype, apptype::APP_DEFAULT | apptype::APP_TAL)
     }
 
     /// `task_compute_main_thread_qos`: by the app type (at least
@@ -602,6 +640,19 @@ impl TaskPolicy {
     }
 }
 
+/// `proc_task_role_to_darwin_role`.
+pub fn task_role_to_darwin_role(r: u8) -> i32 {
+    match r {
+        role::FOREGROUND_APPLICATION => 1,
+        role::BACKGROUND_APPLICATION => 4,
+        role::NONUI_APPLICATION => 3,
+        role::DEFAULT_APPLICATION => 2,
+        role::THROTTLE_APPLICATION => 5,
+        role::DARWINBG_APPLICATION => 6,
+        _ => 0,
+    }
+}
+
 /// `proc_darwin_role_to_task_role`: a `PRIO_DARWIN_ROLE_*` as a task role,
 /// `None` for one that is not.
 pub fn darwin_role_to_task_role(r: u32) -> Option<u8> {
@@ -645,7 +696,7 @@ pub fn spawn_attrs(psa_apptype: u32, psa_qos_clamp: u64, psa_darwin_role: u32) -
 /// spinlocked` makes it from its requested QoS, the highest of its
 /// overrides, and its task's effective policy: (QoS, relative priority as
 /// requested (0 to -15), UI urgent, terminated).
-pub fn thread_effective_qos(req_qos: u8, req_relpri: i32, overrides: u8, task: &Effective) -> (u8, i32, bool, bool) {
+pub fn thread_effective_qos(req_qos: u8, req_relpri: i32, overrides: u8, thread_darwinbg: bool, task: &Effective) -> (u8, i32, bool, bool) {
     let mut q = req_qos;
     if req_qos != qos::UNSPECIFIED {
         q = q.max(overrides);
@@ -657,7 +708,7 @@ pub fn thread_effective_qos(req_qos: u8, req_relpri: i32, overrides: u8, task: &
         q = task.qos_ceiling.min(q);
     }
     let mut relpri = if req_qos != qos::UNSPECIFIED && req_qos == q && overrides == qos::UNSPECIFIED { req_relpri } else { 0 };
-    let darwinbg = task.darwinbg || q == qos::BACKGROUND || q == qos::MAINTENANCE;
+    let darwinbg = task.darwinbg || thread_darwinbg || q == qos::BACKGROUND || q == qos::MAINTENANCE;
     if darwinbg && (q > qos::BACKGROUND || q == qos::UNSPECIFIED) {
         q = qos::BACKGROUND;
         relpri = 0;
@@ -746,20 +797,20 @@ mod tests {
     fn a_threads_priority_follows_its_task() {
         // -15REL legacy: 31 - ((31 - 20) * 15 >> 4) = 21.
         let t = TaskPolicy { priority: pri::BASEPRI_DEFAULT, ..TaskPolicy::default() };
-        let (q, r, u, x) = thread_effective_qos(qos::LEGACY, -15, 0, &t.effective);
+        let (q, r, u, x) = thread_effective_qos(qos::LEGACY, -15, 0, false, &t.effective);
         assert_eq!(thread_base_priority(q, r, u, x, 0, &t), 21);
         // A clamped task: its threads' QoS and priority are held down.
         let app = spawned(apptype::APP_DEFAULT, qos::UTILITY, 0);
-        let (q, r, u, x) = thread_effective_qos(qos::USER_INTERACTIVE, -4, 0, &app.effective);
+        let (q, r, u, x) = thread_effective_qos(qos::USER_INTERACTIVE, -4, 0, false, &app.effective);
         assert_eq!((q, r), (qos::UTILITY, 0));
         assert_eq!(thread_base_priority(q, r, u, x, 0, &app), pri::BASEPRI_UTILITY);
         // A foreground app's user-interactive thread is urgent: 47.
         let fg = spawned(apptype::APP_DEFAULT, 0, 0);
-        let (q, r, u, x) = thread_effective_qos(qos::USER_INTERACTIVE, 0, 0, &fg.effective);
+        let (q, r, u, x) = thread_effective_qos(qos::USER_INTERACTIVE, 0, 0, false, &fg.effective);
         assert_eq!(thread_base_priority(q, r, u, x, 0, &fg), 47);
         // No QoS, a background daemon: never below MAXPRI_THROTTLE.
         let bg = spawned(apptype::DAEMON_BACKGROUND, 0, 0);
-        let (q, r, u, x) = thread_effective_qos(qos::UNSPECIFIED, 0, 0, &bg.effective);
+        let (q, r, u, x) = thread_effective_qos(qos::UNSPECIFIED, 0, 0, false, &bg.effective);
         assert_eq!(q, qos::BACKGROUND);
         assert_eq!(thread_base_priority(q, r, u, x, -20, &bg), pri::MAXPRI_THROTTLE);
     }

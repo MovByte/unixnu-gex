@@ -636,10 +636,10 @@ impl Kernel {
     /// range.
     pub(crate) fn darwin_thread_base_pri(&self, tid: i32) -> u8 {
         use super::taskpolicy::{pri, thread_base_priority, thread_effective_qos};
-        let tp = &self.dtask.policy;
+        let tp = &self.darwin_policy();
         let Some(t) = self.dtask.threads.map.get(&tid) else { return tp.priority as u8 };
         let overrides = t.overrides.iter().map(|o| o.qos).max().unwrap_or(qos::UNSPECIFIED);
-        let (q, relpri, urgent, terminated) = thread_effective_qos(t.policy.qos, t.policy.relpri, overrides, &tp.effective);
+        let (q, relpri, urgent, terminated) = thread_effective_qos(t.policy.qos, t.policy.relpri, overrides, t.policy.int_darwinbg, &tp.effective);
         if q == qos::UNSPECIFIED {
             if let Some(w) = &t.wq {
                 return (i32::from(w.sched_pri)).min(tp.max_priority).max(pri::MAXPRI_THROTTLE) as u8;
@@ -1302,7 +1302,7 @@ impl Kernel {
 
     /// `task_compute_main_thread_qos`.
     pub(crate) fn darwin_main_thread_qos(&self) -> u8 {
-        self.dtask.policy.main_thread_qos(self.pid == 1)
+        self.darwin_policy().main_thread_qos(self.pid == 1)
     }
 
     /// `workq_kernreturn(options, item, affinity, prio)`.

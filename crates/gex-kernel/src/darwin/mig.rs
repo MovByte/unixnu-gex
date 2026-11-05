@@ -191,7 +191,7 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             (Some(flavor), Some(cnt)) if (cnt as u32) <= 16 => {
                 let info: Option<Vec<i32>> = (0..cnt as usize).map(|i| arg(req, 2 + i)).collect();
                 match info {
-                    Some(info) => Reply::err(k.dtask.policy.set(flavor, &info, true)),
+                    Some(info) => Reply::err(k.darwin_policy_with(|p| p.set(flavor, &info, true))),
                     None => bad(),
                 }
             }
@@ -206,7 +206,7 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
                 // task_is_privileged: the security token's uid (one uid here, real and
                 // effective).
                 let privileged = k.creds.uid() == 0;
-                match k.dtask.policy.get(flavor, cnt, get_default != 0, privileged) {
+                match k.darwin_policy().get(flavor, cnt, get_default != 0, privileged) {
                     Some(Ok(w)) => {
                         let mut out = words(&w.iter().map(|&x| x as u32).collect::<Vec<u32>>());
                         out.extend_from_slice(&get_default.to_le_bytes());

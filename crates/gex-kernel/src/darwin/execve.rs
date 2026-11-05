@@ -449,21 +449,21 @@ impl Kernel {
             rlimits: old.rlimits,
             dispatchqueue_serialno_offset: old.dispatchqueue_serialno_offset,
             dispatchqueue_label_offset: old.dispatchqueue_label_offset,
-            // A new process's policy came at its fork; an exec's task is an
-            // exec copy of the old (task_policy_create) that inherits its
-            // role (proc_inherit_task_role).
-            policy: match spawn {
-                Some(s) if s.flags & super::spawn::flag::SETEXEC == 0 => old.policy,
-                _ => {
-                    let mut p = super::taskpolicy::TaskPolicy::create(&old.policy, true);
-                    p.requested.role = old.policy.requested.role;
-                    p.update(false);
-                    p
-                }
-            },
+            policy: old.policy,
             said: old.said,
             ..Default::default()
         };
+        // A new process's policy came with its fork; an exec's task is an
+        // exec copy of the old (task_policy_create) that inherits its role
+        // (proc_inherit_task_role).
+        if spawn.is_none_or(|s| s.flags & super::spawn::flag::SETEXEC != 0) {
+            self.darwin_policy_with(|p| {
+                let mut n = super::taskpolicy::TaskPolicy::create(p, true);
+                n.requested.role = p.requested.role;
+                n.update(false);
+                *p = n;
+            });
+        }
         self.darwin_finish = None;
         self.darwin_pipe_sigpipe = None;
         self.darwin_execsigs();
@@ -478,10 +478,12 @@ impl Kernel {
             if sp.flags & super::spawn::flag::SETSIGDEF != 0 {
                 self.darwin_sigdefault(sp.sigdefault);
             }
-            // exec_handle_spawnattr_policy.
+            // exec_handle_spawnattr_policy for POSIX_SPAWN_SETEXEC (a new
+            // process's came in its spawner's call).
             let (apptype, clamp, role) = sp.policy;
-            if apptype != super::taskpolicy::apptype::NONE || clamp != super::workq::qos::UNSPECIFIED || role != super::taskpolicy::role::UNSPECIFIED {
-                self.dtask.policy.spawnpolicy(apptype, clamp, role);
+            let any = apptype != super::taskpolicy::apptype::NONE || clamp != super::workq::qos::UNSPECIFIED || role != super::taskpolicy::role::UNSPECIFIED;
+            if any && sp.flags & super::spawn::flag::SETEXEC != 0 {
+                self.darwin_policy_with(|p| p.spawnpolicy(apptype, clamp, role));
             }
         }
     }

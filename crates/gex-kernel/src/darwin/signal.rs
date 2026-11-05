@@ -298,6 +298,8 @@ impl Kernel {
     /// Set the signal layer up for a Darwin process: Darwin's defaults, and
     /// told of every process-directed signal posted (for its knotes).
     pub fn darwin_signals_init(&mut self) {
+        // Its uid, for other processes' checks against it.
+        self.procs.set_uid(self.pid, self.creds.uid());
         self.signals.process().set_defaults(default_action);
         self.procs.record_posts(self.pid);
         let bell = self.darwin_timer_bell();

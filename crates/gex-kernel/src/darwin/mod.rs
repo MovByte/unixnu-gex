@@ -37,6 +37,7 @@ pub mod mig;
 pub mod mk_timer;
 pub mod mwl;
 pub mod pipe;
+pub mod priority;
 pub mod psynch;
 pub mod rlimit;
 pub mod sema;
@@ -116,8 +117,9 @@ pub struct Task {
     /// `p_dispatchqueue_serialno_offset`, `p_dispatchqueue_label_offset`.
     pub dispatchqueue_serialno_offset: u64,
     pub dispatchqueue_label_offset: u64,
-    /// The task's policy: app type, role, QoS clamp and what follows.
-    pub policy: taskpolicy::TaskPolicy,
+    /// The task's policy (app type, role, QoS clamp and what follows): its
+    /// cell in the process table, once asked.
+    pub policy: Option<std::sync::Arc<std::sync::Mutex<taskpolicy::TaskPolicy>>>,
     /// Maximum protections lowered from `VM_PROT_ALL`.
     pub maxprot: vm::MaxProt,
     /// Threads a semaphore operation woke, and how.
@@ -143,6 +145,23 @@ impl Task {
 }
 
 impl crate::syscalls::Kernel {
+    /// This process's task policy, as it is now.
+    pub(crate) fn darwin_policy(&self) -> taskpolicy::TaskPolicy {
+        let cell = self.dtask.policy.clone().or_else(|| self.procs.task_policy(self.pid));
+        cell.map(|c| *c.lock().unwrap_or_else(|e| e.into_inner())).unwrap_or_default()
+    }
+
+    /// Change this process's task policy.
+    pub(crate) fn darwin_policy_with<R>(&mut self, f: impl FnOnce(&mut taskpolicy::TaskPolicy) -> R) -> R {
+        if self.dtask.policy.is_none() {
+            self.dtask.policy = self.procs.task_policy(self.pid);
+        }
+        match &self.dtask.policy {
+            Some(c) => f(&mut c.lock().unwrap_or_else(|e| e.into_inner())),
+            None => f(&mut taskpolicy::TaskPolicy::default()),
+        }
+    }
+
     /// Something a Darwin program asked for that this kernel does not do.
     /// It is said once per kind; under strict mode the process stops with
     /// SIGSYS when the call returns ([`Self::darwin_strict_stop`]).

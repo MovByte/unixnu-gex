@@ -143,6 +143,8 @@ pub struct Policy {
     /// importance, once set.
     pub timeshare: Option<bool>,
     pub importance: Option<i32>,
+    /// `thrp_int_darwinbg`: PRIO_DARWIN_THREAD's background.
+    pub int_darwinbg: bool,
 }
 
 /// A thread's cancellation state: XNU's `UT_CANCEL*` bits of `uu_flag`.
@@ -309,6 +311,21 @@ impl Kernel {
     /// outcomes the plain path cannot give. `None` for the rest.
     pub(crate) fn darwin_thread_call(&mut self, m: &mut GuestMem<'_>, raw: u64, a: &[u64; 6]) -> Option<SyscallOutcome> {
         match raw {
+            // A priority may be negative, and setpriority's EIDRM is -2: a
+            // value with the carry clear, not an errno.
+            sys::GETPRIORITY | sys::SETPRIORITY => {
+                let r = if raw == sys::GETPRIORITY { self.darwin_getpriority(a[0] as u32, a[1] as u32) } else { self.darwin_setpriority(a[0] as u32, a[1] as u32, a[2] as i32) };
+                match r {
+                    Ok(v) => {
+                        let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, v);
+                        let _ = m.write(self.ctx_addr + ctx::CF as u64, &[0]);
+                    }
+                    Err(e) => {
+                        let _ = super::set_result(m, self.ctx_addr, (-(e.0 as i64)) as u64);
+                    }
+                }
+                Some(SyscallOutcome::Continue)
+            }
             sys::BSDTHREAD_CREATE => Some(self.darwin_bsdthread_create(m, a)),
             sys::BSDTHREAD_TERMINATE => {
                 self.darwin_bsdthread_terminate(m, a);

@@ -159,9 +159,9 @@ impl Scratch {
 
 impl Kernel {
     /// `forkproc` of this process's Darwin state: what a child takes (its
-    /// signal actions, limits, libpthread's registration, the dispatch
-    /// queue offsets and what task_policy_create inherits); the rest is the
-    /// new task's own.
+    /// signal actions, limits, libpthread's registration and the dispatch
+    /// queue offsets; its task policy is made with its entry in the process
+    /// table); the rest is the new task's own.
     pub(crate) fn darwin_fork_task(&self) -> super::Task {
         let t = &self.dtask;
         super::Task {
@@ -171,9 +171,6 @@ impl Kernel {
             rlimits: t.rlimits,
             dispatchqueue_serialno_offset: t.dispatchqueue_serialno_offset,
             dispatchqueue_label_offset: t.dispatchqueue_label_offset,
-            // task_policy_create: the parent's app type, throttles and
-            // clamp.
-            policy: super::taskpolicy::TaskPolicy::create(&t.policy, false),
             ..super::Task::new_process()
         }
     }
@@ -367,6 +364,13 @@ impl Kernel {
             }
             if at.flags & flag::SETSID != 0 {
                 child.procs.setsid(child.pid)?;
+            }
+        }
+        // exec_handle_spawnattr_policy, in the spawner's call.
+        let (apptype, clamp, role) = after.policy;
+        if apptype != super::taskpolicy::apptype::NONE || clamp != super::workq::qos::UNSPECIFIED || role != super::taskpolicy::role::UNSPECIFIED {
+            if let Some(p) = self.procs.task_policy(child.pid) {
+                p.lock().unwrap_or_else(|e| e.into_inner()).spawnpolicy(apptype, clamp, role);
             }
         }
         img.spawn = Some(after);
