@@ -1622,6 +1622,14 @@ fn run_program_with(
             gex_cache::write_profile(dir, &image_key, &found, PROFILE_LIMIT);
         }
     }
+    // proc_exit closes the descriptors before the process is collectable.
+    // What is left goes on a thread of its own, so the end is published
+    // without waiting for it: freeing the translated code deregisters its
+    // unwind tables one by one, which took a child 15 to 30 seconds.
+    spawn.kernel.lock().unwrap_or_else(|e| e.into_inner()).close_all_fds();
+    // (A thread that cannot be made drops it here, with its closure.)
+    let rest = (store, linker, spawn, memory, shared);
+    let _ = std::thread::Builder::new().name("gex-reap".into()).spawn(move || drop(rest));
     Ok((exit, stats))
 }
 
