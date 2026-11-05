@@ -8850,6 +8850,9 @@ impl Kernel {
     pub fn enter_thread(&mut self, t: &ThreadState) {
         self.ctx_addr = t.ctx_addr;
         self.tid = t.tid;
+        if self.darwin {
+            self.dtask.threads.map.entry(t.tid).or_default().ctx_addr = t.ctx_addr;
+        }
         self.switch_signals(t.tid);
     }
 
@@ -9598,6 +9601,9 @@ impl Kernel {
             self.darwin_workq_sched_block();
             let tid = self.tid;
             self.darwin_set_offcpu(m, tid, true);
+        }
+        if self.darwin && !self.dtask.pending_replies.is_empty() {
+            self.darwin_pending_ready(m);
         }
         if self.darwin {
             if let Some(out) = self.darwin_guard_kill() {

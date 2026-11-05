@@ -263,6 +263,10 @@ pub enum Deferred {
     /// `thread_suspend`'s `thread_wait`: success, once the thread is off
     /// its CPU.
     ThreadWait,
+    /// `thread_get_state` and `thread_set_state` of a thread held to stop.
+    /// (`held`: a stop hold was put on it for this.)
+    GetState { flavor: i32, count: u32, held: bool },
+    SetState { flavor: i32, state: Vec<u32>, held: bool },
 }
 
 /// A request answered once a thread is off its CPU.
@@ -297,11 +301,33 @@ impl Kernel {
         for p in mine {
             let reply = match p.op {
                 Deferred::ThreadWait => Reply::ok(Vec::new()),
+                Deferred::GetState { flavor, count, .. } => self.darwin_thread_state_now(m, tid, flavor, count, None),
+                Deferred::SetState { flavor, ref state, .. } => self.darwin_thread_state_now(m, tid, flavor, 0, Some(state.clone())),
             };
+            if matches!(p.op, Deferred::GetState { held: true, .. } | Deferred::SetState { held: true, .. }) {
+                // thread_unstop, thread_release.
+                if let Some(t) = self.dtask.threads.map.get_mut(&tid) {
+                    t.stop_holds = t.stop_holds.saturating_sub(1);
+                }
+            }
+            if let Some(u) = &reply.unimplemented {
+                let u = u.clone();
+                self.darwin_unimplemented(u);
+            }
             let k = reply.message(p.id, p.rport, p.rtype);
             self.darwin_kernel_send(Box::new(k));
         }
         self.darwin_ipc_settle(m);
+    }
+
+    /// The replies whose thread is off its CPU now, or is the caller: what
+    /// a call that made them answers on its way out.
+    pub(crate) fn darwin_pending_ready(&mut self, m: &mut crate::GuestMem<'_>) {
+        let me = self.tid;
+        let ready: Vec<i32> = self.dtask.pending_replies.iter().map(|p| p.target).filter(|&t| t == me || self.darwin_offcpu(t)).collect();
+        for t in ready {
+            self.darwin_pending_replies(m, t);
+        }
     }
 
     /// Whether thread `tid` is still there (`thread->active`).

@@ -2268,6 +2268,8 @@ fn darwin_return_to_user(state: &mut HostState, data: &mut [u8], in_gate: bool) 
         };
         match held {
             Hold::Run => return resume.map_or(ToUser::Run, ToUser::Resume),
+            // Its registers were set while it was in the kernel.
+            Hold::Resume(pc) => return ToUser::Resume(resume.unwrap_or(pc)),
             Hold::Deliver => {
                 let mut gm = GuestMem::new(data);
                 match state.with_kernel(|k| k.deliver_pending(&mut gm)) {

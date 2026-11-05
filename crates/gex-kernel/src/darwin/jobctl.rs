@@ -31,6 +31,9 @@ pub enum Hold {
     /// Held but aborted: it takes its signals (`bsd_ast` before
     /// `thread_apc_ast`), then asks again.
     Deliver,
+    /// Not held, its registers set while it was in the kernel: it goes on
+    /// at this pc.
+    Resume(u64),
 }
 
 /// A Darwin signal set as Linux's.
@@ -191,9 +194,14 @@ impl Kernel {
         self.collect_signals();
         self.darwin_assign_signals();
         // thread_hold: the task's, or the thread's own (thread_suspend).
-        let thread_held = self.dtask.threads.map.get(&tid).is_some_and(|t| t.suspend > 0);
+        let thread_held = self.dtask.threads.map.get(&tid).is_some_and(|t| t.suspend > 0 || t.stop_holds > 0);
         if self.darwin_job_with(|j| j.holds) == 0 && !thread_held {
             self.darwin_set_offcpu(m, tid, false);
+            let me = self.dtask.threads.map.entry(tid).or_default();
+            if std::mem::take(&mut me.redirect) {
+                let pc = m.read_u64(me.ctx_addr + gex_abi::ctx::PC as u64).unwrap_or(0);
+                return Hold::Resume(pc);
+            }
             return Hold::Run;
         }
         let me = self.dtask.threads.map.entry(tid).or_default();

@@ -200,6 +200,12 @@ pub struct DThread {
     /// Off its CPU: parked by a hold, or waiting in a call (what
     /// `thread_wait` waits for).
     pub offcpu: bool,
+    /// Where its registers are kept while it is in the kernel.
+    pub ctx_addr: u64,
+    /// thread_get_state's and thread_set_state's holds (thread_stop).
+    pub stop_holds: u32,
+    /// Its registers were set: it goes back to user space at its pc.
+    pub redirect: bool,
     /// The thread, made but not started (created suspended).
     pub unstarted: Option<SpawnRequest>,
     /// A workqueue thread's state (`THREAD_TAG_WORKQUEUE`).
@@ -526,7 +532,7 @@ impl Kernel {
             self.darwin_unmake_thread(m, req, port);
             return Err(Errno::EINVAL);
         }
-        let mut thread = DThread::default();
+        let mut thread = DThread { ctx_addr: req.ctx_addr, ..DThread::default() };
         if reg.tsd_offset != 0 {
             let _ = m.write_u64(req.ctx_addr + ctx::TPIDRRO as u64, pthread + reg.tsd_offset);
             flags |= start::TSD_BASE_SET;

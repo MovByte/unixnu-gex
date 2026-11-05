@@ -288,6 +288,23 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         // task_restartable_ranges_synchronize(task).
         (Kobject::Task, 8000) => restartable_register(k, req),
         (Kobject::Task, 8001) => Reply::ok(Vec::new()),
+        // thread_get_state(thread, flavor, &old_stateCnt) -> old_state[]
+        // (at most THREAD_STATE_MAX, 1296 words).
+        (Kobject::Thread(t), 3603) => match (arg(req, 0), arg(req, 1)) {
+            (Some(flavor), Some(cnt)) => k.darwin_thread_state(*t, flavor, (cnt as u32).min(1296), None),
+            _ => bad(),
+        },
+        // thread_set_state(thread, flavor, new_state[new_stateCnt]).
+        (Kobject::Thread(t), 3604) => match (arg(req, 0), arg(req, 1)) {
+            (Some(flavor), Some(cnt)) if (cnt as u32) <= 1296 => {
+                let w: Option<Vec<u32>> = (0..cnt as usize).map(|i| arg(req, 2 + i).map(|x| x as u32)).collect();
+                match w {
+                    Some(w) => k.darwin_thread_state(*t, flavor, cnt as u32, Some(w)),
+                    None => bad(),
+                }
+            }
+            _ => bad(),
+        },
         // thread_policy_set(thread, flavor, policy_info[policy_infoCnt]): at
         // most THREAD_POLICY_INFO_MAX (16) words.
         (Kobject::Thread(t), 3617) => match (arg(req, 0), arg(req, 1)) {
