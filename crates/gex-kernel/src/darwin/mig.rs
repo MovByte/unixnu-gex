@@ -185,6 +185,43 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             }
             r
         }
+        // task_policy_set(task, flavor, policy_info[policy_infoCnt]): at
+        // most TASK_POLICY_INFO_MAX (16) words.
+        (Kobject::Task, 3420) => match (arg(req, 0), arg(req, 1)) {
+            (Some(flavor), Some(cnt)) if (cnt as u32) <= 16 => {
+                let info: Option<Vec<i32>> = (0..cnt as usize).map(|i| arg(req, 2 + i)).collect();
+                match info {
+                    Some(info) => Reply::err(k.dtask.policy.set(flavor, &info, true)),
+                    None => bad(),
+                }
+            }
+            _ => bad(),
+        },
+        // task_policy_get(task, flavor, &policy_infoCnt, &get_default) ->
+        // policy_info[policy_infoCnt], get_default: the count asked for, at
+        // most 16.
+        (Kobject::Task, 3421) => match (arg(req, 0), arg(req, 1), arg(req, 2)) {
+            (Some(flavor), Some(cnt), Some(get_default)) => {
+                let cnt = (cnt as u32).min(16);
+                // task_is_privileged: the security token's uid (one uid here, real and
+                // effective).
+                let privileged = k.creds.uid() == 0;
+                match k.dtask.policy.get(flavor, cnt, get_default != 0, privileged) {
+                    Some(Ok(w)) => {
+                        let mut out = words(&w.iter().map(|&x| x as u32).collect::<Vec<u32>>());
+                        out.extend_from_slice(&get_default.to_le_bytes());
+                        Reply::ok(out)
+                    }
+                    Some(Err(e)) => Reply::err(e),
+                    None => {
+                        let mut r = Reply::err(KERN_FAILURE);
+                        r.unimplemented = Some("task_policy_get's TASK_POLICY_STATE (the importance subsystem's counts and marks)".into());
+                        r
+                    }
+                }
+            }
+            _ => bad(),
+        },
         // mach_port_allocate_name(task, right, name): mach_port_allocate_full
         // with the name asked for; a dead name takes any.
         (Kobject::Task, 3203) => match (arg(req, 0), arg(req, 1)) {

@@ -446,6 +446,162 @@ impl TaskPolicy {
     }
 }
 
+/// `task_policy_flavor_t`s.
+pub mod flavor {
+    pub const CATEGORY_POLICY: i32 = 1;
+    pub const SUPPRESSION_POLICY: i32 = 3;
+    pub const POLICY_STATE: i32 = 4;
+    pub const BASE_QOS_POLICY: i32 = 8;
+    pub const OVERRIDE_QOS_POLICY: i32 = 9;
+    pub const BASE_LATENCY_QOS_POLICY: i32 = 10;
+    pub const BASE_THROUGHPUT_QOS_POLICY: i32 = 11;
+}
+
+/// The flavors' counts, in `integer_t`s.
+const CATEGORY_POLICY_COUNT: u32 = 1;
+const QOS_POLICY_COUNT: u32 = 2;
+const SUPPRESSION_POLICY_COUNT: u32 = 16;
+const POLICY_STATE_COUNT: u32 = 16;
+
+/// `kern_return_t`s.
+const KERN_PROTECTION_FAILURE: i32 = 2;
+const KERN_INVALID_ARGUMENT: i32 = 4;
+
+/// `LATENCY_QOS_TIER_*` and `THROUGHPUT_QOS_TIER_*` (0 is unspecified).
+const LATENCY_TIER: u32 = 0xFF << 16;
+const THROUGHPUT_TIER: u32 = 0xFE << 16;
+
+/// `qos_latency_policy_validate` and `qos_throughput_policy_validate`.
+fn tier_valid(t: u32, base: u32) -> bool {
+    t == 0 || (base | 1..=base | 6).contains(&t)
+}
+
+/// `task_qos_policy_validate`.
+fn qos_policy_validate(info: &[i32]) -> Result<(u8, u8), i32> {
+    if (info.len() as u32) < QOS_POLICY_COUNT {
+        return Err(KERN_INVALID_ARGUMENT);
+    }
+    let (l, t) = (info[0] as u32, info[1] as u32);
+    if !tier_valid(l, LATENCY_TIER) || !tier_valid(t, THROUGHPUT_TIER) {
+        return Err(KERN_INVALID_ARGUMENT);
+    }
+    // qos_extract
+    Ok(((l & 0xFF) as u8, (t & 0xFF) as u8))
+}
+
+/// `qos_latency_policy_package` and `qos_throughput_policy_package`.
+fn package(v: u8, base: u32) -> i32 {
+    if v == 0 { 0 } else { (base | u32::from(v)) as i32 }
+}
+
+impl TaskPolicy {
+    /// `task_policy_set` on the caller's own task (`self_task`), which on
+    /// embedded may not set its own role.
+    pub fn set(&mut self, flavor: i32, info: &[i32], self_task: bool) -> i32 {
+        match flavor {
+            flavor::CATEGORY_POLICY => {
+                if (info.len() as u32) < CATEGORY_POLICY_COUNT || self_task {
+                    return KERN_INVALID_ARGUMENT;
+                }
+                match info[0] {
+                    1 | 2 | 7 => {
+                        self.requested.role = info[0] as u8;
+                        self.update(false);
+                        0
+                    }
+                    // CONTROL_APPLICATION and GRAPHICS_SERVER only for the
+                    // caller's own privileged task.
+                    _ => KERN_INVALID_ARGUMENT,
+                }
+            }
+            flavor::BASE_QOS_POLICY | flavor::OVERRIDE_QOS_POLICY => match qos_policy_validate(info) {
+                Ok((l, t)) => {
+                    if flavor == flavor::BASE_QOS_POLICY {
+                        self.requested.base_latency_qos = l;
+                        self.requested.base_through_qos = t;
+                    } else {
+                        self.requested.over_latency_qos = l;
+                        self.requested.over_through_qos = t;
+                    }
+                    self.update(false);
+                    0
+                }
+                Err(e) => e,
+            },
+            flavor::BASE_LATENCY_QOS_POLICY | flavor::BASE_THROUGHPUT_QOS_POLICY => match qos_policy_validate(info) {
+                Ok((l, t)) => {
+                    if flavor == flavor::BASE_LATENCY_QOS_POLICY {
+                        self.requested.base_latency_qos = l;
+                    } else {
+                        self.requested.base_through_qos = t;
+                    }
+                    self.update(false);
+                    0
+                }
+                Err(e) => e,
+            },
+            // Not enabled on embedded: apps are not de-nap receivers.
+            flavor::SUPPRESSION_POLICY => KERN_INVALID_ARGUMENT,
+            _ => KERN_INVALID_ARGUMENT,
+        }
+    }
+
+    /// `task_policy_get`: the flavor's words (`count` of them, as asked),
+    /// or the error. `privileged`: the caller's euid is 0
+    /// (`task_is_privileged`). `None` for what needs the importance
+    /// subsystem.
+    pub fn get(&self, flavor: i32, count: u32, get_default: bool, privileged: bool) -> Option<Result<Vec<i32>, i32>> {
+        let mut out = vec![0i32; count as usize];
+        match flavor {
+            flavor::CATEGORY_POLICY => {
+                if count < CATEGORY_POLICY_COUNT {
+                    return Some(Err(KERN_INVALID_ARGUMENT));
+                }
+                out[0] = if get_default { 0 } else { i32::from(self.requested.role) };
+            }
+            flavor::BASE_QOS_POLICY | flavor::OVERRIDE_QOS_POLICY => {
+                if count < QOS_POLICY_COUNT {
+                    return Some(Err(KERN_INVALID_ARGUMENT));
+                }
+                if !get_default {
+                    let r = &self.requested;
+                    let (l, t) = if flavor == flavor::BASE_QOS_POLICY { (r.base_latency_qos, r.base_through_qos) } else { (r.over_latency_qos, r.over_through_qos) };
+                    out[0] = package(l, LATENCY_TIER);
+                    out[1] = package(t, THROUGHPUT_TIER);
+                }
+            }
+            flavor::POLICY_STATE => {
+                if count < POLICY_STATE_COUNT {
+                    return Some(Err(KERN_INVALID_ARGUMENT));
+                }
+                if !privileged {
+                    return Some(Err(KERN_PROTECTION_FAILURE));
+                }
+                if !get_default {
+                    return None;
+                }
+            }
+            flavor::SUPPRESSION_POLICY => {
+                if count < SUPPRESSION_POLICY_COUNT {
+                    return Some(Err(KERN_INVALID_ARGUMENT));
+                }
+                if !get_default {
+                    let r = &self.requested;
+                    out[0] = i32::from(r.sup_active);
+                    out[1] = i32::from(r.sup_lowpri_cpu);
+                    out[2] = package(r.sup_timer, LATENCY_TIER);
+                    out[3] = i32::from(r.sup_disk);
+                    out[6] = package(r.sup_throughput, THROUGHPUT_TIER);
+                    out[7] = i32::from(r.sup_cpu);
+                    out[8] = i32::from(r.sup_bg_sockets);
+                }
+            }
+            _ => return Some(Err(KERN_INVALID_ARGUMENT)),
+        }
+        Some(Ok(out))
+    }
+}
+
 /// `proc_darwin_role_to_task_role`: a `PRIO_DARWIN_ROLE_*` as a task role,
 /// `None` for one that is not.
 pub fn darwin_role_to_task_role(r: u32) -> Option<u8> {
