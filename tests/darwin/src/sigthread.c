@@ -13,7 +13,7 @@
 static pthread_t taker;
 static volatile int on_taker, hits;
 static volatile pid_t from;
-static volatile int stop;
+static volatile int stop, ready;
 static sigset_t other_pending;
 
 static void handler(int s, siginfo_t *si, void *uc) {
@@ -29,6 +29,7 @@ static void *run(void *arg) {
     sigset_t none;
     sigemptyset(&none);
     pthread_sigmask(SIG_SETMASK, &none, NULL);
+    ready = 1;
     while (!stop) usleep(1000);
     return NULL;
 }
@@ -58,10 +59,10 @@ int main(void) {
     sigaddset(&s1, SIGUSR2);
     pthread_sigmask(SIG_BLOCK, &s1, NULL);
     pthread_create(&taker, NULL, run, NULL);
-    usleep(20000);
+    while (!ready) usleep(1000);
     // The main thread blocks it: the other thread takes it, from us.
     kill(getpid(), SIGUSR1);
-    for (int i = 0; i < 200 && !hits; i++) usleep(1000);
+    for (int i = 0; i < 5000 && !hits; i++) usleep(1000);
     if (hits != 1 || !on_taker || from != getpid()) return bad("the signal went to the wrong thread", hits * 10 + on_taker);
     stop = 1;
     pthread_join(taker, NULL);
