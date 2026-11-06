@@ -21,6 +21,9 @@ pub const fn native(darwin: i32) -> crate::errno::Errno {
 /// `EBADEXEC`.
 pub const EBADEXEC: crate::errno::Errno = native(85);
 
+/// `EBADMACHO`.
+pub const EBADMACHO: crate::errno::Errno = native(88);
+
 /// Darwin's number for a Linux errno.
 pub fn to_darwin(linux: i32) -> i32 {
     match linux {

@@ -6,12 +6,29 @@
 # A dynamic program needs a Darwin root (GEX_DARWIN_ROOT: dyld and the
 # shared cache, as UniXNU's webroot lays them out) and runs from inside it.
 # Without one it is skipped, or fails when it was asked for by name.
+#
+# The system boots with the device's payload (GEX_DARWIN_BOOT: its trust
+# cache bundle) with these programs' cdhashes added to its static trust
+# cache, as an owner adds their own code: AMFI runs only trusted code.
 set -u
 
 HERE=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 ROOT=$(CDPATH='' cd -- "$HERE/../.." && pwd)
 GEXC=${GEXC:-$ROOT/target/release/gexc}
 [ -d "$HERE/bin" ] || "$HERE/build.sh" >/dev/null
+
+BOOT=$HERE/bin/boot
+mkdir -p "$BOOT"
+# (untrusted is the one left out.)
+progs=$(find "$HERE/bin" -maxdepth 1 -type f ! -name untrusted | sort)
+if [ -n "${GEX_DARWIN_BOOT:-}" ]; then
+    # shellcheck disable=SC2086
+    python3 -I "$ROOT/tools/darwin-trust-cache.py" -o "$BOOT/TrustCache" --bundle "$GEX_DARWIN_BOOT/TrustCache" $progs || exit 1
+else
+    # shellcheck disable=SC2086
+    python3 -I "$ROOT/tools/darwin-trust-cache.py" -o "$BOOT/TrustCache" $progs || exit 1
+fi
+export GEX_DARWIN_BOOT="$BOOT"
 
 fail=0
 named=$#
@@ -119,6 +136,14 @@ hello from /var/tmp/gex-exec-fat with 1 argument" 0
     startsusp) check_root startsusp "startsusp ok" 0 ;;
     readports) check_root readports "readports ok" 0 ;;
     taskthreads) check_root taskthreads "taskthreads ok" 0 ;;
+    amfi)
+        if [ -n "${GEX_DARWIN_ROOT:-}" ]; then
+            mkdir -p "$GEX_DARWIN_ROOT/var/tmp"
+            cp "$HERE/bin/untrusted" "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-untrusted"
+            cp "$HERE/bin/gta" "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-gta"
+        fi
+        check_root amfi "amfi ok" 0
+        ;;
     cfrunloop) check_root cfrunloop "cfrunloop 3 1" 0 ;;
     xpc-anon) check_root xpc-anon "xpc-anon 42" 0 ;;
     *)
@@ -133,7 +158,7 @@ if [ "$named" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads cfrunloop xpc-anon; do
+    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi cfrunloop xpc-anon; do
         run "$p"
     done
 fi

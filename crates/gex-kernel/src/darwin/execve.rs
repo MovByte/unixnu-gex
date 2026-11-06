@@ -43,7 +43,7 @@ fn ebadarch() -> Errno {
     super::errno::native(86)
 }
 fn ebadmacho() -> Errno {
-    super::errno::native(88)
+    super::errno::EBADMACHO
 }
 
 /// What exec found to run: the file and slice the host loads, and the
@@ -59,6 +59,10 @@ pub struct Image {
     pub strings: Strings,
     /// A spawn's, what the child takes after its switch.
     pub spawn: Option<super::spawn::After>,
+    /// The image's signature as its load added it, and the load's code
+    /// signing flags ([`Kernel::darwin_load_signatures`]).
+    pub sig: Option<std::sync::Arc<super::codesign::CodeSign>>,
+    pub load_csflags: u32,
 }
 
 /// An activator's answer: `-1`, `-2`, `-3`, or the image claimed.
@@ -152,6 +156,17 @@ fn fat_validate(h: &[u8], file_size: u64) -> Result<(), Errno> {
 /// `(cputype, cpusubtype, offset, size)`.
 fn fat_best(h: &[u8]) -> Result<(u32, u32, u32, u32), Errno> {
     fat_getarch(h, cpu::TYPE_ARM64, cpu::ARCH_MASK, cpu::SUBTYPE_ANY)
+}
+
+/// A file's Mach-O for this host: a fat file's best graded slice, or the
+/// whole file. `(offset, size)`.
+pub(crate) fn best_slice(b: &[u8]) -> Result<(u64, u64), Errno> {
+    if b.len() >= 4 && be32(b, 0) == mh::FAT_MAGIC {
+        fat_validate(b, b.len() as u64)?;
+        let (_, _, off, size) = fat_best(b)?;
+        return Ok((u64::from(off), u64::from(size)));
+    }
+    Ok((0, b.len() as u64))
 }
 
 /// `fatfile_getarch`: the best graded slice that matches the type asked
@@ -250,7 +265,12 @@ impl Kernel {
                 }
             }
         }
-        Ok(Image { path: img.path, arch_offset: img.arch_offset, arch_size: img.arch_size, cputype: img.origcputype, cpusubtype: img.origcpusubtype, strings: img.strings, spawn: None })
+        // load_machfile's signatures, before the exec commits.
+        let bytes = self.read_file(&img.path).ok_or(Errno::EIO)?;
+        let size = if img.arch_size != 0 { img.arch_size } else { bytes.len() as u64 };
+        let slice = bytes.get(img.arch_offset as usize..(img.arch_offset + size) as usize).ok_or(ebadmacho())?;
+        let (sig, load_csflags) = self.darwin_load_signatures(&img.path, img.arch_offset, slice)?;
+        Ok(Image { path: img.path, arch_offset: img.arch_offset, arch_size: img.arch_size, cputype: img.origcputype, cpusubtype: img.origcpusubtype, strings: img.strings, spawn: None, sig, load_csflags })
     }
 
     /// `namei` of the saved path, links followed, then
@@ -464,6 +484,8 @@ impl Kernel {
             dispatchqueue_label_offset: old.dispatchqueue_label_offset,
             policy: old.policy,
             said: old.said,
+            // p_csflags: the exec's own, made at its start from these.
+            csflags: old.csflags,
             // Until the image's policies make it (`vm_map_set_max_addr`).
             map_max: spawn.map_or(0, |s| s.max_addr),
             ..Default::default()

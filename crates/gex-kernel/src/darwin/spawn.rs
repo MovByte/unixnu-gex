@@ -209,6 +209,10 @@ impl Kernel {
             dispatchqueue_label_offset: t.dispatchqueue_label_offset,
             vm: t.vm.inherited(),
             map_max: t.map_max,
+            // The child runs this image, with this credential's
+            // entitlements, and its code signing flags but CS_KILLED.
+            codesign: t.codesign.clone(),
+            csflags: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(t.csflags.load(std::sync::atomic::Ordering::Acquire) & !super::amfi::cs::KILLED)),
             ..super::Task::new_process()
         }
     }
@@ -380,6 +384,8 @@ impl Kernel {
         // fork1(PROC_CREATE_SPAWN): a new process of this one's, no memory.
         self.darwin_child_ports();
         let mut child = self.fork_kernel();
+        // A spawn is not a fork: CS_GET_TASK_ALLOW is not inherited.
+        child.dtask.csflags.fetch_and(!super::amfi::cs::GET_TASK_ALLOW, std::sync::atomic::Ordering::AcqRel);
         let pid = self.procs.spawn(self.pid);
         // The spawner's NOTE_FORK, whatever becomes of the child.
         crate::procnote::post(self.pid, crate::procnote::note::FORK | pid as u32);
@@ -442,11 +448,8 @@ impl Kernel {
                 return Err(e);
             }
         }
-        // The image's signature, as activation attaches it.
-        child.dtask.codesign = self.read_file(&img.path).and_then(|b| {
-            let s = b.get(img.arch_offset as usize..(img.arch_offset + img.arch_size) as usize)?;
-            super::codesign::CodeSign::of_macho(s)
-        });
+        // The image's signature, as its load added it.
+        child.dtask.codesign = img.sig.as_deref().cloned();
         // exec_handle_exception_port_actions: now that the child's
         // signature is known, its exception ports as task_set_exception_ports
         // sets them (each held right consumed when set).

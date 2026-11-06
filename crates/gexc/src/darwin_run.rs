@@ -3,7 +3,8 @@
 //! A static program (no `LC_LOAD_DYLINKER`) is mapped as it is and started
 //! at its `LC_UNIXTHREAD` pc. A dynamic one starts in dyld, read from the
 //! Darwin root (`--sysroot`), with the shared cache mapped where it was
-//! linked: the root's cryptex copy, or `GEX_DARWIN_CACHE`.
+//! linked: the root's cryptex copy, or `GEX_DARWIN_CACHE`. The system
+//! boots with the payload in `GEX_DARWIN_BOOT` (its trust cache bundle).
 
 use crate::{choose_mem, report_exit, set_wasm_libs, RunArgs};
 use anyhow::{bail, Context, Result};
@@ -59,6 +60,8 @@ pub fn run(mut ra: RunArgs, bytes: &[u8]) -> Result<ExitCode> {
         ra.opts.env.push("MallocNanoZone=0".into());
     }
     ra.opts.darwin = true;
+    // The boot payload: the trust caches the system boots with.
+    ra.opts.darwin_boot = std::env::var_os("GEX_DARWIN_BOOT").map(PathBuf::from);
     ra.opts.darwin_strict = std::env::var("GEX_DARWIN_STRICT").is_ok_and(|v| v == "1");
     // Its commpage is folded below 4 GiB in everything translated for it,
     // which needs the addresses its code builds in registers seen as the

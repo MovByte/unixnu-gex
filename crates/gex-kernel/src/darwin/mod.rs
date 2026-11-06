@@ -13,6 +13,7 @@ use crate::errno::Errno;
 use crate::GuestMem;
 use gex_abi::ctx;
 
+pub mod amfi;
 pub mod applematch;
 pub mod attrcall;
 pub mod attrlist;
@@ -60,10 +61,26 @@ pub mod threadstate;
 pub mod thread;
 pub mod timer;
 pub mod triage;
+pub mod trustcache;
 pub mod vm;
 pub mod voucher;
 pub mod wait;
 pub mod workq;
+
+
+/// The boot loader's payload, as the kernel takes it at boot: the trust
+/// cache bundle (`/chosen/memory-map/TrustCache`), whose first module is
+/// the static trust cache (`load_static_trust_cache`; one that does not
+/// load is the kernel's panic). Without one there are no trust caches.
+/// Once per system.
+pub fn boot(trust_cache: Option<&[u8]>) -> Result<(), String> {
+    let m = match trust_cache {
+        Some(b) => Some(trustcache::load_bundle(b).map_err(|e| format!("failed to load static trust cache module: 0 ({e:?})"))?),
+        None => None,
+    };
+    trustcache::set_static(m);
+    Ok(())
+}
 
 /// A Darwin process's kernel state beyond the BSD side's: its threads and
 /// what they wait on.
@@ -121,8 +138,11 @@ pub struct Task {
     pub kevents: kevent::Kevents,
     /// The process's vouchers and their attribute managers' state.
     pub vouchers: voucher::Vouchers,
-    /// The program's code signature, when it has one.
+    /// The program's code signature, when it has one, with the entitlements
+    /// its credential carries.
     pub codesign: Option<codesign::CodeSign>,
+    /// `p_csflags`, which another process reads and changes (csops).
+    pub csflags: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// `P_LADVLOCK`: the process has taken a POSIX record lock.
     pub ladvlock: bool,
     /// Threads whose lock requests another thread or process woke.
@@ -205,7 +225,7 @@ impl crate::syscalls::Kernel {
                 let pending = old.as_ref().map(|l| std::mem::take(&mut *l.mailbox.lock().unwrap_or_else(|e| e.into_inner()))).unwrap_or_default();
                 let name_port = old.and_then(|l| l.name_port.lock().unwrap_or_else(|e| e.into_inner()).take());
                 let ring = !pending.is_empty();
-                let link = std::sync::Arc::new(ipc::TaskLink { mailbox: std::sync::Mutex::new(pending), bell, pid: self.pid, name_port: std::sync::Mutex::new(name_port), codesign: self.dtask.codesign.clone() });
+                let link = std::sync::Arc::new(ipc::TaskLink { mailbox: std::sync::Mutex::new(pending), bell, pid: self.pid, name_port: std::sync::Mutex::new(name_port), codesign: self.dtask.codesign.clone(), csflags: std::sync::Arc::clone(&self.dtask.csflags) });
                 ipc.links.insert(ipc.task, std::sync::Arc::clone(&link));
                 if ring {
                     link.bell.ring();

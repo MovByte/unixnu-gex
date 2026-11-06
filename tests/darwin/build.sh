@@ -23,21 +23,31 @@ for p in hello-static bsd-carry commpage exclusive-pair aes; do
         -o "$OUT/$p" "$HERE/src/$p.c"
 done
 
-for p in hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads xpc-anon; do
+for p in hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi xpc-anon; do
     cc -O2 -o "$OUT/$p" "$HERE/src/$p.c"
 done
 cc -O2 -framework CoreFoundation -o "$OUT/cfrunloop" "$HERE/src/cfrunloop.c"
-# codesig reads its own signature: signed ad hoc, as the linker leaves an
-# iOS program unsigned.
-codesign -s - -f "$OUT/codesig" 2>/dev/null
-# apple checks the cdhash exec hands it: signed as every iOS program is.
-codesign -s - -f "$OUT/apple" 2>/dev/null
-# memlimit sets its own memory limit, which memorystatus allows an
-# entitled task.
-codesign -s - -f --entitlements "$HERE/src/memlimit.entitlements" "$OUT/memlimit" 2>/dev/null
-# exec's images: an arm64e slice (no pointer authentication on this CPU),
-# and a fat file of it and the arm64 one exec picks.
+# amfi's: a program in no trust cache, and one holding get-task-allow.
+cc -O2 -o "$OUT/untrusted" "$HERE/src/hello.c"
+cc -O2 -o "$OUT/gta" "$HERE/src/hello.c"
+# exec's images: an arm64e slice (no pointer authentication on this CPU).
 xcrun -sdk iphoneos clang -target arm64e-apple-ios17.0 -O2 -o "$OUT/hello-arm64e" "$HERE/src/hello.c"
+# Every iOS program is signed (the linker leaves one unsigned): ad hoc,
+# for the run's trust cache to hold. memlimit sets its own memory limit,
+# which memorystatus allows an entitled task.
+for f in "$OUT"/*; do
+    if [ -f "$f" ]; then
+        codesign -s - -f "$f" 2>/dev/null
+    fi
+done
+codesign -s - -f --entitlements "$HERE/src/memlimit.entitlements" "$OUT/memlimit" 2>/dev/null
+codesign -s - -f --entitlements "$HERE/src/gta.entitlements" "$OUT/gta" 2>/dev/null
+# The exception tests set handlers of every behavior: a platform program
+# (a hardened one) may only with the entitlement that allows it.
+for p in excports excdeliver readports; do
+    codesign -s - -f --entitlements "$HERE/src/exc.entitlements" "$OUT/$p" 2>/dev/null
+done
+# A fat file of the arm64e slice and the arm64 one exec picks.
 lipo -create "$OUT/hello" "$OUT/hello-arm64e" -output "$OUT/hello-fat"
 
 echo "built: $(cd "$OUT" && ls | tr '\n' ' ')"

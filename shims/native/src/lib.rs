@@ -233,6 +233,9 @@ pub struct RunOptions {
     pub darwin_stacksize: u64,
     /// `LC_LOAD_DYLINKER`'s path, as the guest names it.
     pub darwin_dylinker: Option<String>,
+    /// The boot payload's directory (`GEX_DARWIN_BOOT`): the trust cache
+    /// bundle the boot loader hands the kernel (`TrustCache`).
+    pub darwin_boot: Option<std::path::PathBuf>,
     /// Run ahead-of-time code only (`aot_only`): an ejected Windows
     /// program's runtime, with no tier-1 module and no run-time translator.
     pub aot_only: bool,
@@ -250,6 +253,7 @@ impl Default for RunOptions {
             darwin_code_signature: None,
             darwin_stacksize: 0,
             darwin_dylinker: None,
+            darwin_boot: None,
             args: Vec::new(),
             env: Vec::new(),
             trace: false,
@@ -1140,13 +1144,24 @@ fn run_program_with(
     // here (the browser has a shim per process).
     kernel.compat = program.compat();
     kernel.darwin = opts.darwin;
+    // The system boots once: an exec's process runs on the same system.
+    if opts.darwin && fresh {
+        let tc = match &opts.darwin_boot {
+            Some(dir) => match std::fs::read(dir.join("TrustCache")) {
+                Ok(b) => Some(b),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => anyhow::bail!("reading {}: {e}", dir.join("TrustCache").display()),
+            },
+            None => None,
+        };
+        gex_kernel::darwin::boot(tc.as_deref()).map_err(|e| anyhow!("the boot payload: {e}"))?;
+    }
     if opts.darwin {
         kernel.darwin_use_pages();
     }
     kernel.darwin_dyld_infos = opts.darwin_dyld_infos;
     kernel.dtask.strict = opts.darwin_strict;
     kernel.dtask.platform = opts.darwin_platform;
-    kernel.dtask.codesign = opts.darwin_code_signature.as_deref().map(gex_kernel::darwin::codesign::CodeSign::parse);
     // An exec takes the next pidversion (`proc_setpidversion`).
     if opts.darwin {
         kernel.dtask.pidversion = gex_kernel::darwin::next_pidversion();
@@ -4501,6 +4516,7 @@ fn place_image(
                     exe_path: &path,
                     file_start: exec.as_ref().map_or(0, |i| i.arch_offset),
                     code_signature: opts.darwin_code_signature.as_deref(),
+                    signature: exec.as_ref().map(|i| (i.sig.clone(), i.load_csflags)),
                     nano: exec.as_ref().and_then(|i| i.spawn.as_ref()).is_some_and(|sp| sp.flags & gex_kernel::darwin::spawn::flag::NANO_ALLOCATOR != 0),
                 };
                 k.darwin_start(exec.map(|i| i.strings), &loaded, gex_abi::STACK_TOP)

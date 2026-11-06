@@ -311,6 +311,10 @@ pub struct Loaded<'a> {
     pub file_start: u64,
     /// Its `LC_CODE_SIGNATURE` blob.
     pub code_signature: Option<&'a [u8]>,
+    /// An exec's image's signature as its load added it and the load's
+    /// code signing flags; none for the run's first program, whose load is
+    /// done here.
+    pub signature: Option<(Option<std::sync::Arc<super::codesign::CodeSign>>, u32)>,
     /// `_POSIX_SPAWN_NANO_ALLOCATOR` among a spawn's flags.
     pub nano: bool,
 }
@@ -433,6 +437,24 @@ impl Kernel {
     /// `strings` is the exec's area; the run's first program has its
     /// path and vectors from the kernel.
     fn darwin_start_body(&mut self, strings: Option<Strings>, l: &Loaded, user_stack: u64) -> Result<MainStack, Errno> {
+        // The image's code signing flags and its credential's
+        // entitlements; the policy's refusal kills the exec.
+        let (sig, load) = match l.signature.clone() {
+            Some(s) => s,
+            None => {
+                let bytes = self.read_file(l.exe_path).ok_or(Errno::EIO)?;
+                let (off, size) = super::execve::best_slice(&bytes)?;
+                let slice = bytes.get(off as usize..(off + size) as usize).ok_or(super::errno::EBADMACHO)?;
+                self.darwin_load_signatures(l.exe_path, off, slice)?
+            }
+        };
+        if let Err(why) = self.darwin_exec_csflags(sig, load) {
+            if self.trace {
+                eprintln!("[gex:{}] AMFI: killing {}: {why}", self.pid, l.exe_path);
+            }
+            return Err(Errno::EPERM);
+        }
+        self.darwin_launch_constraints()?;
         // The image's entitlements that raise its default memory limit.
         self.darwin_jetsam_entitlements();
         self.darwin_vm_policies();
@@ -470,13 +492,6 @@ impl Kernel {
         };
         self.darwin_user_stack = user_stack;
         self.dtask.custom_stack = custom;
-        // load_code_signature: the executable's signature on its vnode
-        // (ubc_cs_blob_add), refused as LOAD_FAILURE when it is not valid.
-        if let Some(blob) = l.code_signature {
-            let abs = self.vfs.absolute(l.exe_path);
-            let ino = self.vfs.metadata(&abs)?.ino;
-            super::codesign::register_blob((self.vfs.mount_id_of(&abs), ino), l.file_start as i64, blob)?;
-        }
         self.darwin_apple_strings(&mut s, l, [user_stack, stack_size, alloc, alloc_size])?;
         let (mut sp, mut bytes) = s.copyout(user_stack)?;
         if l.dylinker.is_some() {
