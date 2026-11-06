@@ -234,7 +234,8 @@ pub struct RunOptions {
     /// `LC_LOAD_DYLINKER`'s path, as the guest names it.
     pub darwin_dylinker: Option<String>,
     /// The boot payload's directory (`GEX_DARWIN_BOOT`): the trust cache
-    /// bundle the boot loader hands the kernel (`TrustCache`).
+    /// bundle the boot loader hands the kernel (`TrustCache`) and the
+    /// Sandbox kext's platform profile (`sandbox_profile.bin`).
     pub darwin_boot: Option<std::path::PathBuf>,
     /// Run ahead-of-time code only (`aot_only`): an ejected Windows
     /// program's runtime, with no tier-1 module and no run-time translator.
@@ -1146,15 +1147,18 @@ fn run_program_with(
     kernel.darwin = opts.darwin;
     // The system boots once: an exec's process runs on the same system.
     if opts.darwin && fresh {
-        let tc = match &opts.darwin_boot {
-            Some(dir) => match std::fs::read(dir.join("TrustCache")) {
-                Ok(b) => Some(b),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                Err(e) => anyhow::bail!("reading {}: {e}", dir.join("TrustCache").display()),
-            },
-            None => None,
+        // The boot payload's files: absent is none.
+        let read = |name: &str| -> Result<Option<Vec<u8>>> {
+            let Some(dir) = &opts.darwin_boot else { return Ok(None) };
+            match std::fs::read(dir.join(name)) {
+                Ok(b) => Ok(Some(b)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => anyhow::bail!("reading {}: {e}", dir.join(name).display()),
+            }
         };
-        gex_kernel::darwin::boot(tc.as_deref()).map_err(|e| anyhow!("the boot payload: {e}"))?;
+        let tc = read("TrustCache")?;
+        let sandbox = read("sandbox_profile.bin")?;
+        gex_kernel::darwin::boot(tc.as_deref(), sandbox).map_err(|e| anyhow!("the boot payload: {e}"))?;
     }
     if opts.darwin {
         kernel.darwin_use_pages();

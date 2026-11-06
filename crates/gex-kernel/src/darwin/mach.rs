@@ -522,8 +522,8 @@ impl Kernel {
             trap::HOST_CREATE_MACH_VOUCHER => self.host_create_mach_voucher_trap(m, w(0), a[1], a[2] as i32, a[3]),
             trap::MACH_VOUCHER_EXTRACT_ATTR_RECIPE => self.mach_voucher_extract_attr_recipe_trap(m, w(0), w(1), a[2], a[3]),
             trap::TASK_NAME_FOR_PID => self.task_name_for_pid(m, w(0), a[1] as i32, a[2]),
+            trap::TASK_FOR_PID => self.task_for_pid(m, w(0), a[1] as i32, a[2]),
             trap::CLOCK_SLEEP
-            | trap::TASK_FOR_PID
             | trap::DEBUG_CONTROL_PORT_FOR_PID
             | trap::IOKIT_USER_CLIENT => {
                 self.darwin_unimplemented(format!("Mach trap {t}"));
@@ -559,9 +559,15 @@ impl Kernel {
             let _ = m.write_u32(at, 0);
             return kr::FAILURE;
         }
-        // proc_task: the process's task, if it has one here.
+        // proc_task: the process's task, if it has one here; the policies'
+        // say on its name port.
         let ipc = self.ipc();
         let task = if pid == me { Some(ipc.task) } else { ipc.links.iter().find(|(_, l)| l.pid == pid).map(|(&t, _)| t) };
+        if task.is_some() && self.darwin_mac_check_get_task(pid, super::amfi::flavor::NAME) != 0 {
+            let _ = m.write_u32(at, 0);
+            return kr::FAILURE;
+        }
+        let ipc = self.ipc();
         let port = task.and_then(|t| ipc.task_name_port(t));
         // convert_task_name_to_port, ipc_port_copyout_send.
         let name = match port {
@@ -573,6 +579,99 @@ impl Kernel {
         };
         let _ = m.write_u32(at, name);
         kr::SUCCESS
+    }
+
+    /// `port_name_to_task`: the name is a send right to some task's control
+    /// port.
+    fn darwin_name_is_some_task(&mut self, target: u32) -> bool {
+        let ipc = self.ipc();
+        super::ipc::name_valid(target)
+            && ipc.translate_send(target).is_ok_and(|p| {
+                let p = ipc.port(p);
+                p.active && p.kobject == Some(super::ipc::Kobject::Task)
+            })
+    }
+
+    /// `task_for_pid_posix_check`: a live target, and a caller that is
+    /// root, the target itself, or of the target's user, with the target's
+    /// groups among its own and the target not having changed identity.
+    fn darwin_tfp_posix_check(&mut self, pid: i32) -> bool {
+        let Some((tuid, _)) = self.procs.live_nice(pid) else { return false };
+        if self.creds.uid() == 0 || pid == self.pid {
+            return true;
+        }
+        if tuid != self.creds.uid() {
+            return false;
+        }
+        self.darwin_unimplemented("task_for_pid_posix_check of another process of the same user (its groups, saved uid and P_SUGID)".into());
+        false
+    }
+
+    /// `task_for_pid(target_tport, pid, t)` (vm_unix.c): process `pid`'s
+    /// task control port, for a caller holding some task's control port,
+    /// that passes the POSIX check and the policies' (AMFI allows it only
+    /// with Developer Mode); the caller's own is its pinned self port,
+    /// another's is dead without Developer Mode (task_conversion_eval).
+    /// The name, or null, is copied out either way.
+    fn task_for_pid(&mut self, m: &mut GuestMem<'_>, target: u32, pid: i32, at: u64) -> u64 {
+        let fail = |m: &mut GuestMem<'_>, r: u64| {
+            let _ = m.write_u32(at, 0);
+            r
+        };
+        if pid == 0 || !self.darwin_name_is_some_task(target) {
+            return fail(m, kr::FAILURE);
+        }
+        if self.procs.live_nice(pid).is_none() || !self.darwin_tfp_posix_check(pid) {
+            return fail(m, kr::FAILURE);
+        }
+        if self.darwin_mac_check_get_task(pid, super::amfi::flavor::CONTROL) != 0 {
+            return fail(m, kr::FAILURE);
+        }
+        let name = if pid == self.pid {
+            let p = self.darwin_task_self_port();
+            self.ipc().make_send(p);
+            self.darwin_copyout_send(p)
+        } else if !super::amfi::DEVELOPER_MODE {
+            super::ipc::PORT_DEAD
+        } else {
+            self.darwin_unimplemented("task_for_pid of another process (its task access port and control port)".into());
+            return fail(m, kr::FAILURE);
+        };
+        let _ = m.write_u32(at, name);
+        kr::SUCCESS
+    }
+
+    /// `task_read_for_pid` and `task_inspect_for_pid` (system calls with
+    /// errnos): the read or inspect port of process `pid`, after the POSIX
+    /// check and the policies'.
+    pub(crate) fn darwin_task_flavor_for_pid(&mut self, m: &mut GuestMem<'_>, target: u32, pid: i32, at: u64, f: u32) -> Result<u64, crate::errno::Errno> {
+        use crate::errno::Errno;
+        let out = |m: &mut GuestMem<'_>, name: u32| m.write_u32(at, name);
+        if pid == 0 {
+            out(m, 0)?;
+            return Err(Errno::EPERM);
+        }
+        if !self.darwin_name_is_some_task(target) {
+            out(m, 0)?;
+            return Err(Errno::EINVAL);
+        }
+        if self.procs.live_nice(pid).is_none() {
+            out(m, 0)?;
+            return Err(Errno::ESRCH);
+        }
+        if !self.darwin_tfp_posix_check(pid) || self.darwin_mac_check_get_task(pid, f) != 0 {
+            out(m, 0)?;
+            return Err(Errno::EPERM);
+        }
+        if pid != self.pid {
+            self.darwin_unimplemented("task_read_for_pid/task_inspect_for_pid of another process (its task access port and flavored port)".into());
+            out(m, 0)?;
+            return Err(Errno::EPERM);
+        }
+        let p = self.darwin_task_flavor_port(if f == super::amfi::flavor::READ { super::kobject::flavor::READ } else { super::kobject::flavor::INSPECT });
+        let name = self.darwin_copyout_send(p);
+        out(m, name)?;
+        Ok(0)
     }
 
     /// A `_kernelrpc` trap on the task's space, after the target check.

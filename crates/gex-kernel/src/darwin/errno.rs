@@ -18,6 +18,15 @@ pub const fn native(darwin: i32) -> crate::errno::Errno {
     crate::errno::Errno(NATIVE + darwin)
 }
 
+/// A Darwin errno as gex carries it: its Linux number, or past
+/// [`NATIVE`] when Linux has none.
+pub fn errno_of(darwin: i32) -> crate::errno::Errno {
+    match (1..=133).find(|&l| to_darwin(l) == darwin) {
+        Some(l) => crate::errno::Errno(l),
+        None => native(darwin),
+    }
+}
+
 /// `EBADEXEC`.
 pub const EBADEXEC: crate::errno::Errno = native(85);
 

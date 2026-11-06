@@ -125,6 +125,15 @@ pub fn get(oid: &[i32]) -> Option<Value> {
     table().into_iter().find(|(_, o, _)| o.as_slice() == oid).map(|(_, _, v)| v)
 }
 
+/// `kern.osreleasetype`: launchd sets it once, from SystemVersion.plist's
+/// ReleaseType; empty before.
+static OSRELEASETYPE: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+/// `kern.osreleasetype`'s value.
+pub fn os_release_type() -> Vec<u8> {
+    OSRELEASETYPE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

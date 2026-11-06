@@ -38,7 +38,7 @@ const APPS_IDLE_RATIO: u64 = SYSPROCS_IDLE_RATIO_LOW;
 /// The device tree's `kern.max_task_pmem` for j120ap: the system-wide task
 /// limit, in MB. `kern.entitled_max_task_pmem` is absent (0).
 pub const MAX_TASK_FOOTPRINT_MB: i32 = 3072;
-const ENTITLED_MAX_TASK_FOOTPRINT_MB: i32 = 0;
+pub const ENTITLED_MAX_TASK_FOOTPRINT_MB: i32 = 0;
 /// `legacy_footprint_bonus_mb`, with `legacy_footprint_entitlement_mode`
 /// at its default, LEGACY_FOOTPRINT_ENTITLEMENT_LIMIT_INCREASE.
 const LEGACY_FOOTPRINT_BONUS_MB: i32 = 50;

@@ -181,9 +181,13 @@ impl Kernel {
         let mapanon = flags & ANON != 0;
         let mut superpage = false;
         if mapanon {
-            // mac_proc_check_map_anon: AMFI's say on a JIT region.
+            // mac_proc_check_map_anon: AMFI's and Sandbox's say on a JIT
+            // region (neither has one on another mapping).
             if flags & JIT != 0 {
-                self.darwin_unimplemented("mmap MAP_JIT (AMFI's map_anon check and JIT regions)".into());
+                if self.darwin_mac_check_map_jit(u32::from(cur)) != 0 {
+                    return Err(Errno::EINVAL);
+                }
+                self.darwin_unimplemented("mmap MAP_JIT of an entitled process (its JIT region)".into());
                 return Err(Errno::EINVAL);
             }
             // A descriptor carries VM flags: the tag, a superpage size.
@@ -437,11 +441,13 @@ impl Kernel {
         if base != 0 {
             self.dtask.vm.set(base, base + size, Attrs { kind: kind::SUBMAP, ..Attrs::default() });
         }
-        // mac_proc_check_map_anon(MAP_JIT) is AMFI's.
-        if self.darwin_task_entitled("dynamic-codesigning") {
-            self.darwin_unimplemented("AMFI's MAP_JIT check of an entitled image (its jumbo map)".into());
+        // A JIT-entitled image (mac_proc_check_map_anon's MAP_JIT probe)
+        // gets a jumbo map and its single JIT region.
+        let jit = self.darwin_mac_check_map_jit(0) == 0;
+        if jit {
+            self.darwin_unimplemented("a JIT-entitled image's map (vm_map_set_jit_entitled)".into());
         }
-        let jumbo = self.darwin_task_entitled("com.apple.developer.kernel.extended-virtual-addressing");
+        let jumbo = jit || self.darwin_task_entitled("com.apple.developer.kernel.extended-virtual-addressing") || (super::memorystatus::ENTITLED_MAX_TASK_FOOTPRINT_MB != 0 && self.darwin_task_entitled("com.apple.developer.kernel.increased-memory-limit"));
         let mut max = if jumbo { vm::JUMBO_MAX } else { vm::MAP_MAX };
         let want = self.dtask.map_max & !PAGE_MASK;
         if want > max {

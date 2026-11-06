@@ -448,6 +448,7 @@ impl Kernel {
                 self.darwin_load_signatures(l.exe_path, off, slice)?
             }
         };
+        self.dtask.textoff = l.file_start as i64;
         if let Err(why) = self.darwin_exec_csflags(sig, load) {
             if self.trace {
                 eprintln!("[gex:{}] AMFI: killing {}: {why}", self.pid, l.exe_path);

@@ -577,8 +577,10 @@ pub struct TaskLink {
     pub name_port: Mutex<Option<ObjId>>,
     /// Its code signature, for its entitlements.
     pub codesign: Option<super::codesign::CodeSign>,
-    /// Its process's `p_csflags`.
+    /// Its process's `p_csflags`, `p_idversion` and `p_textoff`.
     pub csflags: Arc<std::sync::atomic::AtomicU32>,
+    pub pidversion: i32,
+    pub textoff: i64,
 }
 
 /// What every task shares: the ports and sets (XNU's are kernel objects,

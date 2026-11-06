@@ -82,13 +82,47 @@ mod f {
 /// `MAXPATHLEN`.
 const MAXPATHLEN: usize = 1024;
 
-/// AMFI's `__mac_syscall` for dyld's policy: every relaxation allowed
-/// (paths, path variables, fallback paths, printing, interposing).
-const AMFI_DYLD_POLICY_SELF: u64 = 90;
-const AMFI_DYLD_OUTPUT_ALL: u64 = 0xff;
+/// AMFI's `__mac_syscall` calls: dyld's policy for the caller, and for
+/// another process; whether a cdhash is in a trust cache; the local
+/// signing keys and trust cache loading, and launch constraints.
+mod amfi_call {
+    pub const DYLD_POLICY_SELF: u64 = 90;
+    pub const DYLD_POLICY_FOR_PID: u64 = 91;
+    pub const CHECK_TRUST_CACHE: u64 = 95;
+    pub const GET_LOCAL_SIGNING_PRIVATE_KEY: u64 = 97;
+}
 
-/// The Sandbox policy's `__mac_syscall` for `sandbox_get_container_expected`.
+/// The Sandbox policy's `__mac_syscall` calls: `sandbox_check` and its
+/// variants, and `sandbox_get_container_expected`.
+const SANDBOX_CHECK: u64 = 2;
 const SANDBOX_CONTAINER_EXPECTED: u64 = 67;
+
+/// `CS_OPS_*`.
+mod csop {
+    pub const STATUS: u32 = 0;
+    pub const MARKINVALID: u32 = 1;
+    pub const MARKHARD: u32 = 2;
+    pub const MARKKILL: u32 = 3;
+    pub const CDHASH: u32 = 5;
+    pub const PIDOFFSET: u32 = 6;
+    pub const ENTITLEMENTS_BLOB: u32 = 7;
+    pub const MARKRESTRICT: u32 = 8;
+    pub const SET_STATUS: u32 = 9;
+    pub const BLOB: u32 = 10;
+    pub const IDENTITY: u32 = 11;
+    pub const CLEARINSTALLER: u32 = 12;
+    pub const CLEARPLATFORM: u32 = 13;
+    pub const TEAMID: u32 = 14;
+    pub const CLEAR_LV: u32 = 15;
+    pub const DER_ENTITLEMENTS_BLOB: u32 = 16;
+    pub const VALIDATION_CATEGORY: u32 = 17;
+}
+
+/// `MAC_MAX_POLICY_NAME`.
+const MAC_MAX_POLICY_NAME: usize = 32;
+
+/// `ENOPOLICY`, `ENOSYS` and `ENOTSUP` as Darwin numbers them.
+const ENOPOLICY: i32 = 103;
 
 /// A mount, as `getfsstat64` reports it.
 pub struct Mount {
@@ -430,7 +464,12 @@ impl Kernel {
                 return None;
             }
             sys::SIGPROCMASK | sys::PTHREAD_SIGMASK => res(self.darwin_sigprocmask(m, a[0], a[1], a[2])),
-            sys::CSOPS | sys::CSOPS_AUDITTOKEN => res(self.darwin_csops(m, a[1], a[2], a[3])),
+            sys::TASK_READ_FOR_PID => res(self.darwin_task_flavor_for_pid(m, a[0] as u32, a[1] as i32, a[2], super::amfi::flavor::READ)),
+            sys::TASK_INSPECT_FOR_PID => res(self.darwin_task_flavor_for_pid(m, a[0] as u32, a[1] as i32, a[2], super::amfi::flavor::INSPECT)),
+            sys::CSOPS => res(self.darwin_csops(m, a[0] as i32, a[1] as u32, a[2], a[3], None)),
+            // csops_audittoken: a null token is EINVAL.
+            sys::CSOPS_AUDITTOKEN if a[4] == 0 => res(Err(Errno::EINVAL)),
+            sys::CSOPS_AUDITTOKEN => res(self.darwin_csops(m, a[0] as i32, a[1] as u32, a[2], a[3], Some(a[4]))),
             sys::MAC_SYSCALL => res(self.darwin_mac_syscall(m, a[0], a[1], a[2])),
             // The reason a process aborts: said, then the process ends
             // through the renumbering (exit status 134).
@@ -705,52 +744,428 @@ impl Kernel {
         Ok(0)
     }
 
-    /// Code signing status: every program is valid, signed and a platform
-    /// binary, which is what AMFI would have enforced.
-    fn darwin_csops(&mut self, m: &mut GuestMem<'_>, ops: u64, addr: u64, size: u64) -> Result<u64, Errno> {
-        const CS_OPS_STATUS: u64 = 0;
-        const CS_VALID: u32 = 0x1;
-        const CS_SIGNED: u32 = 0x2000_0000;
-        const CS_PLATFORM_BINARY: u32 = 0x400_0000;
-        if addr == 0 {
-            return Ok(0);
+    /// `csops_internal(pid, ops, uaddr, usersize, uaudittoken)`: a
+    /// process's code signing state, read or changed. Another process's
+    /// state may be changed only by root; the audit token, when given, must
+    /// name the process (its pid and its idversion); Sandbox judges each
+    /// operation (`mac_proc_check_get_cs_info`, `_set_cs_info`).
+    fn darwin_csops(&mut self, m: &mut GuestMem<'_>, pid: i32, ops: u32, uaddr: u64, usize: u64, token: Option<u64>) -> Result<u64, Errno> {
+        use super::amfi::cs;
+        use std::sync::atomic::Ordering;
+        let pid = if pid == 0 { self.pid } else { pid };
+        let forself = pid == self.pid;
+        let reads = matches!(ops, csop::STATUS | csop::CDHASH | csop::PIDOFFSET | csop::ENTITLEMENTS_BLOB | csop::DER_ENTITLEMENTS_BLOB | csop::IDENTITY | csop::BLOB | csop::TEAMID | csop::CLEAR_LV | csop::VALIDATION_CATEGORY);
+        if !reads && !forself && self.creds.uid() != 0 {
+            return Err(Errno::EPERM);
         }
-        m.zero(addr, size.min(4096) as usize)?;
-        if ops == CS_OPS_STATUS && size >= 4 {
-            m.write_u32(addr, CS_VALID | CS_SIGNED | CS_PLATFORM_BINARY)?;
-        }
-        Ok(0)
-    }
-
-    fn darwin_mac_syscall(&mut self, m: &mut GuestMem<'_>, policy: u64, call: u64, arg: u64) -> Result<u64, Errno> {
-        let mut buf = [0u8; 64];
-        let name = match m.read_cstr_into(policy, &mut buf)? {
-            Some(n) => String::from_utf8_lossy(&buf[..n]).into_owned(),
-            None => return Err(Errno::EINVAL),
+        // proc_find: this process, or another's task's link.
+        let (sig, flags, pidversion, textoff) = if forself {
+            (self.dtask.codesign.clone(), std::sync::Arc::clone(&self.dtask.csflags), self.dtask.pidversion, self.dtask.textoff)
+        } else {
+            let ipc = self.ipc();
+            let Some(l) = ipc.links.values().find(|l| l.pid == pid).cloned() else { return Err(Errno::ESRCH) };
+            (l.codesign.clone(), std::sync::Arc::clone(&l.csflags), l.pidversion, l.textoff)
         };
-        match (name.as_str(), call) {
-            ("AMFI", AMFI_DYLD_POLICY_SELF) => {
-                let out = m.read_u64(arg + 8)?;
-                m.write_u64(out, AMFI_DYLD_OUTPUT_ALL)?;
+        if let Some(t) = token {
+            let tok = m.read(t, 32)?;
+            let word = |i: usize| i32::from_le_bytes(tok[4 * i..4 * i + 4].try_into().unwrap());
+            if word(5) != pid || word(7) != pidversion {
+                return Err(Errno::ESRCH);
+            }
+        }
+        let e = if matches!(ops, csop::MARKINVALID | csop::MARKHARD | csop::MARKKILL | csop::MARKRESTRICT | csop::SET_STATUS | csop::CLEARINSTALLER | csop::CLEARPLATFORM | csop::CLEAR_LV) {
+            self.darwin_mac_check_set_cs_info(pid, ops)
+        } else {
+            self.darwin_mac_check_get_cs_info(pid, ops)
+        };
+        if e != 0 {
+            return Err(super::errno::errno_of(e as i32));
+        }
+        let valid = || flags.load(Ordering::Acquire) & (cs::VALID | cs::DEBUGGED) != 0;
+        match ops {
+            csop::STATUS => {
+                let f = flags.load(Ordering::Acquire);
+                // cs_process_enforcement: always on this system.
+                let mut ret = f | cs::ENFORCEMENT;
+                if sig.as_ref().is_some_and(|c| c.platform_binary) {
+                    ret |= cs::PLATFORM_BINARY;
+                }
+                if f & cs::FORCED_LV != 0 {
+                    ret &= !cs::REQUIRE_LV;
+                }
+                if uaddr != 0 {
+                    m.write_u32(uaddr, ret)?;
+                }
                 Ok(0)
             }
-            // sandbox_get_container_expected: two out pointers, a container
-            // expected and the other flag beside it; neither, for a program
-            // that is not a containerised app.
-            ("Sandbox", SANDBOX_CONTAINER_EXPECTED) => {
-                for i in 0..2 {
-                    let out = m.read_u64(arg + 8 * i)?;
-                    if out != 0 {
-                        m.write_u64(out, 0)?;
+            csop::MARKINVALID => {
+                let f = flags.load(Ordering::Acquire);
+                if f & cs::VALID != 0 {
+                    flags.fetch_and(!cs::VALID, Ordering::AcqRel);
+                    if f & cs::KILL != 0 {
+                        flags.fetch_or(cs::KILLED, Ordering::AcqRel);
+                        self.procs.post_kernel(pid, signal_to_linux(super::signal::dsig::SIGKILL));
                     }
                 }
                 Ok(0)
             }
-            _ => {
-                if self.trace {
-                    eprintln!("[gex:{}] __mac_syscall({name}, {call}) is not answered", self.pid);
+            csop::MARKHARD => {
+                let f = flags.fetch_or(cs::HARD, Ordering::AcqRel);
+                if f & cs::VALID == 0 { Err(Errno::EINVAL) } else { Ok(0) }
+            }
+            csop::MARKKILL => {
+                let f = flags.fetch_or(cs::KILL, Ordering::AcqRel);
+                if f & cs::VALID == 0 {
+                    self.procs.post_kernel(pid, signal_to_linux(super::signal::dsig::SIGKILL));
                 }
-                Err(Errno::ENOSYS)
+                Ok(0)
+            }
+            csop::PIDOFFSET => {
+                m.write_u64(uaddr, textoff as u64)?;
+                Ok(0)
+            }
+            // vn_getcdhash: the blob that covers the image's offset.
+            csop::CDHASH => {
+                if usize != 20 {
+                    return Err(Errno::EINVAL);
+                }
+                let Some(h) = sig.as_ref().and_then(|c| c.cdhash) else { return Err(super::errno::EBADEXEC) };
+                m.write(uaddr, &h)?;
+                Ok(0)
+            }
+            csop::ENTITLEMENTS_BLOB | csop::DER_ENTITLEMENTS_BLOB | csop::BLOB => {
+                if !valid() {
+                    return Err(Errno::EINVAL);
+                }
+                let Some(c) = sig.as_ref() else { return Err(super::errno::EBADEXEC) };
+                let blob = match ops {
+                    csop::BLOB => Some(c.blob.clone()),
+                    csop::DER_ENTITLEMENTS_BLOB => c.der.clone(),
+                    // AMFI's XML form of the entitlements: the signature's
+                    // own XML blob.
+                    _ => match (&c.xml, &c.der) {
+                        (Some(x), _) => Some(x.clone()),
+                        (None, None) => None,
+                        (None, Some(_)) => {
+                            self.darwin_unimplemented("csops CS_OPS_ENTITLEMENTS_BLOB of a signature with DER entitlements only (AMFI's XML from DER)".into());
+                            return Err(Errno::EINVAL);
+                        }
+                    },
+                };
+                self.darwin_csops_copy_token(m, blob.as_deref(), usize, uaddr)
+            }
+            csop::VALIDATION_CATEGORY => {
+                if !valid() {
+                    return Err(Errno::EINVAL);
+                }
+                let Some(c) = sig.as_ref() else { return Err(super::errno::EBADEXEC) };
+                m.write_u32(uaddr, c.category)?;
+                Ok(0)
+            }
+            csop::MARKRESTRICT => {
+                flags.fetch_or(cs::RESTRICT, Ordering::AcqRel);
+                Ok(0)
+            }
+            csop::SET_STATUS => {
+                if usize < 4 {
+                    return Err(Errno::ERANGE);
+                }
+                let want = m.read_u32(uaddr)? & (cs::HARD | cs::EXEC_SET_HARD | cs::KILL | cs::EXEC_SET_KILL | cs::RESTRICT | cs::REQUIRE_LV | cs::ENFORCEMENT | cs::EXEC_SET_ENFORCEMENT);
+                if flags.load(Ordering::Acquire) & cs::VALID == 0 {
+                    return Err(Errno::EINVAL);
+                }
+                flags.fetch_or(want, Ordering::AcqRel);
+                Ok(0)
+            }
+            // Library validation is dropped on macOS only; platform status
+            // is cleared on development kernels only.
+            csop::CLEAR_LV | csop::CLEARPLATFORM => Err(super::errno::errno_of(45)),
+            csop::IDENTITY | csop::TEAMID => {
+                if usize < 8 {
+                    return Err(Errno::ERANGE);
+                }
+                if !valid() {
+                    return Err(Errno::EINVAL);
+                }
+                let id = sig.as_ref().and_then(|c| if ops == csop::TEAMID { c.team_id.clone() } else { c.identity.clone() });
+                let Some(id) = id else { return Err(Errno::ENOENT) };
+                let length = id.len() + 1;
+                let mut header = [0u8; 8];
+                header[4..8].copy_from_slice(&((length + 8) as u32).to_be_bytes());
+                m.write(uaddr, &header)?;
+                if usize < 8 + length as u64 {
+                    return Err(Errno::ERANGE);
+                }
+                let mut v = id;
+                v.push(0);
+                m.write(uaddr + 8, &v)?;
+                Ok(0)
+            }
+            csop::CLEARINSTALLER => {
+                flags.fetch_and(!(cs::INSTALLER | cs::DATAVAULT_CONTROLLER | cs::EXEC_INHERIT_SIP), Ordering::AcqRel);
+                Ok(0)
+            }
+            _ => Err(Errno::EINVAL),
+        }
+    }
+
+    /// `csops_copy_token`: a blob, or a zero header for none; for a buffer
+    /// too small, its header with the blob's length, and ERANGE.
+    fn darwin_csops_copy_token(&mut self, m: &mut GuestMem<'_>, blob: Option<&[u8]>, usize: u64, uaddr: u64) -> Result<u64, Errno> {
+        if usize < 8 {
+            return Err(Errno::ERANGE);
+        }
+        let Some(b) = blob else {
+            m.write(uaddr, &[0u8; 8])?;
+            return Ok(0);
+        };
+        if usize < b.len() as u64 {
+            let mut header = [0u8; 8];
+            header[4..8].copy_from_slice(&(b.len() as u32).to_be_bytes());
+            m.write(uaddr, &header)?;
+            return Err(Errno::ERANGE);
+        }
+        m.write(uaddr, b)?;
+        Ok(0)
+    }
+
+    /// `__mac_syscall(policy, call, arg)`: the policy's name, Sandbox's
+    /// check of the call (`mac_proc_check_syscall_mac`), then the named
+    /// policy's `mpo_policy_syscall`; ENOPOLICY for one not loaded.
+    fn darwin_mac_syscall(&mut self, m: &mut GuestMem<'_>, policy: u64, call: u64, arg: u64) -> Result<u64, Errno> {
+        let mut buf = [0u8; MAC_MAX_POLICY_NAME];
+        let name = match m.read_cstr_into(policy, &mut buf)? {
+            Some(n) => buf[..n].to_vec(),
+            None => return Err(Errno::ENAMETOOLONG),
+        };
+        let e = self.darwin_mac_check_syscall_mac(&name, call as u32);
+        if e != 0 {
+            return Err(super::errno::errno_of(e as i32));
+        }
+        let r = match name.as_slice() {
+            b"AMFI" => self.darwin_amfi_syscall(m, call, arg),
+            b"Sandbox" => self.darwin_sandbox_syscall(m, call, arg),
+            _ => Err(ENOPOLICY),
+        };
+        r.map(|()| 0).map_err(super::errno::errno_of)
+    }
+
+    /// AMFI's `mpo_policy_syscall` (`0x...b72a8`); its error, a Darwin
+    /// errno.
+    fn darwin_amfi_syscall(&mut self, m: &mut GuestMem<'_>, call: u64, arg: u64) -> Result<(), i32> {
+        const EINVAL: i32 = 22;
+        let fault = |_| 14;
+        match call {
+            amfi_call::DYLD_POLICY_SELF | amfi_call::DYLD_POLICY_FOR_PID | amfi_call::CHECK_TRUST_CACHE if arg == 0 => Err(EINVAL),
+            // {flags, &output}: the caller's policy.
+            amfi_call::DYLD_POLICY_SELF => {
+                let out = m.read_u64(arg + 8).map_err(fault)?;
+                let p = self.darwin_dyld_policy();
+                m.write_u64(out, p).map_err(fault)
+            }
+            // {flags, &output, pid}: another process's.
+            amfi_call::DYLD_POLICY_FOR_PID => {
+                let out = m.read_u64(arg + 8).map_err(fault)?;
+                let pid = m.read_u32(arg + 16).map_err(fault)? as i32;
+                if pid == 0 {
+                    return Err(EINVAL);
+                }
+                let p = if pid == self.pid {
+                    self.darwin_dyld_policy()
+                } else {
+                    // proc_find: its task's link, while it lives.
+                    let ipc = self.ipc();
+                    let Some(l) = ipc.links.values().find(|l| l.pid == pid).cloned() else { return Err(3) };
+                    let ents = l.codesign.as_ref().map(|c| c.ents.clone()).unwrap_or_default();
+                    super::amfi::dyld_policy(false, l.csflags.load(std::sync::atomic::Ordering::Acquire), &ents)
+                };
+                m.write_u64(out, p).map_err(fault)
+            }
+            // {cdhash, ..., result at 0x18}: in the static trust cache (1),
+            // in a loaded one (2); for an entitled caller.
+            amfi_call::CHECK_TRUST_CACHE => {
+                if !self.darwin_task_entitled("com.apple.private.amfi.can-check-trust-cache") {
+                    return Err(13);
+                }
+                let mut q = [0u8; 0x20];
+                q.copy_from_slice(m.read(arg, 0x20).map_err(fault)?);
+                let cdhash: [u8; 20] = q[..20].try_into().unwrap();
+                let found = u64::from(super::trustcache::platform(&cdhash).is_some());
+                q[0x18..0x20].copy_from_slice(&found.to_le_bytes());
+                m.write(arg, &q).map_err(fault)
+            }
+            // Not on this platform.
+            amfi_call::GET_LOCAL_SIGNING_PRIVATE_KEY => Err(1),
+            98..=102 => {
+                self.darwin_unimplemented(format!("AMFI __mac_syscall {call} (local signing, trust cache loading, launch constraints)"));
+                Err(EINVAL)
+            }
+            _ => Err(78),
+        }
+    }
+
+    /// Sandbox's `sandbox_check` (`0x...a15fcc`): whether the target process
+    /// may do an operation on a filter's object. The request: the result's
+    /// address, the pid, the operation's name, the filter's type and
+    /// argument, the flags (the target selector in bits 30-31), the
+    /// selector's id; the answer, 0 allowed or the denial's errno, goes to
+    /// the result, the call's own error being only the request's.
+    fn darwin_sandbox_check(&mut self, m: &mut GuestMem<'_>, arg: u64) -> Result<(), i32> {
+        const EPERM: i32 = 1;
+        const ENOENT: i32 = 2;
+        const EINVAL: i32 = 22;
+        const ENAMETOOLONG: i32 = 63;
+        let fault = |_| 14;
+        let req = m.read(arg, 0x80).map_err(fault)?.to_vec();
+        let q = |o: usize| u64::from_le_bytes(req[o..o + 8].try_into().unwrap());
+        let (result_at, pid, op_at, ftype, farg, flags, id) = (q(0), q(8) as i64, q(0x10), q(0x18), q(0x20), q(0x28), q(0x30));
+        let answer = |m: &mut GuestMem<'_>, r: u64| m.write_u64(result_at, r).map_err(fault);
+        // The target.
+        let selector = flags >> 30 & 3;
+        if selector == 3 {
+            if !self.darwin_task_entitled("com.apple.private.security.sandbox-reference") {
+                return Err(EPERM);
+            }
+            if id == 0 || id > 0xffff_ffff {
+                return Err(EINVAL);
+            }
+            // No sandbox references are made: no process has a sandbox.
+            return Err(ENOENT);
+        }
+        let found = |k: &mut Kernel, pid: i64, version: Option<u64>| -> bool {
+            let Ok(pid) = i32::try_from(pid) else { return false };
+            let v = if pid == k.pid {
+                Some(k.dtask.pidversion)
+            } else {
+                let ipc = k.ipc();
+                ipc.links.values().find(|l| l.pid == pid).map(|l| l.pidversion)
+            };
+            v.is_some_and(|v| version.is_none_or(|w| i64::from(v) == w as i64))
+        };
+        if selector == 2 {
+            self.darwin_unimplemented("sandbox_check by unique id (process unique ids)".into());
+            return Err(EINVAL);
+        }
+        if !found(self, pid, (selector == 1).then_some(id)) {
+            return answer(m, 3);
+        }
+        if flags & 0x100_0000 != 0 && !found(self, q(0x70) as i64, Some(q(0x78))) {
+            return answer(m, 3);
+        }
+        // No process has a sandbox: with no operation the answer is that,
+        // and a forbidden- operation is allowed.
+        if op_at == 0 {
+            return answer(m, 0);
+        }
+        let mut buf = [0u8; 0x35];
+        let name = match m.read_cstr_into(op_at, &mut buf).map_err(fault)? {
+            Some(n) => buf[..n].to_vec(),
+            None => return Err(ENAMETOOLONG),
+        };
+        if name.starts_with(b"forbidden-") {
+            return answer(m, 0);
+        }
+        let mut s = [0u8; 0x400];
+        let mut string = |m: &mut GuestMem<'_>, at: u64| -> Result<Vec<u8>, i32> {
+            match m.read_cstr_into(at, &mut s).map_err(fault)? {
+                Some(n) => Ok(s[..n].to_vec()),
+                None => Err(ENAMETOOLONG),
+            }
+        };
+        use super::sandbox::kind;
+        let mut a = super::mac::SbArgs { quiet: flags & 1 != 0, ..Default::default() };
+        match ftype {
+            0 => {}
+            5 => (a.kind, a.string) = (kind::POSIX_IPC, Some(string(m, farg)?)),
+            6 | 7 | 50 => {
+                (a.kind, a.string) = (kind::HOST_SPECIAL_PORT, Some(string(m, farg)?));
+                a.global = ftype != 7;
+                a.xpc = ftype == 50;
+            }
+            25 | 27 | 28 | 33 | 34 | 38 | 45 => {
+                a.kind = match ftype {
+                    25 => 9,
+                    27 => 10,
+                    28 => 11,
+                    33 => 12,
+                    34 => 13,
+                    38 => 15,
+                    _ => 17,
+                };
+                a.string = Some(string(m, farg)?);
+            }
+            // {name, flag}
+            35 => {
+                let (n, f) = (m.read_u64(farg).map_err(fault)?, m.read_u32(farg + 8).map_err(fault)?);
+                (a.kind, a.string, a.global) = (14, Some(string(m, n)?), f != 0);
+            }
+            52 if flags & 0x100_0000 == 0 => return answer(m, 3),
+            65 if farg > u64::from(u32::MAX) => return answer(m, EINVAL as u64),
+            65 => (a.kind, a.number) = (kind::SYSCALL_UNIX, farg as u32),
+            75 => return answer(m, EINVAL as u64),
+            1 | 19 | 52 | 240 | 241 => {
+                self.darwin_unimplemented(format!("sandbox_check with filter type {ftype} (vnodes, IOKit entries, signal targets)"));
+                return Err(EINVAL);
+            }
+            _ => return Err(EINVAL),
+        }
+        let Some(op) = super::mac::OPERATION_NAMES.iter().position(|n| n.as_bytes() == name.as_slice()) else { return Err(EINVAL) };
+        if pid != i64::from(self.pid) {
+            self.darwin_unimplemented("sandbox_check of another process (its credential as the subject)".into());
+            return Err(EINVAL);
+        }
+        let r = self.darwin_sb_evaluate(op, &a);
+        // The POSIX access checks want a vnode.
+        if r == 0 && flags & 0x60 != 0 {
+            return Err(EINVAL);
+        }
+        answer(m, u64::from(r))?;
+        // The answers asked for besides: no deny message, no extension
+        // consumed, no extension flags.
+        if flags & 0x1000_0000 != 0 {
+            let size_at = q(0x48);
+            if size_at != 0 {
+                m.write_u64(size_at, 0).map_err(fault)?;
+            }
+        }
+        if flags & 0x800_0000 != 0 && q(0x50) != 0 {
+            m.write_u64(q(0x50), 0).map_err(fault)?;
+        }
+        if flags & 0x200_0000 != 0 && q(0x68) != 0 {
+            m.write_u64(q(0x68), 1).map_err(fault)?;
+        }
+        Ok(())
+    }
+
+    /// AMFI's dyld policy for this process.
+    fn darwin_dyld_policy(&self) -> u64 {
+        let flags = self.dtask.csflags.load(std::sync::atomic::Ordering::Acquire);
+        let ents = self.dtask.codesign.as_ref().map(|c| c.ents.clone()).unwrap_or_default();
+        // P_SUGID is not tracked: no credential change or setuid image sets
+        // it here.
+        super::amfi::dyld_policy(false, flags, &ents)
+    }
+
+    /// Sandbox's `mpo_policy_syscall` (`0x...69f7e50`); its error, a Darwin
+    /// errno.
+    fn darwin_sandbox_syscall(&mut self, m: &mut GuestMem<'_>, call: u64, arg: u64) -> Result<(), i32> {
+        let fault = |_| 14;
+        match call {
+            SANDBOX_CHECK => self.darwin_sandbox_check(m, arg),
+            // {&expected, &has_container}: what the process's sandbox says;
+            // a process without a sandbox has neither.
+            SANDBOX_CONTAINER_EXPECTED => {
+                let (a, b) = (m.read_u64(arg).map_err(fault)?, m.read_u64(arg + 8).map_err(fault)?);
+                for out in [a, b] {
+                    if out != 0 {
+                        m.write_u64(out, 0).map_err(fault)?;
+                    }
+                }
+                Ok(())
+            }
+            _ => {
+                self.darwin_unimplemented(format!("Sandbox __mac_syscall {call}"));
+                Err(45)
             }
         }
     }

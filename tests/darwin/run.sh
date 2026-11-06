@@ -8,8 +8,9 @@
 # Without one it is skipped, or fails when it was asked for by name.
 #
 # The system boots with the device's payload (GEX_DARWIN_BOOT: its trust
-# cache bundle) with these programs' cdhashes added to its static trust
-# cache, as an owner adds their own code: AMFI runs only trusted code.
+# cache bundle and the Sandbox's platform profile) with these programs'
+# cdhashes added to its static trust cache, as an owner adds their own
+# code: AMFI runs only trusted code.
 set -u
 
 HERE=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
@@ -27,6 +28,9 @@ if [ -n "${GEX_DARWIN_BOOT:-}" ]; then
 else
     # shellcheck disable=SC2086
     python3 -I "$ROOT/tools/darwin-trust-cache.py" -o "$BOOT/TrustCache" $progs || exit 1
+fi
+if [ -n "${GEX_DARWIN_BOOT:-}" ] && [ -f "$GEX_DARWIN_BOOT/sandbox_profile.bin" ]; then
+    cp "$GEX_DARWIN_BOOT/sandbox_profile.bin" "$BOOT/"
 fi
 export GEX_DARWIN_BOOT="$BOOT"
 
@@ -136,6 +140,7 @@ hello from /var/tmp/gex-exec-fat with 1 argument" 0
     startsusp) check_root startsusp "startsusp ok" 0 ;;
     readports) check_root readports "readports ok" 0 ;;
     taskthreads) check_root taskthreads "taskthreads ok" 0 ;;
+    policy) check_root policy "policy ok" 0 ;;
     amfi)
         if [ -n "${GEX_DARWIN_ROOT:-}" ]; then
             mkdir -p "$GEX_DARWIN_ROOT/var/tmp"
@@ -158,7 +163,7 @@ if [ "$named" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi cfrunloop xpc-anon; do
+    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy cfrunloop xpc-anon; do
         run "$p"
     done
 fi

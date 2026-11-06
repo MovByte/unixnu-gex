@@ -212,8 +212,29 @@ impl Kernel {
             // The child runs this image, with this credential's
             // entitlements, and its code signing flags but CS_KILLED.
             codesign: t.codesign.clone(),
+            textoff: t.textoff,
             csflags: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(t.csflags.load(std::sync::atomic::Ordering::Acquire) & !super::amfi::cs::KILLED)),
             ..super::Task::new_process()
+        }
+    }
+
+    /// `fork1`'s checks before it makes a process: the table not full
+    /// (`maxproc`, its last slot root's), the user's processes within
+    /// RLIMIT_NPROC (root's are not counted against it), and the MAC
+    /// policies' `mac_proc_check_fork`.
+    pub(crate) fn darwin_fork1_checks(&mut self) -> Result<(), Errno> {
+        let uid = self.creds.uid();
+        let (nprocs, mine) = self.procs.counts(uid);
+        let maxproc = super::rlimit::MAXPROC as usize;
+        if (nprocs >= maxproc - 1 && uid != 0) || nprocs >= maxproc {
+            return Err(Errno::EAGAIN);
+        }
+        if uid != 0 && (mine + 1) as u64 > self.dtask.rlimits.cur(super::rlimit::res::NPROC) {
+            return Err(Errno::EAGAIN);
+        }
+        match self.darwin_mac_check_fork() {
+            0 => Ok(()),
+            e => Err(super::errno::errno_of(e as i32)),
         }
     }
 
@@ -222,6 +243,10 @@ impl Kernel {
     /// state `fork_kernel` gives it. This side returns the child's pid with
     /// x1 clear; the child's x0 is its own pid and x1 is 1.
     pub(crate) fn darwin_fork(&mut self, m: &mut GuestMem<'_>) -> SyscallOutcome {
+        if let Err(e) = self.darwin_fork1_checks() {
+            let _ = super::set_result(m, self.ctx_addr, e.as_return());
+            return SyscallOutcome::Continue;
+        }
         self.darwin_child_ports();
         let mapped: Vec<(u64, u64)> = self.mem.lock().vmas().iter().map(|v| (v.start, v.end)).collect();
         self.dtask.vm.fork(&mapped);
@@ -382,6 +407,7 @@ impl Kernel {
             }
         }
         // fork1(PROC_CREATE_SPAWN): a new process of this one's, no memory.
+        self.darwin_fork1_checks()?;
         self.darwin_child_ports();
         let mut child = self.fork_kernel();
         // A spawn is not a fork: CS_GET_TASK_ALLOW is not inherited.

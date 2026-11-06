@@ -963,6 +963,13 @@ impl ProcTable {
     }
 
     /// A live process's uid and `p_nice` (`proc_find`'s: no zombie).
+    /// How many processes there are (`nprocs`, zombies too) and how many of
+    /// them are `uid`'s (`chgproccnt`'s count).
+    pub fn counts(&self, uid: u32) -> (usize, usize) {
+        let t = self.lock();
+        (t.procs.len(), t.procs.iter().filter(|p| p.uid == uid).count())
+    }
+
     pub fn live_nice(&self, pid: i32) -> Option<(u32, i32)> {
         let t = self.lock();
         let p = t.procs.iter().find(|p| p.pid == pid)?;

@@ -195,6 +195,8 @@ pub struct CodeSign {
     /// Launch constraints of its own (`CSSLOT_LAUNCH_CONSTRAINT_SELF`,
     /// `_PARENT`, `_RESPONSIBLE`).
     pub launch_constraints: bool,
+    /// The blob as added (`csb_mem_kaddr`, `csb_mem_size`).
+    pub blob: Vec<u8>,
     /// The cdhash of the best CodeDirectory.
     pub cdhash: Option<[u8; CDHASH_LEN]>,
     /// AMFI's verdict: the blob's flags (`csb_flags`), a platform binary
@@ -334,6 +336,7 @@ pub fn add_blob(vnode: (u64, u64), file_start: i64, b: &[u8]) -> Result<(std::sy
     let scatter = be32(cd, 44).unwrap_or(0) as usize;
     let start = if be32(cd, 8).unwrap_or(0) >= CS_SUPPORTSSCATTER && scatter != 0 { u64::from(be32(cd, scatter + 4).unwrap_or(0)) << cd[39] } else { 0 };
     let mut sig = CodeSign::parse(b);
+    sig.blob = b.to_vec();
     let flags = (sig.cd_flags & super::amfi::cs::ALLOWED_MACHO) | super::amfi::cs::VALID;
     let v = super::amfi::vnode_check_signature(&sig, flags).map_err(|r| match r {
         super::amfi::Refusal::Fatal(m) => AddError::Policy(m, true),
