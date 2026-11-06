@@ -662,9 +662,6 @@ impl Kernel {
             k.darwin_unimplemented(format!("posix_spawn's {what}"));
             Err(Errno::EINVAL)
         };
-        if at.flags & flag::START_SUSPENDED != 0 {
-            return no(self, "POSIX_SPAWN_START_SUSPENDED (a suspended task its spawner resumes through its task port)");
-        }
         if at.cpumonitor_percent != 0 && at.cpumonitor_percent < u64::from(u8::MAX) {
             return no(self, "CPU usage monitor");
         }

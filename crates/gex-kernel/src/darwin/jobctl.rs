@@ -181,6 +181,16 @@ impl Kernel {
         self.procs.stopped_to_parent(self.pid, status as i32, self.creds.uid());
     }
 
+    /// `POSIX_SPAWN_START_SUSPENDED`: the process SSTOP and its task held
+    /// before it runs (`task_suspend_internal`), with no stop told to its
+    /// parent; `task_resume` or a SIGCONT lets it go.
+    pub(crate) fn darwin_start_suspended(&mut self) {
+        self.darwin_job_with(|j| {
+            j.stopped = true;
+            j.holds += 1;
+        });
+    }
+
     /// `task_resume_internal`: one hold fewer (none to release is no
     /// error), and the held threads let go at none.
     fn darwin_task_resume(&mut self) {

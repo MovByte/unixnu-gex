@@ -467,6 +467,9 @@ impl Kernel {
             map_max: spawn.map_or(0, |s| s.max_addr),
             ..Default::default()
         };
+        if spawn.is_some_and(|s| s.flags & super::spawn::flag::START_SUSPENDED != 0) {
+            self.darwin_start_suspended();
+        }
         // An exec's task is new, and so is its ledger (a spawn's own exec
         // made it before its attributes set limits on it).
         if spawn.is_none() {
