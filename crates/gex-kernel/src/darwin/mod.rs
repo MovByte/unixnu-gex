@@ -20,6 +20,7 @@ pub mod attrlist;
 pub mod bsd;
 pub mod codesign;
 pub mod commpage;
+pub mod cred;
 pub mod errno;
 pub mod exec;
 pub mod footprint;
@@ -147,6 +148,9 @@ pub struct Task {
     pub csflags: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// `p_textoff`: where the image's slice starts in its file.
     pub textoff: i64,
+    /// The process's credential (`p_ucred`'s POSIX part) and `P_SUGID`.
+    pub cred: cred::Cred,
+    pub sugid: bool,
     /// `P_LADVLOCK`: the process has taken a POSIX record lock.
     pub ladvlock: bool,
     /// Threads whose lock requests another thread or process woke.
@@ -282,13 +286,12 @@ impl crate::syscalls::Kernel {
 
     /// The task's audit token (`proc_calc_audit_token`): auid, euid, egid,
     /// ruid, rgid, pid, asid, pidversion. A process launchd has put in no
-    /// session has the default one (`AU_DEFAUDITID`, `AU_DEFAUDITSID`); gex
-    /// keeps one identity, so the real ids are the effective ones.
+    /// session has the default one (`AU_DEFAUDITID`, `AU_DEFAUDITSID`).
     pub(crate) fn darwin_audit_token(&self) -> [u32; 8] {
         const AU_DEFAUDITID: u32 = u32::MAX;
         const AU_DEFAUDITSID: u32 = 0;
-        let (uid, gid) = (self.creds.uid(), self.creds.gid());
-        [AU_DEFAUDITID, uid, gid, uid, gid, self.pid as u32, AU_DEFAUDITSID, self.dtask.pidversion as u32]
+        let c = &self.dtask.cred;
+        [AU_DEFAUDITID, c.uid, c.gid(), c.ruid, c.rgid, self.pid as u32, AU_DEFAUDITSID, self.dtask.pidversion as u32]
     }
 
     /// A fatal Mach port guard exception was raised: with no exception

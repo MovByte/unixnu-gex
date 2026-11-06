@@ -486,6 +486,15 @@ impl Kernel {
             said: old.said,
             // p_csflags: the exec's own, made at its start from these.
             csflags: old.csflags,
+            // exec_handle_sugid: the credential kept (set-id images are not
+            // honored on a release kernel), P_SUGID cleared, the saved ids
+            // the effective ones.
+            cred: {
+                let mut c = old.cred;
+                c.svuid = c.uid;
+                c.svgid = c.gid();
+                c
+            },
             // Until the image's policies make it (`vm_map_set_max_addr`).
             map_max: spawn.map_or(0, |s| s.max_addr),
             ..Default::default()

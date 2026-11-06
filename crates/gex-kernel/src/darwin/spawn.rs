@@ -213,6 +213,9 @@ impl Kernel {
             // entitlements, and its code signing flags but CS_KILLED.
             codesign: t.codesign.clone(),
             textoff: t.textoff,
+            // forkproc: the credential, and P_SUGID with the flags it keeps.
+            cred: t.cred.clone(),
+            sugid: t.sugid,
             csflags: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(t.csflags.load(std::sync::atomic::Ordering::Acquire) & !super::amfi::cs::KILLED)),
             ..super::Task::new_process()
         }
@@ -223,7 +226,8 @@ impl Kernel {
     /// RLIMIT_NPROC (root's are not counted against it), and the MAC
     /// policies' `mac_proc_check_fork`.
     pub(crate) fn darwin_fork1_checks(&mut self) -> Result<(), Errno> {
-        let uid = self.creds.uid();
+        // kauth_getruid(): processes are counted by their real uid.
+        let uid = self.dtask.cred.ruid;
         let (nprocs, mine) = self.procs.counts(uid);
         let maxproc = super::rlimit::MAXPROC as usize;
         if (nprocs >= maxproc - 1 && uid != 0) || nprocs >= maxproc {

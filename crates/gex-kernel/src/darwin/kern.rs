@@ -219,6 +219,9 @@ impl Kernel {
     /// [`super::bsd::translate`] cannot, or `None` to leave it to that.
     /// The result is in the canonical encoding (`-errno` on failure).
     pub(crate) fn darwin_call(&mut self, m: &mut GuestMem<'_>, raw: u64, a: &[u64; 6]) -> Option<u64> {
+        if let Some(r) = self.darwin_cred_syscall(m, raw, a) {
+            return Some(res(r));
+        }
         // O_CLOFORK: a descriptor its process's children do not get, which
         // the descriptor table has no flag for.
         const O_CLOFORK: u64 = 0x0800_0000;
@@ -253,8 +256,6 @@ impl Kernel {
                 (start, _) => res(m.write_u64(a[0], start).map(|_| 0)),
             },
             sys::MAP_WITH_LINKING_NP => res(self.darwin_map_with_linking(m, a)),
-            // No set-id programs here.
-            sys::ISSETUGID => 0,
             sys::GETENTROPY => res(self.canonical(m, nr::GETRANDOM, [a[0], a[1], 0, 0, 0, 0]).map(|_| 0)),
             sys::FCNTL | sys::FCNTL_NOCANCEL => self.darwin_fcntl(m, a),
             sys::FSGETPATH => res(self.darwin_fsgetpath(m, a)),
