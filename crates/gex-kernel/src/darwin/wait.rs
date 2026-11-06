@@ -45,7 +45,7 @@ struct Slot {
 /// Every thread's wait slot.
 #[derive(Debug, Default)]
 pub struct Waits {
-    page: u64,
+    pub(crate) page: u64,
     next: u64,
     free: Vec<u64>,
     slots: HashMap<i32, Slot>,

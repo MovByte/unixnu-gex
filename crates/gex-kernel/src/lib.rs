@@ -229,6 +229,15 @@ impl<'a> GuestMem<'a> {
         Ok(HOST_MAP_FILE.get().is_some_and(|f| f(base + r.start, r.len(), fd, offset)))
     }
 
+    /// The state of each `page`-byte page of `len` bytes at `addr`
+    /// ([`page_state`]), as the host keeps it, into `out`; whether the host
+    /// could say ([`set_host_pages`]).
+    pub fn page_states(&mut self, addr: u64, len: u64, page: u64, out: &mut [u8]) -> Result<bool, Errno> {
+        let r = self.range(addr, usize::try_from(len).map_err(|_| Errno::EFAULT)?)?;
+        let base = self.view_mut().as_mut_ptr() as usize;
+        Ok(HOST_PAGES.get().is_some_and(|f| f(base + r.start, r.len(), page as usize, out)))
+    }
+
     /// `len` bytes at `addr` (page aligned) read as zero after: the host's
     /// fresh pages where it can give them ([`HostAdvice::Discard`], which
     /// reads nothing and frees what was there), else [`Self::zero_dirty`].
@@ -390,6 +399,26 @@ pub enum HostAdvice {
 }
 
 static HOST_VM: std::sync::OnceLock<fn(usize, usize, HostAdvice) -> bool> = std::sync::OnceLock::new();
+
+/// A guest page's state as the host keeps it ([`GuestMem::page_states`]).
+pub mod page_state {
+    /// In memory.
+    pub const PRESENT: u8 = 0x1;
+    /// Out of memory, compressed or paged out, and kept.
+    pub const PAGED_OUT: u8 = 0x2;
+    /// A file's page (not the owner's own memory).
+    pub const EXTERNAL: u8 = 0x4;
+    /// Made reusable, and not counted as the owner's.
+    pub const REUSABLE: u8 = 0x8;
+}
+
+static HOST_PAGES: std::sync::OnceLock<fn(usize, usize, usize, &mut [u8]) -> bool> = std::sync::OnceLock::new();
+
+/// Install the host's page state query: `f(host_address, len, page, out)`
+/// fills one [`page_state`] byte per `page` bytes, true when it could.
+pub fn set_host_pages(f: fn(usize, usize, usize, &mut [u8]) -> bool) {
+    let _ = HOST_PAGES.set(f);
+}
 
 static HOST_MAP_FILE: std::sync::OnceLock<fn(usize, usize, i32, u64) -> bool> = std::sync::OnceLock::new();
 

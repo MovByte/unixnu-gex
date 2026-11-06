@@ -367,4 +367,11 @@ impl Kernel {
         let tid = self.tid;
         self.dtask.kports.thread_exc.get(&tid).is_some_and(valid) || valid(&self.dtask.kports.exc) || valid(&self.ipc().host_exc)
     }
+
+    /// Whether an exception of type `exc` the task raises (a corpse's, no
+    /// thread's) has a handler: the task's or the host's.
+    pub(crate) fn darwin_task_exc_handled(&mut self, exc: usize) -> bool {
+        let valid = |a: &ExcActions| matches!(a[exc].port, Some(Carried::Port(_)));
+        valid(&self.dtask.kports.exc) || valid(&self.ipc().host_exc)
+    }
 }

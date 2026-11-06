@@ -433,6 +433,8 @@ impl Kernel {
     /// `strings` is the exec's area; the run's first program has its
     /// path and vectors from the kernel.
     fn darwin_start_body(&mut self, strings: Option<Strings>, l: &Loaded, user_stack: u64) -> Result<MainStack, Errno> {
+        // The image's entitlements that raise its default memory limit.
+        self.darwin_jetsam_entitlements();
         self.darwin_vm_policies();
         // task_set_main_thread_qos, for an exec's, a spawn's and the first
         // image's main thread alike.

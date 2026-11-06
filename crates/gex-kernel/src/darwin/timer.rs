@@ -131,11 +131,19 @@ impl Kernel {
             self.darwin_kevent_settle(m);
         }
         self.darwin_lock_wakes(m);
-        loop {
+        // memorystatus' idle demotion call, which every task's thread calls
+        // wake for.
+        let jetsam = if self.darwin { self.darwin_jetsam_tick() } else { None };
+        let footprint = if self.darwin { self.darwin_footprint_tick(m) } else { None };
+        let jetsam = match (jetsam, footprint) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let own = loop {
             let now = Instant::now();
-            let (&key, _) = self.dtask.timers.armed.first_key_value()?;
+            let Some((&key, _)) = self.dtask.timers.armed.first_key_value() else { break None };
             if key.0 > now {
-                return Some(key.0);
+                break Some(key.0);
             }
             match self.dtask.timers.armed.remove(&key).expect("first key") {
                 Action::MkTimer(port) => self.mk_timer_expire(m, port, key),
@@ -146,6 +154,10 @@ impl Kernel {
                     self.darwin_kevent_settle(m);
                 }
             }
+        };
+        match (own, jetsam) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
         }
     }
 

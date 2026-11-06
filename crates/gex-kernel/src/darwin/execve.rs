@@ -467,6 +467,11 @@ impl Kernel {
             map_max: spawn.map_or(0, |s| s.max_addr),
             ..Default::default()
         };
+        // An exec's task is new, and so is its ledger (a spawn's own exec
+        // made it before its attributes set limits on it).
+        if spawn.is_none() {
+            self.procs.jetsam().ledgers.insert(self.pid, super::footprint::Ledger::default());
+        }
         // A new process's policy came with its fork; an exec's task is an
         // exec copy of the old (task_policy_create) that inherits its role
         // (proc_inherit_task_role).

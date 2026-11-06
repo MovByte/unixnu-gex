@@ -20,6 +20,7 @@ pub mod codesign;
 pub mod commpage;
 pub mod errno;
 pub mod exec;
+pub mod footprint;
 pub mod exit;
 pub mod exception;
 pub mod execve;
@@ -35,6 +36,7 @@ pub mod kobject;
 pub mod lockf;
 pub mod mach;
 pub mod mach_msg;
+pub mod memorystatus;
 pub mod mig;
 pub mod mman;
 pub mod mk_timer;
@@ -144,6 +146,8 @@ pub struct Task {
     /// Its map's highest address when an entitlement or a spawn raised it
     /// (`vm_map_set_max_addr`); 0 for [`vm::MAP_MAX`].
     pub map_max: u64,
+    /// When its footprint is next measured ([`footprint::SAMPLE`]).
+    pub footprint_due: Option<std::time::Instant>,
     /// Threads a semaphore operation woke, and how.
     pub sema_wake: Vec<(i32, wait::WaitResult)>,
     /// A blocked send's message and its send buffer, by thread.

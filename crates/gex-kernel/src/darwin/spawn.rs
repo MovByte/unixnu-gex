@@ -86,6 +86,10 @@ pub struct Attr {
     pub apptype: u32,
     pub cpumonitor_percent: u64,
     pub jetsam_flags: u16,
+    /// `psa_priority`, `psa_memlimit_active`, `psa_memlimit_inactive`.
+    pub jetsam_priority: i32,
+    pub memlimit_active: i32,
+    pub memlimit_inactive: i32,
     pub qos_clamp: u64,
     pub darwin_role: u32,
     pub thread_limit: i32,
@@ -111,6 +115,9 @@ impl Attr {
             apptype: le32(b, 36),
             cpumonitor_percent: le64(b, 40),
             jetsam_flags: le16(b, 64),
+            jetsam_priority: le32(b, 68) as i32,
+            memlimit_active: le32(b, 72) as i32,
+            memlimit_inactive: le32(b, 76) as i32,
             qos_clamp: le64(b, 80),
             darwin_role: le32(b, 88),
             thread_limit: le32(b, 92) as i32,
@@ -215,6 +222,12 @@ impl Kernel {
         let mapped: Vec<(u64, u64)> = self.mem.lock().vmas().iter().map(|v| (v.start, v.end)).collect();
         self.dtask.vm.fork(&mapped);
         let pid = self.procs.spawn(self.pid);
+        // The child runs this image: its entitlements are these.
+        let mut j = self.procs.jetsam();
+        if let Some(e) = j.get(self.pid).map(|p| p.entitled) {
+            j.set_entitled(pid, e);
+        }
+        drop(j);
         crate::procnote::post(self.pid, crate::procnote::note::FORK | pid as u32);
         let _ = super::set_result(m, self.ctx_addr, pid as u64);
         let _ = m.write_u64(self.ctx_addr + gex_abi::ctx::x(1) as u64, 0);
@@ -458,6 +471,9 @@ impl Kernel {
                 p.lock().unwrap_or_else(|e| e.into_inner()).spawnpolicy(apptype, clamp, role);
             }
         }
+        if let Some(at) = attr {
+            self.darwin_spawn_jetsam(child.pid, at);
+        }
         // _kernelrpc_mach_ports_register3 with the registered ports held.
         if !held.registered.is_empty() {
             let mut ports = [None; 3];
@@ -471,6 +487,30 @@ impl Kernel {
         img.spawn = Some(after);
         child.darwin_exec = Some(Box::new(img));
         Ok(())
+    }
+
+    /// posix_spawn's jetsam attributes (`POSIX_SPAWN_JETSAM_SET`): the new
+    /// process's priority and memory limits, by `memorystatus_update`. With
+    /// POSIX_SPAWN_JETSAM_HIWATER_BACKGROUND, the inactive limit is the
+    /// one given, not fatal, and the active one the system-wide, fatal.
+    fn darwin_spawn_jetsam(&mut self, pid: i32, at: &Attr) {
+        const USE_EFFECTIVE_PRIORITY: u16 = 0x01;
+        const HIWATER_BACKGROUND: u16 = 0x02;
+        const MEMLIMIT_ACTIVE_FATAL: u16 = 0x04;
+        const MEMLIMIT_INACTIVE_FATAL: u16 = 0x08;
+        let f = at.jetsam_flags;
+        if f & JETSAM_SET == 0 {
+            return;
+        }
+        let limits = if f & HIWATER_BACKGROUND != 0 {
+            (-1, true, at.memlimit_inactive, false)
+        } else {
+            (at.memlimit_active, f & MEMLIMIT_ACTIVE_FATAL != 0, at.memlimit_inactive, f & MEMLIMIT_INACTIVE_FATAL != 0)
+        };
+        let range = self.darwin_task_entitled("com.apple.private.internal-jetsam-range");
+        // Its result is not the spawn's.
+        let _ = self.procs.jetsam().update(pid, at.jetsam_priority, 0, false, f & USE_EFFECTIVE_PRIORITY != 0, Some(limits), range);
+        self.darwin_jetsam_effects();
     }
 
     /// `exec_handle_port_actions`: the actions checked (EINVAL for one of
@@ -607,6 +647,10 @@ impl Kernel {
         if at.flags & flag::SETSID != 0 {
             let _ = self.procs.setsid(self.pid);
         }
+        // exec_activate_image's new task, and its ledger, before the
+        // spawn's limits are set on it.
+        self.procs.jetsam().ledgers.insert(self.pid, super::footprint::Ledger::default());
+        self.darwin_spawn_jetsam(self.pid, at);
         img.spawn = Some(after);
         Ok(Box::new(img))
     }
@@ -620,9 +664,6 @@ impl Kernel {
         };
         if at.flags & flag::START_SUSPENDED != 0 {
             return no(self, "POSIX_SPAWN_START_SUSPENDED (a suspended task its spawner resumes through its task port)");
-        }
-        if at.jetsam_flags & JETSAM_SET != 0 {
-            return no(self, "jetsam priority and memory limits (memorystatus)");
         }
         if at.cpumonitor_percent != 0 && at.cpumonitor_percent < u64::from(u8::MAX) {
             return no(self, "CPU usage monitor");

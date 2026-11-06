@@ -8,8 +8,46 @@ use gex_kernel::HostAdvice;
 pub fn install() {
     gex_kernel::set_host_vm(advise);
     gex_kernel::set_host_map_file(map_file);
+    gex_kernel::set_host_pages(pages);
 }
 
+#[cfg(target_os = "macos")]
+extern "C" {
+    static mach_task_self_: libc::c_uint;
+    fn mach_vm_page_range_query(target: libc::c_uint, address: u64, size: u64, dispositions: u64, count: *mut u64) -> libc::c_int;
+}
+
+/// Each page's state by `mach_vm_page_range_query`, the host's own VM's
+/// view of its pages (`VM_PAGE_QUERY_PAGE_*`).
+#[cfg(target_os = "macos")]
+fn pages(at: usize, len: usize, page: usize, out: &mut [u8]) -> bool {
+    use gex_kernel::page_state as ps;
+    const PRESENT: i32 = 0x1;
+    const PAGED_OUT: i32 = 0x10;
+    const EXTERNAL: i32 = 0x80;
+    const REUSABLE: i32 = 0x800;
+    if page != self::page() || at % page != 0 || len % page != 0 || out.len() < len / page {
+        return false;
+    }
+    let n = len / page;
+    let mut d = vec![0i32; n];
+    let mut count = n as u64;
+    // SAFETY: `d` holds `count` dispositions; the range is guest memory.
+    let kr = unsafe { mach_vm_page_range_query(mach_task_self_, at as u64, len as u64, d.as_mut_ptr() as u64, &mut count) };
+    if kr != 0 || count as usize != n {
+        return false;
+    }
+    for (o, &v) in out.iter_mut().zip(&d) {
+        *o = [(PRESENT, ps::PRESENT), (PAGED_OUT, ps::PAGED_OUT), (EXTERNAL, ps::EXTERNAL), (REUSABLE, ps::REUSABLE)].iter().filter(|(b, _)| v & b != 0).fold(0, |a, (_, s)| a | s);
+    }
+    true
+}
+
+/// No per-page query of the host's VM this side of macOS.
+#[cfg(not(target_os = "macos"))]
+fn pages(_at: usize, _len: usize, _page: usize, _out: &mut [u8]) -> bool {
+    false
+}
 
 /// The host's page size.
 fn page() -> usize {

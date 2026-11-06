@@ -225,6 +225,7 @@ impl Kernel {
             sys::FCNTL | sys::FCNTL_NOCANCEL => self.darwin_fcntl(m, a),
             sys::FSGETPATH => res(self.darwin_fsgetpath(m, a)),
             sys::PROC_INFO => res(self.darwin_proc_info(m, a)),
+            sys::MEMORYSTATUS_CONTROL => res(self.darwin_memorystatus_control(m, a)),
             sys::GETTIMEOFDAY => res(darwin_gettimeofday(m, a[0], a[1], a[2])),
             sys::GETRLIMIT => res(self.darwin_getrlimit(m, a[0], a[1])),
             sys::SETRLIMIT => res(self.darwin_setrlimit(m, a[0], a[1])),
@@ -512,12 +513,14 @@ impl Kernel {
     /// `proc_info(callnum, pid, flavor, arg, buffer, buffersize)`.
     fn darwin_proc_info(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
         const CALL_PIDINFO: u64 = 2;
+        const CALL_DIRTYCONTROL: u64 = 8;
         const CALL_SET_DYLD_IMAGES: u64 = 15;
         const PIDPATHINFO: u64 = 11;
         const UNIQIDENTIFIERINFO: u64 = 17;
         let (call, pid, flavor, buf, size) = (a[0], a[1] as i32, a[2] as u32 as u64, a[4], a[5] as u32 as usize);
         let me = pid == self.pid || pid == 0;
         match (call, flavor) {
+            (CALL_DIRTYCONTROL, _) => self.darwin_dirtycontrol(pid, flavor as u32, a[3]),
             // dyld says where its image list is (`buf`, `size` bytes),
             // which task_info(TASK_DYLD_INFO) reports from then on.
             (CALL_SET_DYLD_IMAGES, _) if me => {

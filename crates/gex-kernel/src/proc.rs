@@ -377,6 +377,8 @@ pub struct ProcTable {
     virtual_init: AtomicBool,
     /// The Darwin tasks' ports and spaces, shared by every task here.
     pub darwin_ipc: std::sync::Arc<crate::darwin::ipc::IpcCell>,
+    /// Every process's memorystatus state and the jetsam bands.
+    pub jetsam: Mutex<crate::darwin::memorystatus::Jetsam>,
 }
 
 impl std::fmt::Debug for ProcTable {
@@ -399,7 +401,8 @@ impl ProcTable {
     /// A table holding just the init process, which is its own group and
     /// session leader and whose parent is the kernel that is not there.
     pub fn new() -> ProcTable {
-        ProcTable {
+        let t = ProcTable {
+            jetsam: Default::default(),
             halting: AtomicBool::new(false),
             halt_code: AtomicI32::new(0),
             remote: None,
@@ -432,7 +435,15 @@ impl ProcTable {
                     host_child: false,
                 }],
             }),
-        }
+        };
+        // forkproc's cloning of initproc: init is internal, in no band.
+        t.jetsam().add(INIT_PID, 0, true, crate::darwin::memorystatus::relaunch::UNKNOWN);
+        t
+    }
+
+    /// The memorystatus state, locked.
+    pub fn jetsam(&self) -> std::sync::MutexGuard<'_, crate::darwin::memorystatus::Jetsam> {
+        self.jetsam.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Table> {
@@ -493,6 +504,9 @@ impl ProcTable {
             vm: None,
             host_child,
         });
+        drop(t);
+        // forkproc's memorystatus init, then memorystatus_add.
+        self.jetsam().add(pid, ppid, false, crate::darwin::memorystatus::relaunch::UNKNOWN);
         pid
     }
 
@@ -649,6 +663,8 @@ impl ProcTable {
         if let Some(r) = self.remote {
             return (r.exit)(pid, status);
         }
+        // proc_exit's memorystatus_remove.
+        self.jetsam().remove(pid);
         let virtual_init = self.virtual_init.load(Ordering::Acquire);
         let mut jobc_orphaned = Vec::new();
         let (cell, done, was_ppid, own_q, orphans) = {
@@ -764,6 +780,8 @@ impl ProcTable {
             let mut t = self.lock();
             t.procs.retain(|p| p.pid != pid);
         }
+        // A process reaped unseen (a spawn that failed) leaves the bands.
+        self.jetsam().remove(pid);
         // reap_child_locked's NOTE_REAP.
         crate::procnote::post(pid, crate::procnote::note::REAP);
     }
