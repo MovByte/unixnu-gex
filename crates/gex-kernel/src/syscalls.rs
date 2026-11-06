@@ -9637,11 +9637,17 @@ impl Kernel {
         // A call that returns takes the signals pending for it on the way
         // back (`bsd_ast`), the ones it raised itself among them.
         if self.darwin && matches!(out, SyscallOutcome::Continue) {
+            self.dtask.syscall_exit = true;
             out = match self.deliver_pending(m) {
                 Delivery::None => SyscallOutcome::Continue,
                 Delivery::Resume(pc) => SyscallOutcome::Resume(pc),
-                Delivery::Terminate { signal, core } => SyscallOutcome::Killed { signal, core },
+                Delivery::Terminate { signal, core } => match self.dtask.crash_notify.take() {
+                    // proc_prepareexit's task_exception_notify, waited for.
+                    Some((code, subcode)) => self.darwin_exception_triage(m, crate::darwin::exception::EXC_CRASH, &[code, subcode], crate::darwin::triage::Then::Exit { signal, core }),
+                    None => SyscallOutcome::Killed { signal, core },
+                },
             };
+            self.dtask.syscall_exit = false;
         }
         if self.darwin && matches!(out, SyscallOutcome::Blocking(_)) {
             self.darwin_workq_sched_block();
@@ -10397,7 +10403,7 @@ impl Kernel {
                     // back to user space somewhere new (a workqueue thread
                     // given work).
                     let next = self.darwin_wait_done(m, wait, res);
-                    if let Some(out @ SyscallOutcome::Blocking(_)) = next {
+                    if let Some(out @ (SyscallOutcome::Blocking(_) | SyscallOutcome::Killed { .. })) = next {
                         return out;
                     }
                     if let Some(out) = self.darwin_guard_kill() {
@@ -10408,12 +10414,19 @@ impl Kernel {
                         Some(SyscallOutcome::Resume(pc)) => Some(pc),
                         _ => None,
                     };
-                    return match self.deliver_pending(m) {
+                    self.dtask.syscall_exit = true;
+                    let out = match self.deliver_pending(m) {
                         Delivery::None => resume_at.map_or(SyscallOutcome::Continue, SyscallOutcome::Resume),
                         Delivery::Resume(_) if self.wasm32 => SyscallOutcome::Continue,
                         Delivery::Resume(pc) => SyscallOutcome::Resume(pc),
-                        Delivery::Terminate { signal, core } => SyscallOutcome::Killed { signal, core },
+                        Delivery::Terminate { signal, core } => match self.dtask.crash_notify.take() {
+                            // proc_prepareexit's task_exception_notify, waited for.
+                            Some((code, subcode)) => self.darwin_exception_triage(m, crate::darwin::exception::EXC_CRASH, &[code, subcode], crate::darwin::triage::Then::Exit { signal, core }),
+                            None => SyscallOutcome::Killed { signal, core },
+                        },
                     };
+                    self.dtask.syscall_exit = false;
+                    return out;
                 }
             }
         }

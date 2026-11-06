@@ -147,6 +147,10 @@ pub struct Task {
     /// Its map's highest address when an entitlement or a spawn raised it
     /// (`vm_map_set_max_addr`); 0 for [`vm::MAP_MAX`].
     pub map_max: u64,
+    /// Signals are being taken on the way out of a call, which can wait.
+    pub syscall_exit: bool,
+    /// The EXC_CRASH code and subcode a death owes its handlers.
+    pub crash_notify: Option<(i64, i64)>,
     /// Each thread's kernel reply port, and a reply that came to it.
     pub rpc_reply: std::collections::HashMap<i32, ipc::ObjId>,
     pub rpc_replies: std::collections::HashMap<i32, Box<ipc::msg::Kmsg>>,

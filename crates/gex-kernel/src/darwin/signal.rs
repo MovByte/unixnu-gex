@@ -604,12 +604,20 @@ impl Kernel {
                     continue;
                 }
                 // proc_prepareexit: a death a core signal makes is told to
-                // the EXC_CRASH handler (or makes a corpse for the
-                // EXC_CORPSE_NOTIFY one); with none set, nothing is seen.
+                // the EXC_CRASH handlers (task_exception_notify), its code
+                // the signal and the thread's last exception. The host's
+                // own handler takes it and nothing is seen, unless a handler
+                // was set; that one is sent it on the way out of a call.
                 if p & prop::CORE != 0 {
                     use super::exception as exc;
-                    if self.darwin_exc_handled(exc::EXC_CRASH) || self.darwin_exc_handled(exc::EXC_CORPSE_NOTIFY) {
-                        self.darwin_unimplemented(format!("telling the EXC_CRASH or EXC_CORPSE_NOTIFY handler of a death by Darwin signal {d} (task_exception_notify, corpses)"));
+                    if self.darwin_exc_handled(exc::EXC_CRASH) {
+                        let th = self.dtask.threads.map.get(&self.tid).map(|t| (t.uu_exception, t.uu_code, t.uu_subcode)).unwrap_or_default();
+                        let code = (i64::from(d & 0xff) << 24) | (i64::from(th.0 & 0x0f) << 20) | (th.1 & 0xfffff);
+                        if self.dtask.syscall_exit {
+                            self.dtask.crash_notify = Some((code, th.2));
+                        } else {
+                            self.darwin_unimplemented(format!("telling the EXC_CRASH handler of a death by Darwin signal {d} taken outside a call"));
+                        }
                     }
                 }
                 return Delivery::Terminate { signal: l, core: false };

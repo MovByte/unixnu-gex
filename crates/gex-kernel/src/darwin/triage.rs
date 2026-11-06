@@ -38,6 +38,9 @@ const MACH_EXC_BASE: i32 = 2405;
 pub enum Then {
     /// `thread_exception_return`: back to user space as the thread stands.
     Return,
+    /// `proc_prepareexit`'s EXC_CRASH: the process goes on to die of
+    /// `signal`.
+    Exit { signal: u32, core: bool },
 }
 
 /// An exception on its way through the levels.
@@ -76,6 +79,7 @@ impl Kernel {
 
     /// The levels from `t.level` on, until one takes the exception.
     fn darwin_triage_from(&mut self, m: &mut GuestMem<'_>, mut t: Triage) -> SyscallOutcome {
+        let mut last = KERN_FAILURE;
         while t.level < 3 {
             let actions: Option<ExcActions> = match t.level {
                 0 => self.dtask.kports.thread_exc.get(&self.tid).copied(),
@@ -88,12 +92,16 @@ impl Kernel {
                 continue;
             }
             match self.darwin_exception_deliver(m, &t, &actions[t.exc]) {
-                Delivered::Done(r) if r == kr::SUCCESS || r == RCV_PORT_DIED => break,
-                Delivered::Done(_) => {}
+                Delivered::Done(r) => {
+                    last = r;
+                    if r == kr::SUCCESS || r == RCV_PORT_DIED {
+                        break;
+                    }
+                }
                 Delivered::Sent(p) => return self.darwin_exc_await(m, p),
             }
         }
-        self.darwin_triage_end(m, t.then)
+        self.darwin_triage_end(m, t.then, last)
     }
 
     /// `check_exc_receiver_dependency`: an EXC_CRASH is not sent to a
@@ -107,9 +115,17 @@ impl Kernel {
         !(ipc.port(p).owner == ipc.task && matches!(ipc.port(p).receiver, Receiver::Space(_)))
     }
 
-    fn darwin_triage_end(&mut self, _m: &mut GuestMem<'_>, then: Then) -> SyscallOutcome {
+    fn darwin_triage_end(&mut self, _m: &mut GuestMem<'_>, then: Then, kr: u64) -> SyscallOutcome {
         match then {
             Then::Return => SyscallOutcome::Continue,
+            Then::Exit { signal, core } => {
+                // No handler took it: a corpse, for its notification
+                // handler (with none, the corpse goes unseen).
+                if kr != kr::SUCCESS && self.darwin_task_exc_handled(exc::EXC_CORPSE_NOTIFY) {
+                    self.darwin_unimplemented("a corpse of a crashed task for its EXC_CORPSE_NOTIFY handler (corpses)".into());
+                }
+                SyscallOutcome::Killed { signal, core }
+            }
         }
     }
 
@@ -118,7 +134,7 @@ impl Kernel {
         let Some(Carried::Port(port)) = a.port else { return Delivered::Done(KERN_FAILURE) };
         let ux = self.ipc().global_port(Kobject::UxHandler);
         if port == ux {
-            return Delivered::Done(self.darwin_handle_ux_exception(m, t.exc, t.codes[0]));
+            return Delivered::Done(self.darwin_handle_ux_exception(m, t.exc, t.codes[0], t.codes[1]));
         }
         let code64 = a.behavior & exc::MACH_EXCEPTION_CODES != 0;
         let behavior = a.behavior & !exc::MACH_EXCEPTION_MASK;
@@ -226,7 +242,7 @@ impl Kernel {
         self.ipc().kmsg_destroy(k, true);
         self.darwin_ipc_settle(m);
         if r == kr::SUCCESS || r == RCV_PORT_DIED {
-            return Some(self.darwin_triage_end(m, p.t.then));
+            return Some(self.darwin_triage_end(m, p.t.then, r));
         }
         Some(self.darwin_triage_from(m, p.t))
     }
@@ -262,7 +278,7 @@ impl Kernel {
 
     /// `handle_ux_exception`: the signal the exception means
     /// (`ux_exception`), sent to the thread.
-    fn darwin_handle_ux_exception(&mut self, m: &mut GuestMem<'_>, ty: usize, code: i64) -> u64 {
+    fn darwin_handle_ux_exception(&mut self, m: &mut GuestMem<'_>, ty: usize, code: i64, subcode: i64) -> u64 {
         use super::signal::dsig;
         const KERN_INVALID_ADDRESS: i64 = 1;
         const EXC_EMULATION: usize = 4;
@@ -285,6 +301,11 @@ impl Kernel {
             _ => 0,
         };
         if d != 0 {
+            // uu_exception and uu_subcode, and threadsignal's uu_code.
+            let th = self.dtask.threads.map.entry(self.tid).or_default();
+            th.uu_exception = ty as i32;
+            th.uu_code = code;
+            th.uu_subcode = subcode;
             let l = super::kern::signal_to_linux(d);
             if l == 0 {
                 self.darwin_unimplemented(format!("Darwin signal {d}, which has no Linux number here, from exception {ty}"));

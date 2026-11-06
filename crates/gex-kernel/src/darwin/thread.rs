@@ -188,6 +188,11 @@ pub const CANCEL_POINTS: &[u64] = &[
 /// A Darwin thread's kernel state.
 #[derive(Debug, Default)]
 pub struct DThread {
+    /// The last exception made a signal for it (`uu_exception`,
+    /// `uu_code`, `uu_subcode`).
+    pub uu_exception: i32,
+    pub uu_code: i64,
+    pub uu_subcode: i64,
     pub policy: Policy,
     pub cancel: Cancel,
     /// `thread_suspend` count. A thread made with `PTHREAD_START_SUSPENDED`

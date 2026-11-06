@@ -3,9 +3,16 @@
 // EXCEPTION_STATE | MACH_EXCEPTION_CODES gets mach_exception_raise_state
 // with the thread's state, and the state it replies with is the thread's
 // (x0 here); a handler that fails passes it on to the host's, which makes
-// it SIGSYS, as it does with no handler.
+// it SIGSYS, as it does with no handler. A task dying of a core signal
+// (abort) tells its EXC_CRASH handler, in another task, the signal in its
+// code, and dies once the handler replies.
 
+#include <limits.h>
+#include <mach-o/dyld.h>
 #include <mach/mach.h>
+#include <spawn.h>
+#include <stdlib.h>
+#include <sys/wait.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -88,7 +95,44 @@ static void on_sigsys(int s) {
     sigsys++;
 }
 
-int main(void) {
+// A child that crashes, with the parent's port as its EXC_CRASH handler.
+static int crash(void) {
+    mach_port_t p;
+    mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &p);
+    mach_port_insert_right(mach_task_self(), p, p, MACH_MSG_TYPE_MAKE_SEND);
+    char self[PATH_MAX];
+    uint32_t len = sizeof self;
+    _NSGetExecutablePath(self, &len);
+    char *args[] = {self, "crash", NULL};
+    char *env[] = {"MallocNanoZone=0", NULL};
+    posix_spawnattr_t at;
+    posix_spawnattr_init(&at);
+    posix_spawnattr_setexceptionports_np(&at, EXC_MASK_CRASH, p, EXCEPTION_STATE | MACH_EXCEPTION_CODES, ARM_THREAD_STATE64);
+    pid_t pid;
+    if (posix_spawn(&pid, self, NULL, &at, args, env)) return bad("spawning", 0, 0);
+    request_t req;
+    kern_return_t kr = mach_msg(&req.head, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof req, p, 60000, MACH_PORT_NULL);
+    if (kr || req.head.msgh_id != 2406 || req.exc != EXC_CRASH || req.code_count != 2) return bad("the crash's request", kr ? kr : req.head.msgh_id, 2406);
+    if (req.code[0] != (long)SIGABRT << 24 || req.code[1] != 0) return bad("its code", req.code[0], (long)SIGABRT << 24);
+    char *after = (char *)req.code + req.code_count * sizeof(int64_t);
+    reply_t rep;
+    memset(&rep, 0, sizeof rep);
+    rep.head.msgh_bits = MACH_MSGH_BITS(MACH_MSGH_BITS_REMOTE(req.head.msgh_bits), 0);
+    rep.head.msgh_remote_port = req.head.msgh_remote_port;
+    rep.head.msgh_id = req.head.msgh_id + 100;
+    rep.ndr = NDR_record;
+    memcpy(&rep.flavor, after, 4);
+    memcpy(&rep.state_count, after + 4, 4);
+    memcpy(rep.state, after + 8, rep.state_count * sizeof(natural_t));
+    rep.head.msgh_size = sizeof rep;
+    if ((kr = mach_msg(&rep.head, MACH_SEND_MSG, rep.head.msgh_size, 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL))) return bad("replying", kr, 0);
+    int st;
+    if (waitpid(pid, &st, 0) != pid || !WIFSIGNALED(st) || WTERMSIG(st) != SIGABRT) return bad("the child's death", st, SIGABRT);
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1) abort();
     signal(SIGSYS, on_sigsys);
     // No handler of the task's: the host's makes it SIGSYS, x0 untouched.
     if (trap(-1) != 0x55 || sigsys != 1) return bad("an invalid trap with no handler", sigsys, 1);
@@ -108,6 +152,7 @@ int main(void) {
     // A handler that fails: on to the host's.
     fail_next = 1;
     if (trap(-2) != 0x55 || sigsys != 2 || seen_code != 2) return bad("a failed handler", sigsys, 2);
+    if (crash()) return 1;
     printf("excdeliver ok\n");
     return 0;
 }
