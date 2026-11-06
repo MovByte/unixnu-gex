@@ -45,6 +45,7 @@ pub mod pipe;
 pub mod priority;
 pub mod psynch;
 pub mod rlimit;
+pub mod sandbox;
 pub mod sema;
 pub mod shm;
 pub mod signal;
