@@ -128,17 +128,87 @@ pub enum Filtered {
     Unported(String),
 }
 
+/// What a terminal's modifiers left for the operation's caller to act on
+/// (`0xfffffff006a072f8`'s records): message strings, kept the first time
+/// each is set, and a storage class to name for a vnode operation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Effects {
+    pub message: Option<Vec<u8>>,
+    pub message2: Option<Vec<u8>>,
+    pub message3: Option<Vec<u8>>,
+    pub storage_class: Option<Vec<u8>>,
+}
+
 /// What evaluation came to.
 pub enum Outcome {
-    Decided(Decision),
+    Decided(Decision, Effects),
     /// A node of a kind not ported yet: what it is.
     Unported(String),
+}
+
+/// A string a profile names: at or past the nodes' end, a length (its NUL
+/// counted) and the bytes, the last of them NUL.
+fn string_at(b: &[u8], p: &Profile, at: usize) -> Option<Vec<u8>> {
+    if at < p.nodes_end {
+        return None;
+    }
+    let n = usize::from(u16_at(b, at)?);
+    let s = b.get(at + 2..at + 2 + n)?;
+    (n != 0 && s[n - 1] == 0).then(|| s[..n - 1].to_vec())
+}
+
+/// Apply one 4-byte modifier record at `at`; false refuses the decision.
+fn modify(b: &[u8], p: &Profile, at: usize, d: &mut Decision, fx: &mut Effects, unported: &mut Option<String>) -> bool {
+    let Some(r) = b.get(at..at + 4) else { return false };
+    let arg = u16::from_le_bytes([r[2], r[3]]);
+    let string = || string_at(b, p, p.nodes_end + usize::from(arg) * NODE);
+    match r[0] {
+        // The decision's errno, for a denial.
+        2 => {
+            if d.flags & 1 != 0 {
+                d.errno = if arg == 0 { 1 } else { u32::from(arg) };
+            }
+            true
+        }
+        3..=8 | 13..=16 | 18 => true,
+        9 if d.flags & 1 != 0 => {
+            fx.message = None;
+            true
+        }
+        9 | 10 | 11 => {
+            let Some(s) = string() else { return false };
+            let slot = match r[0] {
+                9 => &mut fx.message,
+                10 => &mut fx.message2,
+                _ => &mut fx.message3,
+            };
+            if slot.is_none() {
+                *slot = Some(s);
+            }
+            true
+        }
+        // Its class is a vnode operation's, under the platform profile only
+        // (the caller's to apply); a bad string refuses wherever it is.
+        12 => match string() {
+            Some(s) => {
+                fx.storage_class = Some(s);
+                true
+            }
+            None => false,
+        },
+        1 | 17 | 19 => {
+            *unported = Some(format!("sandbox modifier {} ({arg})", r[0]));
+            true
+        }
+        // Any other kind is nothing: only a record cut short refuses.
+        _ => true,
+    }
 }
 
 /// Evaluate operation `op` of profile `p` in blob `b`, asking `filter`
 /// about each filter node (its type, flag bit and argument).
 pub fn evaluate(b: &[u8], p: &Profile, op: usize, filter: &mut dyn FnMut(u8, bool, u16) -> Filtered) -> Outcome {
-    let refused = Outcome::Decided(REFUSED);
+    let refused = Outcome::Decided(REFUSED, Effects::default());
     let Some(idx) = (op < OPERATIONS).then(|| u16_at(b, p.ops + 2 * op)).flatten() else { return refused };
     let mut at = p.nodes + usize::from(idx) * NODE;
     loop {
@@ -167,13 +237,30 @@ pub fn evaluate(b: &[u8], p: &Profile, op: usize, filter: &mut dyn FnMut(u8, boo
             }
             1 => {
                 let word = u32::from(n[1]) | u32::from(n[2]) << 8 | u32::from(n[3]) << 16;
-                if word & 0x80_0000 != 0 {
-                    return Outcome::Unported(format!("a sandbox terminal's extended form ({word:#x})"));
+                let mut fx = Effects::default();
+                let mut unported = None;
+                // The extended form: its one modifier inline; else as many
+                // as byte 4 says, past the nodes.
+                let (mut d, records): (Decision, Vec<usize>) = if word & 0x80_0000 != 0 {
+                    (Decision { errno: word & 1, flags: word & 0x7f_ffff }, vec![at + 4])
+                } else {
+                    let d = Decision { errno: word & 1, flags: word & 0xff_ffff };
+                    if n[4] == 0 {
+                        (d, Vec::new())
+                    } else {
+                        let first = p.nodes_end + usize::from(u16::from_le_bytes([n[6], n[7]])) * NODE;
+                        (d, (0..usize::from(n[4])).map(|k| first + 4 * k).collect())
+                    }
+                };
+                for r in records {
+                    if !modify(b, p, r, &mut d, &mut fx, &mut unported) {
+                        return refused;
+                    }
                 }
-                if n[4] != 0 {
-                    return Outcome::Unported(format!("a sandbox terminal's modifiers ({:#x})", n[4]));
+                if let Some(what) = unported {
+                    return Outcome::Unported(what);
                 }
-                return Outcome::Decided(Decision { errno: word & 1, flags: word & 0xff_ffff });
+                return Outcome::Decided(d, fx);
             }
             _ => return refused,
         }
@@ -219,7 +306,7 @@ mod tests {
                 seen.push((t, a));
                 Filtered::Matched(want)
             });
-            let Outcome::Decided(d) = out else { panic!() };
+            let Outcome::Decided(d, _) = out else { panic!() };
             assert_eq!(d.errno, if want { 0 } else { 1 });
         }
         assert_eq!(seen, vec![(3, 7), (3, 7)]);
@@ -230,12 +317,12 @@ mod tests {
         // A node that leads back to itself.
         let b = blob(0, &[[0, 3, 0, 0, 0, 0, 0, 0]]);
         let p = single(&b).unwrap();
-        assert!(matches!(evaluate(&b, &p, 0, &mut |_, _, _| Filtered::Matched(true)), Outcome::Decided(d) if d == REFUSED));
+        assert!(matches!(evaluate(&b, &p, 0, &mut |_, _, _| Filtered::Matched(true)), Outcome::Decided(d, _) if d == REFUSED));
         // A bad opcode, an operation past the table.
         let b = blob(0, &[[7, 0, 0, 0, 0, 0, 0, 0]]);
         let p = single(&b).unwrap();
-        assert!(matches!(evaluate(&b, &p, 0, &mut |_, _, _| Filtered::Matched(true)), Outcome::Decided(d) if d == REFUSED));
-        assert!(matches!(evaluate(&b, &p, OPERATIONS, &mut |_, _, _| Filtered::Matched(true)), Outcome::Decided(d) if d == REFUSED));
+        assert!(matches!(evaluate(&b, &p, 0, &mut |_, _, _| Filtered::Matched(true)), Outcome::Decided(d, _) if d == REFUSED));
+        assert!(matches!(evaluate(&b, &p, OPERATIONS, &mut |_, _, _| Filtered::Matched(true)), Outcome::Decided(d, _) if d == REFUSED));
         let mut b = blob(0, &[allow()]);
         b[4] = 0xbe;
         assert_eq!(single(&b), Err(LoadError::OperationCount(0xbe)));
@@ -262,9 +349,38 @@ mod tests {
         let ps = collection(&b).unwrap();
         assert_eq!(ps.iter().map(|p| p.name).collect::<Vec<_>>(), vec![9, 10]);
         let errnos: Vec<u32> = ps.iter().map(|p| match evaluate(&b, p, 0, &mut |_, _, _| Filtered::Matched(true)) {
-            Outcome::Decided(d) => d.errno,
+            Outcome::Decided(d, _) => d.errno,
             Outcome::Unported(_) => 99,
         }).collect();
         assert_eq!(errnos, vec![1, 0]);
+    }
+}
+
+#[cfg(test)]
+mod platform {
+    use super::*;
+
+    /// Every operation of a real platform profile (`GEX_SANDBOX_PLATFORM`,
+    /// the kernelcache's blob) walks to a decision or to a filter, both
+    /// ways at each filter. Not run without it.
+    #[test]
+    fn a_platform_profiles_terminals_all_read() {
+        let Some(path) = std::env::var_os("GEX_SANDBOX_PLATFORM") else { return };
+        let b = std::fs::read(path).unwrap();
+        let p = single(&b).unwrap();
+        let (mut decided, mut unported) = (0, std::collections::BTreeSet::new());
+        for op in 0..OPERATIONS {
+            for pick in [true, false] {
+                match evaluate(&b, &p, op, &mut |_, _, _| Filtered::Matched(pick)) {
+                    // (A profile's own denial can be the refusal's value,
+                    // EPERM with flags 5.)
+                    Outcome::Decided(..) => decided += 1,
+                    Outcome::Unported(w) => {
+                        unported.insert(w);
+                    }
+                }
+            }
+        }
+        eprintln!("decided {decided}, unported {unported:?}");
     }
 }
