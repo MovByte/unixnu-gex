@@ -23,7 +23,7 @@ void start(void) {
     if (*(const volatile unsigned char *)(COMM_PAGE + 0x22) == 0) {
         status |= 2;
     }
-    if (*(const volatile unsigned char *)(COMM_PAGE_RO + 0x25) != 12) {
+    if (*(const volatile unsigned char *)(COMM_PAGE_RO + 0x25) != 14) {
         status |= 4;
     }
     bsd_exit(status);

@@ -10,8 +10,8 @@ use crate::GuestMem;
 
 /// `NCARGS`: `ARG_MAX`, the arguments and environment together.
 pub const NCARGS: isize = rlimit::ARG_MAX as isize;
-/// The kernel's `PAGE_SIZE`: gex's 4 KiB, the page the commpage says the
-/// kernel and its maps use.
+/// The kernel's `PAGE_SIZE`: arm64 iOS's 16 KiB, the page the commpage
+/// says the kernel and its maps use.
 pub const PAGE_SIZE: u64 = super::mach::PAGE_MASK + 1;
 /// `MAXPATHLEN`.
 const MAXPATHLEN: usize = 1024;

@@ -163,6 +163,12 @@ impl Task {
 }
 
 impl crate::syscalls::Kernel {
+    /// A Darwin process maps in arm64 iOS's 16 KiB pages: `mmap`,
+    /// `munmap` and `mprotect` align to them.
+    pub fn darwin_use_pages(&mut self) {
+        self.mem.lock().set_page(exec::PAGE_SIZE);
+    }
+
     /// This task's IPC state, with the system's table taken for the rest
     /// of the kernel call ([`Self::darwin_ipc_leave`] gives it back).
     pub(crate) fn ipc(&mut self) -> &mut ipc::Ipc {

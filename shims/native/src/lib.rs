@@ -1140,6 +1140,9 @@ fn run_program_with(
     // here (the browser has a shim per process).
     kernel.compat = program.compat();
     kernel.darwin = opts.darwin;
+    if opts.darwin {
+        kernel.darwin_use_pages();
+    }
     kernel.darwin_dyld_infos = opts.darwin_dyld_infos;
     kernel.dtask.strict = opts.darwin_strict;
     kernel.dtask.platform = opts.darwin_platform;

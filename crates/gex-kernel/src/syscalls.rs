@@ -4258,7 +4258,12 @@ impl MapIo<'_> {
                 // An alias's unmap: another mapping still holds the pages;
                 // the last holder's unmaps all of them.
                 let mut a = a;
-                match self.mem.lock().log.shared_maps.unalias(a[0], crate::mem::page_align_up(a[1])) {
+                let unalias = {
+                    let mut mm = self.mem.lock();
+                    let len = mm.up(a[1]);
+                    mm.log.shared_maps.unalias(a[0], len)
+                };
+                match unalias {
                     Unalias::Keep => return Some(Ok(0)),
                     Unalias::Whole(s, l) => (a[0], a[1]) = (s, l),
                     Unalias::Plain => {}
@@ -4306,10 +4311,7 @@ impl MapIo<'_> {
         // is not gone: `cgen::in_pe_image`). A check, not a retire
         // (`MapLog::recheck_code`).
         if r.is_ok() && (a[2] as u32) & crate::mem::prot::EXEC != 0 && (a[2] as u32) & crate::mem::prot::WRITE == 0 {
-            let (start, end) = (
-                crate::mem::page_align_down(a[0]),
-                crate::mem::page_align_up(a[0].saturating_add(a[1])),
-            );
+            let (start, end) = (mm.down(a[0]), mm.up(a[0].saturating_add(a[1])));
             if end > start {
                 mm.log.recheck_code.push((start, end));
                 crate::note_code_change();
@@ -4326,7 +4328,8 @@ impl MapIo<'_> {
             }
         }
         if r.is_ok() && (a[2] as u32) & crate::mem::prot::WRITE != 0 {
-            mm.forget_code(crate::mem::page_align_down(a[0]), crate::mem::page_align_up(a[0].saturating_add(a[1])));
+            let (start, end) = (mm.down(a[0]), mm.up(a[0].saturating_add(a[1])));
+            mm.forget_code(start, end);
         }
         r
     }
@@ -4424,7 +4427,7 @@ impl MapIo<'_> {
         if flags & mflags::ANONYMOUS == 0 && fd >= 0 {
             // A private file mapping is an eager copy, which is exactly
             // correct and needs no page faults.
-            let len_aligned = crate::mem::page_align_up(len);
+            let len_aligned = self.mem.lock().up(len);
             let file = self.fds.get(fd)?;
             let name = file.path.clone();
             if file.handle.maps_own_memory() {
@@ -4600,7 +4603,7 @@ impl MapIo<'_> {
                 // at the `openat` that armed it.
                 if let Some(base) = self
                     .place
-                    .and_then(|p| p.place(&path, crate::mem::page_align_up(len)))
+                    .and_then(|p| p.place(&path, self.mem.lock().up(len)))
                 {
                     addr = base;
                 }
@@ -4742,14 +4745,11 @@ impl MapIo<'_> {
     /// [`Self::retire_code`], saying which call it was for the host's
     /// retire-storm diagnostic ([`crate::note_retire_why`]).
     pub fn retire_code_why(&self, addr: u64, len: u64, why: &'static str, prot: u32) {
-        let (start, end) = (
-            crate::mem::page_align_down(addr),
-            crate::mem::page_align_up(addr.saturating_add(len)),
-        );
+        let mut mm = self.mem.lock();
+        let (start, end) = (mm.down(addr), mm.up(addr.saturating_add(len)));
         if end <= start {
             return;
         }
-        let mut mm = self.mem.lock();
         let executable = mm.vmas().iter().any(|v| v.prot & crate::mem::prot::EXEC != 0 && v.start < end && v.end > start);
         if executable {
             mm.log.retired_code.push((start, end));
@@ -5807,8 +5807,10 @@ pub fn process_vm(procs: &ProcTable, m: &mut GuestMem<'_>, compat: bool, write: 
             break;
         }
         if write && code {
-            let (start, end) = (crate::mem::page_align_down(ra), crate::mem::page_align_up(ra + n));
-            peer.mm.lock().log.retired_code.push((start, end));
+            let mut pm = peer.mm.lock();
+            let (start, end) = (pm.down(ra), pm.up(ra + n));
+            pm.log.retired_code.push((start, end));
+            drop(pm);
             crate::note_code_change();
         }
         done += n;

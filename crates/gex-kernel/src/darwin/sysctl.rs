@@ -71,7 +71,7 @@ pub fn table() -> Vec<(&'static str, Vec<i32>, Value)> {
         ("hw.model", vec![CTL_HW, 2], Str("J120AP")),
         ("hw.ncpu", vec![CTL_HW, 3], I32(NCPUS as i32)),
         ("hw.byteorder", vec![CTL_HW, 4], I32(1234)),
-        ("hw.pagesize", vec![CTL_HW, 7], I32(4096)),
+        ("hw.pagesize", vec![CTL_HW, 7], I32(16384)),
         ("hw.memsize", vec![CTL_HW, 24], I64(4 << 30)),
         ("hw.availcpu", vec![CTL_HW, 25], I32(NCPUS as i32)),
     ];

@@ -64,14 +64,14 @@ pub fn page(ncpus: u8, memory: u64) -> Vec<u8> {
     put(off::VERSION, &THIS_VERSION.to_le_bytes());
     put(off::CPU_CAPABILITIES, &(caps as u32).to_le_bytes());
     put(off::NCPUS, &[ncpus]);
-    put(off::USER_PAGE_SHIFT_32, &[12]);
-    put(off::USER_PAGE_SHIFT_64, &[12]);
+    put(off::USER_PAGE_SHIFT_32, &[14]);
+    put(off::USER_PAGE_SHIFT_64, &[14]);
     put(off::CACHE_LINESIZE, &64u16.to_le_bytes());
     put(off::CPU_CLUSTERS, &[1]);
     put(off::ACTIVE_CPUS, &[ncpus]);
     put(off::PHYSICAL_CPUS, &[ncpus]);
     put(off::LOGICAL_CPUS, &[ncpus]);
-    put(off::KERNEL_PAGE_SHIFT, &[12]);
+    put(off::KERNEL_PAGE_SHIFT, &[14]);
     put(off::MEMORY_SIZE, &memory.to_le_bytes());
     put(off::CPUFAMILY, &CPUFAMILY_ARM_HURRICANE.to_le_bytes());
     // kdebug tracing off: KDEBUG_ENABLE stays zero.
@@ -94,7 +94,7 @@ mod tests {
         let p = page(2, 4 << 30);
         assert_eq!(&p[..16], b"commpage 64-bit\0");
         assert_eq!(p[off::NCPUS], 2);
-        assert_eq!(p[off::USER_PAGE_SHIFT_64], 12);
+        assert_eq!(p[off::USER_PAGE_SHIFT_64], 14);
         assert_eq!(u32::from_le_bytes(p[off::KDEBUG_ENABLE..off::KDEBUG_ENABLE + 4].try_into().unwrap()), 0);
         let caps = u64::from_le_bytes(p[off::CPU_CAPABILITIES64..off::CPU_CAPABILITIES64 + 8].try_into().unwrap());
         assert_eq!((caps >> cap::NUM_CPUS_SHIFT) & 0xff, 2);

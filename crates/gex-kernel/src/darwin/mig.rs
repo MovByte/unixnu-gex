@@ -44,7 +44,7 @@ pub mod machine {
     /// `cpu_subtype` of an ARMv8 core without pointer authentication
     /// (`CPU_SUBTYPE_ARM64_V8`), what `cpu_machine_init` gives the A10X.
     pub const CPU_SUBTYPE: u32 = 1;
-    pub const PAGE_SIZE: u32 = 4096;
+    pub const PAGE_SIZE: u32 = 16384;
 }
 
 fn i32_at(b: &[u8], o: usize) -> Option<i32> {

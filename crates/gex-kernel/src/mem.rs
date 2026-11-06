@@ -299,7 +299,7 @@ impl Mm {
     /// ([`MemoryMap::clean_ranges`] before the mapping, `clean_before`) are
     /// not even read.
     pub(crate) fn zero_new(&self, m: &mut crate::GuestMem<'_>, start: u64, len: u64, prot_bits: u32, mut clean_before: Vec<(u64, u64)>) -> Result<(), Errno> {
-        let end = start + page_align_up(len);
+        let end = start + self.lock().up(len);
         // Arena the mapping had to claim is zero already: reading it to make
         // sure faulted in every page of it (the guest's own first write then
         // faulted again), 340 MB of `apt-get`'s malloc mappings a run. What
@@ -349,6 +349,9 @@ pub const BACKED_ISLAND: u64 = u64::MAX;
 #[derive(Debug, Clone)]
 pub struct MemoryMap {
     vmas: Vec<Vma>,
+    /// The process's page: what `mmap`, `munmap` and `mprotect` align to
+    /// and round lengths up to ([`PAGE_SIZE`], or a Darwin process's).
+    page: u64,
     /// What readers that do not own the map see of it ([`MapView`]).
     view: ViewCell,
     brk_start: u64,
@@ -592,9 +595,32 @@ pub fn page_align_down(v: u64) -> u64 {
 }
 
 impl MemoryMap {
+    /// The process's page size.
+    pub fn page(&self) -> u64 {
+        self.page
+    }
+
+    /// Make the process's page `page` (a Darwin process's, before it maps
+    /// anything).
+    pub fn set_page(&mut self, page: u64) {
+        debug_assert!(page.is_power_of_two() && page >= PAGE_SIZE);
+        self.page = page;
+    }
+
+    /// `v` rounded up to the process's page.
+    pub fn up(&self, v: u64) -> u64 {
+        (v + self.page - 1) & !(self.page - 1)
+    }
+
+    /// `v` rounded down to the process's page.
+    pub fn down(&self, v: u64) -> u64 {
+        v & !(self.page - 1)
+    }
+
     pub fn new(brk_start: u64) -> MemoryMap {
         MemoryMap {
             vmas: Vec::new(),
+            page: PAGE_SIZE,
             view: ViewCell(std::sync::Arc::new(MapView::new(&[]))),
             generation: 0,
             brk_start: page_align_up(brk_start),
@@ -628,6 +654,8 @@ impl MemoryMap {
     /// (a new map would leave them reading the old program's).
     pub fn renew(&mut self, brk_start: u64) {
         let mut fresh = MemoryMap::new(brk_start);
+        // The process's page stays its own.
+        fresh.page = self.page;
         std::mem::swap(&mut fresh.view, &mut self.view);
         std::mem::swap(&mut fresh.log, &mut self.log);
         // The log goes on (the host has still to retire the old code), but
@@ -707,7 +735,7 @@ impl MemoryMap {
                 return None;
             }
             match self.vmas.iter().filter(|v| v.start < candidate + len && v.end > candidate).map(|v| v.end).max() {
-                Some(end) => candidate = page_align_up(end),
+                Some(end) => candidate = self.up(end),
                 None => return Some(candidate),
             }
         }
@@ -800,7 +828,7 @@ impl MemoryMap {
     /// page, as it would any reused hole.
     pub fn donate_arena(&mut self, spans: &[(u64, u64)]) {
         for &(lo, hi) in spans {
-            let (lo, hi) = (page_align_up(lo), page_align_down(hi));
+            let (lo, hi) = (self.up(lo), self.down(hi));
             if lo >= hi {
                 continue;
             }
@@ -1028,7 +1056,7 @@ impl MemoryMap {
         // A chunk at a time, so a guest that maps a page at a time does not
         // ask the host to grow its memory once per page.
         const CHUNK: u64 = 8 * 1024 * 1024;
-        let need = page_align_up(len);
+        let need = self.up(len);
         // Carry on from the free tail instead of above it: glibc's `new_heap`
         // frees most of a `HEAP_MAX_SIZE` back and then asks for more, so
         // claiming a full `len` above the tail strands it every time. `apt-get
@@ -1121,10 +1149,10 @@ impl MemoryMap {
     /// [`Self::adopt`] before it is published.
     fn adopt_unpublished(&mut self, start: u64, end: u64, prot: u32, name: &str, code: Option<(String, u64)>) {
         self.generation += 1;
-        self.mark_dirty(page_align_down(start), page_align_up(end));
+        self.mark_dirty(self.down(start), self.up(end));
         self.vmas.push(Vma {
-            start: page_align_down(start),
-            end: page_align_up(end),
+            start: self.down(start),
+            end: self.up(end),
             prot,
             name: name.to_string(),
             origin: None,
@@ -1148,7 +1176,8 @@ impl MemoryMap {
         code: Option<(String, u64)>,
     ) {
         self.insert_from(start, end, prot, name, code);
-        if let Some(v) = self.vmas.iter_mut().find(|v| v.start == page_align_down(start)) {
+        let at = self.down(start);
+        if let Some(v) = self.vmas.iter_mut().find(|v| v.start == at) {
             v.origin = None;
         }
     }
@@ -1170,10 +1199,10 @@ impl MemoryMap {
         origin: Option<(String, u64)>,
     ) {
         self.generation += 1;
-        let aligned = page_align_down(start);
+        let aligned = self.down(start);
         // Whatever it will hold is the caller's to write; an anonymous
         // mapping the kernel zeroed is marked clean again after.
-        self.mark_dirty(aligned, page_align_up(end));
+        self.mark_dirty(aligned, self.up(end));
         // The offset moves with the start: rounding down to a page boundary
         // walks backwards into the file by the same amount.
         let code = origin.map(|(id, off)| (id, off.saturating_sub(start - aligned)));
@@ -1185,7 +1214,7 @@ impl MemoryMap {
         let origin = if prot & prot::WRITE != 0 { None } else { code.clone() };
         self.vmas.push(Vma {
             start: aligned,
-            end: page_align_up(end),
+            end: self.up(end),
             prot,
             name: name.to_string(),
             code,
@@ -1245,7 +1274,7 @@ impl MemoryMap {
         if addr == 0 {
             return (self.brk_cur, None);
         }
-        let new = page_align_up(addr);
+        let new = self.up(addr);
         if new < self.brk_start || new >= gex_abi::BRK_TOP {
             return (self.brk_cur, None);
         }
@@ -1283,8 +1312,8 @@ impl MemoryMap {
     /// Such a process's mappings are also placed in bands
     /// ([`Self::place_banded`]).
     pub fn set_mmap_top(&mut self, top: u64) {
-        self.mmap_next = self.mmap_next.min(page_align_down(top));
-        self.mmap_ceiling = self.mmap_ceiling.min(page_align_down(top));
+        self.mmap_next = self.mmap_next.min(self.down(top));
+        self.mmap_ceiling = self.mmap_ceiling.min(self.down(top));
         self.banded = true;
     }
 
@@ -1328,10 +1357,10 @@ impl MemoryMap {
         if len == 0 {
             return Err(Errno::EINVAL);
         }
-        let len = page_align_up(len);
+        let len = self.up(len);
 
         if flags & (flags::FIXED | flags::FIXED_NOREPLACE) != 0 {
-            if !addr.is_multiple_of(PAGE_SIZE) {
+            if !addr.is_multiple_of(self.page) {
                 return Err(Errno::EINVAL);
             }
             let end = addr.checked_add(len).ok_or(Errno::ENOMEM)?;
@@ -1361,7 +1390,7 @@ impl MemoryMap {
 
         // An address hint is honoured when the range happens to be free, and
         // is not the runtime's.
-        if addr != 0 && addr.is_multiple_of(PAGE_SIZE) {
+        if addr != 0 && addr.is_multiple_of(self.page) {
             let end = addr.saturating_add(len);
             if end <= self.limit()
                 && self.is_free(addr, end)
@@ -1430,7 +1459,7 @@ impl MemoryMap {
                 }
                 return Err(Errno::ENOMEM);
             }
-            let start = page_align_down(candidate - len);
+            let start = self.down(candidate - len);
             if let Some(&(a, _)) = self.fixed_only.iter().find(|&&(a, b)| start < b && a < start + len) {
                 candidate = a;
                 continue;
@@ -1472,11 +1501,11 @@ impl MemoryMap {
         may_move: bool,
     ) -> Result<(u64, bool), Errno> {
         self.generation += 1;
-        if !addr.is_multiple_of(PAGE_SIZE) || old_len == 0 || new_len == 0 {
+        if !addr.is_multiple_of(self.page) || old_len == 0 || new_len == 0 {
             return Err(Errno::EINVAL);
         }
-        let old_len = page_align_up(old_len);
-        let new_len = page_align_up(new_len);
+        let old_len = self.up(old_len);
+        let new_len = self.up(new_len);
         // The whole range has to be one mapping, as Linux requires.
         let Some(v) = self
             .vmas
@@ -1527,7 +1556,7 @@ impl MemoryMap {
     /// mappings, which a Wine process has thousands of, under the kernel
     /// lock, on every anonymous `mmap`).
     fn first_fit(&self, lo: u64, hi: u64, len: u64) -> Option<u64> {
-        self.first_fit_aligned(lo, hi, len, PAGE_SIZE)
+        self.first_fit_aligned(lo, hi, len, self.page)
     }
 
     /// [`Self::first_fit`] at a power-of-two `align` (a multiple of the page).
@@ -1592,7 +1621,7 @@ impl MemoryMap {
     /// asks for a view plus 60 KiB and trims to 64 KiB granularity then has
     /// only the tail to trim, not a sliver below too.
     fn place_banded(&self, len: u64, anon: bool) -> Option<u64> {
-        let align = if anon && len >= BAND_ALIGN { BAND_ALIGN } else { PAGE_SIZE };
+        let align = if anon && len >= BAND_ALIGN { BAND_ALIGN } else { self.page };
         if len < BAND_LARGE {
             self.first_fit_aligned(MMAP_BOTTOM, self.mmap_ceiling, len, align)
         } else {
@@ -1610,10 +1639,10 @@ impl MemoryMap {
     /// [`Self::unmap`] before it is published.
     fn unmap_unpublished(&mut self, addr: u64, len: u64) -> Result<(), Errno> {
         self.generation += 1;
-        if !addr.is_multiple_of(PAGE_SIZE) {
+        if !addr.is_multiple_of(self.page) {
             return Err(Errno::EINVAL);
         }
-        let len = page_align_up(len);
+        let len = self.up(len);
         let end = addr.checked_add(len).ok_or(Errno::EINVAL)?;
         let mut out = Vec::with_capacity(self.vmas.len() + 1);
         for v in std::mem::take(&mut self.vmas) {
@@ -1712,10 +1741,10 @@ impl MemoryMap {
     /// [`Self::protect`] before it is published.
     fn protect_unpublished(&mut self, addr: u64, len: u64, new_prot: u32) -> Result<(), Errno> {
         self.generation += 1;
-        if !addr.is_multiple_of(PAGE_SIZE) {
+        if !addr.is_multiple_of(self.page) {
             return Err(Errno::EINVAL);
         }
-        let len = page_align_up(len);
+        let len = self.up(len);
         let end = addr.checked_add(len).ok_or(Errno::EINVAL)?;
         if new_prot & prot::WRITE != 0 {
             self.mark_dirty(addr, end);

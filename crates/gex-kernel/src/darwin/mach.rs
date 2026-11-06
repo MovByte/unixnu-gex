@@ -153,8 +153,8 @@ pub(crate) mod prot {
     pub const READ: u64 = 0x1;
 }
 
-/// The map's page mask (`VM_MAP_PAGE_MASK`): gex's 4 KiB pages.
-pub(crate) const PAGE_MASK: u64 = 0xfff;
+/// The map's page mask (`VM_MAP_PAGE_MASK`): arm64 iOS's 16 KiB pages.
+pub(crate) const PAGE_MASK: u64 = 0x3fff;
 
 /// `VM_PURGABLE_*` controls and the state masks.
 mod purgable {
