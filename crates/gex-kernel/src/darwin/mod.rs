@@ -13,6 +13,7 @@ use crate::errno::Errno;
 use crate::GuestMem;
 use gex_abi::ctx;
 
+pub mod applematch;
 pub mod attrcall;
 pub mod attrlist;
 pub mod bsd;
