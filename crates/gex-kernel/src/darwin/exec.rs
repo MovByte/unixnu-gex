@@ -433,6 +433,7 @@ impl Kernel {
     /// `strings` is the exec's area; the run's first program has its
     /// path and vectors from the kernel.
     fn darwin_start_body(&mut self, strings: Option<Strings>, l: &Loaded, user_stack: u64) -> Result<MainStack, Errno> {
+        self.darwin_vm_policies();
         // task_set_main_thread_qos, for an exec's, a spawn's and the first
         // image's main thread alike.
         let q = self.darwin_main_thread_qos();
@@ -482,6 +483,9 @@ impl Kernel {
             b.extend_from_slice(&bytes);
             bytes = b;
         }
+        // create_unix_stack's mach_vm_allocate_kernel(VM_MEMORY_STACK).
+        const VM_MEMORY_STACK: u8 = 30;
+        self.dtask.vm.set(alloc, alloc + size, super::vm::Attrs { alias: VM_MEMORY_STACK, ..Default::default() });
         Ok(MainStack { sp, bytes, alloc, size, guard })
     }
 }

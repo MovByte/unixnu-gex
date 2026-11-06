@@ -314,7 +314,7 @@ impl Mm {
             }
         }
         for (a, b) in dirty_parts(&clean_before, start, end) {
-            m.zero_dirty(a, (b - a) as usize)?;
+            m.discard(a, (b - a) as usize)?;
         }
         if prot_bits & prot::WRITE == 0 {
             self.lock().mark_clean(start, end);

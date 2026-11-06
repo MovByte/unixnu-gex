@@ -141,7 +141,7 @@ mod vmf {
     pub const USER_ALLOCATE: u64 = ANYWHERE | PURGABLE | CHUNK_4GB | RANDOM_ADDR | NO_CACHE | PERMANENT | OVERWRITE | SUPERPAGE_MASK | TPRO | ALIAS_MASK;
     pub const USER_MAP: u64 = USER_ALLOCATE | RETURN_4K_DATA_ADDR | RETURN_DATA_ADDR;
     /// What this kernel's VM does not do yet.
-    pub const UNDONE: u64 = PURGABLE | CHUNK_4GB | RANDOM_ADDR | PERMANENT | SUPERPAGE_MASK | TPRO;
+    pub const UNDONE: u64 = PURGABLE | CHUNK_4GB | RANDOM_ADDR | PERMANENT | TPRO;
 }
 
 /// `VM_PROT_*`.
@@ -678,7 +678,8 @@ impl Kernel {
 
     /// `mach_vm_allocate_kernel` and the anonymous case of
     /// `vm_map_enter_mem_object`: `size` bytes of `cur` protection at
-    /// `*addr` (fixed) or anywhere, aligned to `mask + 1`.
+    /// `*addr` (fixed) or anywhere, aligned to `mask + 1`, with the user
+    /// tag in the flags' top byte.
     fn vm_allocate(&mut self, m: &mut GuestMem<'_>, addr: &mut u64, size: u64, mask: u64, flags: u64, cur: u64) -> u64 {
         use crate::mem::flags as mf;
         if flags & !vmf::USER_ALLOCATE != 0 {
@@ -687,6 +688,10 @@ impl Kernel {
         if size == 0 {
             *addr = 0;
             return kr::SUCCESS;
+        }
+        // vm_map_enter: arm64 has no superpage size.
+        if flags & vmf::SUPERPAGE_MASK != 0 {
+            return kr::INVALID_ARGUMENT;
         }
         if flags & vmf::UNDONE != 0 {
             self.darwin_unimplemented(format!("mach_vm_allocate/mach_vm_map flags {:#x}", flags & vmf::UNDONE));
@@ -697,6 +702,7 @@ impl Kernel {
         let Some(len) = size.checked_add(PAGE_MASK).map(|s| s & !PAGE_MASK).filter(|&l| l != 0) else { return kr::INVALID_ARGUMENT };
         let p = (cur & prot::ALL) as u64;
         let linux_prot = (p & 1) | (p & 2) | (p & 4);
+        let attrs = super::vm::Attrs { alias: (flags >> 24) as u8, no_cache: flags & vmf::NO_CACHE != 0, ..Default::default() };
         if fixed {
             // Without VM_FLAGS_OVERWRITE a fixed request over anything
             // mapped fails.
@@ -705,7 +711,7 @@ impl Kernel {
             }
             return match self.canonical(m, nr::MMAP, [start, len, linux_prot, mf::PRIVATE | mf::ANONYMOUS | mf::FIXED, u64::MAX, 0]) {
                 Ok(_) => {
-                    self.dtask.maxprot.clear(start, start + len);
+                    self.dtask.vm.set(start, start + len, attrs);
                     *addr = start;
                     kr::SUCCESS
                 }
@@ -727,7 +733,7 @@ impl Kernel {
         if end > start + len {
             let _ = self.canonical(m, nr::MUNMAP, [start + len, end - start - len, 0, 0, 0, 0]);
         }
-        self.dtask.maxprot.clear(start, start + len);
+        self.dtask.vm.set(start, start + len, attrs);
         *addr = start;
         kr::SUCCESS
     }
@@ -759,7 +765,7 @@ impl Kernel {
         if e == 0 {
             return kr::SUCCESS;
         }
-        self.dtask.maxprot.clear(s, e);
+        self.dtask.vm.clear(s, e);
         match self.canonical(m, nr::MUNMAP, [s, e - s, 0, 0, 0, 0]) {
             Ok(_) => kr::SUCCESS,
             Err(_) => kr::INVALID_ARGUMENT,
@@ -799,7 +805,7 @@ impl Kernel {
             return kr::INVALID_ADDRESS;
         }
         let mut new = new & prot::ALL;
-        if self.dtask.maxprot.pieces(s, e).iter().any(|&(_, _, max)| new & u64::from(max) != new) {
+        if self.dtask.vm.pieces(s, e).iter().any(|(_, _, a)| new & u64::from(a.max) != new) {
             return kr2::PROTECTION_FAILURE;
         }
         if new & prot::WRITE != 0 && new & prot::EXECUTE != 0 {
@@ -812,7 +818,7 @@ impl Kernel {
                     return kr::INVALID_ADDRESS;
                 }
             }
-            self.dtask.maxprot.set(s, e, new as u8);
+            self.dtask.vm.update(s, e, |a| a.max = new as u8);
             return kr::SUCCESS;
         }
         match self.canonical(m, nr::MPROTECT, [s, e - s, new, 0, 0, 0]) {

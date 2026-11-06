@@ -228,27 +228,8 @@ impl Kernel {
             sys::GETTIMEOFDAY => res(darwin_gettimeofday(m, a[0], a[1], a[2])),
             sys::GETRLIMIT => res(self.darwin_getrlimit(m, a[0], a[1])),
             sys::SETRLIMIT => res(self.darwin_setrlimit(m, a[0], a[1])),
-            // A new mapping's entries have the default maximum protection.
-            // MAP_ANON is 0x1000: a file mapping has a descriptor to look at
-            // (a POSIX shared memory object's checks).
-            sys::MMAP => {
-                if a[3] & 0x1000 == 0 && (a[4] as i32) >= 0 {
-                    if let Err(e) = self.darwin_shm_mmap_check(a) {
-                        return Some(neg(e));
-                    }
-                }
-                let mut b = *a;
-                let n = super::bsd::translate(raw, &mut b);
-                match self.canonical(m, n, b) {
-                    Ok(at) => {
-                        use super::mach::PAGE_MASK;
-                        let end = at.saturating_add(a[1]).saturating_add(PAGE_MASK) & !PAGE_MASK;
-                        self.dtask.maxprot.clear(at & !PAGE_MASK, end);
-                        at
-                    }
-                    Err(e) => neg(e),
-                }
-            }
+            sys::MMAP => res(self.darwin_mmap(m, a)),
+            sys::MADVISE => res(self.darwin_madvise(m, a)),
             // munmap and mprotect (`kern_mman.c`) are mach_vm_deallocate
             // and mach_vm_protect, with the address page aligned.
             sys::MUNMAP => {

@@ -600,13 +600,14 @@ impl Kernel {
         let (freeaddr, freesize, kport, sem) = (a[0], a[1], a[2] as u32, a[3] as u32);
         if freesize != 0 && freeaddr != 0 {
             if self.tid == self.pid {
-                const MADV_DONTNEED: u64 = 4;
+                // Reusable, then inaccessible once it is.
                 let page = u64::from(super::mig::machine::PAGE_SIZE);
                 let size = (freesize - 1) & !(page - 1);
-                let _ = self.canonical(m, crate::syscalls::nr::MADVISE, [freeaddr, size, MADV_DONTNEED, 0, 0, 0]);
-                let _ = self.canonical(m, crate::syscalls::nr::MPROTECT, [freeaddr, size, 0, 0, 0, 0]);
+                if self.darwin_behavior_set(m, freeaddr, size, super::mman::act::REUSABLE) == super::ipc::kr::SUCCESS {
+                    let _ = self.vm_protect(m, freeaddr, size, false, 0);
+                }
             } else {
-                let _ = self.canonical(m, crate::syscalls::nr::MUNMAP, [freeaddr, freesize, 0, 0, 0, 0]);
+                let _ = self.darwin_vm_deallocate(m, freeaddr, freesize);
             }
         }
         // thread_terminate_pinned: the self port is unpinned as the thread

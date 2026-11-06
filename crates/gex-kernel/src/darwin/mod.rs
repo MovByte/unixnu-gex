@@ -36,6 +36,7 @@ pub mod lockf;
 pub mod mach;
 pub mod mach_msg;
 pub mod mig;
+pub mod mman;
 pub mod mk_timer;
 pub mod mwl;
 pub mod pipe;
@@ -138,8 +139,11 @@ pub struct Task {
     /// The task's policy (app type, role, QoS clamp and what follows): its
     /// cell in the process table, once asked.
     pub policy: Option<std::sync::Arc<std::sync::Mutex<taskpolicy::TaskPolicy>>>,
-    /// Maximum protections lowered from `VM_PROT_ALL`.
-    pub maxprot: vm::MaxProt,
+    /// What its map's entries keep beyond the host's mappings.
+    pub vm: vm::Entries,
+    /// Its map's highest address when an entitlement or a spawn raised it
+    /// (`vm_map_set_max_addr`); 0 for [`vm::MAP_MAX`].
+    pub map_max: u64,
     /// Threads a semaphore operation woke, and how.
     pub sema_wake: Vec<(i32, wait::WaitResult)>,
     /// A blocked send's message and its send buffer, by thread.

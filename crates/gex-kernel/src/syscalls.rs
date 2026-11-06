@@ -4281,7 +4281,22 @@ impl MapIo<'_> {
                     maps.retain(|s| s.start + s.len <= a[0] || s.start >= a[0] + a[1]);
                 }
                 self.retire_code_why(a[0], a[1], "munmap", 0);
-                flushed.and_then(|_| self.mem.lock().unmap(a[0], a[1])).map(|_| 0)
+                let mapped: Vec<(u64, u64)> = {
+                    let mm = self.mem.lock();
+                    let (s, e) = (mm.down(a[0]), mm.up(a[0].saturating_add(a[1])));
+                    mm.vmas().iter().filter(|v| v.start < e && v.end > s).map(|v| (v.start.max(s), v.end.min(e))).collect()
+                };
+                let r = flushed.and_then(|_| self.mem.lock().unmap(a[0], a[1]));
+                // What was there goes back to the host, and is known zero
+                // for the next mapping there.
+                if r.is_ok() {
+                    for (s, e) in mapped {
+                        if m.advise(s, e - s, crate::HostAdvice::Discard).unwrap_or(false) {
+                            self.mem.lock().mark_clean(s, e);
+                        }
+                    }
+                }
+                r.map(|_| 0)
             }
             nr::MSYNC => self.flush_shared(m, a[0], a[1]).map(|_| 0),
             nr::MREMAP => self.mremap(m, a),
@@ -4405,7 +4420,7 @@ impl MapIo<'_> {
                 .collect();
             for (lo, hi) in anon {
                 if hi > lo {
-                    m.zero_dirty(lo, (hi - lo) as usize)?;
+                    m.discard(lo, (hi - lo) as usize)?;
                 }
             }
         }

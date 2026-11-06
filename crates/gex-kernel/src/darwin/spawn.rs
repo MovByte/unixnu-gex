@@ -89,6 +89,8 @@ pub struct Attr {
     pub qos_clamp: u64,
     pub darwin_role: u32,
     pub thread_limit: i32,
+    /// `psa_max_addr`.
+    pub max_addr: u64,
     pub options: u32,
     pub limits: [u32; 6],
     pub crash_behavior: u32,
@@ -112,6 +114,7 @@ impl Attr {
             qos_clamp: le64(b, 80),
             darwin_role: le32(b, 88),
             thread_limit: le32(b, 92) as i32,
+            max_addr: le64(b, 96),
             options: le32(b, 128),
             limits: [le32(b, 132), le32(b, 136), le32(b, 140), le32(b, 144), le32(b, 180), le32(b, 184)],
             crash_behavior: le32(b, 148),
@@ -131,6 +134,8 @@ pub struct After {
     pub sigmask: u32,
     pub sigdefault: u32,
     pub inherit: Vec<i32>,
+    /// `psa_max_addr`: the highest address the new map is to have.
+    pub max_addr: u64,
 }
 
 /// What a spawn made.
@@ -180,9 +185,10 @@ impl Held {
 
 impl Kernel {
     /// `forkproc` of this process's Darwin state: what a child takes (its
-    /// signal actions, limits, libpthread's registration and the dispatch
-    /// queue offsets; its task policy is made with its entry in the process
-    /// table); the rest is the new task's own.
+    /// signal actions, limits, libpthread's registration, the dispatch
+    /// queue offsets, and its map's entries as `vm_map_fork` copies them;
+    /// its task policy is made with its entry in the process table); the
+    /// rest is the new task's own.
     pub(crate) fn darwin_fork_task(&self) -> super::Task {
         let t = &self.dtask;
         let (special, registered, exc) = t.child_ports.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
@@ -194,6 +200,8 @@ impl Kernel {
             rlimits: t.rlimits,
             dispatchqueue_serialno_offset: t.dispatchqueue_serialno_offset,
             dispatchqueue_label_offset: t.dispatchqueue_label_offset,
+            vm: t.vm.inherited(),
+            map_max: t.map_max,
             ..super::Task::new_process()
         }
     }
@@ -204,6 +212,8 @@ impl Kernel {
     /// x1 clear; the child's x0 is its own pid and x1 is 1.
     pub(crate) fn darwin_fork(&mut self, m: &mut GuestMem<'_>) -> SyscallOutcome {
         self.darwin_child_ports();
+        let mapped: Vec<(u64, u64)> = self.mem.lock().vmas().iter().map(|v| (v.start, v.end)).collect();
+        self.dtask.vm.fork(&mapped);
         let pid = self.procs.spawn(self.pid);
         crate::procnote::post(self.pid, crate::procnote::note::FORK | pid as u32);
         let _ = super::set_result(m, self.ctx_addr, pid as u64);
@@ -387,7 +397,7 @@ impl Kernel {
     fn darwin_spawn_child(&mut self, m: &GuestMem<'_>, child: &mut Kernel, attr: Option<&Attr>, file_actions: Option<&[u8]>, port_actions: Option<&[u8]>, path: u64, argv: u64, envv: u64) -> Result<(), Errno> {
         let flags = attr.map_or(0, |a| a.flags);
         let policy = attr.map_or((0, 0, 0), |a| super::taskpolicy::spawn_attrs(a.apptype, a.qos_clamp, a.darwin_role));
-        let mut after = After { flags, policy, sigmask: attr.map_or(0, |a| a.sigmask), sigdefault: attr.map_or(0, |a| a.sigdefault), inherit: Vec::new() };
+        let mut after = After { flags, policy, sigmask: attr.map_or(0, |a| a.sigmask), sigdefault: attr.map_or(0, |a| a.sigdefault), inherit: Vec::new(), max_addr: attr.map_or(0, |a| a.max_addr) };
         if let Some(fa) = file_actions {
             after.inherit = child.darwin_file_actions(fa, flags)?;
         }
@@ -571,7 +581,7 @@ impl Kernel {
         let mut copy = self.fork_kernel();
         copy.pid = self.pid;
         copy.tid = self.tid;
-        let mut after = After { flags: at.flags, policy: super::taskpolicy::spawn_attrs(at.apptype, at.qos_clamp, at.darwin_role), sigmask: at.sigmask, sigdefault: at.sigdefault, inherit: Vec::new() };
+        let mut after = After { flags: at.flags, policy: super::taskpolicy::spawn_attrs(at.apptype, at.qos_clamp, at.darwin_role), sigmask: at.sigmask, sigdefault: at.sigdefault, inherit: Vec::new(), max_addr: at.max_addr };
         let activated = (|| {
             if let Some(fa) = file_actions {
                 after.inherit = copy.darwin_file_actions(fa, at.flags)?;

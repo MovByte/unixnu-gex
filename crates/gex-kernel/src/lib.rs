@@ -209,6 +209,27 @@ impl<'a> GuestMem<'a> {
         Ok(())
     }
 
+    /// Ask the host to do `a` with `len` bytes of guest pages at `addr`
+    /// (both page aligned); whether it did. A host without a way to
+    /// ([`set_host_vm`]: the browser's memory cannot) leaves them as they
+    /// are.
+    pub fn advise(&mut self, addr: u64, len: u64, a: HostAdvice) -> Result<bool, Errno> {
+        let r = self.range(addr, usize::try_from(len).map_err(|_| Errno::EFAULT)?)?;
+        let base = self.view_mut().as_mut_ptr() as usize;
+        Ok(HOST_VM.get().is_some_and(|f| f(base + r.start, r.len(), a)))
+    }
+
+    /// `len` bytes at `addr` (page aligned) read as zero after: the host's
+    /// fresh pages where it can give them ([`HostAdvice::Discard`], which
+    /// reads nothing and frees what was there), else [`Self::zero_dirty`].
+    #[track_caller]
+    pub fn discard(&mut self, addr: u64, len: usize) -> Result<(), Errno> {
+        if len != 0 && self.advise(addr, len as u64, HostAdvice::Discard)? {
+            return Ok(());
+        }
+        self.zero_dirty(addr, len)
+    }
+
     // The typed accessors: guest memory is little-endian.
 
     pub fn read_u64(&self, addr: u64) -> Result<u64, Errno> {
@@ -334,6 +355,36 @@ mod tests {
         assert!(b[0x800..0x1800].iter().all(|&x| x == 0));
         assert!(b[..0x800].iter().chain(&b[0x1800..]).all(|&x| x == 7));
     }
+}
+
+/// What a host may be asked to do with guest pages ([`GuestMem::advise`]),
+/// the page advice Darwin's VM takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostAdvice {
+    /// The contents may be discarded: each page reads as it was or as zero.
+    Free,
+    /// As [`HostAdvice::Free`], and not counted as the owner's memory while
+    /// it is reusable.
+    Reusable,
+    /// Reusable pages are the owner's again.
+    Reuse,
+    /// Not wanted soon; the contents stay.
+    Deactivate,
+    /// Wanted soon: made resident now.
+    WillNeed,
+    /// Read as zero.
+    Zero,
+    /// Read as zero, holding no memory until written: the pages replaced by
+    /// fresh ones.
+    Discard,
+}
+
+static HOST_VM: std::sync::OnceLock<fn(usize, usize, HostAdvice) -> bool> = std::sync::OnceLock::new();
+
+/// Install the host's page advice: `f(host_address, len, advice)`, true
+/// when it was taken. Once per process; later calls are ignored.
+pub fn set_host_vm(f: fn(usize, usize, HostAdvice) -> bool) {
+    let _ = HOST_VM.set(f);
 }
 
 /// Zero `b`, writing only the 4 KiB stretches that are not zero already

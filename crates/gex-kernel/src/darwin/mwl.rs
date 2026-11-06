@@ -303,7 +303,7 @@ impl Kernel {
         let prot = u64::from(r.prot & VM_PROT_DEFAULT);
         let size = r.size.checked_add(page_size - 1).ok_or(Kr::Failure)? & !(page_size - 1);
         self.canonical(m, nr::MMAP, [r.address, size, prot, lf::PRIVATE | lf::FIXED, fd as u64, r.file_offset]).map_err(|e| if e == Errno::ENOMEM { Kr::ResourceShortage } else { Kr::Failure })?;
-        self.dtask.maxprot.set(r.address, r.address + size, prot as u8);
+        self.dtask.vm.set(r.address, r.address + size, super::vm::Attrs { kind: super::vm::kind::FILE_PRIVATE, max: prot as u8, ..Default::default() });
         let mut page = vec![0u8; page_size as usize];
         for i in 0..size / page_size {
             let o = r.file_offset + i * page_size;

@@ -4454,7 +4454,10 @@ fn place_image(
         store.data_mut().with_kernel(|k| {
             k.mem
                 .lock()
-                .insert(seg.vaddr, seg.vaddr + seg.mem_size, p, "[image]")
+                .insert(seg.vaddr, seg.vaddr + seg.mem_size, p, "[image]");
+            if k.darwin {
+                k.darwin_image_segment(seg.vaddr, seg.bytes.len() as u64, seg.mem_size);
+            }
         });
     }
 

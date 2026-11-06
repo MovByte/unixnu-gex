@@ -463,6 +463,8 @@ impl Kernel {
             dispatchqueue_label_offset: old.dispatchqueue_label_offset,
             policy: old.policy,
             said: old.said,
+            // Until the image's policies make it (`vm_map_set_max_addr`).
+            map_max: spawn.map_or(0, |s| s.max_addr),
             ..Default::default()
         };
         // A new process's policy came with its fork; an exec's task is an

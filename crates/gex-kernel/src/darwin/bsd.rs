@@ -84,11 +84,11 @@ pub fn at_flags(f: u64) -> u64 {
 }
 
 /// Darwin's `mmap` flags that differ from Linux's.
+/// The flags a POSIX shared memory object's mapping passes on
+/// ([`super::mman`] has checked every flag).
 mod map {
     pub const ANON: u64 = 0x1000;
     pub const NORESERVE: u64 = 0x40;
-    // The rest (MAP_JIT, MAP_RESILIENT_*, MAP_TPRO, ...) mean nothing to
-    // gex and are dropped.
 }
 
 /// The canonical number for BSD call `raw`, with `a` rewritten where the

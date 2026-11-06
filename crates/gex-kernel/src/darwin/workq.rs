@@ -1550,8 +1550,7 @@ impl Kernel {
                 let page = super::mach::PAGE_MASK + 1;
                 let free = t.stackaddr + page;
                 let size = ((PTH_DEFAULT_STACKSIZE + page + PTHREAD_T_OFFSET - 1) & !(page - 1)) - page;
-                const MADV_FREE: u64 = 8;
-                let _ = self.canonical(m, crate::syscalls::nr::MADVISE, [free, size, MADV_FREE, 0, 0, 0]);
+                let _ = self.darwin_behavior_set(m, free, size, super::mman::act::REUSABLE);
             }
             let t = self.wqt(tid);
             t.flags &= !ut::IDLE_CLEANUP;
