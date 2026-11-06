@@ -16,19 +16,24 @@ pub const EXC_BAD_ACCESS: usize = 1;
 pub const EXC_BAD_INSTRUCTION: usize = 2;
 pub const EXC_ARITHMETIC: usize = 3;
 pub const EXC_BREAKPOINT: usize = 6;
+pub const EXC_SYSCALL: usize = 7;
+pub const EXC_MACH_SYSCALL: usize = 8;
+pub const EXC_RPC_ALERT: usize = 9;
 pub const EXC_CRASH: usize = 10;
+pub const EXC_RESOURCE: usize = 11;
+pub const EXC_GUARD: usize = 12;
 pub const EXC_CORPSE_NOTIFY: usize = 13;
 /// `EXC_MASK_VALID`: every type's bit, 1 to 13.
 const EXC_MASK_VALID: u32 = 0x3ffe;
 
-const EXCEPTION_DEFAULT: i32 = 1;
-const EXCEPTION_STATE: i32 = 2;
-const EXCEPTION_STATE_IDENTITY: i32 = 3;
-const EXCEPTION_IDENTITY_PROTECTED: i32 = 4;
+pub const EXCEPTION_DEFAULT: i32 = 1;
+pub const EXCEPTION_STATE: i32 = 2;
+pub const EXCEPTION_STATE_IDENTITY: i32 = 3;
+pub const EXCEPTION_IDENTITY_PROTECTED: i32 = 4;
 const MACH_EXCEPTION_BACKTRACE_PREFERRED: i32 = 0x2000_0000;
 const MACH_EXCEPTION_ERRORS: i32 = 0x4000_0000;
-const MACH_EXCEPTION_CODES: i32 = 0x8000_0000_u32 as i32;
-const MACH_EXCEPTION_MASK: i32 = MACH_EXCEPTION_CODES | MACH_EXCEPTION_ERRORS | MACH_EXCEPTION_BACKTRACE_PREFERRED;
+pub const MACH_EXCEPTION_CODES: i32 = 0x8000_0000_u32 as i32;
+pub const MACH_EXCEPTION_MASK: i32 = MACH_EXCEPTION_CODES | MACH_EXCEPTION_ERRORS | MACH_EXCEPTION_BACKTRACE_PREFERRED;
 
 /// The most entries a get or swap reply holds (`exception_*_array_t`).
 const ARRAY_MAX: usize = 32;
@@ -361,9 +366,11 @@ impl Kernel {
     }
 
     /// Whether an exception of type `exc` taken by the calling thread has a
-    /// handler to go to: the thread's, its task's or the host's.
+    /// handler to go to other than the kernel's own that makes it a signal:
+    /// the thread's, its task's or the host's.
     pub(crate) fn darwin_exc_handled(&mut self, exc: usize) -> bool {
-        let valid = |a: &ExcActions| matches!(a[exc].port, Some(Carried::Port(_)));
+        let ux = self.ipc().global_port(super::ipc::Kobject::UxHandler);
+        let valid = |a: &ExcActions| matches!(a[exc].port, Some(Carried::Port(p)) if p != ux);
         let tid = self.tid;
         self.dtask.kports.thread_exc.get(&tid).is_some_and(valid) || valid(&self.dtask.kports.exc) || valid(&self.ipc().host_exc)
     }
@@ -371,7 +378,8 @@ impl Kernel {
     /// Whether an exception of type `exc` the task raises (a corpse's, no
     /// thread's) has a handler: the task's or the host's.
     pub(crate) fn darwin_task_exc_handled(&mut self, exc: usize) -> bool {
-        let valid = |a: &ExcActions| matches!(a[exc].port, Some(Carried::Port(_)));
+        let ux = self.ipc().global_port(super::ipc::Kobject::UxHandler);
+        let valid = |a: &ExcActions| matches!(a[exc].port, Some(Carried::Port(p)) if p != ux);
         valid(&self.dtask.kports.exc) || valid(&self.ipc().host_exc)
     }
 }

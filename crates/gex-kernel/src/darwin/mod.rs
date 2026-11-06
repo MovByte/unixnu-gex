@@ -57,6 +57,7 @@ pub mod threadpolicy;
 pub mod threadstate;
 pub mod thread;
 pub mod timer;
+pub mod triage;
 pub mod vm;
 pub mod voucher;
 pub mod wait;
@@ -146,6 +147,9 @@ pub struct Task {
     /// Its map's highest address when an entitlement or a spawn raised it
     /// (`vm_map_set_max_addr`); 0 for [`vm::MAP_MAX`].
     pub map_max: u64,
+    /// Each thread's kernel reply port, and a reply that came to it.
+    pub rpc_reply: std::collections::HashMap<i32, ipc::ObjId>,
+    pub rpc_replies: std::collections::HashMap<i32, Box<ipc::msg::Kmsg>>,
     /// When its footprint is next measured ([`footprint::SAMPLE`]).
     pub footprint_due: Option<std::time::Instant>,
     /// Threads a semaphore operation woke, and how.

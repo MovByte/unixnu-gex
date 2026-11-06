@@ -56,7 +56,7 @@ fn words(b: &[u8]) -> Vec<u32> {
 impl Kernel {
     /// `machine_thread_get_state` for a 64-bit thread whose context is at
     /// `c`: the words and the count it answers, or the error.
-    fn machine_thread_get_state(&self, m: &GuestMem<'_>, tid: i32, c: u64, fl: i32, count: u32) -> Result<Vec<u32>, i32> {
+    pub(crate) fn machine_thread_get_state(&self, m: &GuestMem<'_>, tid: i32, c: u64, fl: i32, count: u32) -> Result<Vec<u32>, i32> {
         let need = |n: u32| if count < n { Err(KERN_INVALID_ARGUMENT) } else { Ok(()) };
         let rd = |o: usize| m.read_u64(c + o as u64).unwrap_or(0);
         let state64 = || -> Vec<u32> {
@@ -170,7 +170,7 @@ impl Kernel {
     /// `machine_thread_set_state` for a 64-bit thread whose context is at
     /// `c`; a change to its general registers sends it back to user space
     /// at its (new) pc.
-    fn machine_thread_set_state(&mut self, m: &mut GuestMem<'_>, tid: i32, c: u64, fl: i32, w: &[u32]) -> i32 {
+    pub(crate) fn machine_thread_set_state(&mut self, m: &mut GuestMem<'_>, tid: i32, c: u64, fl: i32, w: &[u32]) -> i32 {
         let n = w.len() as u32;
         let u64_at = |i: usize| u64::from(w[i]) | (u64::from(w[i + 1]) << 32);
         let set_state64 = |k: &mut Kernel, m: &mut GuestMem<'_>, s: &[u32]| {

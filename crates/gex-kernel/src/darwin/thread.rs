@@ -294,6 +294,8 @@ pub enum Finish {
     Kevent(super::kevent::Cont),
     /// An advisory lock's wait (`lf_setlock`).
     Lockf(super::lockf::Cont),
+    /// An exception's handler's reply (`exception_deliver`).
+    Exception(super::triage::Pending),
 }
 
 /// `wait_result_to_return_code` (`sys_ulock.c`).
@@ -793,6 +795,7 @@ impl Kernel {
             Finish::WorkqPark => return <Wq as WorkQueue>::wait_done(self, m, res),
             Finish::Kevent(c) => return <Kq as KQueue>::wait_done(self, m, c, res),
             Finish::Lockf(c) => return self.darwin_lockf_wait_done(m, c, res),
+            Finish::Exception(p) => return self.darwin_exc_wait_done(m, p, res),
             Finish::Psynch(c) => self.darwin_psynch_wait_done(m, c, res),
             Finish::Ulock { addr, no_errno } => {
                 // A waiter that was not woken is still on the queue.

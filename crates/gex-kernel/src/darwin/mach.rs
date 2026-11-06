@@ -2,8 +2,8 @@
 //! of the profile's XNU, `osfmk/arm64/bsd_arm64.c`'s `mach_syscall`).
 //!
 //! A trap returns a `kern_return_t` (or a port name) in x0 and leaves the
-//! carry flag alone. A number with no trap raises `EXC_SYSCALL`, which with
-//! no handler is SIGSYS. The `_kernelrpc_*` traps are
+//! carry flag alone. A number with no trap raises `EXC_SYSCALL`, which the
+//! host's own handler makes SIGSYS. The `_kernelrpc_*` traps are
 //! `osfmk/ipc/mach_kernelrpc.c`'s.
 
 use super::ipc::kr;
@@ -221,10 +221,11 @@ impl Kernel {
                 match self.mach_trap_simple(m, t, a) {
                     Some(r) => r,
                     None => {
-                        // kern_invalid, or past the table: EXC_SYSCALL, which
-                        // no handler takes, is SIGSYS; x0 is left alone.
-                        let _ = self.canonical(m, nr::TGKILL, [self.pid as u64, self.tid as u64, u64::from(crate::signal::sig::SIGSYS), 0, 0, 0]);
-                        return SyscallOutcome::Continue;
+                        // kern_invalid, or past the table: EXC_SYSCALL with
+                        // the call's number (the host's handler makes it
+                        // SIGSYS); x0 is left alone.
+                        let call = -i64::from(t);
+                        return self.darwin_exception_triage(m, super::exception::EXC_SYSCALL, &[call], super::triage::Then::Return);
                     }
                 }
             }

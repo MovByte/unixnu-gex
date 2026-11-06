@@ -234,6 +234,12 @@ pub enum Kobject {
     Voucher(super::voucher::VoucherId),
     /// IKOT_TASK_RESUME: the task's resume port (`itk_resume`).
     TaskResume,
+    /// IKOT_UX_HANDLER: the kernel's handler that makes an exception a
+    /// signal (`ux_handler_port`).
+    UxHandler,
+    /// A thread's kernel reply port (`ith_rpc_reply`): the reply to an RPC
+    /// the kernel made for it.
+    RpcReply(i32),
 }
 
 /// A port's reply semantics (`ip_reply_port_semantics`).
@@ -659,6 +665,9 @@ impl Ipc {
         self.globals = std::mem::take(&mut s.globals);
         self.host_exc = s.host_exc;
         self.held = true;
+        if !self.globals.iter().any(|(g, _)| *g == Kobject::UxHandler) {
+            self.ux_handler_setup();
+        }
         // What stays in `s` is its key counter.
         self.next_task_hint = s.next_task;
     }
@@ -810,6 +819,21 @@ impl Ipc {
 
     /// The port of the kernel's object `k`, one for every task (made on
     /// first use; owned by no task, so any task's kernel serves it).
+    /// `ux_handler_setup`: the host's handler for every exception but
+    /// RPC alerts (Instruments') and guards, `EXCEPTION_DEFAULT |
+    /// MACH_EXCEPTION_CODES`, each action with a send right of its own.
+    fn ux_handler_setup(&mut self) {
+        use super::exception as exc;
+        let p = self.global_port(Kobject::UxHandler);
+        for t in 1..exc::EXC_TYPES_COUNT {
+            if t == exc::EXC_RPC_ALERT || t == exc::EXC_GUARD {
+                continue;
+            }
+            self.make_send(p);
+            self.host_exc[t] = exc::ExcAction { port: Some(right::Carried::Port(p)), behavior: exc::EXCEPTION_DEFAULT | exc::MACH_EXCEPTION_CODES, flavor: 0, privileged: true };
+        }
+    }
+
     pub fn global_port(&mut self, k: Kobject) -> ObjId {
         if let Some(&(_, p)) = self.globals.iter().find(|(g, _)| *g == k) {
             return p;
@@ -955,11 +979,13 @@ impl Ipc {
     fn send_once_notify(&mut self, port: ObjId) {
         let p = self.port_mut(port);
         p.sorights -= 1;
-        if p.active && p.receiver == Receiver::Kernel && p.kobject.is_some() {
+        // A thread's kernel reply port is a queue, not a kernel object.
+        let rpc_reply = matches!(p.kobject, Some(Kobject::RpcReply(_)));
+        if p.active && p.receiver == Receiver::Kernel && p.kobject.is_some() && !rpc_reply {
             self.outbox.push(Notify::KobjectSendOnce { port });
             return;
         }
-        if p.active && p.receiver != Receiver::Kernel {
+        if p.active && (p.receiver != Receiver::Kernel || rpc_reply) {
             self.outbox.push(Notify::SendOnce { to: port });
         }
         self.release(port);

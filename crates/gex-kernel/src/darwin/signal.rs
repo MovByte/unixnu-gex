@@ -22,6 +22,10 @@ pub const NSIG: usize = 32;
 /// Darwin's signal numbers (`bsd/sys/signal.h`) that this code names.
 pub mod dsig {
     pub const SIGILL: u32 = 4;
+    pub const SIGABRT: u32 = 6;
+    pub const SIGEMT: u32 = 7;
+    pub const SIGSYS: u32 = 12;
+    pub const SIGPIPE: u32 = 13;
     pub const SIGTRAP: u32 = 5;
     pub const SIGFPE: u32 = 8;
     pub const SIGKILL: u32 = 9;

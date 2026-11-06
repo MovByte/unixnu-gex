@@ -521,6 +521,10 @@ impl Kernel {
         let p = self.ipc().port(dest);
         match &p.kobject {
             Some(super::ipc::Kobject::Timer) => mr::SEND_INVALID_OPTIONS,
+            // A thread's kernel reply port is no kernel object
+            // (IKOT_NONE): its messages queue for the kernel's receive.
+            Some(super::ipc::Kobject::RpcReply(_)) if options & opt::SEND_MQ_CALL == 0 => mr::SEND_INVALID_OPTIONS,
+            Some(super::ipc::Kobject::RpcReply(_)) => mr::SUCCESS,
             Some(_) => {
                 if options & opt::SEND_KOBJECT_CALL == 0 {
                     return mr::SEND_INVALID_OPTIONS;
@@ -901,6 +905,10 @@ impl Kernel {
     /// `ipc_kobject_server` for a request to this task's (or the kernel's)
     /// object `port`, and the reply sent.
     fn kobject_send(&mut self, port: ObjId, kmsg: Box<Kmsg>, options: u64, timeout_zero: bool) -> Result<(), SendWait> {
+        if let Some(super::ipc::Kobject::RpcReply(tid)) = self.ipc().port(port).kobject {
+            self.darwin_rpc_reply_arrived(port, tid, kmsg);
+            return Ok(());
+        }
         {
             let ipc = &mut self.ipc();
             ipc.port_mut(port).seqno = ipc.port(port).seqno.wrapping_add(1);

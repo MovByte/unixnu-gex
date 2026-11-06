@@ -132,11 +132,13 @@ impl Ipc {
     pub fn send_once_destroyed(&mut self, port: ObjId) {
         let p = self.port_mut(port);
         p.sorights -= 1;
-        if p.active && p.receiver == Receiver::Kernel && p.kobject.is_some() {
+        // A thread's kernel reply port is a queue, not a kernel object.
+        let rpc_reply = matches!(p.kobject, Some(super::Kobject::RpcReply(_)));
+        if p.active && p.receiver == Receiver::Kernel && p.kobject.is_some() && !rpc_reply {
             self.outbox.push(Notify::KobjectSendOnce { port });
             return;
         }
-        if p.active && p.receiver != Receiver::Kernel && (p.messages.len() as u32) < super::QLIMIT_KERNEL {
+        if p.active && (p.receiver != Receiver::Kernel || rpc_reply) && (p.messages.len() as u32) < super::QLIMIT_KERNEL {
             self.outbox.push(Notify::SendOnce { to: port });
         }
         self.release(port);
