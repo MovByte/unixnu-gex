@@ -24,6 +24,7 @@ const KERN_RESOURCE_SHORTAGE: i32 = 6;
 const KERN_NO_ACCESS: i32 = 8;
 const KERN_INVALID_RIGHT: i32 = 17;
 const KERN_INVALID_VALUE: i32 = 18;
+const KERN_INVALID_TASK: i32 = 16;
 const KERN_NOT_SUPPORTED: i32 = 46;
 /// `MIG_BAD_ARGUMENTS`: a request without the routine's shape.
 pub(crate) const MIG_BAD_ARGUMENTS: i32 = -304;
@@ -82,6 +83,35 @@ pub(crate) fn arg_after(req: &Kmsg, ndesc: usize, i: usize) -> Option<i32> {
 /// Answer request `req` sent to kernel object `obj`.
 pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
     let bad = || Reply::err(MIG_BAD_ARGUMENTS);
+    // A read or inspect port takes the routines its flavor satisfies
+    // (task_port_kotype_valid_for_flavor): its own arms, or the control
+    // port's whose port type asks no more; for the others the routine's
+    // conversion finds no task. A routine not served here goes on as the
+    // control port's would.
+    use super::kobject::flavor;
+    let as_control;
+    let obj = match obj {
+        Kobject::TaskRead | Kobject::TaskInspect | Kobject::ThreadRead(_) | Kobject::ThreadInspect(_) => {
+            let thread = matches!(obj, Kobject::ThreadRead(_) | Kobject::ThreadInspect(_));
+            let f = if matches!(obj, Kobject::TaskRead | Kobject::ThreadRead(_)) { flavor::READ } else { flavor::INSPECT };
+            let need = if thread { thread_routine_flavor(req.id) } else { task_routine_flavor(req.id) };
+            match need {
+                // The arms that read the port's flavor themselves.
+                Some(_) if !thread && matches!(req.id, 3405 | 3409) => obj,
+                Some(n) if f > n => return Reply::err(if (3200..3300).contains(&req.id) { KERN_INVALID_TASK } else { KERN_INVALID_ARGUMENT }),
+                // task_conversion_eval, for a read port's conversion.
+                _ if f == flavor::READ && !k.darwin_read_conversion_ok() => return Reply::err(KERN_INVALID_ARGUMENT),
+                _ => {
+                    as_control = match obj {
+                        Kobject::ThreadRead(t) | Kobject::ThreadInspect(t) => Kobject::Thread(*t),
+                        _ => Kobject::Task,
+                    };
+                    &as_control
+                }
+            }
+        }
+        _ => obj,
+    };
     match (obj, req.id) {
         // host_info(host, flavor, out, &count)
         (Kobject::Host | Kobject::HostPriv, 200) => match (arg(req, 0), arg(req, 1)) {
@@ -268,14 +298,24 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         // task_info(task_name, flavor, out, &count): task_info_from_user
         // takes any flavor of port, but TASK_DYLD_INFO needs the read port
         // at least (a name port gives TASK_NULL).
-        (Kobject::Task | Kobject::TaskName, 3405) => match (arg(req, 0), arg(req, 1)) {
-            (Some(17), Some(_)) if matches!(obj, Kobject::TaskName) => Reply::err(KERN_INVALID_ARGUMENT),
+        // task_info_from_user: TASK_DYLD_INFO wants a read port, the rest
+        // any.
+        (Kobject::Task | Kobject::TaskRead | Kobject::TaskInspect | Kobject::TaskName, 3405) => match (arg(req, 0), arg(req, 1)) {
+            (Some(17), Some(_)) if matches!(obj, Kobject::TaskName | Kobject::TaskInspect) => Reply::err(KERN_INVALID_ARGUMENT),
+            (Some(17), Some(_)) if matches!(obj, Kobject::TaskRead) && !k.darwin_read_conversion_ok() => Reply::err(KERN_INVALID_ARGUMENT),
             (Some(flavor), Some(count)) => task_info(flavor, count as u32, k.darwin_dyld_infos, k.darwin_audit_token()),
             _ => bad(),
         },
         // task_get_special_port(task, which) -> port
-        (Kobject::Task, 3409) => match arg(req, 0) {
-            Some(which) => task_get_special_port(k, which),
+        (Kobject::Task | Kobject::TaskRead | Kobject::TaskInspect, 3409) => match arg(req, 0) {
+            Some(which) => {
+                let f = match obj {
+                    Kobject::TaskRead => flavor::READ,
+                    Kobject::TaskInspect => flavor::INSPECT,
+                    _ => flavor::CONTROL,
+                };
+                task_get_special_port(k, which, f)
+            }
             None => bad(),
         },
         // task_set_special_port(task, which, port)
@@ -564,8 +604,38 @@ fn task_info(flavor: i32, count: u32, dyld_infos: u64, audit: [u32; 8]) -> Reply
     }
 }
 
-/// `task_get_special_port_internal` for the control flavor.
-fn task_get_special_port(k: &mut Kernel, which: i32) -> Reply {
+/// The weakest flavor of task port each routine served here takes (its MIG
+/// port type: `task_t`, `task_read_t`, `task_inspect_t`, `task_name_t`).
+fn task_routine_flavor(id: i32) -> Option<u8> {
+    use super::kobject::flavor::*;
+    Some(match id {
+        // task_info (task_name_t), task_get_special_port (an inspect port
+        // or better), task_policy_get (task_policy_get_t: inspect).
+        3405 => NAME,
+        3409 | 3421 => INSPECT,
+        3403 | 3404 | 3410 | 3413 | 3414 | 3415 | 3418 | 3419 | 3420 | 3203 | 3207 | 5404 | 8000 => CONTROL,
+        _ => return None,
+    })
+}
+
+/// The same for thread ports: thread_get_state, thread_suspend and
+/// thread_resume take `thread_read_t`, thread_policy_get
+/// `thread_inspect_t`.
+fn thread_routine_flavor(id: i32) -> Option<u8> {
+    use super::kobject::flavor::*;
+    Some(match id {
+        3603 | 3605 | 3606 => READ,
+        3618 => INSPECT,
+        3604 | 3613 | 3614 | 3615 | 3617 => CONTROL,
+        _ => return None,
+    })
+}
+
+/// `task_get_special_port_internal` for a port of flavor `f`
+/// (`special_port_allowed_with_task_flavor`).
+fn task_get_special_port(k: &mut Kernel, which: i32, f: u8) -> Reply {
+    use super::kobject::flavor;
+    const KERN_INVALID_CAPABILITY: i32 = 20;
     const TASK_KERNEL_PORT: i32 = 1;
     const TASK_HOST_PORT: i32 = 2;
     const TASK_NAME_PORT: i32 = 3;
@@ -575,6 +645,14 @@ fn task_get_special_port(k: &mut Kernel, which: i32) -> Reply {
     const TASK_ACCESS_PORT: i32 = 9;
     const TASK_DEBUG_CONTROL_PORT: i32 = 10;
     const TASK_RESOURCE_NOTIFY_PORT: i32 = 11;
+    let allowed = match f {
+        flavor::CONTROL => true,
+        flavor::READ => matches!(which, TASK_READ_PORT | TASK_INSPECT_PORT | TASK_NAME_PORT),
+        _ => matches!(which, TASK_INSPECT_PORT | TASK_NAME_PORT),
+    };
+    if !allowed {
+        return Reply::err(KERN_INVALID_CAPABILITY);
+    }
     match which {
         TASK_KERNEL_PORT => {
             let p = k.darwin_task_port();
@@ -604,9 +682,8 @@ fn task_get_special_port(k: &mut Kernel, which: i32) -> Reply {
             None => Reply { ret: KERN_SUCCESS, defer: None, out: Vec::new(), ports: Vec::new(), unimplemented: None }.with_null_port(0),
         },
         TASK_INSPECT_PORT | TASK_READ_PORT => {
-            let mut r = Reply::err(KERN_INVALID_ARGUMENT);
-            r.unimplemented = Some("task inspect and read ports".into());
-            r
+            let p = k.darwin_task_flavor_port(if which == TASK_READ_PORT { flavor::READ } else { flavor::INSPECT });
+            Reply::port(Carried::Port(p))
         }
         _ => Reply::err(KERN_INVALID_ARGUMENT),
     }

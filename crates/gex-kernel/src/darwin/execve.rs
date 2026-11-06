@@ -430,8 +430,9 @@ impl Kernel {
             self.darwin_thread_ports_terminate(t);
         }
         let name = self.ipc().task_name_port_take();
+        let flavored = self.darwin_flavor_ports_take();
         let k = &mut self.dtask.kports;
-        let task_ports: Vec<_> = k.task.take().map(|(a, b)| vec![a, b]).unwrap_or_default().into_iter().chain(name).collect();
+        let task_ports: Vec<_> = k.task.take().map(|(a, b)| vec![a, b]).unwrap_or_default().into_iter().chain(name).chain(flavored).collect();
         let ipc = &mut self.ipc();
         for p in task_ports {
             ipc.port_mut(p).kobject = None;

@@ -224,8 +224,15 @@ pub fn name_valid(name: u32) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Kobject {
     Task,
+    /// IKOT_TASK_READ, IKOT_TASK_INSPECT: the task's read and inspect
+    /// ports (`itk_task_ports[TASK_FLAVOR_READ]`, `[TASK_FLAVOR_INSPECT]`).
+    TaskRead,
+    TaskInspect,
     TaskName,
     Thread(i32),
+    /// IKOT_THREAD_READ, IKOT_THREAD_INSPECT.
+    ThreadRead(i32),
+    ThreadInspect(i32),
     Host,
     HostPriv,
     Clock,

@@ -23,6 +23,11 @@ pub struct Kports {
     pub task: Option<(ObjId, ObjId)>,
     /// Each thread's control port and self port.
     pub threads: HashMap<i32, (ObjId, ObjId)>,
+    /// The task's read and inspect ports, made when first asked for and
+    /// gone at their last send right's.
+    pub flavored: [Option<ObjId>; 2],
+    /// Each thread's, the same way.
+    pub thread_flavored: HashMap<(i32, u8), ObjId>,
     /// Each thread's special reply port (`ith_special_reply_port`).
     pub special_reply: HashMap<i32, ObjId>,
     /// `task_set_special_port`'s ports, by which (send rights held).
@@ -38,6 +43,17 @@ pub struct Kports {
     /// `task_restartable_ranges_register`'s ranges.
     pub restartable: Vec<(u64, u16, u16, u32)>,
 }
+
+/// `mach_task_flavor_t`, `mach_thread_flavor_t`.
+pub mod flavor {
+    pub const CONTROL: u8 = 0;
+    pub const READ: u8 = 1;
+    pub const INSPECT: u8 = 2;
+    pub const NAME: u8 = 3;
+}
+
+/// `developer_mode_state()`: off, as an iPad leaves it.
+pub const DEVELOPER_MODE: bool = false;
 
 /// `MIG_NO_REPLY`, `MIG_BAD_ID`.
 pub const MIG_NO_REPLY: i32 = -305;
@@ -68,6 +84,86 @@ impl Kernel {
     /// The task's self port (`itk_self`), what `mach_task_self` names.
     pub(crate) fn darwin_task_self_port(&mut self) -> ObjId {
         self.task_ports().1
+    }
+
+    /// `convert_task_to_port_with_flavor` for the read (`flavor::READ`) or
+    /// inspect flavor: a send right to the task's port of that flavor, made
+    /// immovable and with a no-senders request when it is new. Without
+    /// Developer Mode a read port, copied out into the task's own space,
+    /// is its self port (IPC_LABEL_SUBST_TASK_READ).
+    pub(crate) fn darwin_task_flavor_port(&mut self, f: u8) -> ObjId {
+        let i = usize::from(f - flavor::READ);
+        let kind = if f == flavor::READ { Kobject::TaskRead } else { Kobject::TaskInspect };
+        let self_port = self.darwin_task_self_port();
+        let slot = self.dtask.kports.flavored[i];
+        let p = self.darwin_flavor_port(slot, kind, (f == flavor::READ && !DEVELOPER_MODE).then_some(self_port));
+        self.dtask.kports.flavored[i] = Some(p);
+        p
+    }
+
+    /// The same for thread `tid` (`convert_thread_to_port_with_flavor`).
+    pub(crate) fn darwin_thread_flavor_port(&mut self, tid: i32, f: u8) -> ObjId {
+        let kind = if f == flavor::READ { Kobject::ThreadRead(tid) } else { Kobject::ThreadInspect(tid) };
+        let self_port = self.darwin_thread_ports(tid).1;
+        let slot = self.dtask.kports.thread_flavored.get(&(tid, f)).copied();
+        let p = self.darwin_flavor_port(slot, kind, (f == flavor::READ && !DEVELOPER_MODE).then_some(self_port));
+        self.dtask.kports.thread_flavored.insert((tid, f), p);
+        p
+    }
+
+    fn darwin_flavor_port(&mut self, slot: Option<ObjId>, kind: Kobject, subst: Option<ObjId>) -> ObjId {
+        let ipc = self.ipc();
+        let p = match slot {
+            Some(p) => p,
+            None => {
+                let p = ipc.kobject_port(kind);
+                let pp = ipc.port_mut(p);
+                pp.immovable_send = true;
+                pp.subst = subst;
+                p
+            }
+        };
+        ipc.make_send(p);
+        ipc.port_mut(p).nsrequest_kobject = true;
+        p
+    }
+
+    /// `task_port_with_flavor_no_senders`: a read or inspect port with no
+    /// send right left goes, to be made anew when next asked for.
+    fn darwin_flavor_port_no_senders(&mut self, port: ObjId) {
+        if self.ipc().port(port).srights > 0 {
+            return;
+        }
+        let k = &mut self.dtask.kports;
+        for s in k.flavored.iter_mut() {
+            if *s == Some(port) {
+                *s = None;
+            }
+        }
+        k.thread_flavored.retain(|_, p| *p != port);
+        let ipc = self.ipc();
+        ipc.port_mut(port).kobject = None;
+        ipc.port_destroy(port);
+    }
+
+    /// `task_conversion_eval` of a read port from the task asking: without
+    /// Developer Mode, a platform binary's task is not another's to read
+    /// unless that task is a platform binary too.
+    pub(crate) fn darwin_read_conversion_ok(&mut self) -> bool {
+        let caller = self.dtask.kcaller;
+        if caller == 0 || caller == self.ipc().task || !self.darwin_task_platform_binary() {
+            return true;
+        }
+        self.ipc().links.get(&caller).and_then(|l| l.codesign.as_ref()).is_some_and(|c| c.platform != 0)
+    }
+
+    /// The task's read and inspect ports, and its threads', taken for the
+    /// task's end.
+    pub(crate) fn darwin_flavor_ports_take(&mut self) -> Vec<ObjId> {
+        let k = &mut self.dtask.kports;
+        let mut v: Vec<ObjId> = k.flavored.iter_mut().filter_map(Option::take).collect();
+        v.extend(k.thread_flavored.drain().map(|(_, p)| p));
+        v
     }
 
     /// The host port (`realhost.special[HOST_PORT]`).
@@ -169,6 +265,12 @@ impl Kernel {
         if let Some(a) = self.dtask.kports.thread_exc.remove(&tid) {
             super::exception::release_all(self.ipc(), &a);
         }
+        let flavored: Vec<ObjId> = [flavor::READ, flavor::INSPECT].iter().filter_map(|&f| self.dtask.kports.thread_flavored.remove(&(tid, f))).collect();
+        let ipc = &mut self.ipc();
+        for p in flavored {
+            ipc.port_mut(p).kobject = None;
+            ipc.port_destroy(p);
+        }
         if let Some((kport, pport)) = self.dtask.kports.threads.remove(&tid) {
             let ipc = &mut self.ipc();
             for p in [kport, pport] {
@@ -207,9 +309,10 @@ impl Kernel {
         for t in tids {
             self.darwin_thread_ports_terminate(t);
         }
+        let flavored = self.darwin_flavor_ports_take();
         let k = std::mem::take(&mut self.dtask.kports);
         let name = self.ipc().task_name_port_take();
-        let task_ports: Vec<ObjId> = k.task.map(|(a, b)| vec![a, b]).unwrap_or_default().into_iter().chain(name).chain(k.resume).collect();
+        let task_ports: Vec<ObjId> = k.task.map(|(a, b)| vec![a, b]).unwrap_or_default().into_iter().chain(name).chain(k.resume).chain(flavored).collect();
         let sends: Vec<ObjId> = k.special.values().copied().chain(k.registered.into_iter().flatten()).collect();
         let ipc = self.ipc();
         for p in task_ports {
@@ -326,6 +429,7 @@ impl Kernel {
                 }
             }
             Some(Kobject::Voucher(v)) => self.ipc_voucher_no_senders(v),
+            Some(Kobject::TaskRead | Kobject::TaskInspect | Kobject::ThreadRead(_) | Kobject::ThreadInspect(_)) => self.darwin_flavor_port_no_senders(port),
             other => self.darwin_unimplemented(format!("no-senders for kernel object {other:?}")),
         }
     }

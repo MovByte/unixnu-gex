@@ -7,7 +7,7 @@
 //! (`handle_ux_exception`).
 
 use super::exception::{self as exc, ExcAction, ExcActions};
-use super::ipc::msg::{bits, Kmsg, Sender};
+use super::ipc::msg::{bits, Desc, Kmsg, Sender};
 use super::ipc::right::{msgt, Carried};
 use super::ipc::{kr, Kobject, ObjId, Receiver};
 use super::wait::{Wait, WaitResult};
@@ -59,6 +59,9 @@ pub struct Triage {
 pub struct Pending {
     t: Triage,
     id: i32,
+    /// The reply carries a state, and it is set.
+    state: bool,
+    set_state: bool,
 }
 
 /// One level's delivery: done with a result, or sent and awaited.
@@ -139,54 +142,82 @@ impl Kernel {
         let code64 = a.behavior & exc::MACH_EXCEPTION_CODES != 0;
         let behavior = a.behavior & !exc::MACH_EXCEPTION_MASK;
         let base = if code64 { MACH_EXC_BASE } else { EXC_BASE };
-        match behavior {
-            exc::EXCEPTION_STATE => {
-                let ctx = self.ctx_addr;
-                let old_state = match self.machine_thread_get_state(m, self.tid, ctx, a.flavor, STATE_MAX) {
-                    Ok(s) => s,
-                    Err(e) => return Delivered::Done(e as u32 as u64),
-                };
-                let id = base + 1;
-                let mut body = super::mig::NDR_RECORD.to_vec();
-                body.extend_from_slice(&(t.exc as i32).to_le_bytes());
-                body.extend_from_slice(&t.count.to_le_bytes());
-                for &c in &t.codes[..t.count as usize] {
-                    if code64 {
-                        body.extend_from_slice(&c.to_le_bytes());
-                    } else {
-                        body.extend_from_slice(&(c as i32).to_le_bytes());
-                    }
-                }
-                body.extend_from_slice(&a.flavor.to_le_bytes());
-                body.extend_from_slice(&(old_state.len() as u32).to_le_bytes());
-                for w in &old_state {
-                    body.extend_from_slice(&w.to_le_bytes());
-                }
-                self.darwin_exc_send(port, id, body);
-                Delivered::Sent(Pending { t: *t, id })
-            }
-            exc::EXCEPTION_DEFAULT | exc::EXCEPTION_STATE_IDENTITY => {
-                // The thread's and task's read ports go with it (Developer
-                // Mode off: convert_*_read_to_port).
-                self.darwin_unimplemented(format!("exception {} to a handler of behavior {behavior} (thread and task read ports)", t.exc));
-                Delivered::Done(KERN_FAILURE)
-            }
-            exc::EXCEPTION_IDENTITY_PROTECTED => {
+        let state = behavior == exc::EXCEPTION_STATE || behavior == exc::EXCEPTION_STATE_IDENTITY;
+        let identity = behavior == exc::EXCEPTION_DEFAULT || behavior == exc::EXCEPTION_STATE_IDENTITY;
+        if !(state || identity) {
+            if behavior == exc::EXCEPTION_IDENTITY_PROTECTED {
                 self.darwin_unimplemented(format!("exception {} to an EXCEPTION_IDENTITY_PROTECTED handler (task identity tokens)", t.exc));
-                Delivered::Done(KERN_FAILURE)
             }
-            _ => Delivered::Done(KERN_FAILURE),
+            return Delivered::Done(KERN_FAILURE);
         }
+        let old_state = if state {
+            let ctx = self.ctx_addr;
+            match self.machine_thread_get_state(m, self.tid, ctx, a.flavor, STATE_MAX) {
+                Ok(s) => s,
+                Err(e) => return Delivered::Done(e as u32 as u64),
+            }
+        } else {
+            Vec::new()
+        };
+        let id = base + match behavior {
+            exc::EXCEPTION_DEFAULT => 0,
+            exc::EXCEPTION_STATE => 1,
+            _ => 2,
+        };
+        let mut body = Vec::new();
+        let mut descs = Vec::new();
+        if identity {
+            // The thread's and the task's ports: their read ports without
+            // Developer Mode (convert_*_read_to_port), else their control
+            // ports.
+            use super::kobject::{flavor, DEVELOPER_MODE};
+            let (thread, task) = if DEVELOPER_MODE {
+                let (tp, _) = self.darwin_thread_ports(self.tid);
+                let kp = self.darwin_task_port();
+                self.ipc().make_send(tp);
+                self.ipc().make_send(kp);
+                (tp, kp)
+            } else {
+                (self.darwin_thread_flavor_port(self.tid, flavor::READ), self.darwin_task_flavor_port(flavor::READ))
+            };
+            body.extend_from_slice(&2u32.to_le_bytes());
+            body.extend_from_slice(&[0u8; 24]);
+            descs.push(Desc::Port { off: 4, right: Some(Carried::Port(thread)), raw: 0, disp: msgt::PORT_SEND });
+            descs.push(Desc::Port { off: 16, right: Some(Carried::Port(task)), raw: 0, disp: msgt::PORT_SEND });
+        }
+        body.extend_from_slice(&super::mig::NDR_RECORD);
+        body.extend_from_slice(&(t.exc as i32).to_le_bytes());
+        body.extend_from_slice(&t.count.to_le_bytes());
+        for &c in &t.codes[..t.count as usize] {
+            if code64 {
+                body.extend_from_slice(&c.to_le_bytes());
+            } else {
+                body.extend_from_slice(&(c as i32).to_le_bytes());
+            }
+        }
+        if state {
+            body.extend_from_slice(&a.flavor.to_le_bytes());
+            body.extend_from_slice(&(old_state.len() as u32).to_le_bytes());
+            for w in &old_state {
+                body.extend_from_slice(&w.to_le_bytes());
+            }
+        }
+        self.darwin_exc_send(port, id, body, descs);
+        // A state identity handler's state is set only through a control
+        // port to the thread.
+        let set_state = behavior == exc::EXCEPTION_STATE || super::kobject::DEVELOPER_MODE;
+        Delivered::Sent(Pending { t: *t, id, state, set_state })
     }
 
     /// The request, with a copy of the handler's send right and a
     /// send-once right to the thread's reply port, as the kernel sends it.
-    fn darwin_exc_send(&mut self, port: ObjId, id: i32, body: Vec<u8>) {
+    fn darwin_exc_send(&mut self, port: ObjId, id: i32, body: Vec<u8>, descs: Vec<Desc>) {
         let reply = self.darwin_rpc_reply_port();
         let ipc = self.ipc();
         ipc.copy_send(port);
         ipc.make_sonce(reply);
-        let k = Kmsg { bits: bits::set(msgt::PORT_SEND, msgt::PORT_SEND_ONCE, 0, 0), size: HEADER + body.len() as u32, dest: port, reply: Some(Carried::Port(reply)), voucher: None, voucher_raw: 0, id, body, descs: Vec::new(), sender: Sender::KERNEL, aux: Vec::new(), keep_alive: false, ppriority: 0, qos_override: 0 };
+        let complex = if descs.is_empty() { 0 } else { bits::COMPLEX };
+        let k = Kmsg { bits: bits::set(msgt::PORT_SEND, msgt::PORT_SEND_ONCE, 0, complex), size: HEADER + body.len() as u32, dest: port, reply: Some(Carried::Port(reply)), voucher: None, voucher_raw: 0, id, body, descs, sender: Sender::KERNEL, aux: Vec::new(), keep_alive: false, ppriority: 0, qos_override: 0 };
         self.darwin_kernel_send(Box::new(k));
         self.darwin_ipc_notify_drain();
     }
@@ -264,12 +295,15 @@ impl Kernel {
         if ret != 0 {
             return err(ret);
         }
+        if !p.state {
+            return if b.len() == 12 { kr::SUCCESS } else { err(MIG_TYPE_ERROR) };
+        }
         let (Some(flavor), Some(cnt)) = (i32_at(12), i32_at(16).map(|c| c as u32)) else { return err(MIG_TYPE_ERROR) };
         if cnt > STATE_MAX || b.len() != 20 + cnt as usize * 4 {
             return err(MIG_TYPE_ERROR);
         }
         let new: Vec<u32> = (0..cnt as usize).map(|i| i32_at(20 + i * 4).unwrap() as u32).collect();
-        if p.t.exc == exc::EXC_CORPSE_NOTIFY {
+        if p.t.exc == exc::EXC_CORPSE_NOTIFY || !p.set_state {
             return kr::SUCCESS;
         }
         let ctx = self.ctx_addr;
