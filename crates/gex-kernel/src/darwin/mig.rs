@@ -97,7 +97,8 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             let need = if thread { thread_routine_flavor(req.id) } else { task_routine_flavor(req.id) };
             match need {
                 // The arms that read the port's flavor themselves.
-                Some(_) if !thread && matches!(req.id, 3405 | 3409) => obj,
+                Some(_) if !thread && matches!(req.id, 3402 | 3405 | 3409) => obj,
+                Some(_) if thread && req.id == 3610 => obj,
                 Some(n) if f > n => return Reply::err(if (3200..3300).contains(&req.id) { KERN_INVALID_TASK } else { KERN_INVALID_ARGUMENT }),
                 // task_conversion_eval, for a read port's conversion.
                 _ if f == flavor::READ && !k.darwin_read_conversion_ok() => return Reply::err(KERN_INVALID_ARGUMENT),
@@ -318,6 +319,16 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             }
             None => bad(),
         },
+        // task_threads(task) -> act_list[]: the thread ports of the flavor
+        // of the task port it was asked by.
+        (Kobject::Task | Kobject::TaskRead | Kobject::TaskInspect, 3402) => {
+            let f = match obj {
+                Kobject::TaskRead => flavor::READ,
+                Kobject::TaskInspect => flavor::INSPECT,
+                _ => flavor::CONTROL,
+            };
+            task_threads(k, f)
+        }
         // task_set_special_port(task, which, port)
         (Kobject::Task, 3410) => match (desc_port(req, 0), arg_after(req, 1, 0)) {
             (Some((right, _)), Some(which)) => task_set_special_port(k, which, right),
@@ -428,6 +439,18 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         (Kobject::Thread(t), 3603) => match (arg(req, 0), arg(req, 1)) {
             (Some(flavor), Some(cnt)) => k.darwin_thread_state(*t, flavor, (cnt as u32).min(1296), None),
             _ => bad(),
+        },
+        // thread_get_special_port(thread, which) -> port.
+        (Kobject::Thread(t) | Kobject::ThreadRead(t) | Kobject::ThreadInspect(t), 3610) => match arg(req, 0) {
+            Some(which) => {
+                let f = match obj {
+                    Kobject::ThreadRead(_) => flavor::READ,
+                    Kobject::ThreadInspect(_) => flavor::INSPECT,
+                    _ => flavor::CONTROL,
+                };
+                thread_get_special_port(k, *t, which, f)
+            }
+            None => bad(),
         },
         // thread_set_state(thread, flavor, new_state[new_stateCnt]).
         (Kobject::Thread(t), 3604) => match (arg(req, 0), arg(req, 1)) {
@@ -612,7 +635,7 @@ fn task_routine_flavor(id: i32) -> Option<u8> {
         // task_info (task_name_t), task_get_special_port (an inspect port
         // or better), task_policy_get (task_policy_get_t: inspect).
         3405 => NAME,
-        3409 | 3421 => INSPECT,
+        3402 | 3409 | 3421 => INSPECT,
         3403 | 3404 | 3410 | 3413 | 3414 | 3415 | 3418 | 3419 | 3420 | 3203 | 3207 | 5404 | 8000 => CONTROL,
         _ => return None,
     })
@@ -625,10 +648,98 @@ fn thread_routine_flavor(id: i32) -> Option<u8> {
     use super::kobject::flavor::*;
     Some(match id {
         3603 | 3605 | 3606 => READ,
-        3618 => INSPECT,
+        3610 | 3618 => INSPECT,
         3604 | 3613 | 3614 | 3615 | 3617 => CONTROL,
         _ => return None,
     })
+}
+
+/// `task_threads_internal` for a task port of flavor `f`: each of the
+/// task's threads, in the order made, as a send right of that flavor
+/// (`convert_thread_array_to_ports`). A control port asked by the task
+/// itself gives the threads' self ports; asked from another task, each is
+/// dead without Developer Mode, or when a platform binary's threads go to
+/// a task that is not one (`task_conversion_eval_out_trans`).
+fn task_threads(k: &mut Kernel, f: u8) -> Reply {
+    use super::kobject::flavor;
+    use super::kobject::PortOut;
+    let mut tids = k.thread_signals.tids_in_order();
+    tids.extend(k.dtask.threads.map.keys().copied());
+    tids.sort_unstable();
+    tids.dedup();
+    let own = k.dtask.kcaller == 0 || k.dtask.kcaller == k.ipc().task;
+    let mut rights = Vec::with_capacity(tids.len());
+    for t in tids {
+        let p = match f {
+            flavor::CONTROL if own => {
+                let p = k.darwin_thread_ports(t).1;
+                k.ipc().make_send(p);
+                p
+            }
+            flavor::CONTROL if !super::kobject::DEVELOPER_MODE || !k.darwin_read_conversion_ok() => {
+                rights.push((None, super::ipc::PORT_DEAD));
+                continue;
+            }
+            flavor::CONTROL => {
+                let p = k.darwin_thread_ports(t).0;
+                k.ipc().make_send(p);
+                p
+            }
+            f => k.darwin_thread_flavor_port(t, f),
+        };
+        rights.push((Some(Carried::Port(p)), 0));
+    }
+    let count = rights.len() as u32;
+    let mut out = NDR_RECORD.to_vec();
+    out.extend_from_slice(&count.to_le_bytes());
+    let mut r = Reply::ok(out);
+    r.ports.push(PortOut::Array(rights, super::ipc::right::msgt::PORT_SEND));
+    r
+}
+
+/// `thread_get_special_port_from_user` and
+/// `thread_get_special_port_internal` for thread `t`'s port of flavor `f`
+/// (`special_port_allowed_with_thread_flavor`).
+fn thread_get_special_port(k: &mut Kernel, t: i32, which: i32, f: u8) -> Reply {
+    use super::kobject::flavor;
+    const KERN_INVALID_CAPABILITY: i32 = 20;
+    const THREAD_KERNEL_PORT: i32 = 1;
+    const THREAD_INSPECT_PORT: i32 = 2;
+    const THREAD_READ_PORT: i32 = 3;
+    if !k.darwin_thread_alive(t) {
+        return Reply::err(KERN_INVALID_ARGUMENT);
+    }
+    let own = k.dtask.kcaller == 0 || k.dtask.kcaller == k.ipc().task;
+    if which == THREAD_KERNEL_PORT && own {
+        // mac_task_check_get_movable_control_port (AMFI's policy), then for
+        // a control port a movable send-once substitute of it
+        // (ipc_kobject_alloc_subst_once); a read or inspect port goes on to
+        // the flavor check.
+        let mut r = Reply::err(KERN_FAILURE);
+        r.unimplemented = Some("thread_get_special_port(THREAD_KERNEL_PORT) of the task's own thread (the movable control port policy and IKOT_PORT_SUBST_ONCE)".into());
+        return r;
+    }
+    let allowed = match f {
+        flavor::CONTROL => true,
+        flavor::READ => matches!(which, THREAD_READ_PORT | THREAD_INSPECT_PORT),
+        _ => which == THREAD_INSPECT_PORT,
+    };
+    if !allowed {
+        return Reply::err(KERN_INVALID_CAPABILITY);
+    }
+    match which {
+        // ipc_kobject_copy_send of the control port (no CONFIG_CSR).
+        THREAD_KERNEL_PORT => {
+            let p = k.darwin_thread_ports(t).0;
+            k.ipc().copy_send(p);
+            Reply::port(Carried::Port(p))
+        }
+        THREAD_READ_PORT | THREAD_INSPECT_PORT => {
+            let p = k.darwin_thread_flavor_port(t, if which == THREAD_READ_PORT { flavor::READ } else { flavor::INSPECT });
+            Reply::port(Carried::Port(p))
+        }
+        _ => Reply::err(KERN_INVALID_ARGUMENT),
+    }
 }
 
 /// `task_get_special_port_internal` for a port of flavor `f`

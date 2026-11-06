@@ -1256,7 +1256,7 @@ impl Kernel {
                     body[off + 9] = copy;
                     body[off + 12..off + 16].copy_from_slice(&size.to_le_bytes());
                 }
-                Desc::OolPorts { off, rights, disp, copy } => {
+                Desc::OolPorts { off, rights, disp, .. } => {
                     let count = rights.len();
                     let mut addr = 0;
                     if count != 0 {
@@ -1283,9 +1283,11 @@ impl Kernel {
                             }
                         }
                     }
+                    // ipc_kmsg_deflate_port_array_descriptor: whatever the
+                    // sender asked, the array arrives deallocate, virtual copy.
                     body[off..off + 8].copy_from_slice(&addr.to_le_bytes());
-                    body[off + 8] = u8::from(copy == VIRTUAL_COPY);
-                    body[off + 9] = copy;
+                    body[off + 8] = 1;
+                    body[off + 9] = VIRTUAL_COPY;
                     body[off + 10] = disp as u8;
                     body[off + 12..off + 16].copy_from_slice(&(count as u32).to_le_bytes());
                 }

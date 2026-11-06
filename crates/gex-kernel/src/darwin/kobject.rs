@@ -546,10 +546,13 @@ impl Kernel {
 }
 
 /// A right a reply returns, or a name carried as it is.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum PortOut {
     Right(Carried, u32),
     Raw(u32),
+    /// An array of rights of one type (an out-of-line ports descriptor),
+    /// each a right or a name carried as it is.
+    Array(Vec<(Option<Carried>, u32)>, u32),
 }
 
 /// What a MIG routine answers: its return code and out data, or the rights
@@ -587,8 +590,14 @@ impl Reply {
     /// The rights a reply that goes nowhere held, destroyed.
     fn destroy_ports(self, ipc: &mut super::ipc::Ipc) {
         for p in self.ports {
-            if let PortOut::Right(c, t) = p {
-                ipc.object_destroy(c, t);
+            match p {
+                PortOut::Right(c, t) => ipc.object_destroy(c, t),
+                PortOut::Array(v, t) => {
+                    for c in v.into_iter().filter_map(|(c, _)| c) {
+                        ipc.object_destroy(c, t);
+                    }
+                }
+                PortOut::Raw(_) => {}
             }
         }
     }
@@ -601,13 +610,22 @@ impl Reply {
         let (body, descs, complex) = if self.ret == 0 && !self.ports.is_empty() {
             let mut b = (self.ports.len() as u32).to_le_bytes().to_vec();
             let mut descs = Vec::new();
-            for p in &self.ports {
+            for p in self.ports {
                 let off = b.len();
-                b.extend_from_slice(&[0u8; 12]);
-                let (right, raw, t) = match *p {
+                let (right, raw, t) = match p {
                     PortOut::Right(c, t) => (Some(c), 0, t),
                     PortOut::Raw(n) => (None, n, msgt::PORT_SEND),
+                    // MIG's template: deallocate FALSE, MACH_MSG_PHYSICAL_COPY.
+                    PortOut::Array(rights, t) => {
+                        const MACH_MSG_OOL_PORTS_DESCRIPTOR: u8 = 2;
+                        b.extend_from_slice(&[0u8; 16]);
+                        b[off + 10] = t as u8;
+                        b[off + 11] = MACH_MSG_OOL_PORTS_DESCRIPTOR;
+                        descs.push(Desc::OolPorts { off, rights, disp: t, copy: 0 });
+                        continue;
+                    }
                 };
+                b.extend_from_slice(&[0u8; 12]);
                 b[off + 10] = t as u8;
                 descs.push(Desc::Port { off, right, raw, disp: t });
             }
