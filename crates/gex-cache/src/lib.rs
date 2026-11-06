@@ -129,6 +129,12 @@ fn gex_cache_root() -> Option<PathBuf> {
     Some(base.join("gex"))
 }
 
+/// Where a shared cache's mappings live slid, each a file of its own a
+/// private mapping of a cache can map instead of sliding it again.
+pub fn slid_cache_dir() -> Option<PathBuf> {
+    Some(gex_cache_root()?.join("dsc-slid"))
+}
+
 /// Where compiled modules live.
 pub fn cache_dir() -> Option<PathBuf> {
     Some(gex_cache_root()?.join("modules"))

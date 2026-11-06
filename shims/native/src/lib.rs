@@ -4603,13 +4603,35 @@ fn map_shared_cache(store: &mut Store<HostState>, memory: &gex_mem::GuestMemory,
                 bail!("shared cache mapping {:#x}..{:#x} does not fit in guest memory", m.address, m.address + m.size);
             }
             gex_kernel::big_op("shared cache", end - start);
-            f.seek(SeekFrom::Start(m.file_offset))?;
-            f.read_exact(&mut data[start..end]).with_context(|| format!("reading {}", p.display()))?;
-            if let Some((off, size)) = m.slide_info {
-                let mut info = vec![0u8; size as usize];
-                f.seek(SeekFrom::Start(off))?;
-                f.read_exact(&mut info)?;
-                dsc::apply_slide(&mut data[start..end], &info, 0).with_context(|| format!("sliding {}", p.display()))?;
+            // The file's pages, copy on write, where the host can map them:
+            // a mapping with no slide info straight from the cache, a slid
+            // one from its slid copy (made by the first process to need it).
+            let info = match m.slide_info {
+                Some((off, size)) => {
+                    let mut info = vec![0u8; size as usize];
+                    f.seek(SeekFrom::Start(off))?;
+                    f.read_exact(&mut info)?;
+                    Some(info)
+                }
+                None => None,
+            };
+            let mapped = {
+                let mut gm = GuestMem::new(&mut data[..]);
+                match &info {
+                    None => {
+                        use std::os::fd::AsRawFd;
+                        gm.map_file(m.address, m.size, f.as_raw_fd(), m.file_offset).unwrap_or(false)
+                    }
+                    Some(info) => map_slid(&mut gm, &fh.uuid, m, info),
+                }
+            };
+            if !mapped {
+                f.seek(SeekFrom::Start(m.file_offset))?;
+                f.read_exact(&mut data[start..end]).with_context(|| format!("reading {}", p.display()))?;
+                if let Some(info) = &info {
+                    dsc::apply_slide(&mut data[start..end], info, 0).with_context(|| format!("sliding {}", p.display()))?;
+                    save_slid(&fh.uuid, m, info, &data[start..end]);
+                }
             }
             let mut pr = 0;
             if m.init_prot & dsc::PROT_READ != 0 {
@@ -4638,6 +4660,43 @@ fn map_shared_cache(store: &mut Store<HostState>, memory: &gex_mem::GuestMemory,
         store.data_mut().with_kernel(|k| k.mem.lock().insert(at, at + size, prot::READ | prot::WRITE, "[shared-cache-data]"));
     }
     Ok((h.shared_region_start, h.shared_region_size))
+}
+
+/// The file a shared cache mapping is kept in slid (at its linked
+/// address): named by the cache, the mapping and its slide info.
+fn slid_path(uuid: &[u8; 16], m: &gex_ld::dsc::Mapping, info: &[u8]) -> Option<std::path::PathBuf> {
+    use gex_key::sha256;
+    let mut h = sha256::Sha256::new();
+    h.update(b"gex dsc slid 1\0");
+    h.update(uuid);
+    h.update(&m.file_offset.to_le_bytes());
+    h.update(&m.size.to_le_bytes());
+    h.update(info);
+    Some(gex_cache::slid_cache_dir()?.join(format!("{}.slid", sha256::hex(&h.finish()))))
+}
+
+/// Map a slid mapping's kept file over its place, if there is one.
+fn map_slid(gm: &mut GuestMem<'_>, uuid: &[u8; 16], m: &gex_ld::dsc::Mapping, info: &[u8]) -> bool {
+    use std::os::fd::AsRawFd;
+    let Some(path) = slid_path(uuid, m, info) else { return false };
+    match std::fs::File::open(&path) {
+        Ok(f) if f.metadata().is_ok_and(|md| md.len() == m.size) => gm.map_file(m.address, m.size, f.as_raw_fd(), 0).unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Keep a mapping's slid bytes for the next process (written whole, then
+/// renamed into place, so a reader never sees part of one).
+fn save_slid(uuid: &[u8; 16], m: &gex_ld::dsc::Mapping, info: &[u8], bytes: &[u8]) {
+    let Some(path) = slid_path(uuid, m, info) else { return };
+    let Some(dir) = path.parent() else { return };
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 fn write_u64(data: &mut [u8], off: usize, v: u64) {

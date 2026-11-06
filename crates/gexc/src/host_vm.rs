@@ -7,6 +7,7 @@ use gex_kernel::HostAdvice;
 
 pub fn install() {
     gex_kernel::set_host_vm(advise);
+    gex_kernel::set_host_map_file(map_file);
 }
 
 
@@ -17,6 +18,21 @@ fn page() -> usize {
     *PAGE.get_or_init(|| unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize)
 }
 
+/// A private mapping of `fd` from `offset` over the guest's pages at `at`.
+/// The pages are the file's until written, then the host's copy; none lies
+/// wholly past the file's end (the caller maps only what the file holds).
+fn map_file(at: usize, len: usize, fd: i32, offset: u64) -> bool {
+    let page = page();
+    if at % page != 0 || len % page != 0 || len == 0 || offset % page as u64 != 0 {
+        return false;
+    }
+    let Ok(off) = libc::off_t::try_from(offset) else { return false };
+    // SAFETY: `at..at + len` is guest memory, mapped for the life of the
+    // process; the file's pages replace what the guest just mapped there,
+    // readable and writable as the guest's memory is.
+    let p = unsafe { libc::mmap(at as *mut libc::c_void, len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_FIXED | libc::MAP_PRIVATE, fd, off) };
+    p as usize == at
+}
 
 /// What the host does for a piece of advice.
 enum Host {

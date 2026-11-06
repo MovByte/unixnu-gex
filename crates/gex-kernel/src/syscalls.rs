@@ -4558,8 +4558,30 @@ impl MapIo<'_> {
             // stand (`SharedMaps::recall`).
             let shared = flags & crate::mem::flags::SHARED != 0;
             let before = if shared && len_aligned >= RECALL_MIN { file.handle.changes() } else { 0 };
-            let n = file.pread(offset, m.read_mut(start, len as usize)?)? as usize;
-            m.zero_dirty(start + n as u64, len_aligned as usize - n)?;
+            // A private mapping of a host file is the host's own, copy on
+            // write: its pages are the file's until written, as the
+            // guest's kernel keeps them. Only what the file holds is
+            // mapped so (a page wholly past its end would fault in the
+            // host); the rest reads zero.
+            let hosted = if shared {
+                None
+            } else {
+                match (file.handle.host_fd(), file.metadata()) {
+                    (Some(fd), Ok(md)) => {
+                        let page = self.mem.lock().page();
+                        let held = md.size.saturating_sub(offset).div_ceil(page).saturating_mul(page).min(len_aligned);
+                        (held != 0 && m.map_file(start, held, fd, offset)?).then_some(held)
+                    }
+                    _ => None,
+                }
+            };
+            match hosted {
+                Some(held) => m.discard(start + held, (len_aligned - held) as usize)?,
+                None => {
+                    let n = file.pread(offset, m.read_mut(start, len as usize)?)? as usize;
+                    m.zero_dirty(start + n as u64, len_aligned as usize - n)?;
+                }
+            }
             // A shared mapping is written back at `msync` and `munmap` (where
             // a program that never calls `msync` expects its changes to land).
             // An executable file mapping is a shared library arriving: tell the

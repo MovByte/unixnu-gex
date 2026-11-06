@@ -219,6 +219,16 @@ impl<'a> GuestMem<'a> {
         Ok(HOST_VM.get().is_some_and(|f| f(base + r.start, r.len(), a)))
     }
 
+    /// Map `len` bytes of the host file `fd` from `offset` over the guest's
+    /// pages at `addr`, copy on write, as a private mapping of it
+    /// ([`set_host_map_file`]); whether the host did. Pages it maps are the
+    /// file's until written, so they hold no memory of their own.
+    pub fn map_file(&mut self, addr: u64, len: u64, fd: i32, offset: u64) -> Result<bool, Errno> {
+        let r = self.range(addr, usize::try_from(len).map_err(|_| Errno::EFAULT)?)?;
+        let base = self.view_mut().as_mut_ptr() as usize;
+        Ok(HOST_MAP_FILE.get().is_some_and(|f| f(base + r.start, r.len(), fd, offset)))
+    }
+
     /// `len` bytes at `addr` (page aligned) read as zero after: the host's
     /// fresh pages where it can give them ([`HostAdvice::Discard`], which
     /// reads nothing and frees what was there), else [`Self::zero_dirty`].
@@ -380,6 +390,14 @@ pub enum HostAdvice {
 }
 
 static HOST_VM: std::sync::OnceLock<fn(usize, usize, HostAdvice) -> bool> = std::sync::OnceLock::new();
+
+static HOST_MAP_FILE: std::sync::OnceLock<fn(usize, usize, i32, u64) -> bool> = std::sync::OnceLock::new();
+
+/// Install the host's private file mapping over guest pages:
+/// `f(host_address, len, fd, offset)`, true when it mapped them.
+pub fn set_host_map_file(f: fn(usize, usize, i32, u64) -> bool) {
+    let _ = HOST_MAP_FILE.set(f);
+}
 
 /// Install the host's page advice: `f(host_address, len, advice)`, true
 /// when it was taken. Once per process; later calls are ignored.

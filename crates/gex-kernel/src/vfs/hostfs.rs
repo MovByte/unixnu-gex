@@ -286,6 +286,11 @@ fn file_times(atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>) -> std::fs::
 }
 
 impl FileHandle for HostHandle {
+    fn host_fd(&self) -> Option<i32> {
+        use std::os::unix::io::AsRawFd;
+        Some(self.file.lock().unwrap_or_else(|e| e.into_inner()).as_raw_fd())
+    }
+
     fn xattr(&self, op: super::XattrOp<'_>) -> Option<Result<usize, Errno>> {
         use std::os::unix::io::AsRawFd;
         let f = self.file.lock().unwrap_or_else(|e| e.into_inner());

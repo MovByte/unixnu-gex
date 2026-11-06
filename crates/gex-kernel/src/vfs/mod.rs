@@ -603,6 +603,12 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// The host's descriptor for the file this handle reads, where it is
+    /// one the host can map ([`crate::GuestMem::map_file`]).
+    fn host_fd(&self) -> Option<i32> {
+        None
+    }
+
     /// Whether a mapping of this file is the device's own memory (an OSS
     /// DMA buffer) rather than a copy of its contents: fresh zeroed pages,
     /// never read from the file or written back to it, whose place the
