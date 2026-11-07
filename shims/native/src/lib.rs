@@ -1161,6 +1161,7 @@ fn run_program_with(
         gex_kernel::darwin::boot(tc.as_deref(), sandbox).map_err(|e| anyhow!("the boot payload: {e}"))?;
         // The run's first process: of the user it runs as.
         kernel.dtask.cred = gex_kernel::darwin::cred::Cred::of(uid, gid);
+        kernel.dtask.uniqueid = gex_kernel::darwin::next_uniqueid();
         kernel.darwin_cred_tokens();
     }
     if opts.darwin {
@@ -4523,7 +4524,7 @@ fn place_image(
                     exe_path: &path,
                     file_start: exec.as_ref().map_or(0, |i| i.arch_offset),
                     code_signature: opts.darwin_code_signature.as_deref(),
-                    signature: exec.as_ref().map(|i| (i.sig.clone(), i.load_csflags)),
+                    signature: exec.as_ref().map(|i| (i.sig.clone(), i.load_csflags, i.uuid)),
                     nano: exec.as_ref().and_then(|i| i.spawn.as_ref()).is_some_and(|sp| sp.flags & gex_kernel::darwin::spawn::flag::NANO_ALLOCATOR != 0),
                 };
                 k.darwin_start(exec.map(|i| i.strings), &loaded, gex_abi::STACK_TOP)

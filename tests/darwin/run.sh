@@ -142,6 +142,7 @@ hello from /var/tmp/gex-exec-fat with 1 argument" 0
     taskthreads) check_root taskthreads "taskthreads ok" 0 ;;
     policy) check_root policy "policy ok" 0 ;;
     creds) check_root creds "creds ok" 0 ;;
+    uniqueid) check_root uniqueid "uniqueid ok" 0 ;;
     amfi)
         if [ -n "${GEX_DARWIN_ROOT:-}" ]; then
             mkdir -p "$GEX_DARWIN_ROOT/var/tmp"
@@ -164,7 +165,7 @@ if [ "$named" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds cfrunloop xpc-anon; do
+    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid cfrunloop xpc-anon; do
         run "$p"
     done
 fi

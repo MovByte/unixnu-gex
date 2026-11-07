@@ -314,7 +314,7 @@ pub struct Loaded<'a> {
     /// An exec's image's signature as its load added it and the load's
     /// code signing flags; none for the run's first program, whose load is
     /// done here.
-    pub signature: Option<(Option<std::sync::Arc<super::codesign::CodeSign>>, u32)>,
+    pub signature: Option<(Option<std::sync::Arc<super::codesign::CodeSign>>, u32, [u8; 16])>,
     /// `_POSIX_SPAWN_NANO_ALLOCATOR` among a spawn's flags.
     pub nano: bool,
 }
@@ -439,7 +439,7 @@ impl Kernel {
     fn darwin_start_body(&mut self, strings: Option<Strings>, l: &Loaded, user_stack: u64) -> Result<MainStack, Errno> {
         // The image's code signing flags and its credential's
         // entitlements; the policy's refusal kills the exec.
-        let (sig, load) = match l.signature.clone() {
+        let (sig, load, uuid) = match l.signature.clone() {
             Some(s) => s,
             None => {
                 let bytes = self.read_file(l.exe_path).ok_or(Errno::EIO)?;
@@ -449,6 +449,8 @@ impl Kernel {
             }
         };
         self.dtask.textoff = l.file_start as i64;
+        // p_uuid: the image's.
+        self.dtask.uuid = uuid;
         if let Err(why) = self.darwin_exec_csflags(sig, load) {
             if self.trace {
                 eprintln!("[gex:{}] AMFI: killing {}: {why}", self.pid, l.exe_path);

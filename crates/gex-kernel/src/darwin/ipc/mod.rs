@@ -581,6 +581,8 @@ pub struct TaskLink {
     pub csflags: Arc<std::sync::atomic::AtomicU32>,
     pub pidversion: i32,
     pub textoff: i64,
+    /// Its process's `p_uniqueid`.
+    pub uniqueid: u64,
 }
 
 /// What every task shares: the ports and sets (XNU's are kernel objects,

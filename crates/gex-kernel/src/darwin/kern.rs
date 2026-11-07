@@ -570,20 +570,20 @@ impl Kernel {
                 self.darwin_dyld_infos = buf;
                 Ok(0)
             }
-            // proc_uniqidentifierinfo: a uuid, the unique id and the
-            // parent's, an id version.
-            // The struct has grown over releases; fill what the caller has
-            // room for.
+            // proc_uniqidentifierinfo (56 bytes): the image's UUID, the
+            // process's unique id and its parent's, its pidversion.
             (CALL_PIDINFO, UNIQIDENTIFIERINFO) if me => {
-                if size < 32 {
+                const SIZE: usize = 56;
+                if size < SIZE {
                     return Err(Errno::ENOMEM);
                 }
-                let mut b = [0u8; 64];
-                b[16..24].copy_from_slice(&(self.pid as u64).to_le_bytes());
-                b[24..32].copy_from_slice(&1u64.to_le_bytes());
-                let n = size.min(b.len());
-                m.write(buf, &b[..n])?;
-                Ok(n as u64)
+                let mut b = [0u8; SIZE];
+                b[..16].copy_from_slice(&self.dtask.uuid);
+                b[16..24].copy_from_slice(&self.dtask.uniqueid.to_le_bytes());
+                b[24..32].copy_from_slice(&self.dtask.puniqueid.to_le_bytes());
+                b[32..36].copy_from_slice(&self.dtask.pidversion.to_le_bytes());
+                m.write(buf, &b)?;
+                Ok(SIZE as u64)
             }
             // proc_pidpath: the program's path.
             (CALL_PIDINFO, PIDPATHINFO) if me => {
@@ -1033,24 +1033,21 @@ impl Kernel {
             // No sandbox references are made: no process has a sandbox.
             return Err(ENOENT);
         }
-        let found = |k: &mut Kernel, pid: i64, version: Option<u64>| -> bool {
+        // The process by pid, with its pidversion or its unique id to match.
+        let found = |k: &mut Kernel, pid: i64, version: Option<u64>, unique: Option<u64>| -> bool {
             let Ok(pid) = i32::try_from(pid) else { return false };
-            let v = if pid == k.pid {
-                Some(k.dtask.pidversion)
+            let ids = if pid == k.pid {
+                Some((k.dtask.pidversion, k.dtask.uniqueid))
             } else {
                 let ipc = k.ipc();
-                ipc.links.values().find(|l| l.pid == pid).map(|l| l.pidversion)
+                ipc.links.values().find(|l| l.pid == pid).map(|l| (l.pidversion, l.uniqueid))
             };
-            v.is_some_and(|v| version.is_none_or(|w| i64::from(v) == w as i64))
+            ids.is_some_and(|(v, u)| version.is_none_or(|w| i64::from(v) == w as i64) && unique.is_none_or(|w| u == w))
         };
-        if selector == 2 {
-            self.darwin_unimplemented("sandbox_check by unique id (process unique ids)".into());
-            return Err(EINVAL);
-        }
-        if !found(self, pid, (selector == 1).then_some(id)) {
+        if !found(self, pid, (selector == 1).then_some(id), (selector == 2).then_some(id)) {
             return answer(m, 3);
         }
-        if flags & 0x100_0000 != 0 && !found(self, q(0x70) as i64, Some(q(0x78))) {
+        if flags & 0x100_0000 != 0 && !found(self, q(0x70) as i64, Some(q(0x78)), None) {
             return answer(m, 3);
         }
         // No process has a sandbox: with no operation the answer is that,

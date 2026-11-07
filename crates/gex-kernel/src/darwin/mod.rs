@@ -148,6 +148,11 @@ pub struct Task {
     pub csflags: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// `p_textoff`: where the image's slice starts in its file.
     pub textoff: i64,
+    /// `p_uniqueid` and `p_puniqueid` (its parent's at its fork), and
+    /// `p_uuid`, its image's UUID.
+    pub uniqueid: u64,
+    pub puniqueid: u64,
+    pub uuid: [u8; 16],
     /// The process's credential (`p_ucred`'s POSIX part) and `P_SUGID`.
     pub cred: cred::Cred,
     pub sugid: bool,
@@ -204,7 +209,7 @@ pub struct Task {
 impl Task {
     /// A new process's task: it takes the next pidversion.
     pub fn new_process() -> Task {
-        Task { pidversion: next_pidversion(), ..Default::default() }
+        Task { pidversion: next_pidversion(), uniqueid: next_uniqueid(), ..Default::default() }
     }
 }
 
@@ -233,7 +238,7 @@ impl crate::syscalls::Kernel {
                 let pending = old.as_ref().map(|l| std::mem::take(&mut *l.mailbox.lock().unwrap_or_else(|e| e.into_inner()))).unwrap_or_default();
                 let name_port = old.and_then(|l| l.name_port.lock().unwrap_or_else(|e| e.into_inner()).take());
                 let ring = !pending.is_empty();
-                let link = std::sync::Arc::new(ipc::TaskLink { mailbox: std::sync::Mutex::new(pending), bell, pid: self.pid, name_port: std::sync::Mutex::new(name_port), codesign: self.dtask.codesign.clone(), csflags: std::sync::Arc::clone(&self.dtask.csflags), pidversion: self.dtask.pidversion, textoff: self.dtask.textoff });
+                let link = std::sync::Arc::new(ipc::TaskLink { mailbox: std::sync::Mutex::new(pending), bell, pid: self.pid, name_port: std::sync::Mutex::new(name_port), codesign: self.dtask.codesign.clone(), csflags: std::sync::Arc::clone(&self.dtask.csflags), pidversion: self.dtask.pidversion, textoff: self.dtask.textoff, uniqueid: self.dtask.uniqueid });
                 ipc.links.insert(ipc.task, std::sync::Arc::clone(&link));
                 if ring {
                     link.bell.ring();
@@ -304,6 +309,13 @@ impl crate::syscalls::Kernel {
 
 /// `nextpidversion`: one counter for the system, taken at each exec
 /// (`OSIncrementAtomic` returns the value before).
+/// The system's `nextuniqueid`: a new process takes the next (the kernel's
+/// own process is 0, so the first is 1).
+pub fn next_uniqueid() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
 pub fn next_pidversion() -> i32 {
     static NEXT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)

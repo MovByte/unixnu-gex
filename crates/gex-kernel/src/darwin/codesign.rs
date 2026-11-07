@@ -466,8 +466,8 @@ impl Kernel {
     /// its vnode (`load_code_signature`, `ubc_cs_blob_add`); any refusal is
     /// the load's failure (EBADEXEC). The image's signature and the load's
     /// code signing flags: CS_NO_UNTRUSTED_HELPERS unless the dylinker is
-    /// not platform code, and the blob's flags.
-    pub(crate) fn darwin_load_signatures(&mut self, path: &str, file_start: u64, slice: &[u8]) -> Result<(Option<std::sync::Arc<CodeSign>>, u32), crate::errno::Errno> {
+    /// not platform code, and the blob's flags; and the image's UUID.
+    pub(crate) fn darwin_load_signatures(&mut self, path: &str, file_start: u64, slice: &[u8]) -> Result<(Option<std::sync::Arc<CodeSign>>, u32, [u8; 16]), crate::errno::Errno> {
         use super::amfi::cs;
         let m = gex_ld::macho::parse(slice).map_err(|_| super::errno::EBADMACHO)?;
         let mut flags = cs::NO_UNTRUSTED_HELPERS;
@@ -496,7 +496,8 @@ impl Kernel {
                 flags &= !cs::NO_UNTRUSTED_HELPERS;
             }
         }
-        Ok((sig, flags))
+        // load_result.uuid: the image's LC_UUID.
+        Ok((sig, flags, m.uuid.unwrap_or_default()))
     }
 
     /// `mac_proc_check_launch_constraints` (AMFI's): the image's trust cache

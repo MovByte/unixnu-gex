@@ -214,6 +214,7 @@ impl Kernel {
             codesign: t.codesign.clone(),
             textoff: t.textoff,
             // forkproc: the credential, and P_SUGID with the flags it keeps.
+            puniqueid: t.uniqueid,
             cred: t.cred.clone(),
             sugid: t.sugid,
             csflags: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(t.csflags.load(std::sync::atomic::Ordering::Acquire) & !super::amfi::cs::KILLED)),
