@@ -324,6 +324,13 @@ pub fn next_uniqueid() -> u64 {
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
+/// The system's `thread_unique_id`: a new thread takes the next (the first
+/// is 101).
+pub fn next_thread_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(100);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
 pub fn next_pidversion() -> i32 {
     static NEXT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -350,9 +357,19 @@ pub mod machdep {
     pub const THREAD_SET_TSD: u64 = 2;
 }
 
+/// `machine_thread_set_tsd_base`: a thread's TSD base (`cthread_self`), none
+/// past its map's end, and its TPIDRRO_EL0.
+pub(crate) fn set_tsd_base(m: &mut GuestMem<'_>, ctx_addr: u64, thread: &crate::signal::ThreadSig, tsd: u64, map_max: u64) -> Result<(), Errno> {
+    let tsd = if tsd > map_max { 0 } else { tsd };
+    thread.set_tsd(tsd);
+    m.write_u64(ctx_addr + ctx::TPIDRRO as u64, tsd)
+}
+
 /// A call answered here without going through the Linux dispatch: the
 /// machine-dependent class. `None` for everything else.
-pub fn direct(m: &mut GuestMem<'_>, ctx_addr: u64, raw: u64) -> Option<u64> {
+/// `thread` is the calling thread's record, and `map_max` its task map's
+/// highest address.
+pub fn direct(m: &mut GuestMem<'_>, ctx_addr: u64, raw: u64, thread: &crate::signal::ThreadSig, map_max: u64) -> Option<u64> {
     if raw as u32 as u64 != PLATFORM {
         return None;
     }
@@ -363,7 +380,7 @@ pub fn direct(m: &mut GuestMem<'_>, ctx_addr: u64, raw: u64) -> Option<u64> {
         machdep::ICACHE_INVALIDATE | machdep::DCACHE_FLUSH => 0,
         machdep::THREAD_SET_TSD => {
             let tsd = m.read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(0);
-            match m.write_u64(ctx_addr + ctx::TPIDRRO as u64, tsd) {
+            match set_tsd_base(m, ctx_addr, thread, tsd, map_max) {
                 Ok(()) => 0,
                 Err(e) => neg(e),
             }
@@ -463,8 +480,15 @@ mod tests {
         let mut m = GuestMem::new(&mut b);
         m.write_u64(ctx::x(0) as u64, 0x2_0000_8000).unwrap();
         m.write_u64(ctx::x(3) as u64, machdep::THREAD_SET_TSD).unwrap();
-        assert_eq!(direct(&mut m, 0, PLATFORM), Some(0));
+        let t = crate::signal::ThreadSig::new_thread(0);
+        assert_eq!(direct(&mut m, 0, PLATFORM, &t, vm::MAP_MAX), Some(0));
         assert_eq!(m.read_u64(ctx::TPIDRRO as u64).unwrap(), 0x2_0000_8000);
-        assert_eq!(direct(&mut m, 0, 4), None);
+        assert_eq!(t.tsd(), 0x2_0000_8000);
+        assert_eq!(direct(&mut m, 0, 4, &t, vm::MAP_MAX), None);
+        // Past the map's end, none.
+        m.write_u64(ctx::x(0) as u64, vm::MAP_MAX + 1).unwrap();
+        assert_eq!(direct(&mut m, 0, PLATFORM, &t, vm::MAP_MAX), Some(0));
+        assert_eq!(m.read_u64(ctx::TPIDRRO as u64).unwrap(), 0);
+        assert_eq!(t.tsd(), 0);
     }
 }

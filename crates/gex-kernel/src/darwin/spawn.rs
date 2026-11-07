@@ -425,13 +425,17 @@ impl Kernel {
         self.darwin_fork1_checks()?;
         self.darwin_child_ports();
         let mut child = self.fork_kernel();
-        // A spawn is not a fork: CS_GET_TASK_ALLOW is not inherited.
+        // A spawn is not a fork: CS_GET_TASK_ALLOW is not inherited, and
+        // its thread is not a copy of this one (no thread_dup).
         child.dtask.csflags.fetch_and(!super::amfi::cs::GET_TASK_ALLOW, std::sync::atomic::Ordering::AcqRel);
+        child.signals.thread().set_tsd(0);
         let pid = self.procs.spawn(self.pid);
         // The spawner's NOTE_FORK, whatever becomes of the child.
         crate::procnote::post(self.pid, crate::procnote::note::FORK | pid as u32);
         child.pid = pid;
         child.tid = pid;
+        // Its thread is in its task's list before it first runs.
+        child.thread_sig(pid);
         child.forget_own_pidfds();
         child.darwin_publish();
         match self.darwin_spawn_child(m, &mut child, attr.as_ref(), file_actions.as_deref(), port_actions.as_deref(), path, argv, envv) {
@@ -697,6 +701,9 @@ impl Kernel {
         self.procs.jetsam().ledgers.insert(self.pid, super::footprint::Ledger::default());
         self.darwin_spawn_jetsam(self.pid, at);
         img.spawn = Some(after);
+        // The copy's thread (cloneproc's, for an exec in place) is the one
+        // this process goes on in.
+        img.thread_id = copy.signals.thread().darwin_id();
         Ok(Box::new(img))
     }
 

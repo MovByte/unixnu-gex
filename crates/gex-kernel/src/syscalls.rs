@@ -9422,9 +9422,14 @@ impl Kernel {
         if cwd != child.vfs.cwd {
             child.vfs.put_cwd(cwd);
         }
-        // forkproc keeps neither P_NOCLDSTOP nor P_NOCLDWAIT.
+        // forkproc keeps neither P_NOCLDSTOP nor P_NOCLDWAIT. cloneproc's
+        // thread takes the next thread id, and a fork's is a copy of the
+        // caller (thread_dup), its TSD base with it.
         if self.darwin {
             child.darwin_fork_signals();
+            let t = child.signals.thread();
+            t.set_darwin_id(crate::darwin::next_thread_id());
+            t.set_tsd(self.signals.thread().tsd());
         }
         // fdt_fork: a Darwin kqueue is FG_CONFINED, its process's alone.
         if self.darwin {
@@ -9549,7 +9554,19 @@ impl Kernel {
     /// case is handled in `syscall`.
     /// A Darwin thread, made as `clone` makes one.
     pub(crate) fn darwin_clone(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> Result<SpawnRequest, Errno> {
-        self.sys_clone(m, a)
+        let req = self.sys_clone(m, a)?;
+        self.darwin_thread_made(m, &req);
+        Ok(req)
+    }
+
+    /// A new Darwin thread's own (`thread_create_internal`): the next thread
+    /// id, and no TSD base (`machine_thread_create`) until one is set.
+    fn darwin_thread_made(&mut self, m: &mut GuestMem<'_>, req: &SpawnRequest) {
+        if let Some(t) = self.thread_signals.get(req.tid) {
+            t.set_darwin_id(crate::darwin::next_thread_id());
+            t.set_tsd(0);
+        }
+        let _ = m.write_u64(req.ctx_addr + ctx::TPIDRRO as u64, 0);
     }
 
     /// A thread of this process made from thread context `parent` (a
@@ -9559,7 +9576,9 @@ impl Kernel {
         use crate::syscalls::clone_flags as cf;
         let fs = self.fs_of(parent);
         let flags = cf::VM | cf::FS | cf::FILES | cf::SIGHAND | cf::THREAD | cf::SYSVSEM;
-        self.thread_maker(&fs).make(m, parent, [flags, 1, 0, 0, 0, 0])
+        let req = self.thread_maker(&fs).make(m, parent, [flags, 1, 0, 0, 0, 0])?;
+        self.darwin_thread_made(m, &req);
+        Ok(req)
     }
 
     /// End a thread made by [`Self::darwin_clone`] that never ran: what
@@ -9796,7 +9815,7 @@ impl Kernel {
                 }
                 return out;
             }
-            let ret = match crate::darwin::direct(m, self.ctx_addr, raw) {
+            let ret = match crate::darwin::direct(m, self.ctx_addr, raw, self.signals.thread(), self.darwin_map_max()) {
                 Some(ret) => Some(ret),
                 None => self.darwin_call(m, raw, &a),
             };

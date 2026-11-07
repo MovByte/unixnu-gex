@@ -6,11 +6,16 @@
 // once it has exited and before it is reaped, its BSD info is found only
 // when zombies are asked for (SZOMB), and is ESRCH otherwise.
 // proc_listpids lists every process, the zombie too, and by parent, group
-// and user. PROC_PIDLISTFDS lists the open descriptors and their types.
+// and user. PROC_PIDLISTFDS lists the open descriptors and their types;
+// PROC_PIDLISTTHREADIDS and PROC_PIDLISTTHREADS the threads, in the order
+// made, by thread id (thread_selfid's, from 101 up) and by TSD base, which
+// thread_info(THREAD_IDENTIFIER_INFO) reports too.
 
 #include <errno.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
+#include <mach/mach.h>
+#include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdint.h>
@@ -24,6 +29,16 @@ extern char **environ;
 int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buffersize);
 int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 int proc_listpids(uint32_t type, uint32_t typeinfo, void *buffer, int buffersize);
+
+static int gate[2];
+
+// A second thread: there until the gate is written.
+static void *waiter(void *arg) {
+    char c;
+    (void)arg;
+    read(gate[0], &c, 1);
+    return NULL;
+}
 
 // Whether `pid` is among the pids proc_listpids(type, info) lists, and how
 // many it lists.
@@ -100,6 +115,33 @@ int main(int argc, char **argv) {
     if (proc_pidinfo(getpid(), 1, 0, NULL, 0) < (int)(8 * (b.nfiles + 20))) return bad("the descriptors' room", 0, 1);
     close(pp[0]);
     close(pp[1]);
+    // Its threads: this one, then a second.
+    uint64_t me, other, tsd, ids[64], tsds[64];
+    pthread_threadid_np(NULL, &me);
+    __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tsd));
+    pipe(gate);
+    pthread_t th;
+    pthread_create(&th, NULL, waiter, NULL);
+    pthread_threadid_np(th, &other);
+    int ni = proc_pidinfo(getpid(), 28, 0, ids, sizeof ids) / 8;
+    int nt = proc_pidinfo(getpid(), 6, 0, tsds, sizeof tsds) / 8;
+    int at_me = -1, at_other = -1;
+    for (int i = 0; i < ni; i++) {
+        if (ids[i] == me) at_me = i;
+        if (ids[i] == other) at_other = i;
+    }
+    if (me <= 100 || ni < 2 || at_me < 0 || at_other <= at_me) return bad("its thread ids", ni, 2);
+    if (nt != ni || tsds[at_me] != tsd || tsds[at_other] == 0 || tsds[at_other] == tsd) return bad("its TSD bases", nt, ni);
+    if (proc_pidinfo(getpid(), 28, 0, ids, 8) != 8 || ids[0] != me) return bad("one thread id", 0, 1);
+    struct thread_identifier_info ti;
+    mach_msg_type_number_t cnt = THREAD_IDENTIFIER_INFO_COUNT;
+    mach_port_t self = mach_thread_self();
+    kern_return_t kr = thread_info(self, THREAD_IDENTIFIER_INFO, (thread_info_t)&ti, &cnt);
+    mach_port_deallocate(mach_task_self(), self);
+    if (kr != KERN_SUCCESS || cnt != THREAD_IDENTIFIER_INFO_COUNT || ti.thread_id != me || ti.thread_handle != tsd || ti.dispatch_qaddr <= tsd) return bad("its identifier info", kr, 0);
+    if (proc_pidinfo(getpid(), 28, 0, ids, 7) != 0 || errno != ENOMEM) return bad("no room", errno, ENOMEM);
+    write(gate[1], "", 1);
+    pthread_join(th, NULL);
 
     // A child.
     int p1[2], p2[2];

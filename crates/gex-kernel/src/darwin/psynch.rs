@@ -1003,10 +1003,12 @@ impl Kernel {
         }
         // The owner hint userland passes: trusted unless the kernel knows
         // better (no hint, a stale one, or an unlock in flight).
-        let owner_tid = kwq.owner.map(|t| t as u64);
-        if Some(tid_hint) == owner_tid || tid_hint == 0 || (kwq.lastunlockseq != PTHRW_RWL_INIT && is_seqlower(ugen, kwq.lastunlockseq)) || tid_hint == u64::MAX {
-        } else if self.dtask.threads.map.contains_key(&(tid_hint as i32)) || tid_hint as i32 == self.pid {
-            self.dtask.psynch.kwqs.get_mut(&addr).expect("found").owner = Some(tid_hint as i32);
+        // (The hint is a thread id, `thread_tid`'s; the owner is kept as
+        // the thread itself.)
+        let owner_id = kwq.owner.and_then(|t| self.thread_signals.get(t)).map(|t| t.darwin_id());
+        if Some(tid_hint) == owner_id || tid_hint == 0 || (kwq.lastunlockseq != PTHRW_RWL_INIT && is_seqlower(ugen, kwq.lastunlockseq)) || tid_hint == u64::MAX {
+        } else if let Some(t) = self.darwin_findtid(tid_hint) {
+            self.dtask.psynch.kwqs.get_mut(&addr).expect("found").owner = Some(t);
         }
         match self.psynch_wait(m, addr, WRITE, mgen, firstfit, None, Cont::Mutex { addr }) {
             Ok(out) => out,

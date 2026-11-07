@@ -476,6 +476,12 @@ pub struct Own {
 #[derive(Default)]
 pub struct ThreadSigs(Mutex<std::collections::HashMap<i32, Arc<ThreadSig>>>);
 
+impl std::fmt::Debug for ThreadSigs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set().entries(self.tids_in_order()).finish()
+    }
+}
+
 impl ThreadSigs {
     pub fn get(&self, tid: i32) -> Option<Arc<ThreadSig>> {
         self.0.lock().get(&tid).cloned()
@@ -543,6 +549,10 @@ pub struct ThreadSig {
     /// `pthread_join` waits on): `CLONE_CHILD_CLEARTID`'s word, or
     /// `set_tid_address`'s. Zero for none.
     clear_child_tid: AtomicU64,
+    /// A Darwin thread's `thread_id`, and its TSD base (`cthread_self`),
+    /// for other processes to read.
+    darwin_id: AtomicU64,
+    tsd: AtomicU64,
 }
 
 impl std::fmt::Debug for ThreadSig {
@@ -564,7 +574,27 @@ impl ThreadSig {
             sources: Mutex::new([None; NSIG]),
             own: Mutex::new(Own::default()),
             clear_child_tid: AtomicU64::new(0),
+            darwin_id: AtomicU64::new(0),
+            tsd: AtomicU64::new(0),
         }
+    }
+
+    /// A Darwin thread's `thread_id` (zero before it has one).
+    pub fn darwin_id(&self) -> u64 {
+        self.darwin_id.load(Ordering::Acquire)
+    }
+
+    pub fn set_darwin_id(&self, id: u64) {
+        self.darwin_id.store(id, Ordering::Release);
+    }
+
+    /// A Darwin thread's TSD base (`machine.cthread_self`).
+    pub fn tsd(&self) -> u64 {
+        self.tsd.load(Ordering::Acquire)
+    }
+
+    pub fn set_tsd(&self, tsd: u64) {
+        self.tsd.store(tsd, Ordering::Release);
     }
 
     /// The word the thread's exit clears ([`Self::set_clear_child_tid`]).

@@ -1166,6 +1166,7 @@ fn run_program_with(
         kernel.dtask.cred = gex_kernel::darwin::cred::Cred::of(uid, gid);
         kernel.dtask.uniqueid = gex_kernel::darwin::next_uniqueid();
         kernel.dtask.start = gex_kernel::darwin::procinfo::microtime();
+        kernel.signals.thread().set_darwin_id(gex_kernel::darwin::next_thread_id());
         kernel.darwin_cred_tokens();
     }
     if opts.darwin {
@@ -1265,6 +1266,10 @@ fn run_program_with(
         note_exec(kernel.pid, opts.args.first().map_or("(program)", |a| a.as_str()), &opts.args);
     }
     let tid = kernel.pid;
+    // A Darwin process's first thread is in its task's list from the start.
+    if opts.darwin && kernel.sig_tid == 0 {
+        kernel.thread_sig(tid);
+    }
     let prof_proc = profile::new_process(&kernel, program, kernel.pid, &opts.args, &opts.env);
 
     let mut store = Store::new(
@@ -2848,6 +2853,8 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         // A Darwin child's signal layer is Darwin's too (its defaults, its
         // knotes told of posts), as a new image's is.
         if child.darwin {
+            // Its thread is in its task's list before it first runs.
+            child.thread_sig(pid);
             child.darwin_signals_init();
             child.darwin_ipc_leave();
             child.darwin_publish();
@@ -3653,7 +3660,7 @@ fn run_darwin_image(
     let tid = if kernel.sig_tid != 0 { kernel.sig_tid } else { kernel.tid };
     kernel.exec_signals(tid);
     kernel.exe_path = img.path.clone();
-    kernel.darwin_exec_switch(img.spawn.as_ref());
+    kernel.darwin_exec_switch(img.spawn.as_ref(), img.thread_id);
     let path = img.path.clone();
     // Its string area, for the new stack (`darwin_start`).
     kernel.darwin_exec = Some(img);

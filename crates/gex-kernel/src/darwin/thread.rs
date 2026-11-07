@@ -516,6 +516,11 @@ impl Kernel {
         }
     }
 
+    /// `task_findtid`: this task's thread whose thread id is `id`.
+    pub(crate) fn darwin_findtid(&self, id: u64) -> Option<i32> {
+        self.thread_signals.tids_in_order().into_iter().find(|&t| self.thread_signals.get(t).is_some_and(|s| s.darwin_id() == id))
+    }
+
     fn darwin_bsdthread_create_inner(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<Option<SpawnRequest>, Errno> {
         use crate::syscalls::clone_flags as cf;
         let (func, arg, stack, pthread, mut flags) = (a[0], a[1], a[2], a[3], a[4] & 0xffff_ffff);
@@ -541,7 +546,9 @@ impl Kernel {
         }
         let mut thread = DThread { ctx_addr: req.ctx_addr, ..DThread::default() };
         if reg.tsd_offset != 0 {
-            let _ = m.write_u64(req.ctx_addr + ctx::TPIDRRO as u64, pthread + reg.tsd_offset);
+            if let Some(t) = self.thread_signals.get(req.tid) {
+                let _ = super::set_tsd_base(m, req.ctx_addr, &t, pthread + reg.tsd_offset, self.darwin_map_max());
+            }
             flags |= start::TSD_BASE_SET;
         }
         flags &= !start::SUSPENDED;

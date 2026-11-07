@@ -61,6 +61,9 @@ pub struct Image {
     pub spawn: Option<super::spawn::After>,
     /// What the image's load left ([`Kernel::darwin_load_signatures`]).
     pub load: super::codesign::LoadResult,
+    /// An exec in place's new thread (`cloneproc`'s): its thread id. Zero
+    /// for a spawn's child, whose thread the spawn made.
+    pub thread_id: u64,
 }
 
 /// An activator's answer: `-1`, `-2`, `-3`, or the image claimed.
@@ -210,8 +213,11 @@ impl Kernel {
             let _ = super::set_result(m, self.ctx_addr, Errno::EINVAL.as_return());
             return SyscallOutcome::Continue;
         }
+        // The new thread is made before the image is activated.
+        let thread_id = super::next_thread_id();
         match self.darwin_exec_activate(m, a[0], a[1], a[2]) {
-            Ok(img) => {
+            Ok(mut img) => {
+                img.thread_id = thread_id;
                 self.map_io().flush_all_shared(m);
                 let lossy = |v: Vec<&[u8]>| v.into_iter().map(|s| String::from_utf8_lossy(s).into_owned()).collect::<Vec<_>>();
                 let (argv, envp) = (lossy(img.strings.args()), lossy(img.strings.envs()));
@@ -268,7 +274,7 @@ impl Kernel {
         let size = if img.arch_size != 0 { img.arch_size } else { bytes.len() as u64 };
         let slice = bytes.get(img.arch_offset as usize..(img.arch_offset + size) as usize).ok_or(ebadmacho())?;
         let load = self.darwin_load_signatures(&img.path, img.arch_offset, slice)?;
-        Ok(Image { path: img.path, arch_offset: img.arch_offset, arch_size: img.arch_size, cputype: img.origcputype, cpusubtype: img.origcpusubtype, strings: img.strings, spawn: None, load })
+        Ok(Image { path: img.path, arch_offset: img.arch_offset, arch_size: img.arch_size, cputype: img.origcputype, cpusubtype: img.origcpusubtype, strings: img.strings, spawn: None, load, thread_id: 0 })
     }
 
     /// `namei` of the saved path, links followed, then
@@ -406,7 +412,14 @@ impl Kernel {
 
 impl Kernel {
     /// The task an exec leaves ([`Self::darwin_exec_switch_body`]).
-    pub fn darwin_exec_switch(&mut self, spawn: Option<&super::spawn::After>) {
+    pub fn darwin_exec_switch(&mut self, spawn: Option<&super::spawn::After>, thread_id: u64) {
+        // An exec in place goes on in its new thread: its id, and no TSD
+        // base until the image sets one.
+        if thread_id != 0 {
+            let t = self.signals.thread();
+            t.set_darwin_id(thread_id);
+            t.set_tsd(0);
+        }
         self.darwin_exec_switch_body(spawn);
         self.darwin_ipc_leave();
     }

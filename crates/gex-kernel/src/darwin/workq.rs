@@ -1997,7 +1997,9 @@ impl Kernel {
         if setup_flags & setup::FIRST_USE != 0 {
             let tsd_offset = self.dtask.pthread.tsd_offset;
             if tsd_offset != 0 {
-                let _ = m.write_u64(this + ctx::TPIDRRO as u64, selfp + tsd_offset);
+                if let Some(t) = self.thread_signals.get(tid) {
+                    let _ = super::set_tsd_base(m, this, &t, selfp + tsd_offset, self.darwin_map_max());
+                }
                 upcall_flags |= upcall::TSD_BASE_SET;
             }
         }

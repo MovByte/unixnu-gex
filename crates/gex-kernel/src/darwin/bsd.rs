@@ -215,7 +215,6 @@ pub fn translate(raw: u64, a: &mut [u64; 6]) -> u64 {
         }
         sys::MUNMAP => nr::MUNMAP,
         sys::MPROTECT => nr::MPROTECT,
-        sys::THREAD_SELFID => nr::GETTID,
         sys::GETPID => nr::GETPID,
         sys::GETPPID => nr::GETPPID,
         _ => UNKNOWN,

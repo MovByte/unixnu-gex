@@ -34,6 +34,8 @@ pub struct Public {
     pub path: Vec<u8>,
     /// Its descriptor table, while it lives.
     pub fds: Option<Arc<crate::file::FdTable>>,
+    /// Its threads, while it lives.
+    pub threads: Option<Arc<crate::signal::ThreadSigs>>,
 }
 
 /// `MAXCOMLEN`.
@@ -165,6 +167,7 @@ impl Kernel {
             cpusubtype: self.dtask.cputype.1,
             path: path.to_vec(),
             fds: Some(Arc::clone(&self.fds)),
+            threads: Some(Arc::clone(&self.thread_signals)),
         }
     }
 
@@ -339,6 +342,21 @@ impl Kernel {
                 for (fd, f, _) in fds.entries().into_iter().take(numfds) {
                     b.extend_from_slice(&fd.to_le_bytes());
                     b.extend_from_slice(&fdtype(&f).to_le_bytes());
+                }
+                m.write(buf, &b).map_err(fault)?;
+                Ok(b.len() as u64)
+            }
+            // proc_pidlistthreads: fill_taskthreadlist's each thread's
+            // thread id, or its TSD base (`cthread_self`), in the order
+            // they were made, as many as fit of the threads and ten more.
+            LISTTHREADIDS | LISTTHREADS => {
+                let Some(threads) = target.threads.as_ref() else { return Ok(0) };
+                let list: Vec<_> = threads.tids_in_order().into_iter().filter_map(|t| threads.get(t)).collect();
+                let numthreads = (list.len() + 10).min(bufsize as usize / 8);
+                let mut b = Vec::new();
+                for t in list.iter().take(numthreads) {
+                    let v = if fl == LISTTHREADIDS { t.darwin_id() } else { t.tsd() };
+                    b.extend_from_slice(&v.to_le_bytes());
                 }
                 m.write(buf, &b).map_err(fault)?;
                 Ok(b.len() as u64)
