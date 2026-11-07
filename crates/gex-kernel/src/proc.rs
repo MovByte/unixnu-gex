@@ -233,6 +233,9 @@ struct Proc {
     /// and the real uid it ended with: for its parent's record of its end.
     xhighbits: u8,
     uid: u32,
+    /// Darwin's `p_persona`'s id: the id it is counted against
+    /// (`chgproccnt`) instead of its real uid.
+    persona: Option<u32>,
     /// Darwin's `si_pid`, `si_status`, `si_uid` and `p_xhighbits` record of
     /// the last child that ended or stopped, for its SIGCHLD
     /// ([`ProcTable::take_child_end`]).
@@ -433,6 +436,7 @@ impl ProcTable {
                     posts: None,
                     xhighbits: 0,
                     uid: 0,
+                    persona: None,
                     child_end: None,
                     execed: false,
                     nocldstop: false,
@@ -475,9 +479,10 @@ impl ProcTable {
             Some(p) => (p.pgid, p.sid),
             None => (pid, pid),
         };
-        // forkproc's copy of p_nice and the uid, and task_create's
-        // task_policy_create from the parent's policy, with resetpriority
-        // for a nice value the child inherits.
+        // forkproc's copy of p_nice, the uid and the persona, and
+        // task_create's task_policy_create from the parent's policy, with
+        // resetpriority for a nice value the child inherits.
+        let persona = t.procs.iter().find(|p| p.pid == ppid).and_then(|p| p.persona);
         let (nice, uid, policy) = match t.procs.iter().find(|p| p.pid == ppid) {
             Some(p) => {
                 let parent = *p.child.policy.lock().unwrap_or_else(|e| e.into_inner());
@@ -505,6 +510,7 @@ impl ProcTable {
             posts: None,
             xhighbits: 0,
             uid,
+            persona,
             child_end: None,
             execed: false,
             nocldstop: false,
@@ -985,7 +991,7 @@ impl ProcTable {
     /// them are `uid`'s (`chgproccnt`'s count).
     pub fn counts(&self, uid: u32) -> (usize, usize) {
         let t = self.lock();
-        (t.procs.len(), t.procs.iter().filter(|p| p.uid == uid).count())
+        (t.procs.len(), t.procs.iter().filter(|p| p.persona.unwrap_or(p.uid) == uid).count())
     }
 
     /// Every process in `proc_listpids`' order: the live ones, the latest
@@ -1339,6 +1345,17 @@ impl ProcTable {
 
     /// `pid`'s real uid: as it runs (for another process's checks against
     /// it), and the one it ended with (for its parent's record).
+    /// Darwin process `pid` is in a persona, counted against its id, or in
+    /// none.
+    pub fn set_persona(&self, pid: i32, persona: Option<u32>) {
+        if self.remote.is_some() {
+            return;
+        }
+        if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
+            p.persona = persona;
+        }
+    }
+
     pub fn set_uid(&self, pid: i32, uid: u32) {
         if self.remote.is_some() {
             return;

@@ -985,11 +985,23 @@ impl Kernel {
 
     // -- the bank ------------------------------------------------------------------------
 
-    /// `bank_task_alloc_init`: the task's bank context. The task is in no
-    /// persona, so it may adopt none (`persona_is_adoption_allowed` of
-    /// none).
+    /// `bank_task_alloc_init`: the task's bank context, with its process's
+    /// persona and whether that persona may be adopted
+    /// (`bank_task_is_persona_adoption_allowed`: a system or system proxy
+    /// persona's, on iOS).
     fn bank_task_alloc_init(&mut self) -> BankTask {
-        BankTask { refs: 1, made: 0, voucher_ref: 0, pid: self.pid, persona_id: bank::PERSONA_ID_NONE, flags: 0, hasentitlement: self.bank_task_is_propagate_entitled() }
+        const PROC_PERSONA_INFO_FLAG_ADOPTION_ALLOWED: u32 = 0x1;
+        let persona = self.dtask.persona.clone();
+        let flags = if persona.as_ref().is_some_and(|p| p.adoption_allowed()) { PROC_PERSONA_INFO_FLAG_ADOPTION_ALLOWED } else { 0 };
+        let persona_id = persona.map_or(bank::PERSONA_ID_NONE, |p| p.id);
+        BankTask { refs: 1, made: 0, voucher_ref: 0, pid: self.pid, persona_id, flags, hasentitlement: self.bank_task_is_propagate_entitled() }
+    }
+
+    /// `bank_get_bank_ledger_thread_group_and_persona`'s persona for a
+    /// voucher whose bank value is no account: the current task's bank
+    /// context's.
+    pub(crate) fn darwin_bank_persona_id(&mut self) -> u32 {
+        self.bank_task().persona_id
     }
 
     /// `bank_task_is_propagate_entitled`: a platform binary propagates

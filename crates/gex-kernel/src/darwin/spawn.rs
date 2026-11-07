@@ -61,8 +61,41 @@ const PROC_TYPE_DRIVER: u32 = 0x700;
 const JETSAM_SET: u16 = 0x8000;
 /// `PSA_OPTION_DATALESS_IOPOLICY`.
 const PSA_OPTION_DATALESS_IOPOLICY: u32 = 0x4;
-/// `POSIX_SPAWN_POSIX_CRED_GROUPS`.
+/// Darwin's ENOTSUP.
+const ENOTSUP: i32 = 45;
+/// `POSIX_SPAWN_POSIX_CRED_UID`, `_GID`, `_GROUPS`.
+const POSIX_CRED_UID: u32 = 0x0001_0000;
+const POSIX_CRED_GID: u32 = 0x0002_0000;
 const POSIX_CRED_GROUPS: u32 = 0x0004_0000;
+
+/// `struct _posix_spawn_posix_cred_info`: its flags, uid, gid, groups and
+/// gmuid (its login name is not the kernel's to use).
+#[derive(Clone, Debug)]
+struct PosixCred {
+    flags: u32,
+    uid: u32,
+    gid: u32,
+    ngroups: u32,
+    groups: [u32; NGROUPS_MAX as usize],
+    gmuid: u32,
+}
+
+impl PosixCred {
+    fn parse(b: &[u8]) -> PosixCred {
+        let mut groups = [0; NGROUPS_MAX as usize];
+        for (i, g) in groups.iter_mut().enumerate() {
+            *g = le32(b, 16 + 4 * i);
+        }
+        PosixCred { flags: le32(b, 0), uid: le32(b, 4), gid: le32(b, 8), ngroups: le32(b, 12), groups, gmuid: le32(b, 80) }
+    }
+}
+
+/// A spawn's credentials: its POSIX credentials and its persona.
+#[derive(Clone, Debug, Default)]
+struct SpawnCreds {
+    pcred: Option<PosixCred>,
+    persona: Option<super::persona::SpawnPersona>,
+}
 
 fn le16(b: &[u8], o: usize) -> u16 {
     u16::from_le_bytes(b[o..o + 2].try_into().unwrap())
@@ -238,6 +271,8 @@ impl Kernel {
             cred: t.cred.clone(),
             sugid: t.sugid,
             csflags: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(t.csflags.load(std::sync::atomic::Ordering::Acquire) & !super::amfi::cs::KILLED)),
+            // forkproc: the parent's persona.
+            persona: t.persona.clone(),
             puniqueid: t.uniqueid,
             // The ids and start time a fork chose for its child; a spawn's
             // child takes new ones.
@@ -276,6 +311,12 @@ impl Kernel {
     pub(crate) fn darwin_fork(&mut self, m: &mut GuestMem<'_>) -> SyscallOutcome {
         if let Err(e) = self.darwin_fork1_checks() {
             let _ = super::set_result(m, self.ctx_addr, e.as_return());
+            return SyscallOutcome::Continue;
+        }
+        // forkproc's persona_proc_adopt of this process's persona, the
+        // child counted against the real uid meanwhile.
+        if self.darwin_persona_inherit(1).is_err() {
+            let _ = super::set_result(m, self.ctx_addr, Errno::EAGAIN.as_return());
             return SyscallOutcome::Continue;
         }
         self.darwin_child_ports();
@@ -320,6 +361,42 @@ impl Kernel {
         debug_assert!(old.is_none(), "a child's ports not taken");
     }
 
+    /// The spawn attributes' credential steps for the process the spawn
+    /// makes (this one): POSIX_SPAWN_RESETIDS's real ids as all its ids
+    /// (`kauth_cred_model_setuidgid`, no P_SUGID), then for a spawn without
+    /// exec its POSIX credentials (`spawn_posix_cred_adopt`) and its persona
+    /// (`spawn_persona_adopt`), which an exec in place may not take.
+    fn darwin_spawn_creds(&mut self, at: &Attr, creds: &SpawnCreds) -> Result<(), Errno> {
+        let exec = at.flags & flag::SETEXEC != 0;
+        if at.flags & flag::RESETIDS != 0 {
+            let (ruid, rgid) = (self.dtask.cred.ruid, self.dtask.cred.rgid);
+            if self.dtask.cred.setuidgid(ruid, rgid) {
+                self.darwin_cred_tokens();
+            }
+        }
+        if let Some(pc) = &creds.pcred {
+            if exec {
+                return Err(super::errno::errno_of(ENOTSUP));
+            }
+            if pc.flags & POSIX_CRED_GID != 0 {
+                self.darwin_setgid(pc.gid)?;
+            }
+            if pc.flags & POSIX_CRED_GROUPS != 0 {
+                self.darwin_setgroups_internal(pc.groups[..pc.ngroups as usize].to_vec(), pc.gmuid)?;
+            }
+            if pc.flags & POSIX_CRED_UID != 0 {
+                self.darwin_setuid(pc.uid)?;
+            }
+        }
+        if let Some(sp) = &creds.persona {
+            if exec {
+                return Err(super::errno::errno_of(ENOTSUP));
+            }
+            self.darwin_spawn_persona_adopt(sp)?;
+        }
+        Ok(())
+    }
+
     /// `posix_spawn(pid, path, adesc, argv, envp)`.
     pub(crate) fn darwin_posix_spawn(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> SyscallOutcome {
         match self.darwin_spawn(m, a) {
@@ -351,6 +428,7 @@ impl Kernel {
         let mut file_actions = None;
         let mut port_actions: Option<Vec<u8>> = None;
         let mut coal_info = 0;
+        let mut creds = SpawnCreds::default();
         if adesc != 0 {
             let d = m.read(adesc, ARGS_DESC_SIZE)?.to_vec();
             let pair = |i: usize| (le64(&d, 16 * i), le64(&d, 16 * i + 8));
@@ -392,8 +470,9 @@ impl Kernel {
                 if persona_size != PERSONA_INFO_SIZE {
                     return Err(Errno::ERANGE);
                 }
-                self.darwin_unimplemented("posix_spawn into a persona (personas)".into());
-                return Err(Errno::EINVAL);
+                let sp = super::persona::SpawnPersona::parse(m.read(persona, PERSONA_INFO_SIZE as usize)?);
+                self.darwin_spawn_validate_persona(&sp)?;
+                creds.persona = Some(sp);
             }
             if cred_size != 0 && cred != 0 {
                 if cred_size != POSIX_CRED_INFO_SIZE {
@@ -406,8 +485,7 @@ impl Kernel {
                 if le32(c, 0) & POSIX_CRED_GROUPS != 0 && le32(c, 12) > NGROUPS_MAX {
                     return Err(Errno::EINVAL);
                 }
-                self.darwin_unimplemented("posix_spawn's POSIX credentials (another uid, gid, groups or login for the child)".into());
-                return Err(Errno::EINVAL);
+                creds.pcred = Some(PosixCred::parse(c));
             }
             if mx_size != 0 {
                 self.darwin_spawn_macpolicyinfo(m, mx_size, mx)?;
@@ -437,11 +515,13 @@ impl Kernel {
                     self.darwin_unimplemented("posix_spawn port actions with POSIX_SPAWN_SETEXEC (on the task the exec makes)".into());
                     return Err(Errno::EINVAL);
                 }
-                return self.darwin_spawn_setexec(m, at, file_actions.as_deref(), path, argv, envv).map(Spawned::Exec);
+                return self.darwin_spawn_setexec(m, at, file_actions.as_deref(), &creds, path, argv, envv).map(Spawned::Exec);
             }
         }
-        // fork1(PROC_CREATE_SPAWN): a new process of this one's, no memory.
+        // fork1(PROC_CREATE_SPAWN): a new process of this one's, no memory,
+        // in this one's persona.
         self.darwin_fork1_checks()?;
+        self.darwin_persona_inherit(1).map_err(|_| Errno::EAGAIN)?;
         self.darwin_child_ports();
         let mut child = self.fork_kernel();
         // A spawn is not a fork: CS_GET_TASK_ALLOW is not inherited, and
@@ -457,7 +537,7 @@ impl Kernel {
         child.thread_sig(pid);
         child.forget_own_pidfds();
         child.darwin_publish();
-        match self.darwin_spawn_child(m, &mut child, attr.as_ref(), file_actions.as_deref(), port_actions.as_deref(), path, argv, envv) {
+        match self.darwin_spawn_child(m, &mut child, attr.as_ref(), file_actions.as_deref(), port_actions.as_deref(), &creds, path, argv, envv) {
             Ok(()) => Ok(Spawned::Child(Box::new(child))),
             Err(e) => {
                 // exit1 with P_LIST_DEADPARENT: gone, unseen by its parent,
@@ -478,7 +558,7 @@ impl Kernel {
     /// spawner applies.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
-    fn darwin_spawn_child(&mut self, m: &GuestMem<'_>, child: &mut Kernel, attr: Option<&Attr>, file_actions: Option<&[u8]>, port_actions: Option<&[u8]>, path: u64, argv: u64, envv: u64) -> Result<(), Errno> {
+    fn darwin_spawn_child(&mut self, m: &GuestMem<'_>, child: &mut Kernel, attr: Option<&Attr>, file_actions: Option<&[u8]>, port_actions: Option<&[u8]>, creds: &SpawnCreds, path: u64, argv: u64, envv: u64) -> Result<(), Errno> {
         let flags = attr.map_or(0, |a| a.flags);
         let policy = attr.map_or((0, 0, 0), |a| super::taskpolicy::spawn_attrs(a.apptype, a.qos_clamp, a.darwin_role));
         let mut after = After { flags, policy, sigmask: attr.map_or(0, |a| a.sigmask), sigdefault: attr.map_or(0, |a| a.sigdefault), inherit: Vec::new(), max_addr: attr.map_or(0, |a| a.max_addr), pcontrol: attr.map(|a| a.pcontrol) };
@@ -489,6 +569,14 @@ impl Kernel {
             Some(pa) => self.darwin_spawn_port_actions(child, pa)?,
             None => Held::default(),
         };
+        // The attributes' credentials, before the image is activated (with
+        // them): reset ids, POSIX credentials, then the persona.
+        if let Some(at) = attr {
+            if let Err(e) = child.darwin_spawn_creds(at, creds) {
+                held.release(self);
+                return Err(e);
+            }
+        }
         let binprefs = attr.filter(|a| a.binprefs[0].0 != 0).map(|a| a.binprefs);
         let mut img: Image = match child.darwin_exec_activate_with(m, path, argv, envv, binprefs) {
             Ok(img) => img,
@@ -689,7 +777,9 @@ impl Kernel {
     /// its own and its group and session are set, as the spawn sets them
     /// after its switch of tasks (an error there reaches only the old
     /// image's thread, which ends: the new image runs).
-    fn darwin_spawn_setexec(&mut self, m: &GuestMem<'_>, at: &Attr, file_actions: Option<&[u8]>, path: u64, argv: u64, envv: u64) -> Result<Box<Image>, Errno> {
+    fn darwin_spawn_setexec(&mut self, m: &GuestMem<'_>, at: &Attr, file_actions: Option<&[u8]>, creds: &SpawnCreds, path: u64, argv: u64, envv: u64) -> Result<Box<Image>, Errno> {
+        // cloneproc(CLONEPROC_EXEC), counted against the real uid meanwhile.
+        self.darwin_persona_inherit(1).map_err(|_| Errno::ENOMEM)?;
         let mut copy = self.fork_kernel();
         copy.pid = self.pid;
         copy.tid = self.tid;
@@ -698,6 +788,7 @@ impl Kernel {
             if let Some(fa) = file_actions {
                 after.inherit = copy.darwin_file_actions(fa, at.flags)?;
             }
+            copy.darwin_spawn_creds(at, creds)?;
             let binprefs = Some(at.binprefs).filter(|b| b[0].0 != 0);
             copy.darwin_exec_activate_with(m, path, argv, envv, binprefs)
         })();
@@ -705,6 +796,11 @@ impl Kernel {
         // its close_all_fds, which would end this process's locks).
         let mut img = activated?;
         self.fds = std::sync::Arc::clone(&copy.fds);
+        // POSIX_SPAWN_RESETIDS's credential, the exec's.
+        if copy.dtask.cred != self.dtask.cred {
+            self.dtask.cred = copy.dtask.cred.clone();
+            self.darwin_cred_tokens();
+        }
         // The directory the actions left the copy in, made this process's
         // as a chdir makes it.
         let cwd = copy.caller_cwd();

@@ -45,6 +45,7 @@ pub mod mig;
 pub mod mman;
 pub mod mk_timer;
 pub mod mwl;
+pub mod persona;
 pub mod pipe;
 pub mod priority;
 pub mod procinfo;
@@ -154,6 +155,8 @@ pub struct Task {
     /// `P_LVMRSRCOWNER`: the process may restore others that resource
     /// starvation throttled or suspended.
     pub vmrsrcowner: bool,
+    /// `p_persona`.
+    pub persona: Option<std::sync::Arc<persona::Persona>>,
     /// `p_textoff`: where the image's slice starts in its file.
     pub textoff: i64,
     /// `p_uniqueid` and `p_puniqueid` (its parent's at its fork), and

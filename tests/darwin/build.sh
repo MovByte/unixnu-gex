@@ -23,7 +23,7 @@ for p in hello-static bsd-carry commpage exclusive-pair aes; do
         -o "$OUT/$p" "$HERE/src/$p.c"
 done
 
-for p in hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo xpc-anon; do
+for p in hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona xpc-anon; do
     cc -O2 -o "$OUT/$p" "$HERE/src/$p.c"
 done
 cc -O2 -framework CoreFoundation -o "$OUT/cfrunloop" "$HERE/src/cfrunloop.c"
@@ -42,6 +42,8 @@ for f in "$OUT"/*; do
 done
 codesign -s - -f --entitlements "$HERE/src/memlimit.entitlements" "$OUT/memlimit" 2>/dev/null
 codesign -s - -f --entitlements "$HERE/src/gta.entitlements" "$OUT/gta" 2>/dev/null
+# persona manages personas, which takes the persona manager's entitlement.
+codesign -s - -f --entitlements "$HERE/src/persona.entitlements" "$OUT/persona" 2>/dev/null
 # The exception tests set handlers of every behavior: a platform program
 # (a hardened one) may only with the entitlement that allows it.
 for p in excports excdeliver readports; do

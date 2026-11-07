@@ -38,6 +38,8 @@ pub struct Public {
     pub threads: Option<Arc<crate::signal::ThreadSigs>>,
     /// `p_pcaction`.
     pub pcaction: Arc<std::sync::atomic::AtomicU32>,
+    /// `p_persona`.
+    pub persona: Option<Arc<super::persona::Persona>>,
 }
 
 /// `p_pcaction`'s states (`P_PC*`): the control in its low bits, the action
@@ -193,6 +195,7 @@ impl Kernel {
             fds: Some(Arc::clone(&self.fds)),
             threads: Some(Arc::clone(&self.thread_signals)),
             pcaction: Arc::clone(&self.dtask.pcaction),
+            persona: self.dtask.persona.clone(),
         }
     }
 

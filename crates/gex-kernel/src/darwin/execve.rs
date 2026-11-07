@@ -213,6 +213,12 @@ impl Kernel {
             let _ = super::set_result(m, self.ctx_addr, Errno::EINVAL.as_return());
             return SyscallOutcome::Continue;
         }
+        // cloneproc(CLONEPROC_EXEC), with the process counted once more
+        // against its real uid meanwhile: its persona must still take it.
+        if self.darwin_persona_inherit(1).is_err() {
+            let _ = super::set_result(m, self.ctx_addr, Errno::ENOMEM.as_return());
+            return SyscallOutcome::Continue;
+        }
         // The new thread is made before the image is activated.
         let thread_id = super::next_thread_id();
         match self.darwin_exec_activate(m, a[0], a[1], a[2]) {
@@ -498,7 +504,9 @@ impl Kernel {
             said: old.said,
             // p_csflags: the exec's own, made at its start from these.
             csflags: old.csflags,
-            // An exec's process keeps its unique ids and start time.
+            // An exec's process keeps its unique ids and start time, and its
+            // persona (forkproc's).
+            persona: old.persona,
             uniqueid: old.uniqueid,
             puniqueid: old.puniqueid,
             start: old.start,

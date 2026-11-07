@@ -305,6 +305,7 @@ impl Kernel {
             // No descriptor is a terminal to a Darwin process yet: stdio
             // buffers fully, and termios structures need not be converted.
             sys::IOCTL => res(self.darwin_ioctl(m, a)),
+            sys::PERSONA => res(self.darwin_persona(m, a)),
             // thread_selfid: the calling thread's id (`thread_tid`).
             sys::THREAD_SELFID => self.signals.thread().darwin_id(),
             // gettid(uidp, gidp): a thread's own credentials, which only

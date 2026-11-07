@@ -80,6 +80,19 @@ impl Cred {
         updated
     }
 
+    /// `kauth_cred_model_setuidgid`: `uid` as every user id and `gid` as
+    /// every group id and the only group, the group list following the
+    /// user unless it opted out of memberd; whether that changed it.
+    pub fn setuidgid(&mut self, uid: u32, gid: u32) -> bool {
+        let gmuid = if self.flags & CRF_NOMEMBERD != 0 { UID_NONE } else { uid };
+        let new = Cred { uid, ruid: uid, svuid: uid, groups: vec![gid], rgid: gid, svgid: gid, gmuid, flags: self.flags };
+        if *self == new {
+            return false;
+        }
+        *self = new;
+        true
+    }
+
     /// `kauth_cred_model_setresgid`.
     pub fn setresgid(&mut self, rgid: u32, egid: u32, svgid: u32) -> bool {
         let mut updated = false;
@@ -151,7 +164,7 @@ impl Kernel {
     /// changed credential: the process is marked P_SUGID, and the task's
     /// security tokens follow (the effective ids the kernel's own checks
     /// use, and the real uid the process table counts by).
-    fn darwin_cred_changed(&mut self) {
+    pub(crate) fn darwin_cred_changed(&mut self) {
         self.dtask.sugid = true;
         self.darwin_cred_tokens();
     }
@@ -230,7 +243,7 @@ impl Kernel {
     /// `setuid(uid)`: the real or saved uid, or any for root, who sets the
     /// real and saved ones too; the group list follows the new user unless
     /// it opted out.
-    fn darwin_setuid(&mut self, want: u32) -> Result<u64, Errno> {
+    pub(crate) fn darwin_setuid(&mut self, want: u32) -> Result<u64, Errno> {
         let cur = self.dtask.cred.clone();
         if want != cur.ruid && want != cur.svuid {
             self.darwin_suser()?;
@@ -279,7 +292,7 @@ impl Kernel {
 
     /// `setgid(gid)`: the real or saved gid, or any for root, who sets the
     /// real and saved ones too.
-    fn darwin_setgid(&mut self, want: u32) -> Result<u64, Errno> {
+    pub(crate) fn darwin_setgid(&mut self, want: u32) -> Result<u64, Errno> {
         let cur = self.dtask.cred.clone();
         if want != cur.rgid && want != cur.svgid {
             self.darwin_suser()?;
@@ -327,7 +340,12 @@ impl Kernel {
         if n as usize > NGROUPS {
             return Err(Errno::EINVAL);
         }
-        let mut groups: Vec<u32> = if n >= 1 { m.read(at, 4 * n as usize)?.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect() } else { Vec::new() };
+        let groups: Vec<u32> = if n >= 1 { m.read(at, 4 * n as usize)?.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect() } else { Vec::new() };
+        self.darwin_setgroups_internal(groups, gmuid)
+    }
+
+    /// `setgroups_internal`: root's, the list (none for just gid 0).
+    pub(crate) fn darwin_setgroups_internal(&mut self, mut groups: Vec<u32>, gmuid: u32) -> Result<u64, Errno> {
         self.darwin_suser()?;
         if groups.is_empty() {
             groups.push(0);

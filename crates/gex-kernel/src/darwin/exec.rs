@@ -29,7 +29,7 @@ fn trunc_page(v: u64) -> u64 {
 
 /// `copyinstr(addr, .., max)`: the string without its NUL, ENAMETOOLONG
 /// when there is none in `max` bytes, EFAULT where memory ends first.
-fn copyinstr(m: &GuestMem<'_>, addr: u64, max: usize) -> Result<Vec<u8>, Errno> {
+pub(crate) fn copyinstr(m: &GuestMem<'_>, addr: u64, max: usize) -> Result<Vec<u8>, Errno> {
     match m.read_cstr(addr, max) {
         Err(Errno::ENAMETOOLONG) if m.read(addr, max).is_err() => Err(Errno::EFAULT),
         r => r,

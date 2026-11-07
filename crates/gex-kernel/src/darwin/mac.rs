@@ -228,9 +228,8 @@ impl Facts for KernelFacts<'_> {
         let t = self.a.target.unwrap_or(0);
         Ok(self.sig_of(t).flatten().map(|c| c.ents.bool_true(key)))
     }
-    // Personas are not modelled: no thread has one.
     fn persona(&mut self) -> Result<Option<(i32, u32)>, Stop> {
-        Ok(None)
+        Ok(self.k.darwin_current_persona().map(|p| (p.get_uid() as i32, p.get_type() as u32)))
     }
     // Sandbox's user records come from its system calls; none were made.
     fn home(&mut self) -> Result<Option<Vec<u8>>, Stop> {
