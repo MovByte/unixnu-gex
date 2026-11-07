@@ -322,8 +322,7 @@ impl Kernel {
                     self.darwin_unimplemented(format!("kill with Darwin signal {signum}, which Linux has no number for"));
                     neg(Errno::EINVAL)
                 } else if pid == -1 {
-                    self.darwin_unimplemented(format!("a broadcast kill (killpg1, posix {posix})"));
-                    neg(Errno::EINVAL)
+                    res(self.darwin_killpg1_all(m, signum, posix != 0))
                 } else {
                     res(self.canonical(m, nr::KILL, [pid as i64 as u64, u64::from(signal_to_linux(signum)), 0, 0, 0, 0]))
                 }
@@ -554,6 +553,30 @@ impl Kernel {
     }
 
     /// `proc_info(callnum, pid, flavor, arg, buffer, buffersize)`.
+    /// `killpg1` broadcasting (kill's pid -1): every process past init
+    /// (none is a system process here), the caller only under POSIX
+    /// semantics, that the caller may signal; a zombie counts as found
+    /// without a signal. EPERM (POSIX) or ESRCH when none was.
+    fn darwin_killpg1_all(&mut self, m: &mut GuestMem<'_>, signum: u32, posix: bool) -> Result<u64, Errno> {
+        let sig = u64::from(signal_to_linux(signum));
+        let mut nfound = 0;
+        for (pid, _, _, zombie) in self.procs.listing() {
+            if pid <= 1 || (!posix && pid == self.pid) {
+                continue;
+            }
+            // cansignal (cansignal_nomac for a zombie), then psignal.
+            let s = if zombie { 0 } else { sig };
+            if self.canonical(m, nr::KILL, [pid as u64, s, 0, 0, 0, 0]).is_ok() {
+                nfound += 1;
+            }
+        }
+        match nfound {
+            0 if posix => Err(Errno::EPERM),
+            0 => Err(Errno::ESRCH),
+            _ => Ok(0),
+        }
+    }
+
     /// `fsgetpath(buf, size, fsid, objid)`: the path of a file named by its
     /// filesystem and object ids. Only the shared cache is named so.
     fn darwin_fsgetpath(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {

@@ -19,6 +19,10 @@
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <TargetConditionals.h>
+
+// kill(pid, signum, posix): libc's kill passes posix 1.
+int __kill(pid_t pid, int signum, int posix);
 
 static char self[PATH_MAX];
 static volatile siginfo_t got;
@@ -270,6 +274,20 @@ int main(int argc, char **argv) {
     kill(pid, SIGKILL);
     waitpid(pid, &st, 0);
     close(out);
+
+#if !TARGET_OS_OSX
+    // A broadcast (pid -1) without POSIX semantics: every other process the
+    // caller may signal; with none left, ESRCH (here, before the orphaned
+    // group below leaves a member for init to reap). Never on a Mac, where
+    // it reaches every process of the user.
+    pid = run("tick", &out, NULL, 0);
+    started(out);
+    if (__kill(-1, SIGKILL, 0) != 0) return bad("a broadcast", errno);
+    if (waitpid(pid, &st, 0) != pid || !WIFSIGNALED(st) || WTERMSIG(st) != SIGKILL) return bad("the broadcast's child", st);
+    close(out);
+    if (__kill(-1, 0, 0) != -1 || errno != ESRCH) return bad("a broadcast to no one", errno);
+    if (kill(-1, 0) != 0) return bad("a POSIX broadcast reaching the caller", errno);
+#endif
 
     // A group made orphaned (its member's parent gone) with a member
     // stopped: SIGHUP, then SIGCONT.
