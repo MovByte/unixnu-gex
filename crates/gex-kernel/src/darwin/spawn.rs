@@ -788,6 +788,13 @@ impl Kernel {
         let mut copy = self.fork_kernel();
         copy.pid = self.pid;
         copy.tid = self.tid;
+        // An exec's fdt_fork keeps the FP_CLOFORK descriptors a fork's drops.
+        for (fd, f, cloexec) in self.fds.entries() {
+            if self.fds.clofork(fd) && copy.fds.get(fd).is_err() {
+                let _ = copy.fds.install(fd, f, cloexec);
+                let _ = copy.fds.set_clofork(fd, true);
+            }
+        }
         let mut after = After { flags: at.flags, policy: super::taskpolicy::spawn_attrs(at.apptype, at.qos_clamp, at.darwin_role), sigmask: at.sigmask, sigdefault: at.sigdefault, inherit: Vec::new(), max_addr: at.max_addr, pcontrol: Some(at.pcontrol) };
         let activated = (|| {
             if let Some(fa) = file_actions {

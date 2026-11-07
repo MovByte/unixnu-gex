@@ -9431,10 +9431,11 @@ impl Kernel {
             t.set_darwin_id(crate::darwin::next_thread_id());
             t.set_tsd(self.signals.thread().tsd());
         }
-        // fdt_fork: a Darwin kqueue is FG_CONFINED, its process's alone.
+        // fdt_fork: a Darwin kqueue is FG_CONFINED, its process's alone,
+        // and an FP_CLOFORK descriptor is not the child's.
         if self.darwin {
             for (fd, f, _) in child.fds.entries() {
-                if std::sync::Arc::clone(&f.handle).as_kqueue().is_some() {
+                if std::sync::Arc::clone(&f.handle).as_kqueue().is_some() || child.fds.clofork(fd) {
                     let _ = child.fds.close(fd);
                 }
             }

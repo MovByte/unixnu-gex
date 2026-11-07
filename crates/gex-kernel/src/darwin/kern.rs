@@ -222,17 +222,23 @@ impl Kernel {
         if let Some(r) = self.darwin_cred_syscall(m, raw, a) {
             return Some(res(r));
         }
-        // O_CLOFORK: a descriptor its process's children do not get, which
-        // the descriptor table has no flag for.
+        // O_CLOFORK: the open's descriptor is FP_CLOFORK, one a fork's or a
+        // spawn's child does not get.
         const O_CLOFORK: u64 = 0x0800_0000;
-        let oflags = match raw {
-            sys::OPEN | sys::OPEN_NOCANCEL => Some(a[1]),
-            sys::OPENAT | sys::OPENAT_NOCANCEL => Some(a[2]),
+        let at = match raw {
+            sys::OPEN | sys::OPEN_NOCANCEL => Some(1),
+            sys::OPENAT | sys::OPENAT_NOCANCEL => Some(2),
             _ => None,
         };
-        if oflags.is_some_and(|f| f & O_CLOFORK != 0) {
-            self.darwin_unimplemented("open with O_CLOFORK (a close-on-fork descriptor)".into());
-            return Some(neg(Errno::EINVAL));
+        if let Some(i) = at.filter(|&i| a[i] & O_CLOFORK != 0) {
+            let mut b = *a;
+            b[i] &= !O_CLOFORK;
+            let n = super::bsd::translate(raw, &mut b);
+            let r = self.canonical(m, n, b);
+            if let Ok(fd) = r {
+                let _ = self.fds.set_clofork(fd as i32, true);
+            }
+            return Some(res(r));
         }
         if let Some(r) = self.darwin_fs_call(m, raw, a) {
             return Some(res(r));

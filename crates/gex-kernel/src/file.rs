@@ -394,6 +394,9 @@ impl OpenFile {
 struct Table {
     entries: Vec<Option<Arc<OpenFile>>>,
     cloexec: Vec<bool>,
+    /// XNU's `FP_CLOFORK` (a Darwin open's O_CLOFORK): the descriptor is
+    /// not a fork's or a spawn's child's.
+    clofork: Vec<bool>,
     /// XNU's `fd_nfiles`, the size its descriptor array has grown to (a
     /// Darwin process's `proc_bsdinfo` reports it; Linux has no use for it).
     nfiles: usize,
@@ -548,6 +551,7 @@ impl FdTable {
             while t.entries.len() <= min {
                 t.entries.push(None);
                 t.cloexec.push(false);
+                t.clofork.push(false);
             }
             let slot = t.entries[min..]
                 .iter()
@@ -562,11 +566,13 @@ impl FdTable {
                     }
                     t.entries.push(None);
                     t.cloexec.push(false);
+                    t.clofork.push(false);
                     t.entries.len() - 1
                 }
             };
             t.entries[idx] = Some(file);
             t.cloexec[idx] = cloexec;
+            t.clofork[idx] = false;
             t.grow_to(idx, limit);
             Ok(idx as u64)
         })
@@ -589,9 +595,11 @@ impl FdTable {
             while t.entries.len() <= fd {
                 t.entries.push(None);
                 t.cloexec.push(false);
+                t.clofork.push(false);
             }
             t.entries[fd] = Some(file);
             t.cloexec[fd] = cloexec;
+            t.clofork[fd] = false;
             t.grow_to(fd, limit);
             Ok::<_, Errno>(fd as u64)
         })
@@ -603,6 +611,7 @@ impl FdTable {
         let _ = self.update(|t| {
             t.entries.clear();
             t.cloexec.clear();
+            t.clofork.clear();
             Ok::<_, ()>(())
         });
     }
@@ -649,6 +658,22 @@ impl FdTable {
             }
             _ => Err(Errno::EBADF),
         })
+    }
+
+    /// Mark an open descriptor close-on-fork (XNU's `FP_CLOFORK`).
+    pub fn set_clofork(&self, fd: i32, on: bool) -> Result<(), Errno> {
+        self.update(|t| {
+            if fd < 0 || fd as usize >= t.clofork.len() || t.entries[fd as usize].is_none() {
+                return Err(Errno::EBADF);
+            }
+            t.clofork[fd as usize] = on;
+            Ok(())
+        })
+    }
+
+    /// Whether descriptor `fd` is close-on-fork.
+    pub fn clofork(&self, fd: i32) -> bool {
+        self.read(|t| fd >= 0 && t.clofork.get(fd as usize).copied().unwrap_or(false))
     }
 
     pub fn set_cloexec(&self, fd: i32, on: bool) -> Result<(), Errno> {
