@@ -147,6 +147,13 @@ pub struct Task {
     pub codesign: Option<codesign::CodeSign>,
     /// `p_csflags`, which another process reads and changes (csops).
     pub csflags: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// `p_pcaction`: what is to be done to the process on resource
+    /// starvation (its control state, the low bits) and what has been done
+    /// (its action state, from bit 16), which other processes read.
+    pub pcaction: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// `P_LVMRSRCOWNER`: the process may restore others that resource
+    /// starvation throttled or suspended.
+    pub vmrsrcowner: bool,
     /// `p_textoff`: where the image's slice starts in its file.
     pub textoff: i64,
     /// `p_uniqueid` and `p_puniqueid` (its parent's at its fork), and

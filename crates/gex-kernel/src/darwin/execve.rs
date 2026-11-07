@@ -419,6 +419,7 @@ impl Kernel {
             let t = self.signals.thread();
             t.set_darwin_id(thread_id);
             t.set_tsd(0);
+            t.set_name(None);
         }
         self.darwin_exec_switch_body(spawn);
         self.darwin_ipc_leave();
@@ -512,8 +513,18 @@ impl Kernel {
             },
             // Until the image's policies make it (`vm_map_set_max_addr`).
             map_max: spawn.map_or(0, |s| s.max_addr),
+            // The new proc's p_pcaction is clear (forkproc), and its
+            // P_LVMRSRCOWNER; a spawn's child has what its spawn set.
+            pcaction: match spawn {
+                Some(sp) if sp.flags & super::spawn::flag::SETEXEC == 0 => old.pcaction,
+                _ => Default::default(),
+            },
             ..Default::default()
         };
+        // A spawn's own exec with attributes: its process control.
+        if let Some(pc) = spawn.filter(|s| s.flags & super::spawn::flag::SETEXEC != 0).and_then(|s| s.pcontrol) {
+            self.dtask.pcaction.store(super::spawn::pcaction_of(pc), std::sync::atomic::Ordering::Release);
+        }
         if spawn.is_some_and(|s| s.flags & super::spawn::flag::START_SUSPENDED != 0) {
             self.darwin_start_suspended();
         }

@@ -9,7 +9,10 @@
 // and user. PROC_PIDLISTFDS lists the open descriptors and their types;
 // PROC_PIDLISTTHREADIDS and PROC_PIDLISTTHREADS the threads, in the order
 // made, by thread id (thread_selfid's, from 101 up) and by TSD base, which
-// thread_info(THREAD_IDENTIFIER_INFO) reports too.
+// thread_info(THREAD_IDENTIFIER_INFO) reports too. proc_setcontrol sets
+// this process's control on resource starvation (pbi_flags' PC bits), its
+// thread's name (at most 63 bytes), and the VM resource owner (root's
+// alone); a spawn's psa_pcontrol sets the child's.
 
 #include <errno.h>
 #include <mach-o/dyld.h>
@@ -22,12 +25,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <TargetConditionals.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 extern char **environ;
 int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buffersize);
 int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
+int __proc_info(int callnum, int pid, int flavor, uint64_t arg, void *buffer, int buffersize);
+int posix_spawnattr_setpcontrol_np(posix_spawnattr_t *attr, const int pcontrol);
 int proc_listpids(uint32_t type, uint32_t typeinfo, void *buffer, int buffersize);
 
 static int gate[2];
@@ -142,6 +148,28 @@ int main(int argc, char **argv) {
     if (proc_pidinfo(getpid(), 28, 0, ids, 7) != 0 || errno != ENOMEM) return bad("no room", errno, ENOMEM);
     write(gate[1], "", 1);
     pthread_join(th, NULL);
+    // Its control: suspend on starvation, then none again.
+    struct shortinfo ss;
+    if (__proc_info(5, getpid(), 1, 2, NULL, 0) != 0) return bad("PROC_SELFSET_PCONTROL", errno, 0);
+    if (proc_pidinfo(getpid(), 13, 0, &ss, sizeof ss) != sizeof ss || (ss.flags & 0x600) != 0x400) return bad("PROC_FLAG_PC_SUSP", ss.flags, 0x400);
+    if (__proc_info(5, getpid(), 1, 4, NULL, 0) != -1 || errno != EINVAL) return bad("a control past P_PCMAX", errno, EINVAL);
+    if (__proc_info(5, getppid(), 1, 0, NULL, 0) != -1 || errno != EINVAL) return bad("another's control", errno, EINVAL);
+    __proc_info(5, getpid(), 1, 0, NULL, 0);
+    if (proc_pidinfo(getpid(), 13, 0, &ss, sizeof ss) != sizeof ss || (ss.flags & 0x600) != 0) return bad("no control", ss.flags, 0);
+    // Its thread's name.
+    char longname[64];
+    memset(longname, 'n', sizeof longname);
+    if (pthread_setname_np("procinfo-main") != 0) return bad("pthread_setname_np", errno, 0);
+    if (__proc_info(5, getpid(), 2, 0, longname, 64) != -1 || errno != ENAMETOOLONG) return bad("a long name", errno, ENAMETOOLONG);
+    if (__proc_info(5, getpid(), 2, 0, NULL, 0) != 0) return bad("an empty name", errno, 0);
+    int ewant = geteuid() == 0 ? 0 : EPERM;
+    if ((__proc_info(5, getpid(), 3, 0, NULL, 0) == 0 ? 0 : errno) != ewant) return bad("PROC_SELFSET_VMRSRCOWNER", errno, ewant);
+#if TARGET_OS_OSX
+    ewant = 0;
+#else
+    ewant = ENOTSUP;
+#endif
+    if ((__proc_info(5, getpid(), 4, 0, NULL, 0) == 0 ? 0 : errno) != ewant) return bad("PROC_SELFSET_DELAYIDLESLEEP", errno, ewant);
 
     // A child.
     int p1[2], p2[2];
@@ -152,7 +180,11 @@ int main(int argc, char **argv) {
     snprintf(a2, sizeof a2, "%d", p2[1]);
     char *args[] = {argv[0], a1, a2, NULL};
     pid_t pid;
-    if (posix_spawn(&pid, argv[0], NULL, NULL, args, environ)) return bad("spawn", errno, 0);
+    posix_spawnattr_t sa;
+    posix_spawnattr_init(&sa);
+    posix_spawnattr_setpcontrol_np(&sa, 3);
+    if (posix_spawn(&pid, argv[0], NULL, &sa, args, environ)) return bad("spawn", errno, 0);
+    posix_spawnattr_destroy(&sa);
     char c;
     read(p2[0], &c, 1);
     struct bsdinfo cb;
@@ -160,6 +192,7 @@ int main(int argc, char **argv) {
     if (cb.ppid != (uint32_t)getpid() || cb.nfiles != 50 || cb.status != 2) return bad("the child's parent and table", cb.nfiles, 50);
     struct shortinfo cs;
     if (proc_pidinfo(pid, 13, 0, &cs, sizeof cs) != sizeof cs || cs.ppid != (uint32_t)getpid()) return bad("the child's short info", cs.ppid, getpid());
+    if ((cs.flags & 0x600) != 0x600 || (cb.flags & 0x600) != 0x600) return bad("the child's control (PROC_FLAG_PC_KILL)", cs.flags, 0x600);
     int n;
     if (proc_listpids(1, 0, NULL, 0) <= 0) return bad("the list's room", 0, 1);
     if (!listed(1, 0, getpid(), &n) || !listed(1, 0, pid, &n)) return bad("all pids", n, 0);

@@ -553,6 +553,8 @@ pub struct ThreadSig {
     /// for other processes to read.
     darwin_id: AtomicU64,
     tsd: AtomicU64,
+    /// A Darwin thread's name (`uu_pth_name`), once it has been given one.
+    name: Mutex<Option<Vec<u8>>>,
 }
 
 impl std::fmt::Debug for ThreadSig {
@@ -576,6 +578,7 @@ impl ThreadSig {
             clear_child_tid: AtomicU64::new(0),
             darwin_id: AtomicU64::new(0),
             tsd: AtomicU64::new(0),
+            name: Mutex::new(None),
         }
     }
 
@@ -595,6 +598,15 @@ impl ThreadSig {
 
     pub fn set_tsd(&self, tsd: u64) {
         self.tsd.store(tsd, Ordering::Release);
+    }
+
+    /// A Darwin thread's name (none before it is named).
+    pub fn name(&self) -> Option<Vec<u8>> {
+        self.name.lock().clone()
+    }
+
+    pub fn set_name(&self, name: Option<Vec<u8>>) {
+        *self.name.lock() = name;
     }
 
     /// The word the thread's exit clears ([`Self::set_clear_child_tid`]).

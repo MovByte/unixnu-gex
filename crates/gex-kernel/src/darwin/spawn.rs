@@ -83,6 +83,8 @@ pub struct Attr {
     pub pgroup: i32,
     /// `psa_binprefs` and `psa_subcpuprefs`.
     pub binprefs: [(u32, u32); 4],
+    /// `psa_pcontrol`: the process control on resource starvation.
+    pub pcontrol: i32,
     pub apptype: u32,
     pub cpumonitor_percent: u64,
     pub jetsam_flags: u16,
@@ -112,6 +114,7 @@ impl Attr {
             sigmask: le32(b, 8),
             pgroup: le32(b, 12) as i32,
             binprefs,
+            pcontrol: le32(b, 32) as i32,
             apptype: le32(b, 36),
             cpumonitor_percent: le64(b, 40),
             jetsam_flags: le16(b, 64),
@@ -143,6 +146,22 @@ pub struct After {
     pub inherit: Vec<i32>,
     /// `psa_max_addr`: the highest address the new map is to have.
     pub max_addr: u64,
+    /// `psa_pcontrol`, when the spawn had attributes.
+    pub pcontrol: Option<i32>,
+}
+
+/// The `p_pcaction` a spawn's `psa_pcontrol` gives (`POSIX_SPAWN_PCONTROL_*`
+/// to `P_PC*`): throttle, suspend or kill, and none for anything else.
+pub(crate) fn pcaction_of(pcontrol: i32) -> u32 {
+    const POSIX_SPAWN_PCONTROL_THROTTLE: i32 = 1;
+    const POSIX_SPAWN_PCONTROL_SUSPEND: i32 = 2;
+    const POSIX_SPAWN_PCONTROL_KILL: i32 = 3;
+    match pcontrol {
+        POSIX_SPAWN_PCONTROL_THROTTLE => super::procinfo::P_PCTHROTTLE,
+        POSIX_SPAWN_PCONTROL_SUSPEND => super::procinfo::P_PCSUSP,
+        POSIX_SPAWN_PCONTROL_KILL => super::procinfo::P_PCKILL,
+        _ => 0,
+    }
 }
 
 /// What a spawn made.
@@ -462,7 +481,7 @@ impl Kernel {
     fn darwin_spawn_child(&mut self, m: &GuestMem<'_>, child: &mut Kernel, attr: Option<&Attr>, file_actions: Option<&[u8]>, port_actions: Option<&[u8]>, path: u64, argv: u64, envv: u64) -> Result<(), Errno> {
         let flags = attr.map_or(0, |a| a.flags);
         let policy = attr.map_or((0, 0, 0), |a| super::taskpolicy::spawn_attrs(a.apptype, a.qos_clamp, a.darwin_role));
-        let mut after = After { flags, policy, sigmask: attr.map_or(0, |a| a.sigmask), sigdefault: attr.map_or(0, |a| a.sigdefault), inherit: Vec::new(), max_addr: attr.map_or(0, |a| a.max_addr) };
+        let mut after = After { flags, policy, sigmask: attr.map_or(0, |a| a.sigmask), sigdefault: attr.map_or(0, |a| a.sigdefault), inherit: Vec::new(), max_addr: attr.map_or(0, |a| a.max_addr), pcontrol: attr.map(|a| a.pcontrol) };
         if let Some(fa) = file_actions {
             after.inherit = child.darwin_file_actions(fa, flags)?;
         }
@@ -532,6 +551,10 @@ impl Kernel {
             if super::mig::ports_register(&mut child.dtask.kports, self.ipc(), ports) != 0 {
                 return Err(Errno::EINVAL);
             }
+        }
+        // Upon a successful spawn with attributes, the process control.
+        if let Some(pc) = after.pcontrol {
+            child.dtask.pcaction.store(pcaction_of(pc), std::sync::atomic::Ordering::Release);
         }
         img.spawn = Some(after);
         child.darwin_exec = Some(Box::new(img));
@@ -670,7 +693,7 @@ impl Kernel {
         let mut copy = self.fork_kernel();
         copy.pid = self.pid;
         copy.tid = self.tid;
-        let mut after = After { flags: at.flags, policy: super::taskpolicy::spawn_attrs(at.apptype, at.qos_clamp, at.darwin_role), sigmask: at.sigmask, sigdefault: at.sigdefault, inherit: Vec::new(), max_addr: at.max_addr };
+        let mut after = After { flags: at.flags, policy: super::taskpolicy::spawn_attrs(at.apptype, at.qos_clamp, at.darwin_role), sigmask: at.sigmask, sigdefault: at.sigdefault, inherit: Vec::new(), max_addr: at.max_addr, pcontrol: Some(at.pcontrol) };
         let activated = (|| {
             if let Some(fa) = file_actions {
                 after.inherit = copy.darwin_file_actions(fa, at.flags)?;

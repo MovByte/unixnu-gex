@@ -36,7 +36,28 @@ pub struct Public {
     pub fds: Option<Arc<crate::file::FdTable>>,
     /// Its threads, while it lives.
     pub threads: Option<Arc<crate::signal::ThreadSigs>>,
+    /// `p_pcaction`.
+    pub pcaction: Arc<std::sync::atomic::AtomicU32>,
 }
+
+/// `p_pcaction`'s states (`P_PC*`): the control in its low bits, the action
+/// taken from bit 16.
+pub(crate) const P_PCTHROTTLE: u32 = 1;
+pub(crate) const P_PCSUSP: u32 = 2;
+pub(crate) const P_PCKILL: u32 = 3;
+const P_PCMAX: u32 = 3;
+const PROC_ACTION_MASK: u32 = 0xffff_0000;
+
+/// `PROC_SELFSET_*`.
+mod selfset {
+    pub const PCONTROL: u32 = 1;
+    pub const THREADNAME: u32 = 2;
+    pub const VMRSRCOWNER: u32 = 3;
+    pub const DELAYIDLESLEEP: u32 = 4;
+}
+
+/// `MAXTHREADNAMESIZE`.
+const MAXTHREADNAMESIZE: u32 = 64;
 
 /// `MAXCOMLEN`.
 const MAXCOMLEN: usize = 16;
@@ -140,6 +161,9 @@ fn flavor_size(f: u32) -> Option<(u32, bool)> {
 /// `proc_info`'s and `proc_pidinfo`'s errors as Darwin numbers them.
 mod e {
     pub const EPERM: i32 = 1;
+    pub const EFAULT: i32 = 14;
+    pub const ENAMETOOLONG: i32 = 63;
+    pub const ENOTSUP: i32 = 45;
     pub const ESRCH: i32 = 3;
     pub const ENOMEM: i32 = 12;
     pub const EINVAL: i32 = 22;
@@ -168,6 +192,7 @@ impl Kernel {
             path: path.to_vec(),
             fds: Some(Arc::clone(&self.fds)),
             threads: Some(Arc::clone(&self.thread_signals)),
+            pcaction: Arc::clone(&self.dtask.pcaction),
         }
     }
 
@@ -195,6 +220,7 @@ impl Kernel {
             call::LISTPIDS => self.darwin_listpids(m, pid as u32, fl, buf, size),
             call::PIDINFO => self.darwin_proc_pidinfo(m, pid, fl, arg, buf, size),
             call::DIRTYCONTROL => return self.darwin_dirtycontrol(pid, fl, arg),
+            call::SETCONTROL => self.darwin_setcontrol(m, pid, fl, arg, buf, size),
             // proc_set_dyld_images: dyld says where its image list is
             // (`buf`, `size` bytes), which task_info(TASK_DYLD_INFO)
             // reports from then on (task_set_dyld_info: it moves from one
@@ -268,6 +294,49 @@ impl Kernel {
         }
         m.write(buf, &out).map_err(|_| 14)?;
         Ok(out.len() as u64)
+    }
+
+    /// `proc_setcontrol(pid, flavor, arg, buffer, buffersize)`: the calling
+    /// process's own process control, its thread's name, its standing as
+    /// the VM resource owner (root's alone), or its idle-sleep delay (not
+    /// configured on iOS).
+    fn darwin_setcontrol(&mut self, m: &mut GuestMem<'_>, pid: i32, fl: u32, arg: u64, buf: u64, bufsize: u32) -> Result<u64, i32> {
+        use std::sync::atomic::Ordering;
+        if pid != self.pid {
+            return Err(e::EINVAL);
+        }
+        self.darwin_proc_info_policy(None, call::SETCONTROL, false)?;
+        match fl {
+            selfset::PCONTROL => {
+                let pcontrol = arg as u32;
+                if pcontrol > P_PCMAX {
+                    return Err(e::EINVAL);
+                }
+                // The control state replaced, the action state kept.
+                let pc = &self.dtask.pcaction;
+                let _ = pc.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| Some((v & PROC_ACTION_MASK) | pcontrol));
+            }
+            // bsd_setthreadname: at most MAXTHREADNAMESIZE - 1 bytes, up to
+            // their first NUL.
+            selfset::THREADNAME => {
+                if bufsize > MAXTHREADNAMESIZE - 1 {
+                    return Err(e::ENAMETOOLONG);
+                }
+                let raw = if bufsize == 0 { Vec::new() } else { m.read(buf, bufsize as usize).map_err(|_| e::EFAULT)?.to_vec() };
+                let name = raw.split(|&c| c == 0).next().unwrap_or(&[]).to_vec();
+                self.signals.thread().set_name(Some(name));
+            }
+            selfset::VMRSRCOWNER => {
+                if self.dtask.cred.uid != 0 {
+                    return Err(e::EPERM);
+                }
+                self.dtask.vmrsrcowner = true;
+            }
+            // CONFIG_DELAY_IDLE_SLEEP is macOS's.
+            selfset::DELAYIDLESLEEP => return Err(e::ENOTSUP),
+            _ => return Err(e::ENOTSUP),
+        }
+        Ok(0)
     }
 
     /// `proc_security_policy`: the MAC policies' `proc_check_proc_info`
@@ -492,6 +561,24 @@ impl Kernel {
         if self.procs.sid(pid, pid).ok() == Some(pid) {
             f |= PROC_FLAG_SLEADER;
         }
+        // PROC_CONTROL_STATE and PROC_ACTION_STATE.
+        const PROC_FLAG_PC_THROTTLE: u32 = 0x200;
+        const PROC_FLAG_PC_SUSP: u32 = 0x400;
+        const PROC_FLAG_PC_KILL: u32 = 0x600;
+        const PROC_FLAG_PA_THROTTLE: u32 = 0x800;
+        const PROC_FLAG_PA_SUSP: u32 = 0x1000;
+        let pc = p.pcaction.load(std::sync::atomic::Ordering::Acquire);
+        f |= match pc & P_PCMAX {
+            P_PCTHROTTLE => PROC_FLAG_PC_THROTTLE,
+            P_PCSUSP => PROC_FLAG_PC_SUSP,
+            P_PCKILL => PROC_FLAG_PC_KILL,
+            _ => 0,
+        };
+        f |= match (pc >> 16) & P_PCMAX {
+            P_PCTHROTTLE => PROC_FLAG_PA_THROTTLE,
+            P_PCSUSP => PROC_FLAG_PA_SUSP,
+            _ => 0,
+        };
         // The background and application bits of its task's policy.
         if !zombie {
             f |= self.darwin_bgstate(pid)?;
