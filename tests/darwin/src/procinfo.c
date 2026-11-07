@@ -5,6 +5,8 @@
 // (xnu-10063's sizing; later kernels size it otherwise);
 // once it has exited and before it is reaped, its BSD info is found only
 // when zombies are asked for (SZOMB), and is ESRCH otherwise.
+// proc_listpids lists every process, the zombie too, and by parent, group
+// and user. PROC_PIDLISTFDS lists the open descriptors and their types.
 
 #include <errno.h>
 #include <mach-o/dyld.h>
@@ -21,6 +23,18 @@
 extern char **environ;
 int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buffersize);
 int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
+int proc_listpids(uint32_t type, uint32_t typeinfo, void *buffer, int buffersize);
+
+// Whether `pid` is among the pids proc_listpids(type, info) lists, and how
+// many it lists.
+static int listed(uint32_t type, uint32_t info, pid_t pid, int *count) {
+    static pid_t pids[4096];
+    int n = proc_listpids(type, info, pids, sizeof pids) / (int)sizeof(pid_t);
+    *count = n;
+    for (int i = 0; i < n; i++)
+        if (pids[i] == pid) return 1;
+    return 0;
+}
 
 struct bsdinfo {
     uint32_t flags, status, xstatus, pid, ppid, uid, gid, ruid, rgid, svuid, svgid, rfu;
@@ -75,6 +89,17 @@ int main(int argc, char **argv) {
         if (lc->cmd == LC_BUILD_VERSION) want = ((const struct build_version_command *)lc)->platform;
     if (proc_pidinfo(getpid(), 30, 0, &plat, sizeof plat) != sizeof plat || plat != want) return bad("its platform", plat, want);
     if (proc_pidinfo(99999, 3, 0, &b, sizeof b) != 0 || errno != ESRCH) return bad("no such process", errno, ESRCH);
+    // Its descriptors: 0-2, and a pipe's two ends of type PIPE.
+    int pp[2];
+    pipe(pp);
+    struct { int32_t fd; uint32_t type; } fds[256];
+    int nf = proc_pidinfo(getpid(), 1, 0, fds, sizeof fds) / 8, pipes = 0;
+    for (int i = 0; i < nf; i++)
+        if ((fds[i].fd == pp[0] || fds[i].fd == pp[1]) && fds[i].type == 6) pipes++;
+    if (nf < 5 || fds[0].fd != 0 || pipes != 2) return bad("its descriptors", nf, 5);
+    if (proc_pidinfo(getpid(), 1, 0, NULL, 0) < (int)(8 * (b.nfiles + 20))) return bad("the descriptors' room", 0, 1);
+    close(pp[0]);
+    close(pp[1]);
 
     // A child.
     int p1[2], p2[2];
@@ -93,11 +118,17 @@ int main(int argc, char **argv) {
     if (cb.ppid != (uint32_t)getpid() || cb.nfiles != 50 || cb.status != 2) return bad("the child's parent and table", cb.nfiles, 50);
     struct shortinfo cs;
     if (proc_pidinfo(pid, 13, 0, &cs, sizeof cs) != sizeof cs || cs.ppid != (uint32_t)getpid()) return bad("the child's short info", cs.ppid, getpid());
+    int n;
+    if (proc_listpids(1, 0, NULL, 0) <= 0) return bad("the list's room", 0, 1);
+    if (!listed(1, 0, getpid(), &n) || !listed(1, 0, pid, &n)) return bad("all pids", n, 0);
+    if (!listed(6, getpid(), pid, &n) || n != 1) return bad("its children", n, 1);
+    if (!listed(2, getpgrp(), getpid(), &n) || !listed(4, geteuid(), getpid(), &n) || !listed(5, getuid(), pid, &n)) return bad("by group and user", n, 0);
     write(p1[1], &c, 1);
     siginfo_t si;
     if (waitid(P_PID, pid, &si, WEXITED | WNOWAIT)) return bad("waitid", errno, 0);
     if (proc_pidinfo(pid, 3, 0, &cb, sizeof cb) != 0 || errno != ESRCH) return bad("a zombie without asking", errno, ESRCH);
     if (proc_pidinfo(pid, 3, 1, &cb, sizeof cb) != sizeof cb || cb.status != 5) return bad("the zombie", cb.status, 5);
+    if (!listed(1, 0, pid, &n)) return bad("the zombie listed", n, 0);
     int st;
     waitpid(pid, &st, 0);
     printf("procinfo ok\n");

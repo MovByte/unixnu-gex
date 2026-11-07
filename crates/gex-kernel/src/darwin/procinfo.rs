@@ -188,6 +188,8 @@ impl Kernel {
     pub(crate) fn darwin_proc_info(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
         let (callnum, pid, fl, arg, buf, size) = (a[0], a[1] as i32, a[2] as u32, a[3], a[4], a[5] as u32);
         let r = match callnum {
+            // (`pid` is the list's type, `flavor` its argument.)
+            call::LISTPIDS => self.darwin_listpids(m, pid as u32, fl, buf, size),
             call::PIDINFO => self.darwin_proc_pidinfo(m, pid, fl, arg, buf, size),
             call::DIRTYCONTROL => return self.darwin_dirtycontrol(pid, fl, arg),
             // proc_set_dyld_images: dyld says where its image list is
@@ -214,10 +216,61 @@ impl Kernel {
         r.map_err(super::errno::errno_of)
     }
 
+    /// `proc_listpids(type, typeinfo, buffer, buffersize)`: the pids of the
+    /// processes of a group, a parent, a terminal, an effective or real
+    /// user, or all (the live ones, the latest first and the kernel's
+    /// last, then the zombies); for no buffer, room for twenty more than
+    /// there are.
+    fn darwin_listpids(&mut self, m: &mut GuestMem<'_>, ty: u32, info: u32, buf: u64, bufsize: u32) -> Result<u64, i32> {
+        const ALL_PIDS: u32 = 1;
+        const PGRP_ONLY: u32 = 2;
+        const TTY_ONLY: u32 = 3;
+        const UID_ONLY: u32 = 4;
+        const RUID_ONLY: u32 = 5;
+        const PPID_ONLY: u32 = 6;
+        const KDBG_ONLY: u32 = 7;
+        self.darwin_proc_info_policy(None, call::LISTPIDS, false)?;
+        let mut all = self.procs.listing();
+        let nprocs = all.len() as u32;
+        if buf == 0 {
+            return Ok(u64::from((nprocs + 20) * 4));
+        }
+        if bufsize < 4 {
+            return Err(e::ENOMEM);
+        }
+        let numprocs = (nprocs + 20).min(bufsize / 4) as usize;
+        // The kernel's own process, made first, ends the live ones.
+        let live = all.iter().take_while(|p| !p.3).count();
+        all.insert(live, (0, 0, 0, false));
+        let mut out = Vec::new();
+        for (pid, ppid, pgid, _) in all {
+            let keep = match ty {
+                ALL_PIDS => true,
+                PGRP_ONLY => pgid == info as i32,
+                PPID_ONLY => ppid == info as i32,
+                // No process has a controlling terminal, nor kdebug tracing.
+                TTY_ONLY | KDBG_ONLY => false,
+                UID_ONLY | RUID_ONLY => {
+                    let c = if pid == 0 { Some(super::cred::Cred::default()) } else { self.darwin_public(pid).map(|(p, _)| p.cred) };
+                    c.is_some_and(|c| (if ty == UID_ONLY { c.uid } else { c.ruid }) == info)
+                }
+                _ => false,
+            };
+            if keep {
+                out.extend_from_slice(&pid.to_le_bytes());
+            }
+            if out.len() / 4 >= numprocs {
+                break;
+            }
+        }
+        m.write(buf, &out).map_err(|_| 14)?;
+        Ok(out.len() as u64)
+    }
+
     /// `proc_security_policy`: the MAC policies' `proc_check_proc_info`
     /// (Sandbox's operation for the call), then for most flavors the
     /// caller's euid the target's, or root.
-    fn darwin_proc_info_policy(&mut self, target: &Public, callnum: u64, same_user: bool) -> Result<(), i32> {
+    fn darwin_proc_info_policy(&mut self, target: Option<&Public>, callnum: u64, same_user: bool) -> Result<(), i32> {
         let op = match callnum {
             call::LISTPIDS => 127,
             call::PIDINFO => 128,
@@ -235,6 +288,7 @@ impl Kernel {
                 return Err(r as i32);
             }
         }
+        let Some(target) = target else { return Ok(()) };
         if same_user && self.dtask.cred.uid != target.cred.uid && self.dtask.cred.uid != 0 {
             return Err(e::EPERM);
         }
@@ -269,9 +323,26 @@ impl Kernel {
             return Err(e::ESRCH);
         }
         let same_user = !matches!(fl, T_SHORTBSDINFO | UNIQIDENTIFIERINFO | PATHINFO | COALITIONINFO | PLATFORMINFO);
-        self.darwin_proc_info_policy(&target, call::PIDINFO, same_user)?;
+        self.darwin_proc_info_policy(Some(&target), call::PIDINFO, same_user)?;
         let fault = |_| 14;
         match fl {
+            // proc_pidfdlist: each open descriptor and its type, as many
+            // as fit; for no buffer, room for the table and twenty more.
+            LISTFDS => {
+                let Some(fds) = target.fds.as_ref() else { return Ok(0) };
+                let nfiles = fds.nfiles() as u64;
+                if buf == 0 {
+                    return Ok((nfiles + 20) * 8);
+                }
+                let numfds = nfiles.min(u64::from(bufsize) / 8) as usize;
+                let mut b = Vec::new();
+                for (fd, f, _) in fds.entries().into_iter().take(numfds) {
+                    b.extend_from_slice(&fd.to_le_bytes());
+                    b.extend_from_slice(&fdtype(&f).to_le_bytes());
+                }
+                m.write(buf, &b).map_err(fault)?;
+                Ok(b.len() as u64)
+            }
             UNIQIDENTIFIERINFO => {
                 let b = uniqidentifierinfo(&target);
                 m.write(buf, &b).map_err(fault)?;
@@ -453,6 +524,26 @@ impl Kernel {
             f |= SUPPRESSED;
         }
         Ok(f)
+    }
+}
+
+/// A descriptor's `PROX_FDTYPE_*` (its file glob's `DTYPE_*`).
+fn fdtype(f: &Arc<crate::file::OpenFile>) -> u32 {
+    const VNODE: u32 = 1;
+    const SOCKET: u32 = 2;
+    const PSHM: u32 = 3;
+    const KQUEUE: u32 = 5;
+    const PIPE: u32 = 6;
+    if f.handle.pipe_end().is_some() {
+        PIPE
+    } else if Arc::clone(&f.handle).as_kqueue().is_some() {
+        KQUEUE
+    } else if Arc::clone(&f.handle).as_posix_shm().is_some() {
+        PSHM
+    } else if f.handle.metadata().is_ok_and(|md| md.file_type == crate::vfs::FileType::Socket) {
+        SOCKET
+    } else {
+        VNODE
     }
 }
 

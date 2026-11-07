@@ -263,6 +263,9 @@ struct Proc {
     /// A Darwin process's own record (`crate::darwin::procinfo::Public`),
     /// which other processes read until it is reaped.
     darwin: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    /// When it became a zombie, in the order processes did (XNU's
+    /// `zombproc` list has the latest first); 0 while it lives.
+    zseq: u64,
 }
 
 /// Another process's memory as a host holds it: bytes at a guest address,
@@ -286,6 +289,8 @@ struct Table {
     /// Linux's pids and tids are one, so an id names exactly one task.
     next_pid: i32,
     procs: Vec<Proc>,
+    /// The last zombie's [`Proc::zseq`].
+    zseq: u64,
     /// Each live thread that is not its process's first, and its process.
     threads: std::collections::HashMap<i32, i32>,
     /// Each process group's `pg_jobc`: how many of its members have a
@@ -415,6 +420,7 @@ impl ProcTable {
                 next_pid: INIT_PID + 1,
                 threads: std::collections::HashMap::new(),
                 jobc: std::collections::HashMap::new(),
+                zseq: 0,
                 procs: vec![Proc {
                     pid: INIT_PID,
                     ppid: 0,
@@ -437,6 +443,7 @@ impl ProcTable {
                     vm: None,
                     host_child: false,
                     darwin: None,
+                    zseq: 0,
                 }],
             }),
         };
@@ -508,6 +515,7 @@ impl ProcTable {
             vm: None,
             host_child,
             darwin: None,
+            zseq: 0,
         });
         drop(t);
         // forkproc's memorystatus init, then memorystatus_add.
@@ -674,6 +682,11 @@ impl ProcTable {
         let mut jobc_orphaned = Vec::new();
         let (cell, done, was_ppid, own_q, orphans) = {
             let mut t = self.lock();
+            t.zseq += 1;
+            let zs = t.zseq;
+            if let Some(p) = t.procs.iter_mut().find(|p| p.pid == pid) {
+                p.zseq = zs;
+            }
             let ppid = t.procs.iter().find(|p| p.pid == pid).map(|p| p.ppid);
             // proc_exit's fixjobc, before its children go to init.
             if let Some((pgid, sid)) = t.procs.iter().find(|p| p.pid == pid).map(|p| (p.pgid, p.sid)) {
@@ -973,6 +986,18 @@ impl ProcTable {
     pub fn counts(&self, uid: u32) -> (usize, usize) {
         let t = self.lock();
         (t.procs.len(), t.procs.iter().filter(|p| p.uid == uid).count())
+    }
+
+    /// Every process in `proc_listpids`' order: the live ones, the latest
+    /// made first, then the zombies, the latest first: (pid, ppid, pgid,
+    /// zombie).
+    pub fn listing(&self) -> Vec<(i32, i32, i32, bool)> {
+        let t = self.lock();
+        let mut live: Vec<&Proc> = t.procs.iter().filter(|p| p.zseq == 0).collect();
+        live.reverse();
+        let mut dead: Vec<&Proc> = t.procs.iter().filter(|p| p.zseq != 0).collect();
+        dead.sort_by_key(|p| std::cmp::Reverse(p.zseq));
+        live.into_iter().map(|p| (p.pid, p.ppid, p.pgid, false)).chain(dead.into_iter().map(|p| (p.pid, p.ppid, p.pgid, true))).collect()
     }
 
     /// Set process `pid`'s Darwin record.
