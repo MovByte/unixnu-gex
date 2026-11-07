@@ -27,20 +27,25 @@ static int bad(const char *what, long got, long want) {
     return 1;
 }
 
+static volatile int ticked;
+
 static void *ticker(void *a) {
     (void)a;
     for (;;) {
         write(1, "t", 1);
+        ticked = 1;
         usleep(20000);
     }
     return NULL;
 }
 
-// The child: ticks from a thread, then suspends its own task; once
-// resumed, says how its call went.
+// The child: ticks from a thread, then, once it has ticked (the parent
+// waits for a tick), suspends its own task; once resumed, says how its
+// call went.
 static int child(const char *mode) {
     pthread_t t;
     pthread_create(&t, NULL, ticker, NULL);
+    while (!ticked) usleep(10000);
     usleep(100000);
     char msg[32];
     if (!strcmp(mode, "legacy")) {
