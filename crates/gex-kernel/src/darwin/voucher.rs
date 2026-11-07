@@ -89,7 +89,7 @@ pub mod vkr {
 
 /// The bank's handles: `BANK_DEFAULT_VALUE` (NULL) and
 /// `BANK_DEFAULT_TASK_VALUE` (-1); the task's own bank context.
-mod bank {
+pub(crate) mod bank {
     pub const DEFAULT_VALUE: u64 = 0;
     pub const DEFAULT_TASK_VALUE: u64 = u64::MAX;
     pub const TASK_HANDLE: u64 = 0x1000;

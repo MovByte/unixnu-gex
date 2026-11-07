@@ -446,6 +446,55 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             (Some(flavor), Some(cnt)) => thread_info(k, *t, flavor, (cnt as u32).min(32)),
             _ => bad(),
         },
+        // thread_get_mach_voucher(thread, which) -> voucher: a send right
+        // for the thread's voucher, or none.
+        (Kobject::Thread(t), 3625) => {
+            let v = k.dtask.threads.map.get(t).and_then(|d| d.voucher);
+            match v {
+                Some(v) => {
+                    k.ipc_voucher_reference(v);
+                    let p = k.convert_voucher_to_port(v);
+                    Reply::port(Carried::Port(p))
+                }
+                None => Reply::ok(Vec::new()).with_null_port(0),
+            }
+        }
+        // thread_set_mach_voucher(thread, voucher): the calling thread, or
+        // one not yet started, takes a reference on the voucher (none
+        // clears it); the request's right and its reference are released.
+        (Kobject::Thread(t), 3626) => match desc_port(req, 0) {
+            Some((right, disp)) => {
+                let own = k.dtask.kcaller == 0 || k.dtask.kcaller == k.ipc().task;
+                let started = k.dtask.threads.map.get(t).is_none_or(|d| d.unstarted.is_none());
+                let r = if (!own || *t != k.tid) && started {
+                    KERN_INVALID_ARGUMENT
+                } else {
+                    let voucher = match right {
+                        Some(Carried::Port(p)) => k.convert_port_to_voucher(p),
+                        _ => None,
+                    };
+                    if let Some(v) = voucher {
+                        k.ipc_voucher_reference(v);
+                    }
+                    let d = k.dtask.threads.map.entry(*t).or_default();
+                    let old = std::mem::replace(&mut d.voucher, voucher);
+                    d.voucher_name = 0;
+                    if let Some(o) = old {
+                        k.ipc_voucher_release(o);
+                    }
+                    // MIG's destructor for the converted reference.
+                    if let Some(v) = voucher {
+                        k.ipc_voucher_release(v);
+                    }
+                    0
+                };
+                if let Some(c) = right {
+                    k.ipc().object_destroy(c, disp);
+                }
+                Reply::err(r)
+            }
+            None => bad(),
+        },
         // thread_get_special_port(thread, which) -> port.
         (Kobject::Thread(t) | Kobject::ThreadRead(t) | Kobject::ThreadInspect(t), 3610) => match arg(req, 0) {
             Some(which) => {
@@ -682,9 +731,9 @@ fn task_routine_flavor(id: i32) -> Option<u8> {
 fn thread_routine_flavor(id: i32) -> Option<u8> {
     use super::kobject::flavor::*;
     Some(match id {
-        3603 | 3605 | 3606 => READ,
+        3603 | 3605 | 3606 | 3625 => READ,
         3610 | 3612 | 3618 => INSPECT,
-        3604 | 3613 | 3614 | 3615 | 3617 => CONTROL,
+        3604 | 3613 | 3614 | 3615 | 3617 | 3626 => CONTROL,
         _ => return None,
     })
 }

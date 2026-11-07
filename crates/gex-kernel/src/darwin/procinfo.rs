@@ -77,9 +77,13 @@ pub mod call {
     pub const PIDFDINFO: u64 = 3;
     pub const SETCONTROL: u64 = 5;
     pub const PIDFILEPORTINFO: u64 = 6;
+    pub const TERMINATE: u64 = 7;
     pub const DIRTYCONTROL: u64 = 8;
     pub const PIDRUSAGE: u64 = 9;
+    pub const PIDORIGINATORINFO: u64 = 10;
     pub const SET_DYLD_IMAGES: u64 = 15;
+    pub const SIGNAL_AUDITTOKEN: u64 = 0x11;
+    pub const TERMINATE_AUDITTOKEN: u64 = 0x12;
 }
 
 /// `PROC_PID*` flavors.
@@ -224,6 +228,13 @@ impl Kernel {
             call::PIDINFO => self.darwin_proc_pidinfo(m, pid, fl, arg, buf, size),
             call::DIRTYCONTROL => return self.darwin_dirtycontrol(pid, fl, arg),
             call::SETCONTROL => self.darwin_setcontrol(m, pid, fl, arg, buf, size),
+            call::TERMINATE => return self.darwin_proc_terminate(m, pid),
+            // (`flavor` is the signal, `buffer` the token.)
+            call::SIGNAL_AUDITTOKEN => return self.darwin_signal_audittoken(m, buf, fl).map(|()| 0),
+            call::TERMINATE_AUDITTOKEN => {
+                let pid = self.darwin_audittoken_proc(m, buf)?;
+                return self.darwin_terminate_with_proc(m, pid);
+            }
             // proc_set_dyld_images: dyld says where its image list is
             // (`buf`, `size` bytes), which task_info(TASK_DYLD_INFO)
             // reports from then on (task_set_dyld_info: it moves from one
@@ -240,10 +251,15 @@ impl Kernel {
                 }
                 Ok(0)
             }
-            _ => {
+            call::PIDORIGINATORINFO => self.darwin_pidoriginatorinfo(m, pid, fl, buf, size),
+            // PIDFDINFO, KERNMSGBUF, PIDFILEPORTINFO, PIDRUSAGE,
+            // LISTCOALITIONS, CANUSEFGHW, PIDDYNKQUEUEINFO, TERMINATE_RSR.
+            3 | 4 | 6 | 9 | 11..=13 | 16 => {
                 self.darwin_unimplemented(format!("proc_info call {callnum} (flavor {fl})"));
                 Err(e::EINVAL)
             }
+            // Any other (UDATA_INFO is CONFIG_PROC_UDATA_STORAGE's, macOS's).
+            _ => Err(e::EINVAL),
         };
         r.map_err(super::errno::errno_of)
     }
@@ -297,6 +313,121 @@ impl Kernel {
         }
         m.write(buf, &out).map_err(|_| 14)?;
         Ok(out.len() as u64)
+    }
+
+    /// `proc_pidoriginatorinfo(pid, flavor, buffer, buffersize)`: of the
+    /// calling process (pid 0 or its own), the originator of the current
+    /// thread's voucher: its executable's UUID, or that and its pid.
+    fn darwin_pidoriginatorinfo(&mut self, m: &mut GuestMem<'_>, pid: i32, fl: u32, buf: u64, bufsize: u32) -> Result<u64, i32> {
+        const UUID: u32 = 1;
+        const BGSTATE: u32 = 2;
+        const PID_UUID: u32 = 3;
+        let size = match fl {
+            UUID => 16,
+            BGSTATE => 4,
+            // sizeof(struct proc_originatorinfo).
+            PID_UUID => 48,
+            _ => return Err(e::EINVAL),
+        };
+        if bufsize < size {
+            return Err(e::ENOMEM);
+        }
+        if pid != 0 && pid != self.pid {
+            return Err(e::EINVAL);
+        }
+        if fl == BGSTATE {
+            self.darwin_unimplemented("proc_pidoriginatorinfo PROC_PIDORIGINATOR_BGSTATE (the thread's effective DARWIN_BG)".into());
+            return Err(e::EINVAL);
+        }
+        // thread_get_current_voucher_origin_pid: the bank's
+        // BANK_ORIGINATOR_PID of the thread's voucher (none: EINVAL).
+        const ENOATTR: i32 = 93;
+        let voucher = self.dtask.threads.map.get(&self.tid).and_then(|t| t.voucher);
+        let Some(v) = voucher else { return Err(e::EINVAL) };
+        let origin = match self.mach_voucher_attr_command(v, super::voucher::key::BANK, super::voucher::bank::ORIGINATOR_PID, &[], 4) {
+            Ok(b) => i32::from_le_bytes(b[..4].try_into().unwrap()),
+            Err(super::voucher::vkr::INVALID_TASK) => return Err(e::ESRCH),
+            Err(super::voucher::vkr::INVALID_VALUE) => return Err(ENOATTR),
+            Err(_) => return Err(e::EINVAL),
+        };
+        // proc_piduuidinfo: its executable's UUID, a zombie's too.
+        let (p, _) = self.darwin_public(origin).ok_or(e::ESRCH)?;
+        let mut b = p.uuid.to_vec();
+        if fl == PID_UUID {
+            b.extend_from_slice(&origin.to_le_bytes());
+            b.resize(48, 0);
+        }
+        m.write(buf, &b).map_err(|_| 14)?;
+        Ok(u64::from(size))
+    }
+
+    /// `proc_terminate(pid)`: another process the caller may SIGKILL,
+    /// marked terminated for memorystatus and in its task's policy, sent
+    /// the signal `memorystatus_on_terminate` picks, which is the answer.
+    fn darwin_proc_terminate(&mut self, m: &mut GuestMem<'_>, pid: i32) -> Result<u64, Errno> {
+        if pid <= 0 {
+            return Err(Errno::EINVAL);
+        }
+        // proc_find: not a zombie.
+        if self.darwin_public(pid).is_none_or(|(_, zombie)| zombie) {
+            return Err(Errno::ESRCH);
+        }
+        self.darwin_terminate_with_proc(m, pid)
+    }
+
+    /// The live process an audit token names: its pid (`val[5]`, EINVAL
+    /// unless positive) with the token's pidversion (`val[7]`, ESRCH
+    /// otherwise).
+    fn darwin_audittoken_proc(&mut self, m: &GuestMem<'_>, at: u64) -> Result<i32, Errno> {
+        if at == 0 {
+            return Err(Errno::EINVAL);
+        }
+        let t = m.read(at, 32).map_err(|_| Errno::EFAULT)?;
+        let val = |i: usize| i32::from_le_bytes(t[4 * i..4 * i + 4].try_into().unwrap());
+        let pid = val(5);
+        if pid <= 0 {
+            return Err(Errno::EINVAL);
+        }
+        match self.darwin_public(pid) {
+            Some((p, false)) if p.pidversion == val(7) => Ok(pid),
+            _ => Err(Errno::ESRCH),
+        }
+    }
+
+    /// `proc_signal_with_audittoken`: signal `signum` (1 to 31) to the
+    /// process the token names, if the caller may signal it.
+    fn darwin_signal_audittoken(&mut self, m: &mut GuestMem<'_>, at: u64, signum: u32) -> Result<(), Errno> {
+        use crate::syscalls::nr;
+        if signum == 0 || signum >= 32 {
+            return Err(Errno::EINVAL);
+        }
+        let pid = self.darwin_audittoken_proc(m, at)?;
+        let sig = super::kern::signal_to_linux(signum);
+        if sig == 0 {
+            self.darwin_unimplemented(format!("a signal by audit token with Darwin signal {signum}, which Linux has no number for"));
+            return Err(Errno::EINVAL);
+        }
+        // cansignal, then psignal: kill's check and post.
+        self.canonical(m, nr::KILL, [pid as u64, u64::from(sig), 0, 0, 0, 0]).map(|_| ())
+    }
+
+    /// `proc_terminate_with_proc` of process `pid`.
+    fn darwin_terminate_with_proc(&mut self, m: &mut GuestMem<'_>, pid: i32) -> Result<u64, Errno> {
+        use crate::syscalls::nr;
+        // cansignal(.., SIGKILL), as kill's own check makes it.
+        self.canonical(m, nr::KILL, [pid as u64, 0, 0, 0, 0, 0])?;
+        if pid == self.pid {
+            return Err(Errno::EPERM);
+        }
+        let sig = self.procs.jetsam().on_terminate(pid);
+        // proc_set_task_policy(TASK_POLICY_ATTRIBUTE, TASK_POLICY_TERMINATED).
+        if let Some(cell) = self.procs.task_policy(pid) {
+            let mut p = cell.lock().unwrap_or_else(|e| e.into_inner());
+            p.requested.terminated = true;
+            p.update(false);
+        }
+        self.canonical(m, nr::KILL, [pid as u64, u64::from(super::kern::signal_to_linux(sig)), 0, 0, 0, 0])?;
+        Ok(u64::from(sig))
     }
 
     /// `proc_setcontrol(pid, flavor, arg, buffer, buffersize)`: the calling

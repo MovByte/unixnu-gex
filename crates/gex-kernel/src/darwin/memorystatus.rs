@@ -644,6 +644,21 @@ impl Jetsam {
         r
     }
 
+    /// `memorystatus_on_terminate`: process `pid` marked terminated, and
+    /// the signal to end it: SIGKILL for one tracked and clean, or
+    /// suspended; SIGTERM, to let it clean up, for the rest.
+    pub fn on_terminate(&mut self, pid: i32) -> u32 {
+        const SIGKILL: u32 = 9;
+        const SIGTERM: u32 = 15;
+        let Some(p) = self.procs.get_mut(&pid) else { return SIGTERM };
+        p.dirty |= dirty::TERMINATED;
+        if p.dirty & (dirty::TRACK | dirty::IS_DIRTY) == dirty::TRACK || p.state & state::SUSPENDED != 0 {
+            SIGKILL
+        } else {
+            SIGTERM
+        }
+    }
+
     /// `memorystatus_dirty_get`.
     pub fn dirty_get(&self, pid: i32) -> Option<u32> {
         self.procs.get(&pid).map(Self::dirty_get_of)

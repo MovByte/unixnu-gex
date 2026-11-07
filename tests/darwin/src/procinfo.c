@@ -12,7 +12,12 @@
 // thread_info(THREAD_IDENTIFIER_INFO) reports too. proc_setcontrol sets
 // this process's control on resource starvation (pbi_flags' PC bits), its
 // thread's name (at most 63 bytes), and the VM resource owner (root's
-// alone); a spawn's psa_pcontrol sets the child's.
+// alone); a spawn's psa_pcontrol sets the child's. proc_terminate sends
+// another process SIGTERM (it does no dirty tracking), never the caller;
+// by audit token (its pid and pidversion), so do a signal and a terminate,
+// and a token of another pidversion names no process. The originator of
+// the thread's voucher (a bank voucher it made) is this process, with its
+// UUID; with no voucher there is none.
 
 #include <errno.h>
 #include <mach-o/dyld.h>
@@ -32,6 +37,8 @@
 extern char **environ;
 int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buffersize);
 int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
+// bank_types.h's MACH_VOUCHER_ATTR_BANK_CREATE.
+#define MACH_VOUCHER_ATTR_BANK_CREATE 610
 int __proc_info(int callnum, int pid, int flavor, uint64_t arg, void *buffer, int buffersize);
 int posix_spawnattr_setpcontrol_np(posix_spawnattr_t *attr, const int pcontrol);
 int proc_listpids(uint32_t type, uint32_t typeinfo, void *buffer, int buffersize);
@@ -78,6 +85,10 @@ static int bad(const char *what, long got, long want) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2) {
+        // The child to terminate: it waits to be.
+        for (;;) pause();
+    }
     if (argc > 1) {
         // The child: descriptor 30, then wait for the parent.
         int in = atoi(argv[1]), out = atoi(argv[2]);
@@ -170,6 +181,44 @@ int main(int argc, char **argv) {
     ewant = ENOTSUP;
 #endif
     if ((__proc_info(5, getpid(), 4, 0, NULL, 0) == 0 ? 0 : errno) != ewant) return bad("PROC_SELFSET_DELAYIDLESLEEP", errno, ewant);
+    if (__proc_info(7, getpid(), 0, 0, NULL, 0) != -1 || errno != EPERM) return bad("terminating itself", errno, EPERM);
+    if (__proc_info(7, 0, 0, 0, NULL, 0) != -1 || errno != EINVAL) return bad("terminating pid 0", errno, EINVAL);
+    pid_t victim;
+    char *vargs[] = {argv[0], "wait", NULL};
+    if (posix_spawn(&victim, argv[0], NULL, NULL, vargs, environ)) return bad("spawning to terminate", errno, 0);
+    int sig = __proc_info(7, victim, 0, 0, NULL, 0), vst;
+    waitpid(victim, &vst, 0);
+    if (sig != SIGTERM || !WIFSIGNALED(vst) || WTERMSIG(vst) != SIGTERM) return bad("proc_terminate", sig, SIGTERM);
+    if (posix_spawn(&victim, argv[0], NULL, NULL, vargs, environ)) return bad("spawning to terminate", errno, 0);
+    struct { uint8_t uuid[16]; uint64_t uniqueid, puniqueid; int32_t idversion; uint32_t r2; uint64_t r3, r4; } ui;
+    if (proc_pidinfo(victim, 17, 0, &ui, sizeof ui) != sizeof ui) return bad("its unique ids", errno, 0);
+    uint32_t tok[8] = {0}, stale[8] = {0};
+    tok[5] = stale[5] = (uint32_t)victim;
+    tok[7] = (uint32_t)ui.idversion;
+    stale[7] = (uint32_t)ui.idversion + 1;
+    if (__proc_info(0x11, 0, SIGCONT, 0, stale, sizeof stale) != -1 || errno != ESRCH) return bad("a stale token", errno, ESRCH);
+    if (__proc_info(0x11, 0, 0, 0, tok, sizeof tok) != -1 || errno != EINVAL) return bad("no signal", errno, EINVAL);
+    if (__proc_info(0x11, 0, SIGCONT, 0, tok, sizeof tok) != 0) return bad("a signal by token", errno, 0);
+    sig = __proc_info(0x12, 0, 0, 0, tok, sizeof tok);
+    waitpid(victim, &vst, 0);
+    if (sig != SIGTERM || !WIFSIGNALED(vst) || WTERMSIG(vst) != SIGTERM) return bad("a terminate by token", sig, SIGTERM);
+    struct { uint8_t uuid[16]; pid_t pid; uint32_t pad; uint64_t r2, r3, r4; } oi;
+    if (__proc_info(10, 0, 3, 0, &oi, sizeof oi) != -1 || errno != EINVAL) return bad("no voucher's originator", errno, EINVAL);
+    if (__proc_info(10, getppid(), 3, 0, &oi, sizeof oi) != -1 || errno != EINVAL) return bad("another's originator", errno, EINVAL);
+    if (__proc_info(10, 0, 3, 0, &oi, 16) != -1 || errno != ENOMEM) return bad("a short buffer", errno, ENOMEM);
+    if (__proc_info(10, 0, 9, 0, &oi, sizeof oi) != -1 || errno != EINVAL) return bad("a bad flavor", errno, EINVAL);
+    mach_voucher_attr_recipe_data_t recipe = {MACH_VOUCHER_ATTR_KEY_BANK, MACH_VOUCHER_ATTR_BANK_CREATE, 0, 0};
+    mach_voucher_t v = MACH_PORT_NULL;
+    if (host_create_mach_voucher(mach_host_self(), (mach_voucher_attr_raw_recipe_array_t)&recipe, sizeof recipe, &v) || thread_set_mach_voucher(mach_thread_self(), v)) return bad("a bank voucher", 0, 1);
+    struct { uint8_t uuid[16]; uint64_t uniqueid, puniqueid; int32_t idversion; uint32_t r2; uint64_t r3, r4; } mine_ui;
+    proc_pidinfo(getpid(), 17, 0, &mine_ui, sizeof mine_ui);
+    uint8_t ou[16];
+    if (__proc_info(10, 0, 3, 0, &oi, sizeof oi) != (int)sizeof oi || oi.pid != getpid() || memcmp(oi.uuid, mine_ui.uuid, 16)) return bad("its voucher's originator", oi.pid, getpid());
+    if (__proc_info(10, getpid(), 1, 0, ou, sizeof ou) != 16 || memcmp(ou, mine_ui.uuid, 16)) return bad("its originator's UUID", errno, 0);
+    mach_voucher_t got = MACH_PORT_NULL;
+    if (thread_get_mach_voucher(mach_thread_self(), 0, &got) || got == MACH_PORT_NULL) return bad("its voucher back", 0, 1);
+    thread_set_mach_voucher(mach_thread_self(), MACH_PORT_NULL);
+    if (thread_get_mach_voucher(mach_thread_self(), 0, &got) || got != MACH_PORT_NULL) return bad("its voucher cleared", got, 0);
 
     // A child.
     int p1[2], p2[2];
