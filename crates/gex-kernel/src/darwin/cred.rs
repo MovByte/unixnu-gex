@@ -162,6 +162,7 @@ impl Kernel {
         self.creds.set_uid(c.uid);
         self.creds.set_gid(c.gid());
         self.procs.set_uid(self.pid, c.ruid);
+        self.darwin_publish();
     }
 
     /// The credential calls; none for another call.

@@ -222,6 +222,8 @@ pub struct RunOptions {
     /// section, slid): the kernel records it at exec, as task_info
     /// (TASK_DYLD_INFO) reports it.
     pub darwin_dyld_infos: u64,
+    /// The section's size.
+    pub darwin_dyld_infos_size: u64,
     /// `GEX_DARWIN_STRICT=1`: stop at the first thing the Darwin kernel
     /// does not do.
     pub darwin_strict: bool,
@@ -249,6 +251,7 @@ impl Default for RunOptions {
             darwin: false,
             darwin_cache: None,
             darwin_dyld_infos: 0,
+            darwin_dyld_infos_size: 0,
             darwin_strict: false,
             darwin_platform: (0, 0),
             darwin_code_signature: None,
@@ -1162,12 +1165,15 @@ fn run_program_with(
         // The run's first process: of the user it runs as.
         kernel.dtask.cred = gex_kernel::darwin::cred::Cred::of(uid, gid);
         kernel.dtask.uniqueid = gex_kernel::darwin::next_uniqueid();
+        kernel.dtask.start = gex_kernel::darwin::procinfo::microtime();
         kernel.darwin_cred_tokens();
     }
     if opts.darwin {
         kernel.darwin_use_pages();
     }
     kernel.darwin_dyld_infos = opts.darwin_dyld_infos;
+    kernel.darwin_dyld_infos_size = opts.darwin_dyld_infos_size;
+    kernel.darwin_dyld_final = false;
     kernel.dtask.strict = opts.darwin_strict;
     kernel.dtask.platform = opts.darwin_platform;
     // An exec takes the next pidversion (`proc_setpidversion`).
@@ -2844,6 +2850,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         if child.darwin {
             child.darwin_signals_init();
             child.darwin_ipc_leave();
+            child.darwin_publish();
         }
         (child, regions, store.as_context().data().thread.ctx_addr)
     };
@@ -3660,6 +3667,7 @@ fn run_darwin_image(
         darwin_stacksize: loaded.stacksize,
         darwin_dylinker: loaded.dylinker,
         darwin_dyld_infos: loaded.dyld_infos,
+        darwin_dyld_infos_size: loaded.dyld_infos_size,
         ..opts.clone()
     };
     match run_program_with(&loaded.program, &opts, xlate, Some(Inherited { kernel, proc_state, wayland })) {
@@ -4524,7 +4532,7 @@ fn place_image(
                     exe_path: &path,
                     file_start: exec.as_ref().map_or(0, |i| i.arch_offset),
                     code_signature: opts.darwin_code_signature.as_deref(),
-                    signature: exec.as_ref().map(|i| (i.sig.clone(), i.load_csflags, i.uuid)),
+                    signature: exec.as_ref().map(|i| i.load.clone()),
                     nano: exec.as_ref().and_then(|i| i.spawn.as_ref()).is_some_and(|sp| sp.flags & gex_kernel::darwin::spawn::flag::NANO_ALLOCATOR != 0),
                 };
                 k.darwin_start(exec.map(|i| i.strings), &loaded, gex_abi::STACK_TOP)

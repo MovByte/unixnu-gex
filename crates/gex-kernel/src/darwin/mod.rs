@@ -47,6 +47,7 @@ pub mod mk_timer;
 pub mod mwl;
 pub mod pipe;
 pub mod priority;
+pub mod procinfo;
 pub mod psynch;
 pub mod rlimit;
 pub mod sandbox;
@@ -153,6 +154,13 @@ pub struct Task {
     pub uniqueid: u64,
     pub puniqueid: u64,
     pub uuid: [u8; 16],
+    /// `p_cputype`, `p_cpusubtype`: its image's.
+    pub cputype: (u32, u32),
+    /// `p_start`: when its fork made it.
+    pub start: (u64, u64),
+    /// The ids and start time a fork chose for its child, for the child's
+    /// task to take.
+    pub fork_ids: std::sync::Mutex<Option<(u64, i32, (u64, u64))>>,
     /// The process's credential (`p_ucred`'s POSIX part) and `P_SUGID`.
     pub cred: cred::Cred,
     pub sugid: bool,
@@ -209,7 +217,7 @@ pub struct Task {
 impl Task {
     /// A new process's task: it takes the next pidversion.
     pub fn new_process() -> Task {
-        Task { pidversion: next_pidversion(), uniqueid: next_uniqueid(), ..Default::default() }
+        Task { pidversion: next_pidversion(), uniqueid: next_uniqueid(), start: procinfo::microtime(), ..Default::default() }
     }
 }
 

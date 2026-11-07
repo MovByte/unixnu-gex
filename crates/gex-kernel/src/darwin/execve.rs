@@ -59,12 +59,8 @@ pub struct Image {
     pub strings: Strings,
     /// A spawn's, what the child takes after its switch.
     pub spawn: Option<super::spawn::After>,
-    /// The image's signature as its load added it, and the load's code
-    /// signing flags ([`Kernel::darwin_load_signatures`]).
-    pub sig: Option<std::sync::Arc<super::codesign::CodeSign>>,
-    pub load_csflags: u32,
-    /// The image's LC_UUID.
-    pub uuid: [u8; 16],
+    /// What the image's load left ([`Kernel::darwin_load_signatures`]).
+    pub load: super::codesign::LoadResult,
 }
 
 /// An activator's answer: `-1`, `-2`, `-3`, or the image claimed.
@@ -271,8 +267,8 @@ impl Kernel {
         let bytes = self.read_file(&img.path).ok_or(Errno::EIO)?;
         let size = if img.arch_size != 0 { img.arch_size } else { bytes.len() as u64 };
         let slice = bytes.get(img.arch_offset as usize..(img.arch_offset + size) as usize).ok_or(ebadmacho())?;
-        let (sig, load_csflags, uuid) = self.darwin_load_signatures(&img.path, img.arch_offset, slice)?;
-        Ok(Image { path: img.path, arch_offset: img.arch_offset, arch_size: img.arch_size, cputype: img.origcputype, cpusubtype: img.origcpusubtype, strings: img.strings, spawn: None, sig, load_csflags, uuid })
+        let load = self.darwin_load_signatures(&img.path, img.arch_offset, slice)?;
+        Ok(Image { path: img.path, arch_offset: img.arch_offset, arch_size: img.arch_size, cputype: img.origcputype, cpusubtype: img.origcpusubtype, strings: img.strings, spawn: None, load })
     }
 
     /// `namei` of the saved path, links followed, then
@@ -488,9 +484,10 @@ impl Kernel {
             said: old.said,
             // p_csflags: the exec's own, made at its start from these.
             csflags: old.csflags,
-            // An exec's process keeps its unique ids.
+            // An exec's process keeps its unique ids and start time.
             uniqueid: old.uniqueid,
             puniqueid: old.puniqueid,
+            start: old.start,
             // exec_handle_sugid: the credential kept (set-id images are not
             // honored on a release kernel), P_SUGID cleared, the saved ids
             // the effective ones.

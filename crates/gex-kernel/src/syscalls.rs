@@ -713,6 +713,9 @@ pub struct Kernel {
     /// Where a Darwin process's dyld keeps its image list
     /// (`dyld_all_image_infos`), once it has said: 0 before.
     pub darwin_dyld_infos: u64,
+    /// Its size, and TF_DYLD_ALL_IMAGE_FINAL: dyld has moved it once.
+    pub darwin_dyld_infos_size: u64,
+    pub darwin_dyld_final: bool,
     /// A Darwin process's threads, waits and IPC.
     pub dtask: crate::darwin::Task,
     /// The register the current Darwin call's arguments start at: x1 for
@@ -9080,6 +9083,8 @@ impl Kernel {
             darwin: false,
             darwin_region: (0, 0),
             darwin_dyld_infos: 0,
+            darwin_dyld_infos_size: 0,
+            darwin_dyld_final: false,
             // A new process takes the next pidversion (`forkproc`).
             dtask: crate::darwin::Task::new_process(),
             darwin_arg_base: 0,
@@ -9487,7 +9492,11 @@ impl Kernel {
             compat: self.compat,
             darwin: self.darwin,
             darwin_region: self.darwin_region,
-            darwin_dyld_infos: 0,
+            // task_create_internal: a fork's task has its parent's dyld
+            // image info range (an exec's replaces it).
+            darwin_dyld_infos: self.darwin_dyld_infos,
+            darwin_dyld_infos_size: self.darwin_dyld_infos_size,
+            darwin_dyld_final: false,
             // A new process takes the next pidversion (`forkproc`).
             // forkproc: a Darwin process's child takes what XNU copies.
             dtask: if self.darwin { self.darwin_fork_task() } else { crate::darwin::Task::new_process() },

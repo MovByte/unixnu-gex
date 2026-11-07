@@ -20,6 +20,8 @@ pub struct DarwinImage {
     /// dyld's `dyld_all_image_infos` (its `__all_image_info`, slid): what
     /// the kernel records as the task's dyld info.
     pub dyld_infos: u64,
+    /// Its size (`load_result.all_image_info_size`).
+    pub dyld_infos_size: u64,
 }
 
 /// dyld goes above the program, on a 16 MiB boundary.
@@ -37,7 +39,7 @@ pub fn load(bytes: &[u8], name: &str, read: &dyn Fn(&str) -> Result<Vec<u8>>) ->
         Some(gex_ld::macho::Entry::Main { stacksize, .. }) => *stacksize,
         _ => 0,
     };
-    let mut dyld_infos = 0;
+    let (mut dyld_infos, mut dyld_infos_size) = (0, 0);
     let interp = match &m.dylinker {
         None => None,
         Some(dyld) => {
@@ -48,6 +50,7 @@ pub fn load(bytes: &[u8], name: &str, read: &dyn Fn(&str) -> Result<Vec<u8>>) ->
             let (dm, di) = gex_ld::macho::load(&dbytes, dyld_base(&exe)).with_context(|| format!("loading {dyld}"))?;
             if let Some(s) = dm.section("__DATA_DIRTY", "__all_image_info").or_else(|| dm.section("__DATA", "__all_image_info")) {
                 dyld_infos = s.addr.wrapping_add(di.bias);
+                dyld_infos_size = s.size;
             }
             Some(di)
         }
@@ -59,5 +62,6 @@ pub fn load(bytes: &[u8], name: &str, read: &dyn Fn(&str) -> Result<Vec<u8>>) ->
         stacksize,
         dylinker: m.dylinker.clone(),
         dyld_infos,
+        dyld_infos_size,
     })
 }

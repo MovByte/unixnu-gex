@@ -260,6 +260,9 @@ struct Proc {
     /// Started by the host as a child of the virtual init, which the host
     /// collects (with `wait` as pid 1) rather than the table at its exit.
     host_child: bool,
+    /// A Darwin process's own record (`crate::darwin::procinfo::Public`),
+    /// which other processes read until it is reaped.
+    darwin: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 /// Another process's memory as a host holds it: bytes at a guest address,
@@ -433,6 +436,7 @@ impl ProcTable {
                     info: Vec::new(),
                     vm: None,
                     host_child: false,
+                    darwin: None,
                 }],
             }),
         };
@@ -503,6 +507,7 @@ impl ProcTable {
             info: Vec::new(),
             vm: None,
             host_child,
+            darwin: None,
         });
         drop(t);
         // forkproc's memorystatus init, then memorystatus_add.
@@ -970,6 +975,21 @@ impl ProcTable {
         (t.procs.len(), t.procs.iter().filter(|p| p.uid == uid).count())
     }
 
+    /// Set process `pid`'s Darwin record.
+    pub fn set_darwin(&self, pid: i32, r: Arc<dyn std::any::Any + Send + Sync>) {
+        if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
+            p.darwin = Some(r);
+        }
+    }
+
+    /// Process `pid`'s Darwin record, a zombie's too, and whether it is one.
+    pub fn darwin(&self, pid: i32) -> Option<(Arc<dyn std::any::Any + Send + Sync>, bool)> {
+        let t = self.lock();
+        let p = t.procs.iter().find(|p| p.pid == pid)?;
+        let zombie = !p.child.status.lock().map(|s| s.is_none()).unwrap_or(false);
+        p.darwin.clone().map(|r| (r, zombie))
+    }
+
     pub fn live_nice(&self, pid: i32) -> Option<(u32, i32)> {
         let t = self.lock();
         let p = t.procs.iter().find(|p| p.pid == pid)?;
@@ -1006,6 +1026,16 @@ impl ProcTable {
     }
 
     /// Mark `pid` as having exec'd (`P_EXEC`).
+    /// `P_EXEC`: `pid` has exec'd since its fork.
+    pub fn execed(&self, pid: i32) -> bool {
+        self.lock().procs.iter().find(|p| p.pid == pid).is_some_and(|p| p.execed)
+    }
+
+    /// Group `pgid`'s `pg_jobc`.
+    pub fn jobc(&self, pgid: i32) -> i32 {
+        self.lock().jobc.get(&pgid).copied().unwrap_or(0)
+    }
+
     pub fn set_execed(&self, pid: i32) {
         if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
             p.execed = true;

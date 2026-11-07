@@ -394,6 +394,27 @@ impl OpenFile {
 struct Table {
     entries: Vec<Option<Arc<OpenFile>>>,
     cloexec: Vec<bool>,
+    /// XNU's `fd_nfiles`, the size its descriptor array has grown to (a
+    /// Darwin process's `proc_bsdinfo` reports it; Linux has no use for it).
+    nfiles: usize,
+}
+
+/// XNU's `NDFILE` and `NDEXTENT`.
+const NDFILE: usize = 25;
+const NDEXTENT: usize = 50;
+
+impl Table {
+    /// `fdalloc`'s growth to hold descriptor `fd`: to NDEXTENT, then
+    /// doubling, never past the limit.
+    fn grow_to(&mut self, fd: usize, limit: usize) {
+        while fd >= self.nfiles {
+            let n = if self.nfiles < NDEXTENT { NDEXTENT } else { 2 * self.nfiles }.min(limit);
+            if n <= self.nfiles {
+                break;
+            }
+            self.nfiles = n;
+        }
+    }
 }
 
 /// How many reader slots a table's epoch array has: one per Worker of the
@@ -452,8 +473,15 @@ impl Clone for FdTable {
 }
 
 impl FdTable {
+    /// A new process's table: its creator's copy of an empty one
+    /// (`fdt_fork`'s NDFILE slots).
     pub fn new() -> FdTable {
-        FdTable::from_parts(Table::default(), 0, NOFILE_SOFT)
+        FdTable::from_parts(Table { nfiles: NDFILE, ..Table::default() }, 0, NOFILE_SOFT)
+    }
+
+    /// XNU's `fd_nfiles`.
+    pub fn nfiles(&self) -> usize {
+        self.read(|t| t.nfiles)
     }
 
     fn from_parts(t: Table, generation: u64, limit: usize) -> FdTable {
@@ -539,6 +567,7 @@ impl FdTable {
             };
             t.entries[idx] = Some(file);
             t.cloexec[idx] = cloexec;
+            t.grow_to(idx, limit);
             Ok(idx as u64)
         })
     }
@@ -555,6 +584,7 @@ impl FdTable {
             return Err(Errno::EBADF);
         }
         let fd = fd as usize;
+        let limit = self.limit();
         self.update(|t| {
             while t.entries.len() <= fd {
                 t.entries.push(None);
@@ -562,6 +592,7 @@ impl FdTable {
             }
             t.entries[fd] = Some(file);
             t.cloexec[fd] = cloexec;
+            t.grow_to(fd, limit);
             Ok::<_, Errno>(fd as u64)
         })
     }
@@ -689,8 +720,16 @@ impl FdTable {
 
     /// Duplicate the table, sharing every open-file description. This is what
     /// `fork` needs: the child sees the same offsets.
+    /// A fork's copy (`fdt_fork`): the descriptors, in an array of NDFILE
+    /// slots, or as many NDEXTENTs as reach past the last open one.
     pub fn clone_table(&self) -> FdTable {
-        self.clone()
+        let c = self.clone();
+        let _ = c.update(|t| {
+            let afterlast = t.entries.iter().rposition(Option::is_some).map_or(0, |i| i + 1);
+            t.nfiles = if afterlast <= NDFILE { NDFILE } else { afterlast.div_ceil(NDEXTENT) * NDEXTENT };
+            Ok::<_, ()>(())
+        });
+        c
     }
 }
 

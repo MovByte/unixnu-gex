@@ -551,59 +551,6 @@ impl Kernel {
     }
 
     /// `proc_info(callnum, pid, flavor, arg, buffer, buffersize)`.
-    fn darwin_proc_info(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
-        const CALL_PIDINFO: u64 = 2;
-        const CALL_DIRTYCONTROL: u64 = 8;
-        const CALL_SET_DYLD_IMAGES: u64 = 15;
-        const PIDPATHINFO: u64 = 11;
-        const UNIQIDENTIFIERINFO: u64 = 17;
-        let (call, pid, flavor, buf, size) = (a[0], a[1] as i32, a[2] as u32 as u64, a[4], a[5] as u32 as usize);
-        let me = pid == self.pid || pid == 0;
-        match (call, flavor) {
-            (CALL_DIRTYCONTROL, _) => self.darwin_dirtycontrol(pid, flavor as u32, a[3]),
-            // dyld says where its image list is (`buf`, `size` bytes),
-            // which task_info(TASK_DYLD_INFO) reports from then on.
-            (CALL_SET_DYLD_IMAGES, _) if me => {
-                if buf == 0 || size == 0 {
-                    return Err(Errno::EINVAL);
-                }
-                self.darwin_dyld_infos = buf;
-                Ok(0)
-            }
-            // proc_uniqidentifierinfo (56 bytes): the image's UUID, the
-            // process's unique id and its parent's, its pidversion.
-            (CALL_PIDINFO, UNIQIDENTIFIERINFO) if me => {
-                const SIZE: usize = 56;
-                if size < SIZE {
-                    return Err(Errno::ENOMEM);
-                }
-                let mut b = [0u8; SIZE];
-                b[..16].copy_from_slice(&self.dtask.uuid);
-                b[16..24].copy_from_slice(&self.dtask.uniqueid.to_le_bytes());
-                b[24..32].copy_from_slice(&self.dtask.puniqueid.to_le_bytes());
-                b[32..36].copy_from_slice(&self.dtask.pidversion.to_le_bytes());
-                m.write(buf, &b)?;
-                Ok(SIZE as u64)
-            }
-            // proc_pidpath: the program's path.
-            (CALL_PIDINFO, PIDPATHINFO) if me => {
-                let mut p = self.exe_path.clone().into_bytes();
-                p.push(0);
-                if size < p.len() {
-                    return Err(Errno::ENOMEM);
-                }
-                m.write(buf, &p)?;
-                Ok(p.len() as u64 - 1)
-            }
-            _ => {
-                if self.trace {
-                    eprintln!("[gex:{}] proc_info call {call} flavor {flavor} pid {pid} is not answered", self.pid);
-                }
-                Err(Errno::EOPNOTSUPP)
-            }
-        }
-    }
-
     /// `fsgetpath(buf, size, fsid, objid)`: the path of a file named by its
     /// filesystem and object ids. Only the shared cache is named so.
     fn darwin_fsgetpath(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {

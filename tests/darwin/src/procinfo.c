@@ -1,0 +1,105 @@
+// proc_pidinfo of this process and of a child: the BSD info (its ids,
+// parent, name, status, flags, descriptor table size), the short form,
+// the path, architecture and platform. A spawned child's descriptor table
+// starts at NDFILE (25) slots and grows to NDEXTENT (50) for descriptor 30
+// (xnu-10063's sizing; later kernels size it otherwise);
+// once it has exited and before it is reaped, its BSD info is found only
+// when zombies are asked for (SZOMB), and is ESRCH otherwise.
+
+#include <errno.h>
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <signal.h>
+#include <spawn.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+extern char **environ;
+int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buffersize);
+int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
+
+struct bsdinfo {
+    uint32_t flags, status, xstatus, pid, ppid, uid, gid, ruid, rgid, svuid, svgid, rfu;
+    char comm[16];
+    char name[32];
+    uint32_t nfiles, pgid, pjobc, tdev, tpgid;
+    int32_t nice;
+    uint64_t start_sec, start_usec;
+};
+
+struct shortinfo {
+    uint32_t pid, ppid, pgid, status;
+    char comm[16];
+    uint32_t flags, uid, gid, ruid, rgid, svuid, svgid, rfu;
+};
+
+static int bad(const char *what, long got, long want) {
+    printf("procinfo: %s: %#lx, want %#lx\n", what, got, want);
+    return 1;
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1) {
+        // The child: descriptor 30, then wait for the parent.
+        int in = atoi(argv[1]), out = atoi(argv[2]);
+        dup2(0, 30);
+        char c = 1;
+        write(out, &c, 1);
+        read(in, &c, 1);
+        return 7;
+    }
+    struct bsdinfo b;
+    if (proc_pidinfo(getpid(), 3, 0, &b, sizeof b) != sizeof b) return bad("PROC_PIDTBSDINFO", errno, 0);
+    if (b.pid != (uint32_t)getpid() || b.ppid != (uint32_t)getppid() || b.status != 2) return bad("its pid, parent, status", b.status, 2);
+    if (b.uid != geteuid() || b.ruid != getuid() || b.gid != getegid() || b.rgid != getgid() || b.svuid != geteuid()) return bad("its ids", b.uid, geteuid());
+    if ((b.flags & 0x10) == 0 || (b.flags & 0x4000) == 0) return bad("its flags (LP64, EXEC)", b.flags, 0x4010);
+    const char *base = strrchr(argv[0], '/') ? strrchr(argv[0], '/') + 1 : argv[0];
+    if (strncmp(b.comm, base, 15) || b.comm[15]) return bad("its name", 0, 1);
+    if (b.pgid != (uint32_t)getpgrp() || b.start_sec == 0 || b.nfiles < 25) return bad("its group, start, table", b.nfiles, 25);
+    struct shortinfo s;
+    if (proc_pidinfo(getpid(), 13, 0, &s, sizeof s) != sizeof s || s.pid != b.pid || s.ppid != b.ppid || s.flags != b.flags || strcmp(s.comm, b.comm)) return bad("PROC_PIDT_SHORTBSDINFO", s.flags, b.flags);
+    if (proc_pidinfo(getpid(), 3, 0, &b, sizeof b - 1) != 0 || errno != ENOMEM) return bad("a short buffer", errno, ENOMEM);
+    char path[1024];
+    if (proc_pidpath(getpid(), path, sizeof path) <= 0 || !strstr(path, base)) return bad("its path", errno, 0);
+    uint32_t arch[2];
+    if (proc_pidinfo(getpid(), 19, 0, arch, sizeof arch) != sizeof arch || arch[0] != 0x100000c) return bad("its architecture", arch[0], 0x100000c);
+    // Its platform: its LC_BUILD_VERSION's.
+    uint32_t want = 0, plat = 0;
+    const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(0);
+    const struct load_command *lc = (const struct load_command *)(mh + 1);
+    for (uint32_t i = 0; i < mh->ncmds; i++, lc = (const struct load_command *)((const char *)lc + lc->cmdsize))
+        if (lc->cmd == LC_BUILD_VERSION) want = ((const struct build_version_command *)lc)->platform;
+    if (proc_pidinfo(getpid(), 30, 0, &plat, sizeof plat) != sizeof plat || plat != want) return bad("its platform", plat, want);
+    if (proc_pidinfo(99999, 3, 0, &b, sizeof b) != 0 || errno != ESRCH) return bad("no such process", errno, ESRCH);
+
+    // A child.
+    int p1[2], p2[2];
+    pipe(p1);
+    pipe(p2);
+    char a1[16], a2[16];
+    snprintf(a1, sizeof a1, "%d", p1[0]);
+    snprintf(a2, sizeof a2, "%d", p2[1]);
+    char *args[] = {argv[0], a1, a2, NULL};
+    pid_t pid;
+    if (posix_spawn(&pid, argv[0], NULL, NULL, args, environ)) return bad("spawn", errno, 0);
+    char c;
+    read(p2[0], &c, 1);
+    struct bsdinfo cb;
+    if (proc_pidinfo(pid, 3, 0, &cb, sizeof cb) != sizeof cb) return bad("the child's info", errno, 0);
+    if (cb.ppid != (uint32_t)getpid() || cb.nfiles != 50 || cb.status != 2) return bad("the child's parent and table", cb.nfiles, 50);
+    struct shortinfo cs;
+    if (proc_pidinfo(pid, 13, 0, &cs, sizeof cs) != sizeof cs || cs.ppid != (uint32_t)getpid()) return bad("the child's short info", cs.ppid, getpid());
+    write(p1[1], &c, 1);
+    siginfo_t si;
+    if (waitid(P_PID, pid, &si, WEXITED | WNOWAIT)) return bad("waitid", errno, 0);
+    if (proc_pidinfo(pid, 3, 0, &cb, sizeof cb) != 0 || errno != ESRCH) return bad("a zombie without asking", errno, ESRCH);
+    if (proc_pidinfo(pid, 3, 1, &cb, sizeof cb) != sizeof cb || cb.status != 5) return bad("the zombie", cb.status, 5);
+    int st;
+    waitpid(pid, &st, 0);
+    printf("procinfo ok\n");
+    return 0;
+}

@@ -369,6 +369,17 @@ pub fn range_codesigned(vnode: (u64, u64), start: u64, size: u64) -> bool {
     lo <= start && start + size <= hi
 }
 
+/// What `load_machfile` leaves of an image for its exec: its signature as
+/// added, the load's code signing flags, its LC_UUID, its CPU type and
+/// subtype.
+#[derive(Clone, Debug, Default)]
+pub struct LoadResult {
+    pub sig: Option<std::sync::Arc<CodeSign>>,
+    pub csflags: u32,
+    pub uuid: [u8; 16],
+    pub cputype: (u32, u32),
+}
+
 /// `CS_MAX_BLOB_SIZE`.
 const CS_MAX_BLOB_SIZE: u64 = 40 * 1024 * 1024;
 
@@ -467,7 +478,7 @@ impl Kernel {
     /// the load's failure (EBADEXEC). The image's signature and the load's
     /// code signing flags: CS_NO_UNTRUSTED_HELPERS unless the dylinker is
     /// not platform code, and the blob's flags; and the image's UUID.
-    pub(crate) fn darwin_load_signatures(&mut self, path: &str, file_start: u64, slice: &[u8]) -> Result<(Option<std::sync::Arc<CodeSign>>, u32, [u8; 16]), crate::errno::Errno> {
+    pub(crate) fn darwin_load_signatures(&mut self, path: &str, file_start: u64, slice: &[u8]) -> Result<LoadResult, crate::errno::Errno> {
         use super::amfi::cs;
         let m = gex_ld::macho::parse(slice).map_err(|_| super::errno::EBADMACHO)?;
         let mut flags = cs::NO_UNTRUSTED_HELPERS;
@@ -496,8 +507,8 @@ impl Kernel {
                 flags &= !cs::NO_UNTRUSTED_HELPERS;
             }
         }
-        // load_result.uuid: the image's LC_UUID.
-        Ok((sig, flags, m.uuid.unwrap_or_default()))
+        let le = |o: usize| slice.get(o..o + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
+        Ok(LoadResult { sig, csflags: flags, uuid: m.uuid.unwrap_or_default(), cputype: (le(4), le(8)) })
     }
 
     /// `mac_proc_check_launch_constraints` (AMFI's): the image's trust cache

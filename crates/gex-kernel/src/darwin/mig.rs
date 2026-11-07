@@ -304,7 +304,7 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         (Kobject::Task | Kobject::TaskRead | Kobject::TaskInspect | Kobject::TaskName, 3405) => match (arg(req, 0), arg(req, 1)) {
             (Some(17), Some(_)) if matches!(obj, Kobject::TaskName | Kobject::TaskInspect) => Reply::err(KERN_INVALID_ARGUMENT),
             (Some(17), Some(_)) if matches!(obj, Kobject::TaskRead) && !k.darwin_read_conversion_ok() => Reply::err(KERN_INVALID_ARGUMENT),
-            (Some(flavor), Some(count)) => task_info(flavor, count as u32, k.darwin_dyld_infos, k.darwin_audit_token()),
+            (Some(flavor), Some(count)) => task_info(flavor, count as u32, (k.darwin_dyld_infos, k.darwin_dyld_infos_size), k.darwin_audit_token()),
             _ => bad(),
         },
         // task_get_special_port(task, which) -> port
@@ -590,14 +590,13 @@ fn host_info(flavor: i32, count: u32) -> Reply {
 }
 
 /// `task_info`, with the caller's count checked as XNU checks it.
-fn task_info(flavor: i32, count: u32, dyld_infos: u64, audit: [u32; 8]) -> Reply {
+fn task_info(flavor: i32, count: u32, dyld_infos: (u64, u64), audit: [u32; 8]) -> Reply {
     const TASK_AUDIT_TOKEN: i32 = 15;
     const TASK_AUDIT_TOKEN_COUNT: u32 = 8;
     const TASK_DYLD_INFO: i32 = 17;
     const TASK_DYLD_INFO_COUNT: u32 = 5;
     const TASK_LEGACY_DYLD_INFO_COUNT: u32 = 4;
     /// `sizeof(struct dyld_all_image_infos)` for a 64-bit process.
-    const ALL_IMAGE_INFOS_SIZE: u32 = 0x170;
     match flavor {
         // all_image_info_addr and all_image_info_size (8 bytes each), and
         // with room all_image_info_format (TASK_DYLD_ALL_IMAGE_INFO_64).
@@ -605,9 +604,8 @@ fn task_info(flavor: i32, count: u32, dyld_infos: u64, audit: [u32; 8]) -> Reply
             if count < TASK_LEGACY_DYLD_INFO_COUNT {
                 return Reply::err(KERN_INVALID_ARGUMENT);
             }
-            let a = dyld_infos;
-            let size = if a == 0 { 0 } else { ALL_IMAGE_INFOS_SIZE };
-            let mut w = vec![a as u32, (a >> 32) as u32, size, 0];
+            let (a, size) = dyld_infos;
+            let mut w = vec![a as u32, (a >> 32) as u32, size as u32, (size >> 32) as u32];
             if count >= TASK_DYLD_INFO_COUNT {
                 w.push(1);
             }

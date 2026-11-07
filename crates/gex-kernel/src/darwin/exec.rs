@@ -314,7 +314,7 @@ pub struct Loaded<'a> {
     /// An exec's image's signature as its load added it and the load's
     /// code signing flags; none for the run's first program, whose load is
     /// done here.
-    pub signature: Option<(Option<std::sync::Arc<super::codesign::CodeSign>>, u32, [u8; 16])>,
+    pub signature: Option<super::codesign::LoadResult>,
     /// `_POSIX_SPAWN_NANO_ALLOCATOR` among a spawn's flags.
     pub nano: bool,
 }
@@ -439,7 +439,7 @@ impl Kernel {
     fn darwin_start_body(&mut self, strings: Option<Strings>, l: &Loaded, user_stack: u64) -> Result<MainStack, Errno> {
         // The image's code signing flags and its credential's
         // entitlements; the policy's refusal kills the exec.
-        let (sig, load, uuid) = match l.signature.clone() {
+        let lr = match l.signature.clone() {
             Some(s) => s,
             None => {
                 let bytes = self.read_file(l.exe_path).ok_or(Errno::EIO)?;
@@ -449,15 +449,17 @@ impl Kernel {
             }
         };
         self.dtask.textoff = l.file_start as i64;
-        // p_uuid: the image's.
-        self.dtask.uuid = uuid;
-        if let Err(why) = self.darwin_exec_csflags(sig, load) {
+        // p_uuid, p_cputype and p_cpusubtype: the image's.
+        self.dtask.uuid = lr.uuid;
+        self.dtask.cputype = lr.cputype;
+        if let Err(why) = self.darwin_exec_csflags(lr.sig, lr.csflags) {
             if self.trace {
                 eprintln!("[gex:{}] AMFI: killing {}: {why}", self.pid, l.exe_path);
             }
             return Err(Errno::EPERM);
         }
         self.darwin_launch_constraints()?;
+        self.darwin_publish();
         // The image's entitlements that raise its default memory limit.
         self.darwin_jetsam_entitlements();
         self.darwin_vm_policies();
@@ -470,6 +472,9 @@ impl Kernel {
         let mut s = match strings {
             Some(s) => s,
             None => {
+                // The run's first program is exec'd as XNU execs its first
+                // process (load_init_program): P_EXEC.
+                self.procs.set_execed(self.pid);
                 let mut s = Strings::new();
                 s.save_path(l.exe_path.as_bytes())?;
                 s.extract_kernel(&self.argv.clone(), &self.envp.clone())?;

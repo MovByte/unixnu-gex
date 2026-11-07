@@ -213,12 +213,19 @@ impl Kernel {
             // entitlements, and its code signing flags but CS_KILLED.
             codesign: t.codesign.clone(),
             textoff: t.textoff,
+            cputype: t.cputype,
+            uuid: t.uuid,
             // forkproc: the credential, and P_SUGID with the flags it keeps.
-            puniqueid: t.uniqueid,
             cred: t.cred.clone(),
             sugid: t.sugid,
             csflags: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(t.csflags.load(std::sync::atomic::Ordering::Acquire) & !super::amfi::cs::KILLED)),
-            ..super::Task::new_process()
+            puniqueid: t.uniqueid,
+            // The ids and start time a fork chose for its child; a spawn's
+            // child takes new ones.
+            ..match t.fork_ids.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                Some((uniqueid, pidversion, start)) => super::Task { uniqueid, pidversion, start, ..super::Task::default() },
+                None => super::Task::new_process(),
+            }
         }
     }
 
@@ -256,6 +263,9 @@ impl Kernel {
         let mapped: Vec<(u64, u64)> = self.mem.lock().vmas().iter().map(|v| (v.start, v.end)).collect();
         self.dtask.vm.fork(&mapped);
         let pid = self.procs.spawn(self.pid);
+        // forkproc's ids and start time for the child, which its task takes.
+        let ids = (super::next_uniqueid(), super::next_pidversion(), super::procinfo::microtime());
+        *self.dtask.fork_ids.lock().unwrap_or_else(|e| e.into_inner()) = Some(ids);
         // The child runs this image: its entitlements are these.
         let mut j = self.procs.jetsam();
         if let Some(e) = j.get(self.pid).map(|p| p.entitled) {
@@ -423,6 +433,7 @@ impl Kernel {
         child.pid = pid;
         child.tid = pid;
         child.forget_own_pidfds();
+        child.darwin_publish();
         match self.darwin_spawn_child(m, &mut child, attr.as_ref(), file_actions.as_deref(), port_actions.as_deref(), path, argv, envv) {
             Ok(()) => Ok(Spawned::Child(Box::new(child))),
             Err(e) => {
@@ -480,7 +491,7 @@ impl Kernel {
             }
         }
         // The image's signature, as its load added it.
-        child.dtask.codesign = img.sig.as_deref().cloned();
+        child.dtask.codesign = img.load.sig.as_deref().cloned();
         // exec_handle_exception_port_actions: now that the child's
         // signature is known, its exception ports as task_set_exception_ports
         // sets them (each held right consumed when set).
