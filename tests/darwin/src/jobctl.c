@@ -116,6 +116,19 @@ static int started(int fd) {
     return ok;
 }
 
+// Whether the child goes on ticking: output written after what was
+// already there, within three seconds, however slowly it runs.
+static int ticking(int fd) {
+    char c;
+    while (read(fd, &c, 1) == 1) {
+    }
+    for (int i = 0; i < 300; i++) {
+        if (read(fd, &c, 1) == 1) return 1;
+        usleep(10000);
+    }
+    return 0;
+}
+
 static int has(const char *buf, int n, char c) {
     return memchr(buf, c, n) != NULL;
 }
@@ -228,7 +241,7 @@ int main(int argc, char **argv) {
     pid = run("blocked", &out, &in, 0);
     started(out);
     kill(pid, SIGTSTP);
-    if (drain(out, 150, buf, sizeof buf) == 0) return bad("a masked SIGTSTP stopping", 0);
+    if (!ticking(out)) return bad("a masked SIGTSTP stopping", 0);
     if (waitpid(pid, &st, WUNTRACED | WNOHANG) != 0) return bad("a masked SIGTSTP reported", st);
     before = chlds;
     write(in, "u", 1);
@@ -244,7 +257,7 @@ int main(int argc, char **argv) {
     pid = run("tick", &out, NULL, POSIX_SPAWN_SETSID);
     started(out);
     kill(pid, SIGTSTP);
-    if (drain(out, 150, buf, sizeof buf) == 0 || waitpid(pid, &st, WUNTRACED | WNOHANG) != 0) return bad("SIGTSTP in an orphaned group", st);
+    if (!ticking(out) || waitpid(pid, &st, WUNTRACED | WNOHANG) != 0) return bad("SIGTSTP in an orphaned group", st);
     kill(pid, SIGSTOP);
     if (!stopped_by(pid, SIGSTOP)) return bad("SIGSTOP in an orphaned group", 0);
     // setpgid of a child that has exec'd.
