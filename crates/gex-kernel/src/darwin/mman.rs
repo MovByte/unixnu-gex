@@ -183,11 +183,7 @@ impl Kernel {
         if mapanon {
             // mac_proc_check_map_anon: AMFI's and Sandbox's say on a JIT
             // region (neither has one on another mapping).
-            if flags & JIT != 0 {
-                if self.darwin_mac_check_map_jit(u32::from(cur)) != 0 {
-                    return Err(Errno::EINVAL);
-                }
-                self.darwin_unimplemented("mmap MAP_JIT of an entitled process (its JIT region)".into());
+            if flags & JIT != 0 && self.darwin_mac_check_map_jit(u32::from(cur)) != 0 {
                 return Err(Errno::EINVAL);
             }
             // A descriptor carries VM flags: the tag, a superpage size.
@@ -263,16 +259,30 @@ impl Kernel {
         if !mapanon && size.checked_add(file_pos).is_none() {
             return Err(Errno::EINVAL);
         }
-        // vm_map_enter: VM_MAP_POLICY_WX_STRIP_X (no entry here is a JIT
-        // region).
-        if cur & prot::WRITE as u8 != 0 && cur & prot::EXECUTE as u8 != 0 {
+        // vm_map_enter: the map's one JIT region (an iOS map allows no
+        // second, VM_MAP_POLICY_ALLOW_MULTIPLE_JIT), at a random address
+        // (VM_MAP_POLICY_ALLOW_JIT_RANDOM_ADDRESS), writable and executable
+        // at once, and not inherited (VM_MAP_POLICY_ALLOW_JIT_INHERIT);
+        // execute stripped from any other writable mapping
+        // (VM_MAP_POLICY_WX_STRIP_X).
+        let jit = flags & JIT != 0;
+        if jit {
+            if self.dtask.vm.jit_entry_exists {
+                return Err(Errno::EINVAL);
+            }
+            let hint = self.darwin_random_address_for_size(size).map_err(|_| Errno::ENOMEM)?;
+            let (_, limit) = self.darwin_effective_range();
+            addr = self.darwin_find_space(hint, limit, size, 0).ok_or(Errno::ENOMEM)?;
+            attrs.inherit = inherit::NONE;
+            attrs.jit = true;
+        } else if cur & prot::WRITE as u8 != 0 && cur & prot::EXECUTE as u8 != 0 {
             cur &= !(prot::EXECUTE as u8);
         }
         attrs.max = maxprot;
 
         use crate::mem::flags as lf;
         let mut l = if flags & SHARED != 0 { lf::SHARED } else { lf::PRIVATE };
-        if flags & FIXED != 0 {
+        if flags & FIXED != 0 || jit {
             l |= lf::FIXED;
         }
         let (lfd, lpos) = if mapanon {
@@ -288,6 +298,9 @@ impl Kernel {
             Err(_) => return Err(Errno::EINVAL),
         };
         self.dtask.vm.set(at, at + size, attrs);
+        if jit {
+            self.dtask.vm.jit_entry_exists = true;
+        }
         Ok(at + pageoff)
     }
 
@@ -442,11 +455,9 @@ impl Kernel {
             self.dtask.vm.set(base, base + size, Attrs { kind: kind::SUBMAP, ..Attrs::default() });
         }
         // A JIT-entitled image (mac_proc_check_map_anon's MAP_JIT probe)
-        // gets a jumbo map and its single JIT region.
+        // gets a jumbo map; vm_map_set_jit_entitled's pmap_set_jit_entitled
+        // does nothing on a device without PPL.
         let jit = self.darwin_mac_check_map_jit(0) == 0;
-        if jit {
-            self.darwin_unimplemented("a JIT-entitled image's map (vm_map_set_jit_entitled)".into());
-        }
         let jumbo = jit || self.darwin_task_entitled("com.apple.developer.kernel.extended-virtual-addressing") || (super::memorystatus::ENTITLED_MAX_TASK_FOOTPRINT_MB != 0 && self.darwin_task_entitled("com.apple.developer.kernel.increased-memory-limit"));
         let mut max = if jumbo { vm::JUMBO_MAX } else { vm::MAP_MAX };
         let want = self.dtask.map_max & !PAGE_MASK;

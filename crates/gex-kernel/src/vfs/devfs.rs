@@ -409,7 +409,7 @@ impl FileHandle for DevDir {
 /// shared by the threads of this kernel, and every read mixes that counter
 /// in again. Not a cryptographic generator: the host's entropy is not
 /// reachable from here.
-fn fill_random(buf: &mut [u8]) {
+pub(crate) fn fill_random(buf: &mut [u8]) {
     use std::cell::Cell;
     use std::sync::atomic::{AtomicU64, Ordering};
     const GOLDEN: u64 = 0x9e37_79b9_7f4a_7c15;

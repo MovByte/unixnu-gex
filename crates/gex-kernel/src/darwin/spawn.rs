@@ -319,6 +319,11 @@ impl Kernel {
             let _ = super::set_result(m, self.ctx_addr, Errno::EAGAIN.as_return());
             return SyscallOutcome::Continue;
         }
+        if self.dtask.vm.inherits_jit() {
+            self.darwin_unimplemented("fork of an inherited JIT region (its copy's execute access taken from the child's pages)".into());
+            let _ = super::set_result(m, self.ctx_addr, Errno::EINVAL.as_return());
+            return SyscallOutcome::Continue;
+        }
         self.darwin_child_ports();
         let mapped: Vec<(u64, u64)> = self.mem.lock().vmas().iter().map(|v| (v.start, v.end)).collect();
         self.dtask.vm.fork(&mapped);

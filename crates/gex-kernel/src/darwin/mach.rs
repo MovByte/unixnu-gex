@@ -141,7 +141,7 @@ mod vmf {
     pub const USER_ALLOCATE: u64 = ANYWHERE | PURGABLE | CHUNK_4GB | RANDOM_ADDR | NO_CACHE | PERMANENT | OVERWRITE | SUPERPAGE_MASK | TPRO | ALIAS_MASK;
     pub const USER_MAP: u64 = USER_ALLOCATE | RETURN_4K_DATA_ADDR | RETURN_DATA_ADDR;
     /// What this kernel's VM does not do yet.
-    pub const UNDONE: u64 = PURGABLE | CHUNK_4GB | RANDOM_ADDR | PERMANENT | TPRO;
+    pub const UNDONE: u64 = PURGABLE | CHUNK_4GB | PERMANENT | TPRO;
 }
 
 /// `VM_PROT_*`.
@@ -818,8 +818,26 @@ impl Kernel {
                 Err(_) => kr::NO_SPACE,
             };
         }
-        // Anywhere: over-allocate by the alignment and trim.
         let mask = mask & !PAGE_MASK;
+        // vm_map_locate_space with VM_FLAGS_RANDOM_ADDR: from a random hint
+        // with room after it, the first fit.
+        if flags & vmf::RANDOM_ADDR != 0 {
+            let hint = match self.darwin_random_address_for_size(len) {
+                Ok(h) => h,
+                Err(k) => return k,
+            };
+            let (_, limit) = self.darwin_effective_range();
+            let Some(start) = self.darwin_find_space(hint, limit, len, mask) else { return kr::NO_SPACE };
+            return match self.canonical(m, nr::MMAP, [start, len, linux_prot, mf::PRIVATE | mf::ANONYMOUS | mf::FIXED, u64::MAX, 0]) {
+                Ok(_) => {
+                    self.dtask.vm.set(start, start + len, attrs);
+                    *addr = start;
+                    kr::SUCCESS
+                }
+                Err(_) => kr::NO_SPACE,
+            };
+        }
+        // Anywhere: over-allocate by the alignment and trim.
         let Some(want) = len.checked_add(mask) else { return kr::NO_SPACE };
         let at = match self.canonical(m, nr::MMAP, [0, want, linux_prot, mf::PRIVATE | mf::ANONYMOUS, u64::MAX, 0]) {
             Ok(at) => at,
@@ -836,6 +854,62 @@ impl Kernel {
         self.dtask.vm.set(start, start + len, attrs);
         *addr = start;
         kr::SUCCESS
+    }
+
+    /// The range a map's anywhere allocations are made in
+    /// (`vm_map_get_range` of a map without user ranges: from its first
+    /// page to its end), within the memory gex backs, its high arena.
+    pub(crate) fn darwin_effective_range(&self) -> (u64, u64) {
+        (gex_abi::HIGH_ARENA_BASE.max(PAGE_MASK + 1), self.darwin_map_max().min(gex_abi::LIMIT64))
+    }
+
+    /// `vm_map_random_address_for_size`: up to 1000 random page-aligned
+    /// addresses of the effective range (`random()`'s 31 bits in pages),
+    /// the first that starts a hole of `size` bytes; KERN_NO_SPACE without
+    /// one.
+    pub(crate) fn darwin_random_address_for_size(&self, size: u64) -> Result<u64, u64> {
+        const MAX_TRIES_TO_GET_RANDOM_ADDRESS: usize = 1000;
+        const VM_MAP_PAGE_SHIFT: u32 = 14;
+        let (min, max) = self.darwin_effective_range();
+        let space = max.saturating_sub(min);
+        if size >= space {
+            return Err(kr::NO_SPACE);
+        }
+        let space = space - size;
+        let map_max = self.darwin_map_max();
+        let mm = self.mem.lock();
+        let vmas = mm.vmas();
+        for _ in 0..MAX_TRIES_TO_GET_RANDOM_ADDRESS {
+            let mut b = [0u8; 4];
+            crate::vfs::devfs::fill_random(&mut b);
+            let r = u64::from(u32::from_le_bytes(b) & 0x7fff_ffff) << VM_MAP_PAGE_SHIFT;
+            let addr = (min + r % space) & !PAGE_MASK;
+            if mm.vma_at(addr).is_some() {
+                continue;
+            }
+            let hole_end = vmas.get(vmas.partition_point(|v| v.start <= addr)).map_or(map_max, |v| v.start);
+            if hole_end - addr >= size {
+                return Ok(addr);
+            }
+        }
+        Err(kr::NO_SPACE)
+    }
+
+    /// `vm_map_store_find_space` from `hint`: the first `size` bytes free
+    /// at or after it, aligned to `mask`, ending by `limit`.
+    pub(crate) fn darwin_find_space(&self, hint: u64, limit: u64, size: u64, mask: u64) -> Option<u64> {
+        let mm = self.mem.lock();
+        let mut at = hint.checked_add(mask)? & !mask;
+        loop {
+            let end = at.checked_add(size)?;
+            if end > limit {
+                return None;
+            }
+            match mm.vmas().iter().find(|v| v.start < end && at < v.end) {
+                Some(v) => at = v.end.checked_add(mask)? & !mask,
+                None => return Some(at),
+            }
+        }
     }
 
     /// `mach_vm_map` of anonymous memory, read and write.
@@ -874,7 +948,8 @@ impl Kernel {
 
     /// `mach_vm_protect` and `vm_map_protect`. Every page must be mapped
     /// and allow the protection; an iOS map strips execute from a writable
-    /// request (`VM_MAP_POLICY_WX_STRIP_X`: no entry here is a JIT region).
+    /// request (`VM_MAP_POLICY_WX_STRIP_X`) on each entry but its JIT
+    /// region (no `pmap_has_prot_policy` on a device without PPL).
     pub(crate) fn vm_protect(&mut self, m: &mut GuestMem<'_>, start: u64, size: u64, set_max: bool, new: u64) -> u64 {
         if start.checked_add(size).is_none() || new & !(prot::ALL | prot::COPY) != 0 {
             return kr::INVALID_ARGUMENT;
@@ -904,27 +979,35 @@ impl Kernel {
         if at < e {
             return kr::INVALID_ADDRESS;
         }
-        let mut new = new & prot::ALL;
-        if self.dtask.vm.pieces(s, e).iter().any(|(_, _, a)| new & u64::from(a.max) != new) {
+        let new = new & prot::ALL;
+        let pieces = self.dtask.vm.pieces(s, e);
+        if pieces.iter().any(|(_, _, a)| new & u64::from(a.max) != new) {
             return kr2::PROTECTION_FAILURE;
         }
-        if new & prot::WRITE != 0 && new & prot::EXECUTE != 0 {
-            new &= !prot::EXECUTE;
-        }
+        let wx = new & prot::WRITE != 0 && new & prot::EXECUTE != 0;
+        let entry_prot = |jit: bool| if wx && !jit { new & !prot::EXECUTE } else { new };
         if set_max {
             // The current protection keeps only what the new maximum allows.
             for (vs, ve, cur) in vmas {
-                if self.canonical(m, nr::MPROTECT, [vs, ve - vs, cur & new, 0, 0, 0]).is_err() {
-                    return kr::INVALID_ADDRESS;
+                for &(ps, pe, a) in pieces.iter().filter(|p| p.0 < ve && vs < p.1) {
+                    let (ps, pe) = (ps.max(vs), pe.min(ve));
+                    if self.canonical(m, nr::MPROTECT, [ps, pe - ps, cur & entry_prot(a.jit), 0, 0, 0]).is_err() {
+                        return kr::INVALID_ADDRESS;
+                    }
                 }
             }
-            self.dtask.vm.update(s, e, |a| a.max = new as u8);
+            for (ps, pe, a) in pieces {
+                let max = entry_prot(a.jit) as u8;
+                self.dtask.vm.update(ps, pe, |a| a.max = max);
+            }
             return kr::SUCCESS;
         }
-        match self.canonical(m, nr::MPROTECT, [s, e - s, new, 0, 0, 0]) {
-            Ok(_) => kr::SUCCESS,
-            Err(_) => kr::INVALID_ADDRESS,
+        for (ps, pe, a) in pieces {
+            if self.canonical(m, nr::MPROTECT, [ps, pe - ps, entry_prot(a.jit), 0, 0, 0]).is_err() {
+                return kr::INVALID_ADDRESS;
+            }
         }
+        kr::SUCCESS
     }
 
     /// `mach_vm_purgable_control` and `vm_map_purgable_control`: no memory

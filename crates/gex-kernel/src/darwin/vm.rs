@@ -80,11 +80,14 @@ pub struct Attrs {
     /// Copy-on-write since a fork: its object is shared with the other
     /// task's entry until one of them writes (and gets a shadow object).
     pub cow: bool,
+    /// `used_for_jit`: the map's JIT region, writable and executable at
+    /// once.
+    pub jit: bool,
 }
 
 impl Default for Attrs {
     fn default() -> Attrs {
-        Attrs { kind: kind::ANON, max: PROT_ALL, alias: 0, inherit: inherit::DEFAULT, behavior: behavior::DEFAULT, zero_wired: false, no_cache: false, cow: false }
+        Attrs { kind: kind::ANON, max: PROT_ALL, alias: 0, inherit: inherit::DEFAULT, behavior: behavior::DEFAULT, zero_wired: false, no_cache: false, cow: false, jit: false }
     }
 }
 
@@ -92,6 +95,9 @@ impl Default for Attrs {
 #[derive(Debug, Default)]
 pub struct Entries {
     ranges: BTreeMap<u64, (u64, Attrs)>,
+    /// `jit_entry_exists`: the map has had its JIT region (it stays set
+    /// once the region is unmapped).
+    pub jit_entry_exists: bool,
 }
 
 impl Entries {
@@ -187,12 +193,25 @@ impl Entries {
         }
     }
 
+    /// Whether a JIT region is to be inherited (`vm_inherit` made it so):
+    /// its copy is to lose execute access.
+    pub fn inherits_jit(&self) -> bool {
+        self.ranges.values().any(|(_, a)| a.jit && a.inherit != inherit::NONE)
+    }
+
     /// The child's entries from a map [`Entries::fork`] has marked: those
     /// inherited by copy or share; one not inherited is absent.
     pub fn inherited(&self) -> Entries {
         let mut child = Entries::default();
-        for (&s, &(e, a)) in &self.ranges {
+        for (&s, &(e, mut a)) in &self.ranges {
             if a.inherit != inherit::NONE {
+                // vm_map_entry_copy_code_signing: an iOS map allows no copy
+                // of a JIT region (VM_MAP_POLICY_ALLOW_JIT_COPY): the copy
+                // loses execute access and is no JIT region.
+                if a.jit {
+                    a.jit = false;
+                    a.max &= !4;
+                }
                 child.ranges.insert(s, (e, a));
             }
         }
