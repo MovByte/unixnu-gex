@@ -257,16 +257,21 @@ fn vnode_missing(alist: &AttrList, options: u64) -> Vec<String> {
     }
 }
 
-/// `NAMEI_NOFOLLOW_ANY`: a link on the way, in any component, is `ELOOP`.
-fn no_link_on_the_way(pio: &PathIo<'_>, abs_of_base: &str, rel: &str) -> Result<(), Errno> {
+/// `NAMEI_NOFOLLOW_ANY`: a link the lookup would traverse is `ELOOP` (its
+/// loop count starts at MAXSYMLINKS): one in any component before the
+/// last, and the last when it is followed (`follow_last`, or a trailing
+/// slash).
+pub(crate) fn no_link_on_the_way(pio: &PathIo<'_>, abs_of_base: &str, rel: &str, follow_last: bool) -> Result<(), Errno> {
     let mut cur = abs_of_base.to_string();
-    for comp in rel.split('/').filter(|c| !c.is_empty()) {
-        match comp {
+    let comps: Vec<&str> = rel.split('/').filter(|c| !c.is_empty()).collect();
+    let follow_last = follow_last || rel.ends_with('/');
+    for (i, comp) in comps.iter().enumerate() {
+        match *comp {
             "." => continue,
             ".." => cur = crate::vfs::parent_of(&cur),
             c => {
                 cur = format!("{}/{}", cur.trim_end_matches('/'), c);
-                if pio.ns.metadata_nofollow(&cur)?.file_type == FileType::Symlink {
+                if (i + 1 < comps.len() || follow_last) && pio.ns.metadata_nofollow(&cur)?.file_type == FileType::Symlink {
                     return Err(Errno::ELOOP);
                 }
             }
@@ -313,7 +318,7 @@ impl Kernel {
             let abs = pio.at_path_str(dir as i32, given)?;
             if options & fsopt::NOFOLLOW_ANY != 0 {
                 let base = if given.starts_with('/') { "/".to_string() } else { pio.at_path_str(dir as i32, ".")? };
-                no_link_on_the_way(&pio, &base, given)?;
+                no_link_on_the_way(&pio, &base, given, false)?;
             }
             let nofollow = options & (fsopt::NOFOLLOW | fsopt::NOFOLLOW_ANY) != 0;
             let md = if nofollow { pio.ns.metadata_nofollow(&abs)? } else { pio.ns.metadata(&abs)? };

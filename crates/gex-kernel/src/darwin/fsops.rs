@@ -80,13 +80,16 @@ impl Kernel {
                 let flags = a[4] as u32 as u64;
                 if flags & !(RENAME_SECLUDE | RENAME_EXCL | RENAME_SWAP | RENAME_NOFOLLOW_ANY) != 0 || flags & (RENAME_EXCL | RENAME_SWAP) == RENAME_EXCL | RENAME_SWAP {
                     Err(Errno::EINVAL)
-                } else if flags & (RENAME_SECLUDE | RENAME_NOFOLLOW_ANY | RENAME_SWAP) != 0 {
+                } else if flags & (RENAME_SECLUDE | RENAME_SWAP) != 0 {
                     // The filesystems here have no atomic exchange.
-                    self.darwin_unimplemented(format!("renameatx_np flags {flags:#x} (RENAME_SWAP, RENAME_SECLUDE, RENAME_NOFOLLOW_ANY)"));
+                    self.darwin_unimplemented(format!("renameatx_np flags {flags:#x} (RENAME_SWAP, RENAME_SECLUDE)"));
                     Err(Errno::EINVAL)
                 } else {
+                    // RENAME_NOFOLLOW_ANY: both lookups NAMEI_NOFOLLOW_ANY,
+                    // neither following its last component.
+                    let r = if flags & RENAME_NOFOLLOW_ANY != 0 { self.darwin_no_link_on_the_way(m, a[0], a[1]).and_then(|()| self.darwin_no_link_on_the_way(m, a[2], a[3])) } else { Ok(()) };
                     let l = if flags & RENAME_EXCL != 0 { 1 } else { 0 };
-                    self.canonical(m, nr::RENAMEAT2, [dirfd(a[0]), a[1], dirfd(a[2]), a[3], l, 0])
+                    r.and_then(|()| self.canonical(m, nr::RENAMEAT2, [dirfd(a[0]), a[1], dirfd(a[2]), a[3], l, 0]))
                 }
             }
             // The mode's ALLPERMS.
@@ -96,13 +99,13 @@ impl Kernel {
                 let flag = a[3] as u32 as u64;
                 if flag & !(AT_SYMLINK_NOFOLLOW | AT_SYMLINK_NOFOLLOW_ANY) != 0 {
                     Err(Errno::EINVAL)
-                } else if flag & AT_SYMLINK_NOFOLLOW_ANY != 0 {
-                    self.darwin_unimplemented("fchmodat AT_SYMLINK_NOFOLLOW_ANY".into());
-                    Err(Errno::EINVAL)
                 } else {
-                    // A symlink's own mode (lchmod) is refused as the
+                    // chmodat: AT_SYMLINK_NOFOLLOW_ANY looks up without
+                    // following the last component and with no link on the
+                    // way. A symlink's own mode (lchmod) is refused as the
                     // filesystems here keep none.
-                    self.canonical(m, nr::FCHMODAT, [dirfd(a[0]), a[1], a[2] & ALLPERMS, if flag & AT_SYMLINK_NOFOLLOW != 0 { 0x100 } else { 0 }, 0, 0])
+                    let r = if flag & AT_SYMLINK_NOFOLLOW_ANY != 0 { self.darwin_no_link_on_the_way(m, a[0], a[1]) } else { Ok(()) };
+                    r.and_then(|()| self.canonical(m, nr::FCHMODAT, [dirfd(a[0]), a[1], a[2] & ALLPERMS, if flag & (AT_SYMLINK_NOFOLLOW | AT_SYMLINK_NOFOLLOW_ANY) != 0 { 0x100 } else { 0 }, 0, 0]))
                 }
             }
             sys::CHOWN | sys::LCHOWN | sys::FCHOWN | sys::FCHOWNAT => {
@@ -146,6 +149,17 @@ impl Kernel {
 
     /// `truncate(path, length)`: `truncate_validate_common`, then the file's
     /// size set.
+    /// NAMEI_NOFOLLOW_ANY's check of the path at `path` from directory
+    /// `fd` (Darwin's numbering), its last component not followed.
+    pub(crate) fn darwin_no_link_on_the_way(&mut self, m: &GuestMem<'_>, fd: u64, path: u64) -> Result<(), Errno> {
+        const MAXPATHLEN: usize = 1024;
+        let raw = m.read_cstr(path, MAXPATHLEN)?;
+        let given = std::str::from_utf8(&raw).map_err(|_| Errno::EINVAL)?;
+        let pio = self.path_io();
+        let base = if given.starts_with('/') { "/".to_string() } else { pio.at_path_str(dirfd(fd) as i32, ".")? };
+        super::attrcall::no_link_on_the_way(&pio, &base, given, false)
+    }
+
     fn darwin_truncate(&mut self, m: &mut GuestMem<'_>, path: u64, len: i64) -> Result<u64, Errno> {
         if len < 0 {
             return Err(Errno::EINVAL);

@@ -401,9 +401,12 @@ impl Kernel {
                 let (fd, path, flag) = if raw == sys::UNLINK { (super::bsd::dirfd(super::bsd::AT_FDCWD as u64), a[0], 0) } else { (super::bsd::dirfd(a[0]), a[1], a[2] as u32 as u64) };
                 if flag & !(AT_REMOVEDIR | AT_REMOVEDIR_DATALESS | AT_SYMLINK_NOFOLLOW_ANY) != 0 {
                     neg(Errno::EINVAL)
-                } else if flag & (AT_REMOVEDIR_DATALESS | AT_SYMLINK_NOFOLLOW_ANY) != 0 {
-                    self.darwin_unimplemented(format!("unlinkat flags {flag:#x} (dataless directories, AT_SYMLINK_NOFOLLOW_ANY)"));
+                } else if flag & AT_REMOVEDIR_DATALESS != 0 {
+                    self.darwin_unimplemented(format!("unlinkat flags {flag:#x} (dataless directories)"));
                     neg(Errno::EINVAL)
+                } else if let Err(e) = if flag & AT_SYMLINK_NOFOLLOW_ANY != 0 { self.darwin_no_link_on_the_way(m, a[0], a[1]) } else { Ok(()) } {
+                    // VNODE_REMOVE_NOFOLLOW_ANY: no link on the way.
+                    neg(e)
                 } else if flag & AT_REMOVEDIR != 0 {
                     res(self.canonical(m, nr::UNLINKAT, [fd, path, 0x200, 0, 0, 0]))
                 } else {
@@ -414,6 +417,8 @@ impl Kernel {
                 }
             }
             sys::FSTAT64 if self.darwin_pipe_of(a[0]).is_some() => res(self.darwin_pipe_stat(m, a[0], a[1])),
+            sys::FSTATAT64 => res(self.darwin_fstatat64(m, a)),
+            sys::FACCESSAT => res(self.darwin_faccessat(m, a)),
             sys::SIGACTION => res(self.darwin_sigaction(m, a[0], a[1], a[2])),
             sys::SIGALTSTACK => res(self.darwin_sigaltstack(m, a[0], a[1])),
             sys::GETFSSTAT64 => res(self.darwin_getfsstat(m, a[0], a[1])),
@@ -559,6 +564,58 @@ impl Kernel {
     }
 
     /// `proc_info(callnum, pid, flavor, arg, buffer, buffersize)`.
+    /// `fstatat64(fd, path, ub, flag)`: its flags checked; AT_FDONLY
+    /// stats the descriptor (a vnode's: ENOTSUP for any other); with
+    /// AT_SYMLINK_NOFOLLOW_ANY no link on the way, the last not followed.
+    fn darwin_fstatat64(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
+        const AT_SYMLINK_NOFOLLOW: u64 = 0x20;
+        const AT_REALDEV: u64 = 0x200;
+        const AT_FDONLY: u64 = 0x400;
+        const AT_SYMLINK_NOFOLLOW_ANY: u64 = 0x800;
+        let flag = a[3] as u32 as u64;
+        if flag & !(AT_SYMLINK_NOFOLLOW | AT_REALDEV | AT_FDONLY | AT_SYMLINK_NOFOLLOW_ANY) != 0 {
+            return Err(Errno::EINVAL);
+        }
+        if flag & AT_REALDEV != 0 {
+            self.darwin_unimplemented("fstatat AT_REALDEV (the filesystem's real fsid, VA_REALFSID)".into());
+            return Err(Errno::EINVAL);
+        }
+        if flag & AT_FDONLY != 0 {
+            // fp_getfvp: a vnode's descriptor.
+            let file = self.fds.get(a[0] as i32)?;
+            let h = &file.handle;
+            if h.pipe_end().is_some() || std::sync::Arc::clone(h).as_kqueue().is_some() || std::sync::Arc::clone(h).as_posix_shm().is_some() || h.metadata().is_ok_and(|md| md.file_type == crate::vfs::FileType::Socket) {
+                return Err(super::errno::errno_of(45));
+            }
+            return self.canonical(m, nr::FSTAT, [a[0], a[2], 0, 0, 0, 0]);
+        }
+        if flag & AT_SYMLINK_NOFOLLOW_ANY != 0 {
+            self.darwin_no_link_on_the_way(m, a[0], a[1])?;
+        }
+        let nofollow = if flag & (AT_SYMLINK_NOFOLLOW | AT_SYMLINK_NOFOLLOW_ANY) != 0 { 0x100 } else { 0 };
+        self.canonical(m, nr::NEWFSTATAT, [super::bsd::dirfd(a[0]), a[1], a[2], nofollow, 0, 0])
+    }
+
+    /// `faccessat(fd, path, amode, flag)`: its flags checked; with
+    /// AT_SYMLINK_NOFOLLOW_ANY no link on the way, the last not followed.
+    fn darwin_faccessat(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
+        const AT_EACCESS: u64 = 0x10;
+        const AT_SYMLINK_NOFOLLOW: u64 = 0x20;
+        const AT_SYMLINK_NOFOLLOW_ANY: u64 = 0x800;
+        let flag = a[3] as u32 as u64;
+        if flag & !(AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_SYMLINK_NOFOLLOW_ANY) != 0 {
+            return Err(Errno::EINVAL);
+        }
+        if flag & AT_SYMLINK_NOFOLLOW_ANY != 0 {
+            self.darwin_no_link_on_the_way(m, a[0], a[1])?;
+        }
+        let mut f = flag & !AT_SYMLINK_NOFOLLOW_ANY;
+        if flag & AT_SYMLINK_NOFOLLOW_ANY != 0 {
+            f |= AT_SYMLINK_NOFOLLOW;
+        }
+        self.canonical(m, nr::FACCESSAT, [super::bsd::dirfd(a[0]), a[1], a[2], super::bsd::at_flags(f), 0, 0])
+    }
+
     /// `killpg1` broadcasting (kill's pid -1): every process past init
     /// (none is a system process here), the caller only under POSIX
     /// semantics, that the caller may signal; a zombie counts as found
