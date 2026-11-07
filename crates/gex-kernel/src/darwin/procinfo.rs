@@ -335,21 +335,24 @@ impl Kernel {
         if pid != 0 && pid != self.pid {
             return Err(e::EINVAL);
         }
+        // proc_get_originatorbgstate: background if the thread is, not if
+        // the process is an application; else as the originator's task is.
         if fl == BGSTATE {
-            self.darwin_unimplemented("proc_pidoriginatorinfo PROC_PIDORIGINATOR_BGSTATE (the thread's effective DARWIN_BG)".into());
-            return Err(e::EINVAL);
+            const PROC_FLAG_APPLICATION: u32 = 0x100_0000;
+            let mut bg = u32::from(self.darwin_thread_darwinbg(self.tid));
+            if bg == 0 && self.darwin_bgstate(self.pid)? & PROC_FLAG_APPLICATION == 0 {
+                let origin = self.darwin_voucher_origin_pid()?;
+                // proc_pidbackgrounded: a live process's task's DARWIN_BG.
+                if self.darwin_public(origin).is_none_or(|(_, zombie)| zombie) {
+                    return Err(e::ESRCH);
+                }
+                let tp = if origin == self.pid { Some(self.darwin_policy()) } else { self.procs.task_policy(origin).map(|c| *c.lock().unwrap_or_else(|e| e.into_inner())) };
+                bg = u32::from(tp.is_some_and(|p| p.effective.darwinbg));
+            }
+            m.write(buf, &bg.to_le_bytes()).map_err(|_| 14)?;
+            return Ok(4);
         }
-        // thread_get_current_voucher_origin_pid: the bank's
-        // BANK_ORIGINATOR_PID of the thread's voucher (none: EINVAL).
-        const ENOATTR: i32 = 93;
-        let voucher = self.dtask.threads.map.get(&self.tid).and_then(|t| t.voucher);
-        let Some(v) = voucher else { return Err(e::EINVAL) };
-        let origin = match self.mach_voucher_attr_command(v, super::voucher::key::BANK, super::voucher::bank::ORIGINATOR_PID, &[], 4) {
-            Ok(b) => i32::from_le_bytes(b[..4].try_into().unwrap()),
-            Err(super::voucher::vkr::INVALID_TASK) => return Err(e::ESRCH),
-            Err(super::voucher::vkr::INVALID_VALUE) => return Err(ENOATTR),
-            Err(_) => return Err(e::EINVAL),
-        };
+        let origin = self.darwin_voucher_origin_pid()?;
         // proc_piduuidinfo: its executable's UUID, a zombie's too.
         let (p, _) = self.darwin_public(origin).ok_or(e::ESRCH)?;
         let mut b = p.uuid.to_vec();
@@ -359,6 +362,23 @@ impl Kernel {
         }
         m.write(buf, &b).map_err(|_| 14)?;
         Ok(u64::from(size))
+    }
+
+    /// `thread_get_current_voucher_origin_pid`: the bank's
+    /// BANK_ORIGINATOR_PID of the current thread's voucher, as the errno
+    /// its callers make of a failure (none: EINVAL).
+    fn darwin_voucher_origin_pid(&mut self) -> Result<i32, i32> {
+        // thread_get_current_voucher_origin_pid: the bank's
+        // BANK_ORIGINATOR_PID of the thread's voucher (none: EINVAL).
+        const ENOATTR: i32 = 93;
+        let voucher = self.dtask.threads.map.get(&self.tid).and_then(|t| t.voucher);
+        let Some(v) = voucher else { return Err(e::EINVAL) };
+        match self.mach_voucher_attr_command(v, super::voucher::key::BANK, super::voucher::bank::ORIGINATOR_PID, &[], 4) {
+            Ok(b) => Ok(i32::from_le_bytes(b[..4].try_into().unwrap())),
+            Err(super::voucher::vkr::INVALID_TASK) => Err(e::ESRCH),
+            Err(super::voucher::vkr::INVALID_VALUE) => Err(ENOATTR),
+            Err(_) => Err(e::EINVAL),
+        }
     }
 
     /// `proc_terminate(pid)`: another process the caller may SIGKILL,

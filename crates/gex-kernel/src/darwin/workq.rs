@@ -657,6 +657,14 @@ impl Kernel {
         thread_base_priority(q, relpri, urgent, terminated, t.policy.importance.unwrap_or(0), tp) as u8
     }
 
+    /// Thread `tid`'s effective DARWIN_BG.
+    pub(crate) fn darwin_thread_darwinbg(&self, tid: i32) -> bool {
+        let tp = self.darwin_policy();
+        let Some(t) = self.dtask.threads.map.get(&tid) else { return super::taskpolicy::thread_effective_darwinbg(qos::UNSPECIFIED, qos::UNSPECIFIED, false, &tp.effective) };
+        let overrides = t.overrides.iter().map(|o| o.qos).max().unwrap_or(qos::UNSPECIFIED);
+        super::taskpolicy::thread_effective_darwinbg(t.policy.qos, overrides, t.policy.int_darwinbg || t.policy.ext_darwinbg, &tp.effective)
+    }
+
     // -- idle threads -----------------------------------------------------------
 
     fn workq_oldest_killable_idle_thread(&mut self) -> Option<i32> {

@@ -17,7 +17,8 @@
 // by audit token (its pid and pidversion), so do a signal and a terminate,
 // and a token of another pidversion names no process. The originator of
 // the thread's voucher (a bank voucher it made) is this process, with its
-// UUID; with no voucher there is none.
+// UUID; with no voucher there is none. Its background state is the
+// thread's own (PRIO_DARWIN_THREAD), else the originator's task's.
 
 #include <errno.h>
 #include <mach-o/dyld.h>
@@ -31,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <TargetConditionals.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -204,6 +206,10 @@ int main(int argc, char **argv) {
     if (sig != SIGTERM || !WIFSIGNALED(vst) || WTERMSIG(vst) != SIGTERM) return bad("a terminate by token", sig, SIGTERM);
     struct { uint8_t uuid[16]; pid_t pid; uint32_t pad; uint64_t r2, r3, r4; } oi;
     if (__proc_info(10, 0, 3, 0, &oi, sizeof oi) != -1 || errno != EINVAL) return bad("no voucher's originator", errno, EINVAL);
+    // (An application is in the foreground without asking its voucher.)
+    uint32_t bgs = 7;
+    int app = (s.flags & 0x1000000) != 0, r = __proc_info(10, 0, 2, 0, &bgs, sizeof bgs);
+    if (app ? (r != 4 || bgs != 0) : (r != -1 || errno != EINVAL)) return bad("no voucher's background state", r, app ? 4 : -1);
     if (__proc_info(10, getppid(), 3, 0, &oi, sizeof oi) != -1 || errno != EINVAL) return bad("another's originator", errno, EINVAL);
     if (__proc_info(10, 0, 3, 0, &oi, 16) != -1 || errno != ENOMEM) return bad("a short buffer", errno, ENOMEM);
     if (__proc_info(10, 0, 9, 0, &oi, sizeof oi) != -1 || errno != EINVAL) return bad("a bad flavor", errno, EINVAL);
@@ -215,6 +221,10 @@ int main(int argc, char **argv) {
     uint8_t ou[16];
     if (__proc_info(10, 0, 3, 0, &oi, sizeof oi) != (int)sizeof oi || oi.pid != getpid() || memcmp(oi.uuid, mine_ui.uuid, 16)) return bad("its voucher's originator", oi.pid, getpid());
     if (__proc_info(10, getpid(), 1, 0, ou, sizeof ou) != 16 || memcmp(ou, mine_ui.uuid, 16)) return bad("its originator's UUID", errno, 0);
+    if (__proc_info(10, 0, 2, 0, &bgs, sizeof bgs) != 4 || bgs != 0) return bad("a foreground originator", bgs, 0);
+    setpriority(PRIO_DARWIN_THREAD, 0, PRIO_DARWIN_BG);
+    if (__proc_info(10, 0, 2, 0, &bgs, sizeof bgs) != 4 || bgs != 1) return bad("a background thread", bgs, 1);
+    setpriority(PRIO_DARWIN_THREAD, 0, 0);
     mach_voucher_t got = MACH_PORT_NULL;
     if (thread_get_mach_voucher(mach_thread_self(), 0, &got) || got == MACH_PORT_NULL) return bad("its voucher back", 0, 1);
     thread_set_mach_voucher(mach_thread_self(), MACH_PORT_NULL);

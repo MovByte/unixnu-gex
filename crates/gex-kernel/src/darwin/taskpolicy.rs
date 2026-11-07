@@ -719,6 +719,25 @@ pub fn thread_effective_qos(req_qos: u8, req_relpri: i32, overrides: u8, thread_
     (q, relpri, task.qos_ui_is_urgent, task.terminated)
 }
 
+/// A thread's effective DARWIN_BG (`thep_darwinbg`): its task's, any it
+/// requested, or a background or maintenance effective QoS (its requested
+/// QoS and overrides under its task's clamp and ceiling); none once its
+/// task is terminated.
+pub fn thread_effective_darwinbg(req_qos: u8, overrides: u8, thread_darwinbg: bool, task: &Effective) -> bool {
+    let mut q = req_qos;
+    if req_qos != qos::UNSPECIFIED {
+        q = q.max(overrides);
+    }
+    if task.qos_clamp != qos::UNSPECIFIED {
+        q = if q != qos::UNSPECIFIED { task.qos_clamp.min(q) } else { task.qos_clamp };
+    }
+    if task.qos_ceiling != qos::UNSPECIFIED && q != qos::UNSPECIFIED {
+        q = task.qos_ceiling.min(q);
+    }
+    let darwinbg = task.darwinbg || thread_darwinbg || q == qos::BACKGROUND || q == qos::MAINTENANCE;
+    darwinbg && !task.terminated
+}
+
 /// `thread_qos_scaled_relative_priority`: a relative priority (0 to -15)
 /// scaled into the band between a QoS's priority and the next lower one's.
 fn scaled_relpri(q: u8, relpri: i32) -> i32 {
