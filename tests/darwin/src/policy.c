@@ -3,15 +3,19 @@
 // signed, a platform binary, killed and hardened when invalid, library
 // validation, enforcement), its cdhash and identifier and no team; dyld's
 // policy from AMFI; no task port of its own from task_for_pid (AMFI allows
-// that only with Developer Mode); no JIT mapping (not entitled); and the
-// MAC system call's errors.
+// that only with Developer Mode), nor of a child of its user, which passes
+// the POSIX check; no JIT mapping (not entitled); and the MAC system call's
+// errors.
 
 #include <errno.h>
 #include <mach/mach.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <signal.h>
+#include <spawn.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
@@ -33,7 +37,10 @@ static int bad(const char *what, long got, long want) {
 }
 
 int main(int argc, char **argv, char **envp, char **apple) {
-    (void)argc, (void)argv, (void)envp;
+    (void)envp;
+    if (argc > 1) {
+        for (;;) pause();
+    }
     uint32_t st = 0;
     if (csops(0, 0, &st, sizeof st)) return bad("CS_OPS_STATUS", errno, 0);
     uint32_t want = CS_VALID | CS_SIGNED | CS_PLATFORM_BINARY | CS_HARD | CS_KILL | CS_REQUIRE_LV | CS_ENFORCEMENT | CS_NO_UNTRUSTED_HELPERS;
@@ -72,6 +79,14 @@ int main(int argc, char **argv, char **envp, char **apple) {
     task_t t = 1;
     kern_return_t kr = task_for_pid(mach_task_self(), getpid(), &t);
     if (kr != KERN_FAILURE || t != MACH_PORT_NULL) return bad("task_for_pid of itself", kr, KERN_FAILURE);
+    pid_t child;
+    char *cargs[] = {argv[0], "wait", NULL};
+    if (posix_spawn(&child, argv[0], NULL, NULL, cargs, envp)) return bad("a child", errno, 0);
+    t = 1;
+    kr = task_for_pid(mach_task_self(), child, &t);
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
+    if (kr != KERN_FAILURE || t != MACH_PORT_NULL) return bad("task_for_pid of a child", kr, KERN_FAILURE);
     if (mmap(NULL, 16384, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0) != MAP_FAILED || errno != EINVAL) return bad("a JIT mapping", errno, EINVAL);
     printf("policy ok\n");
     return 0;

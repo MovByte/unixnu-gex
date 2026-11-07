@@ -211,7 +211,7 @@ impl Kernel {
 
     /// Process `pid`'s record (this process's as it is now) and whether it
     /// is a zombie; none for no Darwin process of that pid.
-    fn darwin_public(&self, pid: i32) -> Option<(Public, bool)> {
+    pub(crate) fn darwin_public(&self, pid: i32) -> Option<(Public, bool)> {
         if pid == self.pid {
             return Some((self.darwin_public_now(), false));
         }

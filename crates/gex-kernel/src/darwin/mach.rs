@@ -592,19 +592,40 @@ impl Kernel {
             })
     }
 
-    /// `task_for_pid_posix_check`: a live target, and a caller that is
-    /// root, the target itself, or of the target's user, with the target's
-    /// groups among its own and the target not having changed identity.
+    /// `task_for_pid_posix_check` (KERN_TFP_POLICY_DEFAULT): a live
+    /// target, and a caller that is root or the target itself; else one
+    /// whose effective uid is all the target's user ids, with the target's
+    /// groups among its own (`kauth_cred_gid_subset`; no external resolver
+    /// on iOS) unless the target is a third party's debuggable driver, and
+    /// the target not having changed identity (P_SUGID).
     fn darwin_tfp_posix_check(&mut self, pid: i32) -> bool {
-        let Some((tuid, _)) = self.procs.live_nice(pid) else { return false };
-        if self.creds.uid() == 0 || pid == self.pid {
+        let Some((target, false)) = self.darwin_public(pid) else { return false };
+        let me = self.dtask.cred.clone();
+        if me.uid == 0 || pid == self.pid {
             return true;
         }
-        if tuid != self.creds.uid() {
-            return false;
+        if !self.darwin_third_party_debuggable_driver(pid) {
+            let t = &target.cred;
+            if t.uid != me.uid || t.ruid != me.uid || t.svuid != me.uid {
+                return false;
+            }
+            // kauth_cred_ismember_gid: the credential's own list.
+            let member = |g: u32| me.groups.contains(&g) || g == me.rgid || g == me.svgid;
+            if !t.groups.iter().all(|&g| member(g)) || !member(t.rgid) || !member(t.svgid) {
+                return false;
+            }
         }
-        self.darwin_unimplemented("task_for_pid_posix_check of another process of the same user (its groups, saved uid and P_SUGID)".into());
-        false
+        !target.sugid
+    }
+
+    /// `proc_is_third_party_debuggable_driver` (iOS): a driver task, not a
+    /// platform binary, entitled to DriverKit and allowed get-task.
+    fn darwin_third_party_debuggable_driver(&mut self, pid: i32) -> bool {
+        let driver = self.procs.task_policy(pid).is_some_and(|c| c.lock().unwrap_or_else(|e| e.into_inner()).requested.apptype == super::taskpolicy::apptype::DRIVER);
+        let Some(link) = self.ipc().links.values().find(|l| l.pid == pid).cloned() else { return false };
+        let csflags = link.csflags.load(std::sync::atomic::Ordering::Acquire);
+        let sig = link.codesign.as_ref();
+        driver && !sig.is_some_and(|c| c.platform_binary) && sig.is_some_and(|c| c.entitled("com.apple.developer.driverkit")) && csflags & super::amfi::cs::GET_TASK_ALLOW != 0
     }
 
     /// `task_for_pid(target_tport, pid, t)` (vm_unix.c): process `pid`'s
