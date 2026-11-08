@@ -3,6 +3,8 @@
 // written there runs, and runs again rewritten; mprotect keeps both on it.
 // A second JIT region, or one asked for fixed or shared, is EINVAL, and so
 // is a new one after the first is unmapped (the map has had its region).
+// Inherited by a fork's child (VM_INHERIT_COPY), its copy is no JIT region:
+// it has its bytes but no execute access, nor may it be given it (EACCES).
 // VM_FLAGS_RANDOM_ADDR places an allocation anywhere free.
 
 #include <errno.h>
@@ -10,7 +12,10 @@
 #include <mach/mach.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <signal.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 static int bad(const char *what, long got, long want) {
     printf("jit: %s: %#lx, want %#lx\n", what, got, want);
@@ -41,6 +46,22 @@ int main(void) {
     if (q != MAP_FAILED || errno != EINVAL) return bad("a shared JIT region", errno, EINVAL);
     if (mprotect(p, len, PROT_READ | PROT_WRITE) || mprotect(p, len, rwx)) return bad("mprotect", errno, 0);
     if (run(p, 1) != 1) return bad("its code after mprotect", 0, 1);
+    if (minherit(p, len, VM_INHERIT_COPY)) return bad("minherit", errno, 0);
+    // The child's copy: its bytes, no execute access (running it faults),
+    // and none to be had.
+    for (int i = 0; i < 2; i++) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            if (p[0] != (0x52800000u | (1u << 5))) _exit(12);
+            if (mprotect(p, len, rwx) != -1 || errno != EACCES) _exit(13);
+            if (i == 1) ((int (*)(void))p)();
+            _exit(0);
+        }
+        int st;
+        if (pid < 0 || waitpid(pid, &st, 0) != pid) return bad("fork", errno, 0);
+        if (i == 0 && (!WIFEXITED(st) || WEXITSTATUS(st) != 0)) return bad("the child's copy", WIFEXITED(st) ? WEXITSTATUS(st) : -1, 0);
+        if (i == 1 && (!WIFSIGNALED(st) || (WTERMSIG(st) != SIGBUS && WTERMSIG(st) != SIGSEGV))) return bad("running the child's copy", st, SIGBUS);
+    }
     munmap(p, len);
     q = mmap(NULL, 16384, rwx, MAP_ANON | MAP_PRIVATE | MAP_JIT, -1, 0);
     if (q != MAP_FAILED || errno != EINVAL) return bad("a JIT region after the first", errno, EINVAL);

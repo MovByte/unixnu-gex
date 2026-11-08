@@ -9434,6 +9434,18 @@ impl Kernel {
             let t = child.signals.thread();
             t.set_darwin_id(crate::darwin::next_thread_id());
             t.set_tsd(self.signals.thread().tsd());
+            // vm_map_entry_copy_code_signing: an iOS map allows no copy of
+            // its JIT region (VM_MAP_POLICY_ALLOW_JIT_COPY): an inherited
+            // one's pages lose execute access in the child.
+            // Losing execute retires the translations there, as mprotect's
+            // does.
+            for (s, e) in self.dtask.vm.inherited_jit() {
+                let parts: Vec<(u64, u64, u32)> = child.mem.lock().vmas().iter().filter(|v| v.start < e && v.end > s).map(|v| (v.start.max(s), v.end.min(e), v.prot)).collect();
+                for (a, b, p) in parts {
+                    child.map_io().retire_code_why(a, b - a, "fork", p & !crate::mem::prot::EXEC);
+                    let _ = child.mem.lock().protect(a, b - a, p & !crate::mem::prot::EXEC);
+                }
+            }
         }
         // fdt_fork: a Darwin kqueue is FG_CONFINED, its process's alone,
         // and an FP_CLOFORK descriptor is not the child's.

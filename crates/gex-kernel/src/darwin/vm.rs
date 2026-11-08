@@ -193,10 +193,10 @@ impl Entries {
         }
     }
 
-    /// Whether a JIT region is to be inherited (`vm_inherit` made it so):
-    /// its copy is to lose execute access.
-    pub fn inherits_jit(&self) -> bool {
-        self.ranges.values().any(|(_, a)| a.jit && a.inherit != inherit::NONE)
+    /// The JIT region's ranges a fork's child inherits (`vm_inherit` made
+    /// it so): its copy is to lose execute access.
+    pub fn inherited_jit(&self) -> Vec<(u64, u64)> {
+        self.ranges.iter().filter(|(_, (_, a))| a.jit && a.inherit != inherit::NONE).map(|(&s, &(e, _))| (s, e)).collect()
     }
 
     /// The child's entries from a map [`Entries::fork`] has marked: those
