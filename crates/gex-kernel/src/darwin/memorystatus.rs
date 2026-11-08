@@ -1165,13 +1165,6 @@ impl crate::syscalls::Kernel {
         (deadline != 0).then(|| super::mach::abs_to_instant(deadline))
     }
 
-    /// `cansignal(current, target, SIGKILL)`: root, the process itself, or
-    /// one of the same uid (a process has one uid here).
-    fn jetsam_cansignal(&self, pid: i32) -> bool {
-        let uid = self.creds.uid();
-        uid == 0 || pid == self.pid || self.procs.live_nice(pid).is_some_and(|(t, _)| t == uid)
-    }
-
     /// `proc_dirtycontrol(pid, flavor, arg)`: `proc_info`'s
     /// PROC_INFO_CALL_DIRTYCONTROL. The value is the call's return.
     pub(crate) fn darwin_dirtycontrol(&mut self, pid: i32, flavor: u32, arg: u64) -> Result<u64, Errno> {
@@ -1196,14 +1189,14 @@ impl crate::syscalls::Kernel {
                 self.procs.jetsam().dirty_track(pid, pcontrol).map(|_| 0)
             }
             SET => {
-                if !self.jetsam_cansignal(pid) {
+                if !self.darwin_cansignal(pid, super::signal::dsig::SIGKILL, true) {
                     return Err(Errno::EPERM);
                 }
                 self.procs.jetsam().dirty_set(pid, me, pcontrol).map(|_| 0)
             }
             GET => Ok(u64::from(self.procs.jetsam().dirty_get(pid).unwrap_or(0))),
             CLEAR => {
-                if !self.jetsam_cansignal(pid) {
+                if !self.darwin_cansignal(pid, super::signal::dsig::SIGKILL, true) {
                     return Err(Errno::EPERM);
                 }
                 self.procs.jetsam().dirty_clear(pid, pcontrol).map(|_| 0)

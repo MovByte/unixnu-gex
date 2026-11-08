@@ -242,6 +242,9 @@ struct Proc {
     /// signal that ended it).
     rval: Option<u32>,
     xstat: u32,
+    /// Darwin's `P_LEXIT`: its exit has begun (`exit()`, or a jetsam
+    /// kill's `exit_with_reason`).
+    lexit: bool,
     /// Darwin's `p_persona`'s id: the id it is counted against
     /// (`chgproccnt`) instead of its real uid.
     persona: Option<u32>,
@@ -448,6 +451,7 @@ impl ProcTable {
                     lterm: 0,
                     rval: None,
                     xstat: 0,
+                    lexit: false,
                     persona: None,
                     child_end: None,
                     execed: false,
@@ -525,6 +529,7 @@ impl ProcTable {
             lterm: 0,
             rval: None,
             xstat: 0,
+            lexit: false,
             persona,
             child_end: None,
             execed: false,
@@ -1156,13 +1161,20 @@ impl ProcTable {
     pub fn jetsam_kill(&self, pid: i32, flags: u32) {
         let mut t = self.lock();
         let Some(p) = t.procs.iter_mut().find(|p| p.pid == pid) else { return };
-        if p.child.status.lock().map(|s| s.is_some()).unwrap_or(true) {
+        if p.lexit || p.child.status.lock().map(|s| s.is_some()).unwrap_or(true) {
             return;
         }
+        p.lexit = true;
         p.lterm |= flags;
         p.pending.fetch_or(1u64 << (SIGKILL - 1), Ordering::AcqRel);
         SIGNAL_SEQ.fetch_add(1, Ordering::Release);
         p.queue.notify();
+    }
+
+    /// `proc_exiting(pid)`: its exit has begun, or it has ended.
+    pub fn exiting(&self, pid: i32) -> bool {
+        let Some((lexit, cell)) = self.lock().procs.iter().find(|p| p.pid == pid).map(|p| (p.lexit, Arc::clone(&p.child.status))) else { return false };
+        lexit || cell.lock().map(|s| s.is_some()).unwrap_or(false)
     }
 
     /// `pid`'s `p_lflag` termination bits ([`ProcTable::jetsam_kill`]),
@@ -1395,6 +1407,7 @@ impl ProcTable {
         if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
             p.xhighbits = (rval >> 24) as u8;
             p.rval = Some(rval);
+            p.lexit = true;
             p.uid = uid;
         }
     }

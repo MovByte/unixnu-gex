@@ -1151,8 +1151,10 @@ impl Kernel {
 
     /// `filt_procattach`: no tracking across forks (ENOTSUP), a process
     /// that exists (ESRCH); EV_CLEAR, the data ignored, and on the
-    /// process's list. The exit status is anyone's to ask for who may
-    /// signal the process, which here is everyone: gex keeps one identity.
+    /// process's list. The exit status (NOTE_EXIT with NOTE_EXITSTATUS) is
+    /// its parent's to ask for, or any process's that may SIGKILL it
+    /// (EACCES otherwise); no process is traced here, so no
+    /// parent-in-waiting asks.
     fn filt_procattach(&mut self, n: KnId) -> u32 {
         use crate::procnote::note;
         let (pid, sfflags) = {
@@ -1165,6 +1167,11 @@ impl Kernel {
         }
         if !self.procs.alive(pid) {
             self.knote(n).set_error(Errno::ESRCH);
+            return 0;
+        }
+        let status = note::EXIT | note::EXITSTATUS;
+        if sfflags & status == status && self.procs.ppid(pid) != self.pid && !self.darwin_cansignal(pid, super::signal::dsig::SIGKILL, true) {
+            self.knote(n).set_error(Errno::EACCES);
             return 0;
         }
         let inbox = std::sync::Arc::clone(&self.dtask.kevents.proc_inbox);

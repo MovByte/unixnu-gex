@@ -23,7 +23,7 @@ for p in hello-static bsd-carry commpage exclusive-pair aes; do
         -o "$OUT/$p" "$HERE/src/$p.c"
 done
 
-for p in hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona jit xpc-anon; do
+for p in hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm jit xpc-anon; do
     cc -O2 -o "$OUT/$p" "$HERE/src/$p.c"
 done
 cc -O2 -framework CoreFoundation -o "$OUT/cfrunloop" "$HERE/src/cfrunloop.c"
@@ -44,6 +44,8 @@ codesign -s - -f --entitlements "$HERE/src/memlimit.entitlements" "$OUT/memlimit
 codesign -s - -f --entitlements "$HERE/src/gta.entitlements" "$OUT/gta" 2>/dev/null
 # persona manages personas, which takes the persona manager's entitlement.
 codesign -s - -f --entitlements "$HERE/src/persona.entitlements" "$OUT/persona" 2>/dev/null
+# killperm spawns into a persona to have another user's process.
+codesign -s - -f --entitlements "$HERE/src/persona.entitlements" "$OUT/killperm" 2>/dev/null
 # jit maps a JIT region: dynamic-codesigning for AMFI, and for the platform
 # profile one of the signing identifiers it lets generate code (XNU's jitbox).
 codesign -s - -f -i com.apple.test.xnu.jitbox --entitlements "$HERE/src/jit.entitlements" "$OUT/jit" 2>/dev/null

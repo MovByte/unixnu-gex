@@ -620,7 +620,7 @@ impl Kernel {
 
     /// `proc_is_third_party_debuggable_driver` (iOS): a driver task, not a
     /// platform binary, entitled to DriverKit and allowed get-task.
-    fn darwin_third_party_debuggable_driver(&mut self, pid: i32) -> bool {
+    pub(crate) fn darwin_third_party_debuggable_driver(&mut self, pid: i32) -> bool {
         let driver = self.procs.task_policy(pid).is_some_and(|c| c.lock().unwrap_or_else(|e| e.into_inner()).requested.apptype == super::taskpolicy::apptype::DRIVER);
         let Some(link) = self.ipc().links.values().find(|l| l.pid == pid).cloned() else { return false };
         let csflags = link.csflags.load(std::sync::atomic::Ordering::Acquire);

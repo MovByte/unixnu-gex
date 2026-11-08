@@ -480,15 +480,19 @@ impl Kernel {
             self.darwin_unimplemented(format!("a signal by audit token with Darwin signal {signum}, which Linux has no number for"));
             return Err(Errno::EINVAL);
         }
-        // cansignal, then psignal: kill's check and post.
+        if !self.darwin_cansignal(pid, signum, true) {
+            return Err(Errno::EPERM);
+        }
         self.canonical(m, nr::KILL, [pid as u64, u64::from(sig), 0, 0, 0, 0]).map(|_| ())
     }
 
     /// `proc_terminate_with_proc` of process `pid`.
     fn darwin_terminate_with_proc(&mut self, m: &mut GuestMem<'_>, pid: i32) -> Result<u64, Errno> {
         use crate::syscalls::nr;
-        // cansignal(.., SIGKILL), as kill's own check makes it.
-        self.canonical(m, nr::KILL, [pid as u64, 0, 0, 0, 0, 0])?;
+        // Who may SIGKILL it may SIGTERM it too.
+        if !self.darwin_cansignal(pid, super::signal::dsig::SIGKILL, true) {
+            return Err(Errno::EPERM);
+        }
         if pid == self.pid {
             return Err(Errno::EPERM);
         }

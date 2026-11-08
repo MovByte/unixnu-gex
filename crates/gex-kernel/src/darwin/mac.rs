@@ -43,6 +43,7 @@ pub mod op {
     pub const PROCESS_FORK: usize = 122;
     pub const PROCESS_INFO_CODESIGNATURE: usize = 124;
     pub const PROCESS_LEGACY_CODESIGNING_STATUS_SET: usize = 142;
+    pub const SIGNAL: usize = 146;
     pub const SYSTEM_KAS_INFO: usize = 166;
     pub const SYSTEM_MAC_SYSCALL: usize = 173;
 }
@@ -365,6 +366,17 @@ impl Kernel {
     pub(crate) fn darwin_mac_check_syscall_mac(&mut self, policy: &[u8], call: u32) -> u32 {
         let a = SbArgs { kind: sandbox::kind::MAC_SYSCALL, number2: call, string: Some(policy.to_vec()), ..Default::default() };
         self.darwin_sb_evaluate(op::SYSTEM_MAC_SYSCALL, &a)
+    }
+
+    /// `mac_proc_check_signal` of `signum` to process `pid` (Sandbox's
+    /// signal; AMFI has no hook): allowed for a target already exiting
+    /// (`proc_exiting`), else one evaluation, quiet for signal 0.
+    pub(crate) fn darwin_mac_check_signal(&mut self, pid: i32, signum: u32) -> u32 {
+        if self.procs.exiting(pid) {
+            return 0;
+        }
+        let a = SbArgs { kind: sandbox::kind::PROCESS, target: Some(pid), quiet: signum == 0, ..Default::default() };
+        self.darwin_sb_evaluate(op::SIGNAL, &a)
     }
 
     /// `mac_proc_check_map_anon` for a MAP_JIT mapping: AMFI's (a probe,

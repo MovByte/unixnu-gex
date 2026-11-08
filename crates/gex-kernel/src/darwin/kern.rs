@@ -327,10 +327,8 @@ impl Kernel {
                 } else if signum != 0 && signal_to_linux(signum) == 0 {
                     self.darwin_unimplemented(format!("kill with Darwin signal {signum}, which Linux has no number for"));
                     neg(Errno::EINVAL)
-                } else if pid == -1 {
-                    res(self.darwin_killpg1_all(m, signum, posix != 0))
                 } else {
-                    res(self.canonical(m, nr::KILL, [pid as i64 as u64, u64::from(signal_to_linux(signum)), 0, 0, 0, 0]))
+                    res(self.darwin_kill(m, pid, signum, posix != 0))
                 }
             }
             sys::KQUEUE => res(<Kq as KQueue>::kqueue(self)),
@@ -616,21 +614,66 @@ impl Kernel {
         self.canonical(m, nr::FACCESSAT, [super::bsd::dirfd(a[0]), a[1], a[2], super::bsd::at_flags(f), 0, 0])
     }
 
+    /// `kill(pid, signum, posix)`: one process (a zombie succeeds unsignalled),
+    /// EPERM unless the caller may signal it; a broadcast (-1), the caller's
+    /// group (0) or another group (`killpg1`).
+    fn darwin_kill(&mut self, m: &mut GuestMem<'_>, pid: i32, signum: u32, posix: bool) -> Result<u64, Errno> {
+        if pid > 0 {
+            // proc_find, else pzfind.
+            match self.procs.listing().into_iter().find(|e| e.0 == pid) {
+                None => return Err(Errno::ESRCH),
+                Some((_, _, _, true)) => return Ok(0),
+                Some(_) => {}
+            }
+            if !self.darwin_cansignal(pid, signum, true) {
+                return Err(Errno::EPERM);
+            }
+            if signum != 0 {
+                self.darwin_kill_post(m, pid, signum);
+            }
+            return Ok(0);
+        }
+        match pid {
+            -1 => self.darwin_killpg1_all(m, signum, posix),
+            0 => {
+                let pgid = self.procs.pgid(self.pid, self.pid)?;
+                self.darwin_killpg1_group(m, signum, pgid, posix)
+            }
+            _ => {
+                // pgrp_find: a group with members.
+                if self.procs.pgrp_members(-pid).is_empty() {
+                    return Err(Errno::ESRCH);
+                }
+                self.darwin_killpg1_group(m, signum, -pid, posix)
+            }
+        }
+    }
+
+    /// `psignal(p, signum)` of a signal `kill`'s rules let through.
+    fn darwin_kill_post(&mut self, m: &mut GuestMem<'_>, pid: i32, signum: u32) {
+        let _ = self.canonical(m, nr::KILL, [pid as u64, u64::from(signal_to_linux(signum)), 0, 0, 0, 0]);
+    }
+
     /// `killpg1` broadcasting (kill's pid -1): every process past init
     /// (none is a system process here), the caller only under POSIX
-    /// semantics, that the caller may signal; a zombie counts as found
-    /// without a signal. EPERM (POSIX) or ESRCH when none was.
+    /// semantics, that the caller may signal (`cansignal`; for a zombie,
+    /// which counts as found but is not signalled, `cansignal_nomac`).
+    /// EPERM (POSIX) or ESRCH when none was.
     fn darwin_killpg1_all(&mut self, m: &mut GuestMem<'_>, signum: u32, posix: bool) -> Result<u64, Errno> {
-        let sig = u64::from(signal_to_linux(signum));
         let mut nfound = 0;
         for (pid, _, _, zombie) in self.procs.listing() {
             if pid <= 1 || (!posix && pid == self.pid) {
                 continue;
             }
-            // cansignal (cansignal_nomac for a zombie), then psignal.
-            let s = if zombie { 0 } else { sig };
-            if self.canonical(m, nr::KILL, [pid as u64, s, 0, 0, 0, 0]).is_ok() {
+            if zombie {
+                if self.darwin_cansignal(pid, signum, false) {
+                    nfound += 1;
+                }
+            } else if self.darwin_cansignal(pid, signum, true) {
                 nfound += 1;
+                if signum != 0 {
+                    self.darwin_kill_post(m, pid, signum);
+                }
             }
         }
         match nfound {
@@ -638,6 +681,60 @@ impl Kernel {
             0 => Err(Errno::ESRCH),
             _ => Ok(0),
         }
+    }
+
+    /// `killpg1` of group `pgid`: each live member but the kernel's and
+    /// init (none is a system process here) that the caller may signal.
+    /// EPERM (POSIX) or ESRCH when none was.
+    fn darwin_killpg1_group(&mut self, m: &mut GuestMem<'_>, signum: u32, pgid: i32, posix: bool) -> Result<u64, Errno> {
+        let mut nfound = 0;
+        for (pid, _, _, live) in self.procs.pgrp_members(pgid) {
+            if pid <= 1 || !live {
+                continue;
+            }
+            if self.darwin_cansignal(pid, signum, true) {
+                nfound += 1;
+                if signum != 0 {
+                    self.darwin_kill_post(m, pid, signum);
+                }
+            }
+        }
+        match nfound {
+            0 if posix => Err(Errno::EPERM),
+            0 => Err(Errno::ESRCH),
+            _ => Ok(0),
+        }
+    }
+
+    /// `cansignal` (`mac`: the policies' `mac_proc_check_signal` first) or
+    /// `cansignal_nomac`: whether this process may send `signum` to process
+    /// `pid`. Itself; never SIGKILL to init; root anything; SIGCONT within
+    /// its session; a third-party debuggable driver (iOS); else a real or
+    /// effective uid of the caller's that is the target's real or saved.
+    pub(crate) fn darwin_cansignal(&mut self, pid: i32, signum: u32, mac: bool) -> bool {
+        use super::signal::dsig;
+        if mac && self.darwin_mac_check_signal(pid, signum) != 0 {
+            return false;
+        }
+        if pid == self.pid {
+            return true;
+        }
+        if signum == dsig::SIGKILL && pid == crate::proc::INIT_PID {
+            return false;
+        }
+        let (ruid, uid) = (self.dtask.cred.ruid, self.dtask.cred.uid);
+        if uid == 0 {
+            return true;
+        }
+        if signum == dsig::SIGCONT && self.procs.sid(self.pid, self.pid).ok() == self.procs.sid(self.pid, pid).ok() {
+            return true;
+        }
+        if self.darwin_third_party_debuggable_driver(pid) {
+            return true;
+        }
+        let Some((dst, _)) = self.darwin_public(pid) else { return false };
+        let d = &dst.cred;
+        ruid == d.ruid || ruid == d.svuid || uid == d.ruid || uid == d.svuid
     }
 
     /// `fsgetpath(buf, size, fsid, objid)`: the path of a file named by its
