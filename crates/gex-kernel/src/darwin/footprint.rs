@@ -149,9 +149,7 @@ impl Kernel {
     /// where the host cannot say.
     pub(crate) fn darwin_phys_footprint(&mut self, m: &mut GuestMem<'_>) -> Option<u64> {
         let (alias, alias_end) = (gex_abi::DARWIN_COMMPAGE_ALIAS, gex_abi::DARWIN_COMMPAGE_ALIAS + (gex_abi::DARWIN_COMMPAGE_END - gex_abi::DARWIN_COMMPAGE_RO));
-        // The wait words' page is gex's, not the task's.
-        let waits = self.dtask.waits.page;
-        let vmas: Vec<(u64, u64)> = self.mem.lock().vmas().iter().map(|v| (v.start, v.end)).filter(|&(s, e)| !(s >= alias && e <= alias_end) && !(waits != 0 && s <= waits && waits < e && e - s <= PAGE)).collect();
+        let vmas: Vec<(u64, u64)> = self.mem.lock().vmas().iter().map(|v| (v.start, v.end)).filter(|&(s, e)| !(s >= alias && e <= alias_end)).collect();
         let (mut internal, mut leaves, mut twigs) = (0u64, std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
         let mut out = vec![0u8; 4096];
         for (s, e) in vmas {

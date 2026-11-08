@@ -3,8 +3,9 @@
 //! thread wakes it with a result, its deadline passes, or a signal
 //! interrupts it.
 //!
-//! Each waiting thread sleeps on a futex word of its own, in a page the
-//! kernel keeps for these words. A wakeup stores the thread's result under
+//! Each waiting thread sleeps on a futex word of its own, in its context
+//! (`gex_abi::ctx::WAIT`), which is the kernel's and not in the program's
+//! address space. A wakeup stores the thread's result under
 //! the kernel lock, then bumps the word and wakes it. The sleeper read the
 //! word under the same lock before it slept, so a wakeup between that read
 //! and the sleep is not lost: the word no longer holds what it read.
@@ -28,10 +29,6 @@ pub enum WaitResult {
     Restart,
 }
 
-/// The size of the page of wait words, and so the most threads that can
-/// wait at once.
-const PAGE: u64 = 64 * 1024;
-
 /// A thread's wait slot.
 #[derive(Clone, Copy, Debug, Default)]
 struct Slot {
@@ -45,9 +42,6 @@ struct Slot {
 /// Every thread's wait slot.
 #[derive(Debug, Default)]
 pub struct Waits {
-    pub(crate) page: u64,
-    next: u64,
-    free: Vec<u64>,
     slots: HashMap<i32, Slot>,
 }
 
@@ -62,11 +56,9 @@ impl Waits {
         self.slots.values().filter(|s| s.waiting).count()
     }
 
-    /// Forget a thread that has ended, its word back to the free list.
+    /// Forget a thread that has ended.
     pub fn forget(&mut self, tid: i32) {
-        if let Some(s) = self.slots.remove(&tid) {
-            self.free.push(s.word);
-        }
+        self.slots.remove(&tid);
     }
 }
 
@@ -79,32 +71,15 @@ pub struct Wait {
 }
 
 impl Kernel {
-    /// The word `tid` sleeps on, from the kernel's page (mapped on the
-    /// first wait).
-    fn darwin_wait_word(&mut self, m: &mut GuestMem<'_>, tid: i32) -> Result<u64, Errno> {
+    /// The word `tid` sleeps on: its context's (`gex_abi::ctx::WAIT`).
+    fn darwin_wait_word(&mut self, tid: i32) -> u64 {
         if let Some(s) = self.dtask.waits.slots.get(&tid) {
-            return Ok(s.word);
+            return s.word;
         }
-        let w = &mut self.dtask.waits;
-        let word = match w.free.pop() {
-            Some(word) => word,
-            None => {
-                if w.page == 0 {
-                    use crate::mem::flags as mf;
-                    let at = self.canonical(m, crate::syscalls::nr::MMAP, [0, PAGE, 3, mf::PRIVATE | mf::ANONYMOUS, u64::MAX, 0])?;
-                    self.dtask.waits.page = at;
-                }
-                let w = &mut self.dtask.waits;
-                if w.next + 4 > PAGE {
-                    return Err(Errno::EAGAIN);
-                }
-                let word = w.page + w.next;
-                w.next += 4;
-                word
-            }
-        };
+        let ctx = if tid == self.tid { self.ctx_addr } else { self.darwin_ctx_of(tid) };
+        let word = ctx + gex_abi::ctx::WAIT as u64;
         self.dtask.waits.slots.insert(tid, Slot { word, ..Default::default() });
-        Ok(word)
+        word
     }
 
     /// Put the calling thread to sleep for `wait`. The caller has already
@@ -112,10 +87,7 @@ impl Kernel {
     /// the wait ends ([`Self::darwin_wait_done`]).
     pub(crate) fn darwin_block(&mut self, m: &mut GuestMem<'_>, wait: Wait) -> SyscallOutcome {
         let tid = self.tid;
-        let word = match self.darwin_wait_word(m, tid) {
-            Ok(w) => w,
-            Err(_) => panic!("gex: Darwin thread {tid}: no wait word left"),
-        };
+        let word = self.darwin_wait_word(tid);
         let slot = self.dtask.waits.slots.get_mut(&tid).expect("slot made above");
         slot.waiting = true;
         slot.result = None;

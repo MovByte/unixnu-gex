@@ -495,13 +495,15 @@ pub mod ctx {
     /// which never use the vector registers, so their first 64 bytes.
     pub const COMPAT_SCRATCH: usize = if super::X86 { SCRATCH } else { V };
 
+    /// The word a Darwin thread sleeps on while it waits in the kernel
+    /// (`gex_kernel::darwin::wait`): the kernel's, in the thread's context
+    /// and not in the program's address space. After the x86-64 scratch
+    /// area, or after `v31`.
+    pub const WAIT: usize = if super::X86 { SCRATCH + 64 } else { V + 32 * 16 };
+
     /// Total size of the context structure, rounded up. The x87 stack and
-    /// the scratch area are x86-64's; an AArch64 context ends with `v31`.
-    pub const SIZE: usize = if super::X86 {
-        SCRATCH + 64
-    } else {
-        V + 32 * 16
-    };
+    /// the scratch area are x86-64's; both end with the wait word.
+    pub const SIZE: usize = WAIT + 8;
 
     /// Where the guest puts a system-call number: `x8`, or `rax` (`x(0)` in
     /// gex's numbering of x86-64 registers, which is the hardware's).
@@ -1328,8 +1330,9 @@ mod tests {
         assert!(ctx::V >= ctx::LAST_SYSCALL + 8);
         assert!(ctx::X87 == ctx::v(31) + 16);
         assert!(ctx::X87 % 16 == 0 && ctx::X87_TMP % 16 == 0);
-        assert!(!X86 || ctx::SIZE >= ctx::SCRATCH + 64);
-        assert!(X86 || ctx::SIZE == ctx::v(31) + 16);
+        assert!(!X86 || ctx::WAIT >= ctx::SCRATCH + 64);
+        assert!(X86 || ctx::WAIT == ctx::v(31) + 16);
+        assert!(ctx::SIZE == ctx::WAIT + 8);
         assert!(ctx::SIZE % 8 == 0);
         // The vector slots must be 16-byte aligned for `v128` accesses.
         assert!(ctx::V % 16 == 0);
