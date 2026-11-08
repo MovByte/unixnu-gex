@@ -520,6 +520,7 @@ fn engine_config() -> wasmtime::Config {
     config.wasm_function_references(true);
     config.wasm_gc(true);
     config.wasm_multi_memory(true);
+    gex_cache::configure(&mut config);
     config
 }
 

@@ -868,6 +868,9 @@ fn new_engine() -> Result<Engine> {
     if std::env::var_os("GEX_PERFMAP").is_some() {
         config.profiler(wasmtime::ProfilingStrategy::PerfMap);
     }
+    // Native unwind information: off, but for a profiling or debugging run
+    // (GEX_NATIVE_UNWIND=1).
+    gex_cache::configure(&mut config);
     Engine::new(&config).context("creating the wasm engine")
 }
 

@@ -93,6 +93,36 @@ fn evict(dir: &Path, budget: u64) -> u64 {
 /// SHA-256, from gex-key (the browser shim computes keys without wasmtime).
 pub use gex_key::sha256;
 
+/// Whether compiled code carries native unwind information (`.eh_frame`):
+/// only with `GEX_NATIVE_UNWIND=1`. Only a host unwinder walking through
+/// wasm frames reads it (a native profiler or debugger, the `backtrace`
+/// crate); wasm traps, backtraces and exceptions walk frame pointers and
+/// wasmtime's own tables instead. Registering it with the host unwinder is
+/// slow and serialised on macOS, for every module loaded and unloaded.
+pub fn native_unwind() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GEX_NATIVE_UNWIND").as_deref() == Ok("1"))
+}
+
+/// Configure an engine whose modules this cache keeps: every one is
+/// compiled with [`native_unwind`]'s setting.
+pub fn configure(config: &mut wasmtime::Config) {
+    config.native_unwind_info(native_unwind());
+}
+
+/// A cache name for code compiled with [`native_unwind`]'s setting.
+/// `Module::deserialize` does not compare the setting outside Windows, so
+/// code compiled with the other one is kept under another name, and a
+/// profiling run (`GEX_NATIVE_UNWIND=1`) never loads code it cannot
+/// unwind through.
+fn flavored(name: &str) -> std::borrow::Cow<'_, str> {
+    if native_unwind() {
+        format!("{name}-unwind").into()
+    } else {
+        name.into()
+    }
+}
+
 /// Bumped whenever the *layout* of a cache entry changes.
 ///
 /// What gex itself does to the guest is covered by [`build_fingerprint`], not
@@ -251,6 +281,7 @@ pub fn load_or_compile(
     key: &str,
     build: impl FnOnce() -> Result<(Vec<u8>, Vec<u8>)>,
 ) -> Result<Loaded> {
+    let key = flavored(key);
     let path = dir.join(format!("{key}.cwasm"));
     let meta_path = dir.join(format!("{key}.meta"));
     // Both halves must be present: a module without its metadata says nothing
@@ -313,6 +344,14 @@ pub fn load_or_compile(
 /// modules such as a function-tier unit, which the shared cache's budget
 /// would evict at once), compiled from `wasm` when absent or unusable.
 pub fn load_or_compile_at(engine: &Engine, path: &Path, wasm: &[u8]) -> Result<Module> {
+    let path = match path.file_stem().and_then(|s| s.to_str()) {
+        Some(stem) if native_unwind() => path.with_file_name(match path.extension().and_then(|x| x.to_str()) {
+            Some(x) => format!("{}.{x}", flavored(stem)),
+            None => flavored(stem).into_owned(),
+        }),
+        _ => path.to_path_buf(),
+    };
+    let path = path.as_path();
     memo(engine, wasm.len(), || format!("at:{}", path.display()), || load_or_compile_at_uncached(engine, path, wasm))
 }
 
@@ -427,7 +466,7 @@ fn content_name(wasm: &[u8]) -> String {
     }
     let mut h = sha256::Sha256::new();
     h.update(wasm);
-    let name = format!("{}.cwasm", sha256::hex(&h.finish()));
+    let name = format!("{}.cwasm", flavored(&sha256::hex(&h.finish())));
     if let Some(id) = id {
         let mut m = KEYS_CONTENT.lock().unwrap_or_else(|e| e.into_inner());
         if m.len() >= 64 {
