@@ -6053,6 +6053,11 @@ impl ThreadEnd<'_> {
     /// `pthread_join` waits on it). The id goes first, so a thread that has
     /// joined it no longer finds it in `/proc`.
     pub fn end(&self, m: &mut GuestMem<'_>, ctx_addr: u64, tid: i32) {
+        // Its processor time, final, to its task's (task->total_*_time).
+        self.thread.cpu.end();
+        if let (Some(times), Some(pid)) = (self.thread.cpu.times(), self.procs.task_owner(tid)) {
+            self.procs.add_dead_cpu(pid, times);
+        }
         self.thread_fs.set(ctx_addr, None);
         self.threads.remove(tid);
         self.procs.end_tid(tid);
@@ -9668,9 +9673,24 @@ impl Kernel {
 
     /// A guest syscall at `pc` (the trap instruction's own address).
     pub fn syscall(&mut self, m: &mut GuestMem<'_>, pc: u64) -> SyscallOutcome {
+        if self.darwin {
+            self.signals.thread().cpu.enter();
+        }
         let out = self.syscall_body(m, pc);
         self.darwin_ipc_leave();
+        if self.darwin {
+            self.signals.thread().cpu.leave(matches!(out, SyscallOutcome::Blocking(_)));
+        }
         out
+    }
+
+    /// The calling thread begins to run its program on this host thread:
+    /// its processor time is counted from now.
+    pub fn thread_cpu_start(&mut self) {
+        if self.darwin {
+            let tid = self.tid;
+            self.signals.thread().cpu.start(tid);
+        }
     }
 
     /// Handle one system call (`svc #0`, or `syscall`).
@@ -10412,8 +10432,14 @@ impl Kernel {
 
     /// A blocked call's wait has ended with `r`.
     pub fn finish_blocking(&mut self, m: &mut GuestMem<'_>, r: SysResult) -> SyscallOutcome {
+        if self.darwin {
+            self.signals.thread().cpu.enter();
+        }
         let out = self.finish_blocking_body(m, r);
         self.darwin_ipc_leave();
+        if self.darwin {
+            self.signals.thread().cpu.leave(matches!(out, SyscallOutcome::Blocking(_)));
+        }
         out
     }
 
@@ -10877,8 +10903,11 @@ impl Kernel {
         fault_address: u64,
     ) -> Delivery {
         if self.darwin {
+            // The exception is the kernel's to take, on the thread's time.
+            self.signals.thread().cpu.enter();
             let out = self.darwin_raise_fault(m, signo, pc, fault_address);
             self.darwin_ipc_leave();
+            self.signals.thread().cpu.leave(false);
             return out;
         }
         let action = self.signals.action(signo);

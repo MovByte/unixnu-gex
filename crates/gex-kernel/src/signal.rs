@@ -574,6 +574,8 @@ pub struct ThreadSig {
     /// A Darwin thread's exit reason (`uu_exit_reason`): the first a
     /// signal brought it, kept for the life of the thread.
     exit_reason: Mutex<Option<Note>>,
+    /// Its processor time.
+    pub cpu: crate::cpu::ThreadCpu,
 }
 
 impl std::fmt::Debug for ThreadSig {
@@ -599,6 +601,7 @@ impl ThreadSig {
             tsd: AtomicU64::new(0),
             name: Mutex::new(None),
             exit_reason: Mutex::new(None),
+            cpu: crate::cpu::ThreadCpu::default(),
         }
     }
 

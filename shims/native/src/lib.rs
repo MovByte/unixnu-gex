@@ -2391,6 +2391,8 @@ fn run_thread_loop(
     let mut pc = entry;
     let gate = store.data().spawn.as_ref().map(|s| Arc::clone(&s.gate));
     let memory = store.data().memory.clone();
+    // The thread's processor time counts from here, on this host thread.
+    store.data_mut().with_kernel(|k| k.thread_cpu_start());
     loop {
         // A Darwin thread made, or about to resume, while its task is held
         // waits first (thread_create's thread_hold, thread_apc_ast).

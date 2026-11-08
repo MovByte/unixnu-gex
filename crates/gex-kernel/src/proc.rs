@@ -247,6 +247,11 @@ struct Proc {
     lexit: bool,
     /// Darwin's `p_exit_reason`: why it ended, set as its exit began.
     exit_reason: Option<crate::signal::Note>,
+    /// The user and system time of its threads that have ended
+    /// (`task->total_user_time`, `total_system_time`), in nanoseconds.
+    dead_cpu: (u64, u64),
+    /// Its reaped children's (`p_stats->p_cru`'s times).
+    children_cpu: (u64, u64),
     /// Darwin's `p_persona`'s id: the id it is counted against
     /// (`chgproccnt`) instead of its real uid.
     persona: Option<u32>,
@@ -455,6 +460,8 @@ impl ProcTable {
                     xstat: 0,
                     lexit: false,
                     exit_reason: None,
+                    dead_cpu: (0, 0),
+                    children_cpu: (0, 0),
                     persona: None,
                     child_end: None,
                     execed: false,
@@ -537,6 +544,8 @@ impl ProcTable {
             xstat: 0,
             lexit: false,
             exit_reason: None,
+            dead_cpu: (0, 0),
+            children_cpu: (0, 0),
             persona,
             child_end: None,
             execed: false,
@@ -841,6 +850,26 @@ impl ProcTable {
     pub fn reap(&self, pid: i32) {
         if let Some(r) = self.remote {
             return (r.reap)(pid);
+        }
+        // reap_child_locked's ruadd of the child's times (its threads', at
+        // its end) to its parent's p_cru.
+        let ended = {
+            let t = self.lock();
+            t.procs.iter().find(|p| p.pid == pid).map(|p| (p.ppid, p.dead_cpu, p.darwin.clone()))
+        };
+        if let Some((ppid, (mut user, mut sys), record)) = ended {
+            if let Some(threads) = record.and_then(|r| r.downcast::<crate::darwin::procinfo::Public>().ok()).and_then(|p| p.threads.clone()) {
+                for tid in threads.tids() {
+                    if let Some((u, s)) = threads.get(tid).and_then(|t| t.cpu.times()) {
+                        user += u;
+                        sys += s;
+                    }
+                }
+            }
+            if let Some(parent) = self.lock().procs.iter_mut().find(|p| p.pid == ppid) {
+                parent.children_cpu.0 += user;
+                parent.children_cpu.1 += sys;
+            }
         }
         {
             let mut t = self.lock();
@@ -1202,6 +1231,24 @@ impl ProcTable {
     /// `pid`'s `p_exit_reason`, a zombie's too.
     pub fn exit_reason(&self, pid: i32) -> Option<crate::signal::Note> {
         self.lock().procs.iter().find(|p| p.pid == pid).and_then(|p| p.exit_reason.clone())
+    }
+
+    /// Add a thread's final times to `pid`'s ended threads'.
+    pub fn add_dead_cpu(&self, pid: i32, (user, sys): (u64, u64)) {
+        if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
+            p.dead_cpu.0 += user;
+            p.dead_cpu.1 += sys;
+        }
+    }
+
+    /// `pid`'s reaped children's user and system time.
+    pub fn children_cpu(&self, pid: i32) -> (u64, u64) {
+        self.lock().procs.iter().find(|p| p.pid == pid).map_or((0, 0), |p| p.children_cpu)
+    }
+
+    /// `pid`'s ended threads' user and system time.
+    pub fn dead_cpu(&self, pid: i32) -> (u64, u64) {
+        self.lock().procs.iter().find(|p| p.pid == pid).map_or((0, 0), |p| p.dead_cpu)
     }
 
     /// `proc_exiting(pid)`: its exit has begun, or it has ended.

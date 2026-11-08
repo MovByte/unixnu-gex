@@ -32,6 +32,7 @@ fn big_op_slow(what: &str, len: usize, at: &std::panic::Location<'_>) {
     }
 }
 
+pub mod cpu;
 pub mod cpus;
 pub mod darwin;
 pub mod errno;

@@ -272,6 +272,8 @@ impl Kernel {
             sys::SETRLIMIT => res(self.darwin_setrlimit(m, a[0], a[1])),
             sys::MMAP => res(self.darwin_mmap(m, a)),
             sys::MADVISE => res(self.darwin_madvise(m, a)),
+            sys::GETRUSAGE => res(self.darwin_getrusage(m, a[0] as i32, a[1])),
+            sys::THREAD_SELFUSAGE => res(self.darwin_thread_selfusage()),
             sys::MINHERIT => res(self.darwin_minherit(a)),
             // munmap and mprotect (`kern_mman.c`) are mach_vm_deallocate
             // and mach_vm_protect, with the address page aligned.

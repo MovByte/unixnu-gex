@@ -2787,6 +2787,16 @@ pub fn set_thread_time(started: fn(i32), ended: fn(i32), runtime: fn(i32) -> Opt
     let _ = THREAD_TIME.set(ThreadTime { started, ended, runtime });
 }
 
+/// Guest thread `tid`'s host thread's processor time in nanoseconds.
+pub(crate) fn host_thread_ns(tid: i32) -> Option<u64> {
+    (THREAD_TIME.get()?.runtime)(tid)
+}
+
+/// Whether the host has per-thread clocks.
+pub(crate) fn host_clocks() -> Option<()> {
+    THREAD_TIME.get().map(|_| ())
+}
+
 /// A guest thread starts on the calling host thread.
 pub fn thread_started(tid: i32) {
     if let Some(t) = THREAD_TIME.get() {
@@ -2796,6 +2806,7 @@ pub fn thread_started(tid: i32) {
 
 /// Guest thread `tid` has ended.
 pub fn thread_ended(tid: i32) {
+    crate::cpu::host_thread_ending(tid);
     if let Some(t) = THREAD_TIME.get() {
         (t.ended)(tid);
     }
