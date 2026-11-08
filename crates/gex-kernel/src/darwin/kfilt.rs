@@ -204,7 +204,10 @@ impl Kernel {
                 }
                 u32::from(k.hook32 != 0)
             }
-            f if f == id(evfilt::PROC) => self.filt_procevent(n, hint as u32),
+            // (A process's end carries its exit detail in the hint's high
+            // half: what filt_procevent reads from kn_proc's p_lflag and
+            // code signing flags, read as it ended.)
+            f if f == id(evfilt::PROC) => self.filt_procevent(n, hint as u32, (hint >> 32) as u32),
             f => panic!("filt_bad_event[{f}]({n}, {hint})"),
         }
     }
@@ -1168,8 +1171,8 @@ impl Kernel {
         let bell = self.darwin_timer_bell();
         let id = crate::procnote::listen(
             pid,
-            std::sync::Arc::new(move |hint: u32| {
-                inbox.lock().unwrap_or_else(|e| e.into_inner()).push((n, hint));
+            std::sync::Arc::new(move |hint: u32, detail: u32| {
+                inbox.lock().unwrap_or_else(|e| e.into_inner()).push((n, hint, detail));
                 bell.ring();
             }),
         );
@@ -1182,8 +1185,9 @@ impl Kernel {
 
     /// `filt_procevent`: the event collected if asked for; an exit (or a
     /// reap, for a knote that waits for one) ends the knote; the exit
-    /// status kept for the event's data with NOTE_EXITSTATUS.
-    fn filt_procevent(&mut self, n: KnId, hint: u32) -> u32 {
+    /// status kept for the event's data with NOTE_EXITSTATUS, and with
+    /// NOTE_EXIT_DETAIL what ended it (`detail`).
+    fn filt_procevent(&mut self, n: KnId, hint: u32, detail: u32) -> u32 {
         use crate::procnote::note;
         let event = hint & !note::PDATAMASK;
         let k = self.knote(n);
@@ -1200,8 +1204,8 @@ impl Kernel {
                 k.hook32 |= hint & note::PDATAMASK;
             }
             if k.sfflags & note::EXIT_DETAIL != 0 {
-                // No jetsam, decryption or code-signing kill here to say.
                 k.fflags |= note::EXIT_DETAIL;
+                k.hook32 |= detail;
             }
         }
         u32::from(k.fflags != 0)
@@ -1211,9 +1215,9 @@ impl Kernel {
     /// knote told; whether any was.
     pub(crate) fn darwin_proc_knotes(&mut self) -> bool {
         let notes = std::mem::take(&mut *self.dtask.kevents.proc_inbox.lock().unwrap_or_else(|e| e.into_inner()));
-        for &(n, hint) in &notes {
+        for &(n, hint, detail) in &notes {
             if self.knote_exists(n) {
-                self.knote_list(&[n], i64::from(hint));
+                self.knote_list(&[n], i64::from(hint) | i64::from(detail) << 32);
             }
         }
         !notes.is_empty()

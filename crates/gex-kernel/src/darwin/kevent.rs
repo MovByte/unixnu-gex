@@ -410,7 +410,7 @@ pub struct Kevents {
     /// The vnode notes posted to the process's vnode knotes, to tell them.
     pub vnote_inbox: Arc<Mutex<Vec<(KnId, u32)>>>,
     /// The process notes posted to the process's EVFILT_PROC knotes.
-    pub proc_inbox: Arc<Mutex<Vec<(KnId, u32)>>>,
+    pub proc_inbox: Arc<Mutex<Vec<(KnId, u32, u32)>>>,
     closed: Arc<Mutex<Vec<KqId>>>,
     /// Threads to wake when the call settles.
     wake: Vec<(i32, WaitResult)>,

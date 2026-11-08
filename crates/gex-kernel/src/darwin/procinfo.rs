@@ -40,6 +40,57 @@ pub struct Public {
     pub pcaction: Arc<std::sync::atomic::AtomicU32>,
     /// `p_persona`.
     pub persona: Option<Arc<super::persona::Persona>>,
+    /// `p_csflags`.
+    pub csflags: Arc<std::sync::atomic::AtomicU32>,
+}
+
+/// `p_lflag`'s termination bits.
+pub(crate) const P_LTERM_DECRYPTFAIL: u32 = 0x0400_0000;
+pub(crate) const P_LTERM_JETSAM: u32 = 0x0800_0000;
+pub(crate) const P_JETSAM_VMPAGESHORTAGE: u32 = 0x0000_0000;
+pub(crate) const P_JETSAM_VMTHRASHING: u32 = 0x1000_0000;
+pub(crate) const P_JETSAM_HIWAT: u32 = 0x2000_0000;
+pub(crate) const P_JETSAM_PID: u32 = 0x3000_0000;
+pub(crate) const P_JETSAM_IDLEEXIT: u32 = 0x4000_0000;
+pub(crate) const P_JETSAM_VNODE: u32 = 0x5000_0000;
+pub(crate) const P_JETSAM_FCTHRASHING: u32 = 0x6000_0000;
+const P_JETSAM_MASK: u32 = 0x7000_0000;
+
+/// What ended a process, as NOTE_EXIT_DETAIL says it (`filt_procevent`
+/// and `proc_pidnoteexit`): a decryption failure, a jetsam kill and its
+/// cause, a code signing kill.
+pub(crate) fn exit_detail(lterm: u32, csflags: u32) -> u32 {
+    const NOTE_EXIT_DECRYPTFAIL: u32 = 0x0001_0000;
+    const NOTE_EXIT_MEMORY: u32 = 0x0002_0000;
+    const NOTE_EXIT_CSERROR: u32 = 0x0004_0000;
+    const NOTE_EXIT_MEMORY_VMPAGESHORTAGE: u32 = 0x8000_0000;
+    const NOTE_EXIT_MEMORY_VMTHRASHING: u32 = 0x4000_0000;
+    const NOTE_EXIT_MEMORY_HIWAT: u32 = 0x2000_0000;
+    const NOTE_EXIT_MEMORY_PID: u32 = 0x1000_0000;
+    const NOTE_EXIT_MEMORY_IDLE: u32 = 0x0800_0000;
+    const NOTE_EXIT_MEMORY_VNODE: u32 = 0x0400_0000;
+    const NOTE_EXIT_MEMORY_FCTHRASHING: u32 = 0x0200_0000;
+    let mut d = 0;
+    if lterm & P_LTERM_DECRYPTFAIL != 0 {
+        d |= NOTE_EXIT_DECRYPTFAIL;
+    }
+    if lterm & P_LTERM_JETSAM != 0 {
+        d |= NOTE_EXIT_MEMORY;
+        d |= match lterm & P_JETSAM_MASK {
+            P_JETSAM_VMPAGESHORTAGE => NOTE_EXIT_MEMORY_VMPAGESHORTAGE,
+            P_JETSAM_VMTHRASHING => NOTE_EXIT_MEMORY_VMTHRASHING,
+            P_JETSAM_FCTHRASHING => NOTE_EXIT_MEMORY_FCTHRASHING,
+            P_JETSAM_VNODE => NOTE_EXIT_MEMORY_VNODE,
+            P_JETSAM_HIWAT => NOTE_EXIT_MEMORY_HIWAT,
+            P_JETSAM_PID => NOTE_EXIT_MEMORY_PID,
+            P_JETSAM_IDLEEXIT => NOTE_EXIT_MEMORY_IDLE,
+            _ => 0,
+        };
+    }
+    if csflags & super::amfi::cs::KILLED != 0 {
+        d |= NOTE_EXIT_CSERROR;
+    }
+    d
 }
 
 /// `p_pcaction`'s states (`P_PC*`): the control in its low bits, the action
@@ -167,6 +218,7 @@ fn flavor_size(f: u32) -> Option<(u32, bool)> {
 /// `proc_info`'s and `proc_pidinfo`'s errors as Darwin numbers them.
 mod e {
     pub const EPERM: i32 = 1;
+    pub const EACCES: i32 = 13;
     pub const EFAULT: i32 = 14;
     pub const ENAMETOOLONG: i32 = 63;
     pub const ENOTSUP: i32 = 45;
@@ -200,6 +252,7 @@ impl Kernel {
             threads: Some(Arc::clone(&self.thread_signals)),
             pcaction: Arc::clone(&self.dtask.pcaction),
             persona: self.dtask.persona.clone(),
+            csflags: Arc::clone(&self.dtask.csflags),
         }
     }
 
@@ -624,11 +677,40 @@ impl Kernel {
                 m.write(buf, &target.platform.to_le_bytes()).map_err(fault)?;
                 Ok(4)
             }
+            NOTEEXIT => {
+                let data = self.darwin_pidnoteexit(pid, &target, zombie, arg)?;
+                m.write(buf, &data.to_le_bytes()).map_err(fault)?;
+                Ok(4)
+            }
             _ => {
                 self.darwin_unimplemented(format!("proc_pidinfo flavor {fl}"));
                 Err(e::EINVAL)
             }
         }
+    }
+
+    /// `proc_pidnoteexit`: for its parent only, what a NOTE_EXIT knote
+    /// with `flags` (NOTE_EXITSTATUS, NOTE_EXIT_DETAIL) would carry. (No
+    /// process is traced here, so no parent-in-waiting asks.)
+    fn darwin_pidnoteexit(&self, pid: i32, p: &Public, zombie: bool, flags: u64) -> Result<u32, i32> {
+        use crate::procnote::note;
+        let flags = flags as u32;
+        if self.procs.ppid(pid) != self.pid {
+            return Err(e::EACCES);
+        }
+        let mut data = 0;
+        if flags & note::EXITSTATUS != 0 {
+            let xstat = if zombie {
+                self.procs.exit_status(pid).map_or(0, |w| super::exit::status_from_linux(w as u32) & 0xffff)
+            } else {
+                self.darwin_pstat(pid, false).1
+            };
+            data |= xstat & note::PDATAMASK;
+        }
+        if flags & note::EXIT_DETAIL != 0 {
+            data |= exit_detail(self.procs.lterm(pid), p.csflags.load(std::sync::atomic::Ordering::Acquire));
+        }
+        Ok(data)
     }
 
     /// `p_stat`: SRUN, SSTOP for a stopped process, SZOMB.

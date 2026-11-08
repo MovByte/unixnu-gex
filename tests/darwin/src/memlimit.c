@@ -3,7 +3,8 @@
 // task whose touched pages go past it (SIGKILL); pages it made reusable or
 // unmapped are not counted; a task that nears its limit (80 %) is told by
 // its EVFILT_MEMORYSTATUS knote (NOTE_MEMORYSTATUS_PROC_LIMIT_WARN). Needs
-// the com.apple.private.memorystatus entitlement.
+// the com.apple.private.memorystatus entitlement. The kill is a jetsam's:
+// PROC_PIDNOTEEXIT tells the parent NOTE_EXIT_MEMORY_PID.
 
 #include <errno.h>
 #include <mach-o/dyld.h>
@@ -18,6 +19,8 @@
 #include <unistd.h>
 
 #define MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES 7
+#define PROC_PIDNOTEEXIT 21
+#define NOTE_EXIT_MEMORY_PID 0x10000000
 #define MEMORYSTATUS_MEMLIMIT_ATTR_FATAL 0x1
 #ifndef EVFILT_MEMORYSTATUS
 #define EVFILT_MEMORYSTATUS (-14)
@@ -25,6 +28,7 @@
 #define NOTE_MEMORYSTATUS_PROC_LIMIT_WARN 0x10
 
 int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags, void *buffer, size_t buffersize);
+int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buffersize);
 
 typedef struct {
     int32_t active;
@@ -91,7 +95,15 @@ static int run(const char *mode) {
     char *env[] = {"MallocNanoZone=0", NULL};
     pid_t pid;
     int st;
-    if (posix_spawn(&pid, self, NULL, NULL, args, env) || waitpid(pid, &st, 0) != pid) return -1;
+    if (posix_spawn(&pid, self, NULL, NULL, args, env)) return -1;
+    // A jetsam kill, as its parent is told of it before collecting it.
+    siginfo_t si;
+    if (waitid(P_PID, pid, &si, WEXITED | WNOWAIT) != 0) return -1;
+    uint32_t d = 0;
+    if (proc_pidinfo(pid, PROC_PIDNOTEEXIT, NOTE_EXITSTATUS | NOTE_EXIT_DETAIL, &d, sizeof d) != sizeof d) return -1;
+    if (strcmp(mode, "over") == 0 && d != (SIGKILL | NOTE_EXIT_MEMORY | NOTE_EXIT_MEMORY_PID)) return -2;
+    if (strcmp(mode, "over") != 0 && d != 0) return -3;
+    if (waitpid(pid, &st, 0) != pid) return -1;
     return st;
 }
 

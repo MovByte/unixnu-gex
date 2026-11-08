@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 /// The signal a parent is owed when a child ends.
 const SIGCHLD: u32 = crate::signal::sig::SIGCHLD;
+const SIGKILL: u32 = crate::signal::sig::SIGKILL;
 const SIGHUP: u32 = crate::signal::sig::SIGHUP;
 const SIGCONT: u32 = crate::signal::sig::SIGCONT;
 use std::sync::{Arc, Mutex};
@@ -233,6 +234,9 @@ struct Proc {
     /// and the real uid it ended with: for its parent's record of its end.
     xhighbits: u8,
     uid: u32,
+    /// Darwin's `p_lflag` termination bits: `P_LTERM_JETSAM` and the
+    /// jetsam cause (`P_JETSAM_MASK`), set by a jetsam kill.
+    lterm: u32,
     /// Darwin's `p_persona`'s id: the id it is counted against
     /// (`chgproccnt`) instead of its real uid.
     persona: Option<u32>,
@@ -436,6 +440,7 @@ impl ProcTable {
                     posts: None,
                     xhighbits: 0,
                     uid: 0,
+                    lterm: 0,
                     persona: None,
                     child_end: None,
                     execed: false,
@@ -510,6 +515,7 @@ impl ProcTable {
             posts: None,
             xhighbits: 0,
             uid,
+            lterm: 0,
             persona,
             child_end: None,
             execed: false,
@@ -730,12 +736,13 @@ impl ProcTable {
         }
         // Published outside the table lock: a waiter wakes on `done` then wants
         // the table, so holding both here in the other order deadlocks.
+        let detail = self.exit_detail(pid);
         *cell.lock().unwrap_or_else(|e| e.into_inner()) = Some(status);
         self.orphanpg(pid, &jobc_orphaned);
         done.notify_all();
         // proc_exit's NOTE_EXIT, with the low half of the status as Darwin
-        // encodes it.
-        crate::procnote::post(pid, crate::procnote::note::EXIT | (crate::darwin::exit::status_from_linux(status as u32) & 0xffff));
+        // encodes it, and what ended it, read now while it is there.
+        crate::procnote::post_exit(pid, crate::procnote::note::EXIT | (crate::darwin::exit::status_from_linux(status as u32) & 0xffff), detail);
         // The parent is owed a SIGCHLD. A `wait4` parked on the condvar
         // doesn't need one, but a parent that polls `WNOHANG` and sleeps in
         // `sigsuspend` between polls has nothing else to wake it -- coreutils
@@ -1117,6 +1124,50 @@ impl ProcTable {
             p.queue.notify();
         }
         post_signal(&[pid], signo);
+    }
+
+    /// `jetsam_do_kill`'s `exit_with_reason(p, W_EXITCODE(0, SIGKILL))`:
+    /// unless `pid` has ended already, its `p_lflag` gains `flags` (the
+    /// jetsam bits) and it ends as SIGKILL ends it. No signal is posted,
+    /// so its knotes hear no NOTE_SIGNAL.
+    pub fn jetsam_kill(&self, pid: i32, flags: u32) {
+        let mut t = self.lock();
+        let Some(p) = t.procs.iter_mut().find(|p| p.pid == pid) else { return };
+        if p.child.status.lock().map(|s| s.is_some()).unwrap_or(true) {
+            return;
+        }
+        p.lterm |= flags;
+        p.pending.fetch_or(1u64 << (SIGKILL - 1), Ordering::AcqRel);
+        SIGNAL_SEQ.fetch_add(1, Ordering::Release);
+        p.queue.notify();
+    }
+
+    /// `pid`'s `p_lflag` termination bits ([`ProcTable::jetsam_kill`]),
+    /// a zombie's too.
+    pub fn lterm(&self, pid: i32) -> u32 {
+        self.lock().procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.lterm)
+    }
+
+    /// `pid`'s wait status, in the table's (Linux's) encoding, once it has
+    /// ended and until it is reaped.
+    pub fn exit_status(&self, pid: i32) -> Option<i32> {
+        let cell = self.lock().procs.iter().find(|p| p.pid == pid).map(|p| Arc::clone(&p.child.status))?;
+        let s = *cell.lock().unwrap_or_else(|e| e.into_inner());
+        s
+    }
+
+    /// `filt_procevent`'s NOTE_EXIT_DETAIL bits for `pid`, from its
+    /// termination bits and its code signing flags.
+    fn exit_detail(&self, pid: i32) -> u32 {
+        let (lterm, record) = {
+            let t = self.lock();
+            let Some(p) = t.procs.iter().find(|p| p.pid == pid) else { return 0 };
+            (p.lterm, p.darwin.clone())
+        };
+        let csflags = record
+            .and_then(|r| r.downcast::<crate::darwin::procinfo::Public>().ok())
+            .map_or(0, |p| p.csflags.load(Ordering::Acquire));
+        crate::darwin::procinfo::exit_detail(lterm, csflags)
     }
 
     /// psignal's stop of `pid` told to its parent: unless the parent has

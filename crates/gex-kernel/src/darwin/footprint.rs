@@ -238,9 +238,10 @@ impl Kernel {
             return;
         }
         if fatal {
-            // memorystatus_kill_process_sync(kMemorystatusKilledPerProcessLimit).
-            self.procs.jetsam().effects.kill.push(self.pid);
-            self.darwin_jetsam_effects();
+            // memorystatus_kill_process_sync(kMemorystatusKilledPerProcessLimit):
+            // memorystatus_do_kill's jetsam_do_kill.
+            use super::procinfo::{P_JETSAM_PID, P_LTERM_JETSAM};
+            self.procs.jetsam_kill(self.pid, P_LTERM_JETSAM | P_JETSAM_PID);
         } else {
             self.procs.jetsam().hwm_candidates = true;
             self.darwin_warn_process(m, active, fatal, true);

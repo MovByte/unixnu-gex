@@ -26,8 +26,9 @@ pub mod note {
     pub const CHILD: u32 = 0x4;
 }
 
-/// Who hears a process's notes.
-pub type Listener = Arc<dyn Fn(u32) + Send + Sync>;
+/// Who hears a process's notes: each hint, and for NOTE_EXIT the
+/// NOTE_EXIT_DETAIL bits of what ended the process (none otherwise).
+pub type Listener = Arc<dyn Fn(u32, u32) + Send + Sync>;
 
 #[derive(Default)]
 struct Registry {
@@ -75,11 +76,16 @@ pub fn unlisten(id: u64) {
 
 /// `proc_knote(pid, hint)`.
 pub fn post(pid: i32, hint: u32) {
+    post_exit(pid, hint, 0);
+}
+
+/// `proc_knote(pid, hint)` for a process's end, with its exit detail.
+pub fn post_exit(pid: i32, hint: u32, detail: u32) {
     if !any() {
         return;
     }
     let who: Vec<Listener> = registry().by_pid.get(&pid).map(|v| v.iter().map(|(_, f)| Arc::clone(f)).collect()).unwrap_or_default();
     for f in who {
-        f(hint);
+        f(hint, detail);
     }
 }
