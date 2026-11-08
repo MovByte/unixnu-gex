@@ -688,6 +688,10 @@ struct Emitter<'a> {
     /// i32 scratches the wasm32 path uses. Zero, and never declared, unless
     /// the memory is 64-bit: a wasm32 function keeps exactly its locals.
     scratch_addr: (u32, u32),
+    /// A Darwin process's address being held to its floor
+    /// (`gex_abi::DARWIN_GUEST_FLOOR`). Zero, and never declared, for any
+    /// other process.
+    scratch_floor: u32,
     /// Scratch for the safepoint counter.
     scratch_i32: u32,
     /// Scratch for the dispatch page index.
@@ -791,8 +795,10 @@ impl<'a> Emitter<'a> {
         } else {
             (0, 0)
         };
+        let scratch_floor = if gex_abi::mem64() && gex_abi::commpage_fold() { f.add_local(ValType::I64) } else { 0 };
         Emitter {
             scratch_addr,
+            scratch_floor,
             f,
             cx,
             ctx_local: 0,
@@ -1523,6 +1529,9 @@ impl<'a> Emitter<'a> {
         // nothing, and the engine traps any bulk address past the end.
         let on = null_guard_on();
         let null_guard = on && biased && !self.is_ctx(addr);
+        // A Darwin process's floor (`gex_abi::DARWIN_GUEST_FLOOR`): always,
+        // for every access but to the thread's own context.
+        let darwin_floor = gex_abi::commpage_fold() && biased && !self.is_ctx(addr);
         // A memory64 guest memory takes the guest address
         // as it stands: past the end of the memory, the engine's own check
         // traps, which is the SIGSEGV the guard below exists to produce. The
@@ -1532,8 +1541,9 @@ impl<'a> Emitter<'a> {
                 let ea = c.wrapping_add(offset as u64);
                 // A Darwin process: its commpage is at its alias.
                 let ea = gex_abi::fold_commpage(ea).unwrap_or(ea);
-                // Below the null guard: an address past every memory's end.
-                let ea = if null_guard && ea < gex_abi::NULL_GUARD { u64::MAX - 15 } else { ea };
+                // Below the null guard or a Darwin process's floor: an
+                // address past every memory's end.
+                let ea = if (null_guard && ea < gex_abi::NULL_GUARD) || (darwin_floor && ea < gex_abi::DARWIN_GUEST_FLOOR) { u64::MAX - 15 } else { ea };
                 self.f.i64_const(ea as i64);
                 return 0;
             }
@@ -1543,6 +1553,17 @@ impl<'a> Emitter<'a> {
             if gex_abi::commpage_fold() {
                 self.f.i64_const(gex_abi::DARWIN_ADDR_MASK as i64);
                 self.f.byte(0x83); // i64.and
+                // Below its floor: an address past every memory's end.
+                if darwin_floor {
+                    let t = self.scratch_floor;
+                    self.f.local_set(t);
+                    self.f.i64_const((u64::MAX - 15) as i64);
+                    self.f.local_get(t);
+                    self.f.local_get(t);
+                    self.f.i64_const(gex_abi::DARWIN_GUEST_FLOOR as i64);
+                    self.f.byte(code::I64_LT_U);
+                    self.f.byte(0x1b); // select
+                }
             }
             let max_static: i64 = if gex_abi::X86 { 0xffff } else if on { u32::MAX as i64 - gex_abi::NULL_GUARD as i64 } else { u32::MAX as i64 };
             if null_guard {

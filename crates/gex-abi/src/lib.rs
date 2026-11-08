@@ -1207,6 +1207,13 @@ pub const DARWIN_ADDR_MASK: u64 = LIMIT64 - 1;
 /// at the top of the 64-bit memory, a range the kernel reserves for it.
 pub const DARWIN_COMMPAGE_ALIAS: u64 = DARWIN_COMMPAGE_RO & DARWIN_ADDR_MASK;
 
+/// The lowest address a Darwin process's code may reach: below it are the
+/// 4 GiB `__PAGEZERO` every arm64 program has (`load_machfile` refuses one
+/// without; the map's minimum is raised past it) and the tables gex keeps
+/// above it, where the process has nothing mapped. Every translated access
+/// below it traps, as on the device the access would fault.
+pub const DARWIN_GUEST_FLOOR: u64 = HIGH_ARENA_BASE;
+
 static COMMPAGE_FOLD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Fold Darwin's commpage addresses in everything translated from now on, and
