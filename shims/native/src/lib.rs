@@ -2177,7 +2177,13 @@ fn perform_block(
             // sender's kill has returned, so a wait begun after that kill must
             // still find it.)
             loop {
-                for c in &candidates {
+                // A child the system reaped as it ended (a Darwin parent
+                // with P_NOCLDWAIT) is no longer there to wait for; none
+                // left, the wait finds none.
+                if candidates.iter().all(|c| c.reaped.load(std::sync::atomic::Ordering::Acquire)) {
+                    return Err(Errno::ECHILD);
+                }
+                for c in candidates.iter().filter(|c| !c.reaped.load(std::sync::atomic::Ordering::Acquire)) {
                     // The end to collect; else whether the child has ended
                     // (an end the call did not ask for).
                     let ended: std::result::Result<i32, bool> = {

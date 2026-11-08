@@ -263,6 +263,9 @@ struct Proc {
     /// (its SIGCHLD action has SA_NOCLDSTOP).
     execed: bool,
     nocldstop: bool,
+    /// Darwin's `P_NOCLDWAIT` (its SIGCHLD action has SA_NOCLDWAIT, or is
+    /// SIG_IGN): its children are reaped as they end, not left to it.
+    nocldwait: bool,
     /// `p_nice`.
     nice: i32,
     /// Signals `tgkill` sent to one thread of this process from another
@@ -466,6 +469,7 @@ impl ProcTable {
                     child_end: None,
                     execed: false,
                     nocldstop: false,
+                    nocldwait: false,
                     nice: 0,
                     to_threads: Vec::new(),
                     queue: crate::wait::Queue::new(),
@@ -550,6 +554,7 @@ impl ProcTable {
             child_end: None,
             execed: false,
             nocldstop: false,
+            nocldwait: false,
             nice,
             to_threads: Vec::new(),
             queue: crate::wait::Queue::new(),
@@ -779,6 +784,15 @@ impl ProcTable {
             if let Some(p) = p {
                 p.xstat = x;
             }
+            // A parent with P_NOCLDWAIT never sees it end: it is reaped
+            // before its end is published (no wait collects it).
+            let ppid = t.procs.iter().find(|p| p.pid == pid).map(|p| p.ppid);
+            let dead = ppid.is_some_and(|pp| t.procs.iter().any(|q| q.pid == pp && q.nocldwait)) && !virtual_init_parent(&t, ppid, virtual_init);
+            if dead {
+                if let Some(c) = t.procs.iter().find(|p| p.pid == pid) {
+                    c.child.reaped.store(true, Ordering::Release);
+                }
+            }
             x
         };
         *cell.lock().unwrap_or_else(|e| e.into_inner()) = Some(status);
@@ -794,6 +808,7 @@ impl ProcTable {
         // collectable: a handler's `WNOHANG` wait would otherwise find it
         // still running and wait for a SIGCHLD that has already come (as
         // dbus-daemon's activation helper does).
+        let mut dead_parent = None;
         let parent_q = {
             let mut t = self.lock();
             // its parent now (it may have been given to init since), or, if
@@ -813,6 +828,13 @@ impl ProcTable {
                     None => 0,
                 },
                 _ => match ppid {
+                // proc_exit for a parent with P_NOCLDWAIT: no record of the
+                // end, no SIGCHLD, no wakeup but reap_child_locked's; the
+                // system reaps it (REAP_DEAD_PARENT).
+                Some(ppid) if t.procs.iter().any(|p| p.pid == ppid && p.nocldwait) && t.procs.iter().find(|p| p.pid == pid).is_some_and(|p| p.child.reaped.load(Ordering::Acquire)) => {
+                    dead_parent = Some(ppid);
+                    0
+                }
                 Some(ppid) if t.procs.iter().any(|p| p.pid == ppid) => {
                     // proc_exit: the parent's record of this end, the top
                     // byte of the exit value moved to it but for pid 1's.
@@ -834,6 +856,17 @@ impl ProcTable {
                 },
             }
         };
+        if let Some(ppid) = dead_parent {
+            self.reap(pid);
+            // reap_child_locked: a parent left with no children is woken
+            // (its wait finds none).
+            let q = {
+                let t = self.lock();
+                let none_left = !t.procs.iter().any(|p| p.ppid == ppid);
+                t.procs.iter().find(|p| p.pid == ppid).filter(|_| none_left).map_or(0, |p| p.queue.id())
+            };
+            crate::wait::notify(q);
+        }
         // The parent's `wait4`, and its SIGCHLD.
         crate::wait::notify(parent_q);
         if parent_q != 0 {
@@ -851,13 +884,18 @@ impl ProcTable {
         if let Some(r) = self.remote {
             return (r.reap)(pid);
         }
-        // reap_child_locked's ruadd of the child's times (its threads', at
-        // its end) to its parent's p_cru.
+        // reap_child_locked's ruadd of the child's final rusage (its own
+        // times, its threads' at its end, and its reaped children's, as
+        // proc_exit made it) to its parent's p_cru, unless the parent has
+        // P_NOCLDWAIT.
         let ended = {
             let t = self.lock();
-            t.procs.iter().find(|p| p.pid == pid).map(|p| (p.ppid, p.dead_cpu, p.darwin.clone()))
+            t.procs.iter().find(|p| p.pid == pid).map(|p| {
+                let rollup = t.procs.iter().find(|q| q.pid == p.ppid).is_some_and(|q| !q.nocldwait);
+                (p.ppid, (p.dead_cpu.0 + p.children_cpu.0, p.dead_cpu.1 + p.children_cpu.1), p.darwin.clone(), rollup)
+            })
         };
-        if let Some((ppid, (mut user, mut sys), record)) = ended {
+        if let Some((ppid, (mut user, mut sys), record, true)) = ended {
             if let Some(threads) = record.and_then(|r| r.downcast::<crate::darwin::procinfo::Public>().ok()).and_then(|p| p.threads.clone()) {
                 for tid in threads.tids() {
                     if let Some((u, s)) = threads.get(tid).and_then(|t| t.cpu.times()) {
@@ -1151,6 +1189,13 @@ impl ProcTable {
     pub fn set_nocldstop(&self, pid: i32, on: bool) {
         if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
             p.nocldstop = on;
+        }
+    }
+
+    /// `pid`'s `P_NOCLDWAIT`, kept from its SIGCHLD action.
+    pub fn set_nocldwait(&self, pid: i32, on: bool) {
+        if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
+            p.nocldwait = on;
         }
     }
 
@@ -2004,4 +2049,10 @@ mod tests {
             assert!(!all[..i].contains(x), "pid {x} handed out twice");
         }
     }
+}
+
+/// Whether `ppid` is pid 1 under a virtual init (whose own rules apply to
+/// its children's ends, not P_NOCLDWAIT's).
+fn virtual_init_parent(_t: &Table, ppid: Option<i32>, virtual_init: bool) -> bool {
+    virtual_init && ppid == Some(INIT_PID)
 }

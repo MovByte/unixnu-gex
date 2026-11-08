@@ -459,8 +459,9 @@ impl Kernel {
         if d == dsig::SIGCHLD {
             ps.nocldstop = v.flags & saf::NOCLDSTOP != 0;
             ps.nocldwait = v.flags & saf::NOCLDWAIT != 0 || v.handler == SIG_IGN;
-            let nocldstop = ps.nocldstop;
+            let (nocldstop, nocldwait) = (ps.nocldstop, ps.nocldwait);
             self.procs.set_nocldstop(self.pid, nocldstop);
+            self.procs.set_nocldwait(self.pid, nocldwait);
         }
         let ignored = v.handler == SIG_IGN || (SIGPROP[d as usize] & prop::IGNORE != 0 && v.handler == SIG_DFL);
         if ignored {
