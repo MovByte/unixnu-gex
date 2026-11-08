@@ -103,7 +103,7 @@ impl<'a> FnBody<'a> {
         e.value_local = vec![None; n];
         e.value_const = vec![None; n];
         e.value_ctx = vec![false; n];
-        e.value_floored = vec![false; n];
+        e.value_xsel = vec![false; n];
         e.value_ty = vec![Ty::I64; n];
         e.value_fp = vec![None; n];
         FnBody { e, last: vec![usize::MAX; n], borrowed: Vec::new() }
@@ -225,7 +225,7 @@ impl<'a> FnBody<'a> {
         for c in self.e.value_ctx.iter_mut() {
             *c = false;
         }
-        for c in self.e.value_floored.iter_mut() {
+        for c in self.e.value_xsel.iter_mut() {
             *c = false;
         }
         // Values are numbered per block: forget the last block's (a value

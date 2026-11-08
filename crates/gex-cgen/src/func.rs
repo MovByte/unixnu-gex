@@ -2021,7 +2021,7 @@ pub fn live_in_with(f: &Function, sums: &HashMap<u64, Summary>, zf: &HashSet<u64
                         ..
                     } => l.insert(*r),
                     // A trap reads everything (on its faulting path).
-                    Stmt::Trap { .. } => l = RegSet::ALL,
+                    Stmt::Trap { .. } | Stmt::MemCheck { .. } => l = RegSet::ALL,
                     _ if emit::clobbers(s) => l = RegSet::ALL,
                     _ => {}
                 }
@@ -2069,7 +2069,7 @@ pub fn touched(funcs: &[Function]) -> HashMap<u64, RegSet> {
                     Stmt::Def { expr: Expr::ReadReg(r), .. } => l.insert(*r),
                     // A host helper may read or write any register in the
                     // context (x87, fxsave, cpuid), and a trap reads them all.
-                    Stmt::HostCall { .. } | Stmt::Def { expr: Expr::HostCall { .. }, .. } | Stmt::Trap { .. } => l = RegSet::ALL,
+                    Stmt::HostCall { .. } | Stmt::Def { expr: Expr::HostCall { .. }, .. } | Stmt::Trap { .. } | Stmt::MemCheck { .. } => l = RegSet::ALL,
                     _ if emit::clobbers(s) => l = RegSet::ALL,
                     _ => {}
                 }
@@ -2336,7 +2336,7 @@ pub fn trap_free(funcs: &[Function], sums: &HashMap<u64, Summary>) -> HashMap<u6
         }
         let mut callees = Vec::new();
         for b in &f.blocks {
-            if b.stmts.iter().any(|s| emit::clobbers(s) || matches!(s, Stmt::Trap { .. })) {
+            if b.stmts.iter().any(|s| emit::clobbers(s) || matches!(s, Stmt::Trap { .. } | Stmt::MemCheck { .. })) {
                 continue 'f;
             }
             let backward = |e: &Edge| {

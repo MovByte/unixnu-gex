@@ -9679,6 +9679,7 @@ impl Kernel {
         let out = self.syscall_body(m, pc);
         self.darwin_ipc_leave();
         if self.darwin {
+            self.darwin_flush_perms(m);
             self.signals.thread().cpu.leave(matches!(out, SyscallOutcome::Blocking(_)));
         }
         out
@@ -10438,6 +10439,7 @@ impl Kernel {
         let out = self.finish_blocking_body(m, r);
         self.darwin_ipc_leave();
         if self.darwin {
+            self.darwin_flush_perms(m);
             self.signals.thread().cpu.leave(matches!(out, SyscallOutcome::Blocking(_)));
         }
         out

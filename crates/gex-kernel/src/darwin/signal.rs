@@ -884,6 +884,25 @@ impl Kernel {
     /// signal when no exception handler takes it (`exception_triage`
     /// asks the thread's, the task's and the host's first: sending it
     /// there is not done here, and fails loudly).
+    /// An access the instruction at `pc` made at `addr` that its page does
+    /// not allow (`write`: a store's or an atomic's), as `vm_fault` answers
+    /// `handle_user_abort`: KERN_INVALID_ADDRESS where nothing is mapped,
+    /// which `ux_exception` makes SIGSEGV, else KERN_PROTECTION_FAILURE,
+    /// SIGBUS. The fault raised; the (Linux-numbered) signal with it.
+    pub fn darwin_access_fault(&mut self, m: &mut GuestMem<'_>, pc: u64, addr: u64, write: bool) -> (Delivery, u32) {
+        let prot = if addr >= gex_abi::DARWIN_GUEST_FLOOR { self.mem.lock().vma_at(addr).map(|v| v.prot) } else { None };
+        let l = match prot {
+            None => crate::signal::sig::SIGSEGV,
+            Some(p) => {
+                if p & if write { crate::mem::prot::WRITE } else { crate::mem::prot::READ } != 0 {
+                    self.darwin_unimplemented(format!("an access check at {addr:#x} (pc {pc:#x}) failed for a page whose protection {p:#x} allows it: the protection table is out of date"));
+                }
+                crate::signal::sig::SIGBUS
+            }
+        };
+        (self.raise_fault(m, l, pc, addr), l)
+    }
+
     pub(crate) fn darwin_raise_fault(&mut self, m: &mut GuestMem<'_>, l: u32, pc: u64, fault_address: u64) -> Delivery {
         let Some(d) = signal_from_linux(l) else { return Delivery::Terminate { signal: l, core: false } };
         use super::exception as exc;

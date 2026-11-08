@@ -388,7 +388,7 @@ fn trailing_flag_writes(stmts: &[Stmt]) -> Vec<usize> {
                 seen.insert(*reg);
             }
             Stmt::Def { expr: Expr::ReadReg(r), .. } => seen.insert(*r),
-            Stmt::Trap { .. } => break,
+            Stmt::Trap { .. } | Stmt::MemCheck { .. } => break,
             _ if gex_cgen::emit::clobbers(s) => break,
             _ => {}
         }

@@ -145,8 +145,37 @@ pub const DISPATCH_MAX_PAGES64: u64 = LIMIT64 / DISPATCH_PAGE;
 /// The M64 [`PATCHED_PAGES`]: one bit per page of [`DISPATCH_MAX_PAGES64`].
 pub const PATCHED_PAGES64: u64 = DISPATCH_DIR64 + DISPATCH_MAX_PAGES64 * 4;
 
+/// A Darwin process's page protections, as its translated code and its
+/// kernel's copies check them: one byte per [`PERM_PAGE`] of [`LIMIT64`],
+/// after [`PATCHED_PAGES64`]. A byte's low four bits are 0 where nothing is
+/// mapped, else [`perm::MAPPED`] with the mapping's protection bits; its
+/// high four ([`perm::BOTH_SHIFT`]) are what this page and the next both
+/// allow, so an access that may reach the next page is let through with one
+/// look. Every page below [`DARWIN_GUEST_FLOOR`] reads 0. Kept by the
+/// process's kernel as its map changes, before the change returns to the
+/// program.
+pub const PERM_TABLE64: u64 = PATCHED_PAGES64 + DISPATCH_MAX_PAGES64 / 8;
+
+/// The page [`PERM_TABLE64`] has a byte for: a Darwin process's 16 KiB.
+pub const PERM_PAGE_SHIFT: u32 = 14;
+pub const PERM_PAGE: u64 = 1 << PERM_PAGE_SHIFT;
+
+/// Bytes in [`PERM_TABLE64`].
+pub const PERM_TABLE_BYTES: u64 = LIMIT64 >> PERM_PAGE_SHIFT;
+
+/// A [`PERM_TABLE64`] byte's bits: the protection's (read, write, execute,
+/// as `PROT_*`), and whether the page is mapped at all.
+pub mod perm {
+    pub const READ: u8 = 1;
+    pub const WRITE: u8 = 2;
+    pub const EXEC: u8 = 4;
+    pub const MAPPED: u8 = 8;
+    /// Where in a byte what the page and the next both allow is.
+    pub const BOTH_SHIFT: u32 = 4;
+}
+
 /// End of the M64 tables, rounded to 1 MiB.
-pub const HIGH_TABLES_END: u64 = (PATCHED_PAGES64 + DISPATCH_MAX_PAGES64 / 8 + 0xf_ffff) & !0xf_ffff;
+pub const HIGH_TABLES_END: u64 = (PERM_TABLE64 + PERM_TABLE_BYTES + 0xf_ffff) & !0xf_ffff;
 
 /// The bottom of an M64 process's high arena: non-executable data (Linux
 /// `mmap` without `PROT_EXEC`, NT allocations without an executable
@@ -1052,6 +1081,12 @@ pub mod cache_op {
     /// host lets tier-1 have the address: the miss that follows translates
     /// it and its block takes the slot.
     pub const FTAB_TIER1: i32 = 14;
+    /// Not a cache operation: a Darwin process's access check
+    /// (`Stmt::MemCheck`) failed for a load, at `addr` (the context holds the
+    /// state before the instruction at `pc`). The host raises the fault.
+    pub const PERM_READ: i32 = 15;
+    /// The same for a store, or an atomic access.
+    pub const PERM_WRITE: i32 = 16;
 }
 
 /// The lowest address a guest access may name: below it are the runtime's
@@ -1340,7 +1375,8 @@ mod tests {
         // The M64 tables sit above every M32 address, below the arena.
         assert!(DISPATCH_DIR64 >= GUEST_LIMIT);
         assert!(DISPATCH_MAX_PAGES64 * DISPATCH_PAGE == LIMIT64);
-        assert!(PATCHED_PAGES64 + DISPATCH_MAX_PAGES64 / 8 <= HIGH_TABLES_END);
+        assert!(PATCHED_PAGES64 + DISPATCH_MAX_PAGES64 / 8 <= PERM_TABLE64);
+        assert!(PERM_TABLE64 + PERM_TABLE_BYTES <= HIGH_TABLES_END && HIGH_TABLES_END <= DARWIN_GUEST_FLOOR);
         assert!(HIGH_ARENA_BASE < LIMIT64 && HIGH_ARENA_BASE % WASM_PAGE == 0);
     }
 }

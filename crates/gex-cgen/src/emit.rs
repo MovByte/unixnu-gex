@@ -908,6 +908,9 @@ impl<'a> Emitter<'a> {
                     self.line(format!("*(volatile {ut} *)({p}) = ({nt}){v};"));
                 }
             }
+            // Only a Darwin process's code has them, and none of it is
+            // compiled to C.
+            Stmt::MemCheck { pc, .. } => panic!("an access check (block at {pc:#x}) in a C unit: Darwin code is not compiled to C"),
             Stmt::Trap { cond, pc, code } => {
                 // tier-1's lowering: only the faulting path writes back
                 // (everything, flags too: the host raises a signal from this

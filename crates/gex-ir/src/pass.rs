@@ -140,7 +140,7 @@ pub fn const_fold_forwarding(block: &mut Block, forward: bool) {
                         regs.push((*reg, b));
                     }
                 }
-                Stmt::Def { .. } | Stmt::Store { .. } | Stmt::VStore { .. } | Stmt::Fence | Stmt::Trap { .. } => {}
+                Stmt::Def { .. } | Stmt::Store { .. } | Stmt::VStore { .. } | Stmt::Fence | Stmt::Trap { .. } | Stmt::MemCheck { .. } => {}
                 _ => regs.clear(),
             }
         }
@@ -428,7 +428,7 @@ pub fn flag_effects(block: &Block) -> (u64, u64) {
             }
             // A fault hands the whole state to the host: every flag not yet
             // written in this block is read from the block's entry.
-            Stmt::Trap { .. } => {
+            Stmt::Trap { .. } | Stmt::MemCheck { .. } => {
                 uses |= ALL_FLAGS & !defs;
             }
             _ => {}
@@ -491,7 +491,7 @@ pub fn dead_store_elim_with(block: &mut Block, dead_out: &[GuestReg]) {
                 overwritten.clear();
             }
             // A register written before a fault is observable in it.
-            Stmt::Trap { .. } => overwritten.clear(),
+            Stmt::Trap { .. } | Stmt::MemCheck { .. } => overwritten.clear(),
             _ => {}
         }
     }

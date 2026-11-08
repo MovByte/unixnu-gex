@@ -244,7 +244,22 @@ impl crate::syscalls::Kernel {
     /// A Darwin process maps in arm64 iOS's 16 KiB pages: `mmap`,
     /// `munmap` and `mprotect` align to them.
     pub fn darwin_use_pages(&mut self) {
-        self.mem.lock().set_page(exec::PAGE_SIZE);
+        let mut mm = self.mem.lock();
+        mm.set_page(exec::PAGE_SIZE);
+        mm.keep_perms();
+    }
+
+    /// Write what has changed of the map to its protection table
+    /// (`gex_abi::PERM_TABLE64`), before the thread returns to its program:
+    /// a mapping call's change is in force when the call returns, for every
+    /// thread.
+    pub(crate) fn darwin_flush_perms(&mut self, m: &mut GuestMem<'_>) {
+        let writes = self.mem.lock().take_perm_writes();
+        for (page, bytes) in writes {
+            if m.write(gex_abi::PERM_TABLE64 + page, &bytes).is_err() {
+                self.darwin_unimplemented(format!("the protection table past the guest memory's end (page {page:#x})"));
+            }
+        }
     }
 
     /// This task's IPC state, with the system's table taken for the rest

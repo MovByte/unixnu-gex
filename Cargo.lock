@@ -704,6 +704,7 @@ dependencies = [
 name = "gex-ir"
 version = "0.0.1"
 dependencies = [
+ "gex-abi",
  "gex-f80",
 ]
 

@@ -1028,6 +1028,16 @@ pub enum Stmt {
     /// `if cond { write back; store pc; breakpoint(ctx, pc, code) }`, the
     /// host raising the fault from `breakpoint`.
     Trap { cond: Value, pc: u64, code: i32 },
+    /// A Darwin process's check of the access that follows, `size` bytes at
+    /// `addr + offset` made by the instruction at `pc`, against its pages'
+    /// protections (`gex_abi::PERM_TABLE64`): `need` is the
+    /// `gex_abi::perm` bits it takes (a load's read, a store's write, an
+    /// atomic's both). Where a page of it does not allow them, the
+    /// instruction faults there, nothing of it done: like a [`Stmt::Trap`]
+    /// it reads every register, the context holding the state before the
+    /// instruction and `PC` its address. The builder puts one before every
+    /// guest access when asked to ([`Builder::check_accesses`]).
+    MemCheck { addr: Value, offset: i64, size: u32, need: u8, pc: u64 },
     /// Store the low `bytes` bytes of a vector to guest memory.
     VStore {
         addr: Value,
@@ -1194,6 +1204,7 @@ impl Stmt {
             Stmt::HostCall { args, .. } => args.iter().copied().for_each(f),
             Stmt::X87 { args, .. } => args.iter().copied().for_each(f),
             Stmt::Trap { cond, .. } => f(*cond),
+            Stmt::MemCheck { addr, .. } => f(*addr),
             Stmt::VStore { addr, val, .. } => {
                 f(*addr);
                 f(*val);
@@ -1241,6 +1252,7 @@ impl Stmt {
             Stmt::Store { .. }
             | Stmt::HostCall { .. }
             | Stmt::Trap { .. }
+            | Stmt::MemCheck { .. }
             | Stmt::VStore { .. }
             | Stmt::MemCopy { .. }
             | Stmt::MemFill { .. }
@@ -1343,17 +1355,50 @@ impl Block {
 /// Incrementally builds a [`Block`]. The lifter's only interface to GIR.
 pub struct Builder {
     block: Block,
+    /// Whether each guest access gets its [`Stmt::MemCheck`], and the
+    /// address of the instruction being lifted.
+    checks: bool,
+    insn: u64,
 }
 
 impl Builder {
     pub fn new(start: u64) -> Builder {
         Builder {
             block: Block::new(start),
+            checks: false,
+            insn: start,
         }
+    }
+
+    /// Put a [`Stmt::MemCheck`] before every guest access from now on (a
+    /// Darwin process's, whose pages' protections its code is held to).
+    pub fn check_accesses(&mut self) {
+        self.checks = true;
+    }
+
+    /// The instruction at `pc` is being lifted: its accesses' checks fault
+    /// there.
+    pub fn set_insn(&mut self, pc: u64) {
+        self.insn = pc;
+    }
+
+    /// The check of an access, before it.
+    fn check(&mut self, addr: Value, offset: i64, size: u32, need: u8) {
+        let pc = self.insn;
+        self.block.stmts.push(Stmt::MemCheck { addr, offset, size, need, pc });
     }
 
     /// Append a value-producing expression and return its handle.
     pub fn def(&mut self, expr: Expr) -> Value {
+        if self.checks {
+            use gex_abi::perm;
+            match &expr {
+                Expr::Load { addr, offset, sz, .. } => self.check(*addr, *offset, sz.bytes(), perm::READ),
+                Expr::VLoad { addr, offset, bytes, .. } => self.check(*addr, *offset, *bytes, perm::READ),
+                Expr::Rmw { addr, sz, .. } | Expr::CmpXchg { addr, sz, .. } => self.check(*addr, 0, sz.bytes(), perm::READ | perm::WRITE),
+                _ => {}
+            }
+        }
         let v = Value(self.block.n_values);
         self.block.n_values += 1;
         self.block.stmts.push(Stmt::Def { dst: v, expr });
@@ -1369,6 +1414,13 @@ impl Builder {
     }
 
     pub fn stmt(&mut self, s: Stmt) {
+        if self.checks {
+            match &s {
+                Stmt::Store { addr, offset, sz, .. } => self.check(*addr, *offset, sz.bytes(), gex_abi::perm::WRITE),
+                Stmt::VStore { addr, offset, bytes, .. } => self.check(*addr, *offset, *bytes, gex_abi::perm::WRITE),
+                _ => {}
+            }
+        }
         self.block.stmts.push(s);
     }
 

@@ -325,6 +325,8 @@ pub fn run_with_memory(f: &Function, seed: u64, mut regs: Vec<u64>, m: &Model, i
                         vals.insert(*o, v);
                     }
                 }
+                // The model's memory has no protections to check.
+                Stmt::MemCheck { .. } => {}
                 Stmt::Trap { cond, pc, code } => match get(&vals, *cond) {
                     Some(0) => {}
                     Some(_) => finish!(Stop::Fault(*pc, *code)),

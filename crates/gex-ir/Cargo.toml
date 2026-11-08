@@ -6,5 +6,7 @@ license.workspace = true
 description = "GIR: gex's SSA IR for binary translation"
 
 [dependencies]
+# The protection bits a Darwin process's access checks take (`Stmt::MemCheck`).
+gex-abi.workspace = true
 # The x87's arithmetic, for the interpreter's `Stmt::X87`.
 gex-f80.workspace = true

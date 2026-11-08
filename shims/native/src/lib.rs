@@ -4774,6 +4774,32 @@ fn low_access(caller: &mut Caller<'_, HostState>, what: &str, addr: u64, pc: u64
     Err(StopExecution.into())
 }
 
+/// A Darwin process's access its page does not allow
+/// (`cache_op::PERM_READ`, `PERM_WRITE`): the fault raised at the
+/// instruction, whose state the context holds; its handler runs next, or
+/// the process ends.
+fn darwin_access_fault(caller: &mut Caller<'_, HostState>, addr: u64, pc: u64, write: bool) -> Result<()> {
+    let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+    let state = caller.data_mut();
+    let mut gm = GuestMem::new(memory.bytes());
+    let (delivery, l) = state.with_kernel(|k| k.darwin_access_fault(&mut gm, pc, addr, write));
+    match delivery {
+        gex_kernel::signal::Delivery::Resume(target) => {
+            state.resume_cause = Some(format!("signal {l} for an access at {addr:#x}"));
+            state.resume_at = Some(target);
+        }
+        _ => {
+            state.exit = Some(Exit::Signal {
+                signal: l as i32,
+                pc,
+                detail: format!("{} at {addr:#x}, which its page does not allow", if write { "a store" } else { "a load" }),
+                internal: false,
+            })
+        }
+    }
+    Err(StopExecution.into())
+}
+
 /// Wire the `gex.*` import surface to the kernel.
 fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
     let m = IMPORT_MODULE;
@@ -5682,6 +5708,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             }
             if op == gex_abi::cache_op::LOW_ACCESS {
                 return low_access(&mut caller, "a locked access", addr as u64, pc as u64);
+            }
+            if op == gex_abi::cache_op::PERM_READ || op == gex_abi::cache_op::PERM_WRITE {
+                return darwin_access_fault(&mut caller, addr as u64, pc as u64, op == gex_abi::cache_op::PERM_WRITE);
             }
             if op == gex_abi::cache_op::SPLIT_LOCK {
                 eprintln!(

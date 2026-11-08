@@ -224,6 +224,9 @@ pub fn block(b: &Block) -> String {
             Stmt::Trap { cond, pc, code } => {
                 let _ = writeln!(s, "  trap if {cond:?} at 0x{pc:x} code {code}");
             }
+            Stmt::MemCheck { addr, offset, size, need, pc } => {
+                let _ = writeln!(s, "  memcheck {size} bytes at {addr:?}+{offset} need {need:#x} at 0x{pc:x}");
+            }
             Stmt::VStore {
                 addr,
                 offset,

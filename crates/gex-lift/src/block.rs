@@ -25,6 +25,10 @@ impl Default for BlockLimits {
 /// with [`Term::Illegal`] rather than failing the build.
 pub fn lift_block(fetch: impl Fn(u64) -> Option<u32>, start: u64, limits: BlockLimits) -> Block {
     let mut builder = Builder::new(start);
+    // A Darwin process's code is held to its pages' protections.
+    if gex_abi::commpage_fold() && gex_abi::mem64() {
+        builder.check_accesses();
+    }
     let mut pc = start;
     let mut term = None;
     // A block's predecessor is unknown here, so the flags start unknown.
@@ -37,6 +41,7 @@ pub fn lift_block(fetch: impl Fn(u64) -> Option<u32>, start: u64, limits: BlockL
         };
         let inst = decode(raw, pc);
         let mark = builder.mark();
+        builder.set_insn(pc);
         let mut lifter = Lifter::new(&mut builder).with_raw(raw).with_flags(flags);
         let flow = lifter.lift(&inst, pc);
         flags = lifter.flags();

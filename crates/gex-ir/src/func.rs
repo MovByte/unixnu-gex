@@ -733,6 +733,7 @@ pub fn for_each_use_mut(s: &mut Stmt, mut f: impl FnMut(&mut Value)) {
         Stmt::HostCall { args, .. } => args.iter_mut().for_each(f),
         Stmt::X87 { args, .. } => args.iter_mut().for_each(f),
         Stmt::Trap { cond, .. } => f(cond),
+        Stmt::MemCheck { addr, .. } => f(addr),
         Stmt::MemCopy { dst, src, len } => {
             f(dst);
             f(src);
@@ -926,7 +927,7 @@ pub fn effect(s: &Stmt) -> Effect {
         Stmt::HostCall { func, .. } => e.host = Some(*func),
         // Pure: no effect beyond the values it defines.
         Stmt::X87 { .. } => {}
-        Stmt::Trap { .. } => e.trap = true,
+        Stmt::Trap { .. } | Stmt::MemCheck { .. } => e.trap = true,
         Stmt::MemCopy { dst, src, .. } => {
             e.mem.push(rd(*src, 0, None, Order::Relaxed));
             e.mem.push(wr(*dst, 0, None, Order::Relaxed));

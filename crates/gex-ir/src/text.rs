@@ -437,6 +437,7 @@ pub fn stmt(s: &Stmt) -> String {
         Stmt::HostCall { func, args } => format!("host {} {}", tok(func), vs(args)),
         Stmt::X87 { op, args, outs } => format!("{} = x87 {} {}", vs(outs), x87_tok(*op), vs(args)),
         Stmt::Trap { cond, pc, code } => format!("trap {} {:#x} {}", v(*cond), pc, code),
+        Stmt::MemCheck { addr, offset, size, need, pc } => format!("memcheck {} {} {} {} {:#x}", size, need, v(*addr), offset, pc),
         Stmt::VStore {
             addr,
             offset,
@@ -1130,6 +1131,19 @@ fn parse_stmt(k: &mut Toks) -> Result<Stmt, String> {
                 cond,
                 pc,
                 code: i32::try_from(code).map_err(|_| k.err(format!("trap code {code} out of range")))?,
+            }
+        }
+        "memcheck" => {
+            let size = k.u32()?;
+            let need = k.u32()?;
+            let addr = k.val()?;
+            let offset = k.int()?;
+            Stmt::MemCheck {
+                size,
+                need: u8::try_from(need).map_err(|_| k.err(format!("memcheck need {need} out of range")))?,
+                addr,
+                offset,
+                pc: k.num()?,
             }
         }
         "vstore" => {

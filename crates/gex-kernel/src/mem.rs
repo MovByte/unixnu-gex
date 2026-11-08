@@ -431,6 +431,101 @@ pub struct MemoryMap {
     /// What the mapping calls leave for the host and for each other, under
     /// the same lock as the map they describe ([`MapLog`]).
     pub log: MapLog,
+    /// A Darwin process's protection table ([`Perms`]); `None` for every
+    /// other process.
+    perms: Option<Perms>,
+}
+
+/// A Darwin process's page protections as its table
+/// (`gex_abi::PERM_TABLE64`) was last written, and the ranges written over
+/// since by a change to the map that its kernel has still to write.
+#[derive(Debug)]
+pub struct Perms {
+    /// Each mapping's range and protection, as the table was last told.
+    shown: Vec<(u64, u64, u32)>,
+    /// Ranges whose bytes are to be written again.
+    dirty: Vec<(u64, u64)>,
+}
+
+impl Clone for Perms {
+    /// A copy of the map is another memory's (a fork's child's), whose
+    /// table holds nothing yet: all of it is to be written.
+    fn clone(&self) -> Perms {
+        Perms { shown: self.shown.clone(), dirty: vec![(0, gex_abi::LIMIT64)] }
+    }
+}
+
+impl Perms {
+    /// The mappings are now `now`: where their protection differs from
+    /// what the table was told (a mapping made, removed or changed), to be
+    /// written again.
+    fn note(&mut self, now: Vec<(u64, u64, u32)>) {
+        fn at(r: &[(u64, u64, u32)], a: u64) -> Option<u32> {
+            let i = r.partition_point(|&(s, _, _)| s <= a);
+            r[..i].last().filter(|&&(_, e, _)| a < e).map(|&(_, _, p)| p)
+        }
+        let mut pts: Vec<u64> = self.shown.iter().chain(now.iter()).flat_map(|&(s, e, _)| [s, e]).collect();
+        pts.sort_unstable();
+        pts.dedup();
+        for w in pts.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            if at(&self.shown, a) != at(&now, a) {
+                match self.dirty.last_mut() {
+                    Some(last) if last.1 == a => last.1 = b,
+                    _ => self.dirty.push((a, b)),
+                }
+            }
+        }
+        self.shown = now;
+    }
+
+    /// The table's bytes for what has changed: each run's first page and
+    /// its bytes, read from `vmas` (the map as it now stands). A page's
+    /// protection is its mapping's, [`gex_abi::perm::MAPPED`] with it, only
+    /// where mappings cover all of it (the protection all of them allow),
+    /// else 0, and 0 below the process's floor; its byte is that with what
+    /// it and the next page both allow above (so a change's page before it
+    /// is written too).
+    fn writes(&mut self, vmas: &[Vma]) -> Vec<(u64, Vec<u8>)> {
+        use gex_abi::{perm, PERM_PAGE, PERM_PAGE_SHIFT, PERM_TABLE_BYTES};
+        let mut dirty = std::mem::take(&mut self.dirty);
+        dirty.sort_unstable();
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        for (s, e) in dirty {
+            let (ps, pe) = ((s >> PERM_PAGE_SHIFT).saturating_sub(1), ((e + PERM_PAGE - 1) >> PERM_PAGE_SHIFT).min(PERM_TABLE_BYTES));
+            if ps >= pe {
+                continue;
+            }
+            match runs.last_mut() {
+                Some(last) if ps <= last.1 => last.1 = last.1.max(pe),
+                _ => runs.push((ps, pe)),
+            }
+        }
+        let floor = gex_abi::DARWIN_GUEST_FLOOR >> PERM_PAGE_SHIFT;
+        runs.into_iter()
+            .map(|(ps, pe)| {
+                // One page more, for the last page's next.
+                let n = (pe - ps) as usize + 1;
+                let mut acc = vec![0xffu8; n];
+                let mut covered = vec![0u64; n];
+                let (lo, hi) = (ps << PERM_PAGE_SHIFT, (pe + 1) << PERM_PAGE_SHIFT);
+                let first = vmas.partition_point(|v| v.end <= lo);
+                for v in vmas[first..].iter().take_while(|v| v.start < hi) {
+                    let byte = perm::MAPPED | (v.prot & 7) as u8;
+                    let (a, b) = (v.start.max(lo), v.end.min(hi));
+                    for p in (a >> PERM_PAGE_SHIFT)..=((b - 1) >> PERM_PAGE_SHIFT) {
+                        let (pa, pb) = (a.max(p << PERM_PAGE_SHIFT), b.min((p + 1) << PERM_PAGE_SHIFT));
+                        let i = (p - ps) as usize;
+                        covered[i] += pb - pa;
+                        acc[i] &= byte;
+                    }
+                }
+                let own: Vec<u8> = (0..n).map(|i| if covered[i] == PERM_PAGE && ps + i as u64 >= floor && ps + (i as u64) < PERM_TABLE_BYTES { acc[i] } else { 0 }).collect();
+                let bytes = (0..n - 1).map(|i| own[i] | (own[i] & own[i + 1]) << perm::BOTH_SHIFT).collect();
+                (ps, bytes)
+            })
+            .collect()
+    }
 }
 
 /// What a process's mapping calls note beside its map: kept with the map,
@@ -640,6 +735,25 @@ impl MemoryMap {
             take_end: 0,
             fixed_only: Vec::new(),
             log: MapLog::default(),
+            perms: None,
+        }
+    }
+
+    /// Keep this map's protection table (`gex_abi::PERM_TABLE64`): a
+    /// Darwin process's, before it maps anything. All of it is to be
+    /// written.
+    pub fn keep_perms(&mut self) {
+        self.perms = Some(Perms { shown: Vec::new(), dirty: vec![(0, gex_abi::LIMIT64)] });
+        self.publish();
+    }
+
+    /// What the protection table is to be written with since it last was
+    /// (each run's first page and its bytes); nothing for a map that keeps
+    /// none.
+    pub fn take_perm_writes(&mut self) -> Vec<(u64, Vec<u8>)> {
+        match &mut self.perms {
+            Some(p) if !p.dirty.is_empty() => p.writes(&self.vmas),
+            _ => Vec::new(),
         }
     }
 
@@ -661,6 +775,8 @@ impl MemoryMap {
         // The log goes on (the host has still to retire the old code), but
         // not the old image's shared mappings: exec wrote them back already.
         fresh.log.shared_maps.clear();
+        // The table goes on, its old mappings' bytes to be cleared.
+        fresh.perms = self.perms.take();
         *self = fresh;
         self.publish();
     }
@@ -766,10 +882,13 @@ impl MemoryMap {
     }
 
     /// Publish the map as it stands to its [`MapView`].
-    fn publish(&self) {
+    fn publish(&mut self) {
         if KEEPS_VIEWS {
             let ranges = MapView::ranges(&self.vmas);
             self.view.0.cur.write(|_| (Some(ranges), ()));
+        }
+        if let Some(p) = &mut self.perms {
+            p.note(self.vmas.iter().map(|v| (v.start, v.end, v.prot)).collect());
         }
     }
 

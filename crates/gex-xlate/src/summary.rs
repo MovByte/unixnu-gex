@@ -840,7 +840,7 @@ fn run_block(b: &FBlock, st: &mut St, acc: &mut Acc) -> HashMap<Value, AV> {
                     vals.insert(*o, AV::top(taint));
                 }
             }
-            Stmt::Trap { .. } => {
+            Stmt::Trap { .. } | Stmt::MemCheck { .. } => {
                 st.kill(i64::MIN, st.floor());
                 // Taken, it hands the exact context to a signal handler,
                 // which may leave by longjmp: every register is read and

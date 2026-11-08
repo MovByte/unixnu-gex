@@ -688,10 +688,10 @@ struct Emitter<'a> {
     /// i32 scratches the wasm32 path uses. Zero, and never declared, unless
     /// the memory is 64-bit: a wasm32 function keeps exactly its locals.
     scratch_addr: (u32, u32),
-    /// A Darwin process's address being held to its floor
-    /// (`gex_abi::DARWIN_GUEST_FLOOR`). Zero, and never declared, for any
-    /// other process.
-    scratch_floor: u32,
+    /// A Darwin process's access being checked (`Stmt::MemCheck`): its
+    /// first byte's address, and a protection table index. Zero, and never
+    /// declared, for any other process.
+    scratch_check: (u32, u32),
     /// Scratch for the safepoint counter.
     scratch_i32: u32,
     /// Scratch for the dispatch page index.
@@ -723,9 +723,10 @@ struct Emitter<'a> {
     pub(crate) value_ctx: Vec<bool>,
     /// The values that choose, in a Darwin process, between a guest address
     /// and one in the thread's context (a store-exclusive's: its scratch
-    /// slot when its monitor does not match). The floor guarded the guest
-    /// address where the choice was made; the context is below it.
-    pub(crate) value_floored: Vec<bool>,
+    /// slot when its monitor does not match): an access check
+    /// (`Stmt::MemCheck`) holds the guest address to its pages' protections
+    /// and lets the context's be.
+    pub(crate) value_xsel: Vec<bool>,
     /// The locals `alloc` made: block-local temporaries, never holding a
     /// value from one block to another (fmode's `strip_dead_tees`).
     pub(crate) temps: Vec<u32>,
@@ -800,10 +801,10 @@ impl<'a> Emitter<'a> {
         } else {
             (0, 0)
         };
-        let scratch_floor = if gex_abi::mem64() && gex_abi::commpage_fold() { f.add_local(ValType::I64) } else { 0 };
+        let scratch_check = if gex_abi::mem64() && gex_abi::commpage_fold() { (f.add_local(ValType::I64), f.add_local(ValType::I64)) } else { (0, 0) };
         Emitter {
             scratch_addr,
-            scratch_floor,
+            scratch_check,
             f,
             cx,
             ctx_local: 0,
@@ -818,7 +819,7 @@ impl<'a> Emitter<'a> {
             value_u32: Vec::new(),
             value_chase: Vec::new(),
             value_ctx: Vec::new(),
-            value_floored: Vec::new(),
+            value_xsel: Vec::new(),
             temps: Vec::new(),
             value_ty: Vec::new(),
             free_i32: Vec::new(),
@@ -1021,7 +1022,7 @@ impl<'a> Emitter<'a> {
         self.value_local = vec![None; n];
         self.value_const = vec![None; n];
         self.value_ctx = vec![false; n];
-        self.value_floored = vec![false; n];
+        self.value_xsel = vec![false; n];
         self.value_ty = vec![Ty::I64; n];
         let dying = dying_after(block);
         self.prof_entry(block);
@@ -1096,7 +1097,7 @@ impl<'a> Emitter<'a> {
         self.value_local = vec![None; n];
         self.value_const = vec![None; n];
         self.value_ctx = vec![false; n];
-        self.value_floored = vec![false; n];
+        self.value_xsel = vec![false; n];
         self.value_ty = vec![Ty::I64; n];
 
         let dying = dying_after(block);
@@ -1520,6 +1521,115 @@ impl<'a> Emitter<'a> {
         debug_assert_eq!(off, 0);
     }
 
+    /// A Darwin process's access check ([`Stmt::MemCheck`]): the pages of
+    /// the access's first and last bytes looked up in its protection table
+    /// (`gex_abi::PERM_TABLE64`). Where either lacks `need`, the registers
+    /// are written back, `PC` is the instruction's, and the host raises the
+    /// fault (`cache_op::PERM_READ` or `PERM_WRITE`) at the access's first
+    /// byte in a page that does not allow it. Not for the thread's own
+    /// context, which the runtime keeps below the floor; a store-exclusive's
+    /// choice of its scratch slot there is let be.
+    fn emit_mem_check(&mut self, addr: Value, offset: i64, size: u32, need: u8, pc: u64) {
+        use gex_abi::{PERM_PAGE, PERM_PAGE_SHIFT, PERM_TABLE64, PERM_TABLE_BYTES};
+        if self.is_ctx(addr) {
+            return;
+        }
+        let (t, idx) = self.scratch_check;
+        // The first byte, as `emit_address` makes it.
+        if let Some(c) = self.value_const.get(addr.0 as usize).copied().flatten() {
+            let ea = c.wrapping_add(offset as u64);
+            let ea = gex_abi::fold_commpage(ea).unwrap_or(ea);
+            self.f.i64_const(ea as i64);
+        } else {
+            self.push(addr);
+            self.f.i64_const(gex_abi::DARWIN_ADDR_MASK as i64);
+            self.f.byte(0x83); // i64.and
+            if offset != 0 {
+                self.f.i64_const(offset);
+                self.f.byte(0x7c); // i64.add
+            }
+        }
+        self.f.local_set(t);
+        // A byte's page's protection. The first byte's index is in the
+        // table when the static offset is under a page (the address was
+        // wrapped into the memory, and the byte past the table reads 0,
+        // `HIGH_TABLES_END` padding it); else, and for the last byte, the
+        // index is held to the table's end.
+        let small = (0..PERM_PAGE as i64).contains(&offset);
+        let byte = |e: &mut Self, past: u32, clamp: bool| {
+            e.f.local_get(t);
+            if past != 0 {
+                e.f.i64_const(past as i64);
+                e.f.byte(0x7c); // i64.add
+            }
+            e.f.i64_const(PERM_PAGE_SHIFT as i64);
+            e.f.byte(0x88); // i64.shr_u
+            if clamp {
+                e.f.local_tee(idx);
+                e.f.i64_const(PERM_TABLE_BYTES as i64);
+                e.f.local_get(idx);
+                e.f.i64_const(PERM_TABLE_BYTES as i64);
+                e.f.byte(code::I64_LT_U);
+                e.f.select();
+            }
+            e.f.load64(0x2d, 0, PERM_TABLE64); // i32.load8_u
+        };
+        // Whether a page's byte (on the stack) lacks `need`, in its own
+        // bits or in what it and the next page both allow.
+        let lacks_in = |e: &mut Self, bits: i32| {
+            e.f.i32_const(bits);
+            e.f.byte(0x71); // i32.and
+            e.f.i32_const(bits);
+            e.f.byte(0x47); // i32.ne
+        };
+        let lacks = |e: &mut Self| lacks_in(e, need as i32);
+        // The fast test: the first byte's page lacks it, or (for an access
+        // that may reach the next page) the two pages do not both have it.
+        byte(self, 0, !small);
+        lacks_in(self, if size > 1 { (need as i32) << gex_abi::perm::BOTH_SHIFT } else { need as i32 });
+        // A store-exclusive's slot in this thread's context is no guest page.
+        if self.value_xsel.get(addr.0 as usize).copied().unwrap_or(false) {
+            self.f.local_get(t);
+            self.ctx_base();
+            self.f.byte(0x7d); // i64.sub
+            self.f.i64_const(ctx::SIZE as i64);
+            self.f.byte(0x5a); // i64.ge_u
+            self.f.byte(0x71); // i32.and
+        }
+        self.f.if_void();
+        // The whole test: either page lacks it.
+        if size > 1 {
+            byte(self, 0, !small);
+            lacks(self);
+            byte(self, size - 1, true);
+            lacks(self);
+            self.f.byte(0x72); // i32.or
+            self.f.if_void();
+        }
+        self.flush_conditional();
+        self.store_pc(pc);
+        self.f.local_get(self.ctx_local);
+        self.f.i64_const(pc as i64);
+        self.f.i32_const(if need & gex_abi::perm::WRITE != 0 { gex_abi::cache_op::PERM_WRITE } else { gex_abi::cache_op::PERM_READ });
+        // Where: the first byte if its page does not allow it, else the
+        // first byte of the last byte's page.
+        self.f.local_get(t);
+        self.f.local_get(t);
+        self.f.i64_const(size as i64 - 1);
+        self.f.byte(0x7c); // i64.add
+        self.f.i64_const(!(PERM_PAGE as i64 - 1));
+        self.f.byte(0x83); // i64.and
+        byte(self, 0, !small);
+        lacks(self);
+        self.f.select();
+        self.f.call(self.cx.cache_op);
+        self.f.unreachable();
+        if size > 1 {
+            self.f.end();
+        }
+        self.f.end();
+    }
+
     /// Whether `v` is the context address plus offsets (`value_ctx`).
     fn is_ctx(&self, v: Value) -> bool {
         self.value_ctx.get(v.0 as usize).copied().unwrap_or(false)
@@ -1537,9 +1647,6 @@ impl<'a> Emitter<'a> {
         // nothing, and the engine traps any bulk address past the end.
         let on = null_guard_on();
         let null_guard = on && biased && !self.is_ctx(addr);
-        // A Darwin process's floor (`gex_abi::DARWIN_GUEST_FLOOR`): always,
-        // for every access but to the thread's own context.
-        let darwin_floor = gex_abi::commpage_fold() && biased && !self.is_ctx(addr) && !self.value_floored.get(addr.0 as usize).copied().unwrap_or(false);
         // A memory64 guest memory takes the guest address
         // as it stands: past the end of the memory, the engine's own check
         // traps, which is the SIGSEGV the guard below exists to produce. The
@@ -1549,9 +1656,10 @@ impl<'a> Emitter<'a> {
                 let ea = c.wrapping_add(offset as u64);
                 // A Darwin process: its commpage is at its alias.
                 let ea = gex_abi::fold_commpage(ea).unwrap_or(ea);
-                // Below the null guard or a Darwin process's floor: an
-                // address past every memory's end.
-                let ea = if (null_guard && ea < gex_abi::NULL_GUARD) || (darwin_floor && ea < gex_abi::DARWIN_GUEST_FLOOR) { u64::MAX - 15 } else { ea };
+                // Below the null guard: an address past every memory's end.
+                // (A Darwin process's access was checked before it,
+                // `Stmt::MemCheck`.)
+                let ea = if null_guard && ea < gex_abi::NULL_GUARD { u64::MAX - 15 } else { ea };
                 self.f.i64_const(ea as i64);
                 return 0;
             }
@@ -1561,17 +1669,6 @@ impl<'a> Emitter<'a> {
             if gex_abi::commpage_fold() {
                 self.f.i64_const(gex_abi::DARWIN_ADDR_MASK as i64);
                 self.f.byte(0x83); // i64.and
-                // Below its floor: an address past every memory's end.
-                if darwin_floor {
-                    let t = self.scratch_floor;
-                    self.f.local_set(t);
-                    self.f.i64_const((u64::MAX - 15) as i64);
-                    self.f.local_get(t);
-                    self.f.local_get(t);
-                    self.f.i64_const(gex_abi::DARWIN_GUEST_FLOOR as i64);
-                    self.f.byte(code::I64_LT_U);
-                    self.f.byte(0x1b); // select
-                }
             }
             let max_static: i64 = if gex_abi::X86 { 0xffff } else if on { u32::MAX as i64 - gex_abi::NULL_GUARD as i64 } else { u32::MAX as i64 };
             if null_guard {
@@ -1858,6 +1955,7 @@ impl<'a> Emitter<'a> {
                 self.host_call(*func, args, None, block);
             }
             Stmt::X87 { op, args, outs } => self.emit_x87(*op, args, outs),
+            Stmt::MemCheck { addr, offset, size, need, pc } => self.emit_mem_check(*addr, *offset, *size, *need, *pc),
             Stmt::Trap { cond, pc, code } => {
                 // Only the faulting path writes the registers back, so they
                 // stay dirty for the path that carries on.
@@ -1900,6 +1998,12 @@ impl<'a> Emitter<'a> {
                     };
                     self.f.simd_mem_lane(sub, align, static_off, 0);
                 }
+            }
+            // A Darwin process's accesses are each checked against its
+            // pages' protections (`Stmt::MemCheck`); a bulk one's range is
+            // not, so none is made in one.
+            Stmt::MemCopy { .. } | Stmt::MemFill { .. } | Stmt::MemCmp { .. } | Stmt::StrOp { .. } if gex_abi::commpage_fold() => {
+                panic!("a bulk memory operation in a Darwin process's block at {:#x}: its range is not checked against the pages' protections", self.block_start)
             }
             Stmt::MemCopy { dst, src, len } if copy_loop() => {
                 self.emit_memcopy_loop(*dst, *src, *len);
@@ -2765,14 +2869,11 @@ impl<'a> Emitter<'a> {
             self.value_ctx.resize(idx + 1, false);
         }
         self.value_ctx[idx] = is_ctx;
-        let xsel = match expr {
-            Expr::Select { cond, a, b, ty: Ty::I64 } if gex_abi::commpage_fold() && gex_abi::mem64() && self.is_ctx(*b) && !self.is_ctx(*a) => Some((*cond, *a, *b)),
-            _ => None,
-        };
-        if self.value_floored.len() <= idx {
-            self.value_floored.resize(idx + 1, false);
+        let xsel = matches!(expr, Expr::Select { a, b, ty: Ty::I64, .. } if gex_abi::commpage_fold() && self.is_ctx(*b) && !self.is_ctx(*a));
+        if self.value_xsel.len() <= idx {
+            self.value_xsel.resize(idx + 1, false);
         }
-        self.value_floored[idx] = xsel.is_some();
+        self.value_xsel[idx] = xsel;
         if let Some(f) = self.value_fp.get_mut(idx) {
             *f = None;
         }
@@ -2829,24 +2930,6 @@ impl<'a> Emitter<'a> {
                 self.push(*a);
                 self.push(*b);
                 self.f.byte(cmp_op(*op, *ty));
-            }
-            Expr::Select { cond, a, b, .. } if xsel.is_some() => {
-                // The guest address wrapped and floored as `emit_address`
-                // does, then the context's when the condition is false.
-                self.push(*a);
-                self.f.i64_const(gex_abi::DARWIN_ADDR_MASK as i64);
-                self.f.byte(0x83); // i64.and
-                let t = self.scratch_floor;
-                self.f.local_set(t);
-                self.f.i64_const((u64::MAX - 15) as i64);
-                self.f.local_get(t);
-                self.f.local_get(t);
-                self.f.i64_const(gex_abi::DARWIN_GUEST_FLOOR as i64);
-                self.f.byte(code::I64_LT_U);
-                self.f.select();
-                self.push(*b);
-                self.push(*cond);
-                self.f.select();
             }
             Expr::Select { cond, a, b, .. } => {
                 self.push(*a);

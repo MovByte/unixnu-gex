@@ -152,7 +152,7 @@ pub fn live_in(f: &Function, sums: &HashMap<u64, Summary>) -> Vec<RegSet> {
                 match s {
                     Stmt::WriteReg { reg, .. } => l.remove(*reg),
                     Stmt::Def { expr: Expr::ReadReg(r), .. } => l.insert(*r),
-                    Stmt::Trap { .. } => l = RegSet::ALL,
+                    Stmt::Trap { .. } | Stmt::MemCheck { .. } => l = RegSet::ALL,
                     _ if gex_cgen::emit::clobbers(s) => l = RegSet::ALL,
                     _ => {}
                 }

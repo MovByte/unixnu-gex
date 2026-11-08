@@ -270,6 +270,7 @@ impl Kernel {
         if !self.darwin || self.procs.halt_code().is_some() {
             return Hold::Run;
         }
+        self.darwin_flush_perms(m);
         self.collect_signals();
         self.darwin_assign_signals();
         // thread_hold: the task's, or the thread's own (thread_suspend).
