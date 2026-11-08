@@ -266,6 +266,7 @@ impl Kernel {
             sys::FCNTL | sys::FCNTL_NOCANCEL => self.darwin_fcntl(m, a),
             sys::FSGETPATH => res(self.darwin_fsgetpath(m, a)),
             sys::PROC_INFO => res(self.darwin_proc_info(m, a)),
+            sys::PROCESS_POLICY => res(self.darwin_process_policy(m, a)),
             sys::MEMORYSTATUS_CONTROL => res(self.darwin_memorystatus_control(m, a)),
             sys::GETTIMEOFDAY => res(darwin_gettimeofday(m, a[0], a[1], a[2])),
             sys::GETRLIMIT => res(self.darwin_getrlimit(m, a[0], a[1])),

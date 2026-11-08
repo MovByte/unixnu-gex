@@ -46,6 +46,8 @@ pub mod op {
     pub const SIGNAL: usize = 146;
     pub const SYSTEM_KAS_INFO: usize = 166;
     pub const SYSTEM_MAC_SYSCALL: usize = 173;
+    pub const SYSTEM_SCHED: usize = 180;
+    pub const SYSTEM_SUSPEND_RESUME: usize = 183;
 }
 
 /// The operations' names (the kext's `operation_names`), by index.

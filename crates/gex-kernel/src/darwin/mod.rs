@@ -49,6 +49,7 @@ pub mod persona;
 pub mod pipe;
 pub mod priority;
 pub mod procinfo;
+pub mod procpolicy;
 pub mod psynch;
 pub mod reason;
 pub mod rlimit;
