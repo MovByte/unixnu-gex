@@ -13,6 +13,8 @@ pub enum Value {
     I64(i64),
     /// `struct timeval`: seconds, microseconds.
     Timeval(i64, i32),
+    /// `kern.boottime`: the calendar time at boot, as a `struct timeval`.
+    BootTime,
     /// The asking process's `user_stack`, as an `int` (`kern.usrstack`)
     /// or whole (`kern.usrstack64`).
     UserStack32,
@@ -38,6 +40,10 @@ impl Value {
                 b.extend_from_slice(&us.to_le_bytes());
                 b.extend_from_slice(&[0; 4]);
                 b
+            }
+            Value::BootTime => {
+                let us = super::mach::boottime_usec();
+                Value::Timeval((us / 1_000_000) as i64, (us % 1_000_000) as i32).bytes(user_stack)
             }
         }
     }
@@ -70,7 +76,7 @@ pub fn table() -> Vec<(&'static str, Vec<i32>, Value)> {
         ("kern.hostid", vec![CTL_KERN, 11], I32(0)),
         ("kern.posix1version", vec![CTL_KERN, 17], I32(200_112)),
         ("kern.ngroups", vec![CTL_KERN, 18], I32(16)),
-        ("kern.boottime", vec![CTL_KERN, 21], Timeval(1_730_000_000, 0)),
+        ("kern.boottime", vec![CTL_KERN, 21], BootTime),
         ("kern.maxfilesperproc", vec![CTL_KERN, 29], I32(super::rlimit::MAXFILESPERPROC as i32)),
         ("kern.maxprocperuid", vec![CTL_KERN, 30], I32(super::rlimit::MAXPROCPERUID as i32)),
         ("kern.usrstack", vec![CTL_KERN, 35], UserStack32),

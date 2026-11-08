@@ -98,9 +98,21 @@ pub mod trap {
 /// gives as 125/3 nanoseconds per tick.
 pub const TIMEBASE: (u32, u32) = (125, 3);
 
+/// The counter's origin, which is this system's boot, and the calendar
+/// time then.
+fn origin() -> (Instant, std::time::SystemTime) {
+    static START: std::sync::OnceLock<(Instant, std::time::SystemTime)> = std::sync::OnceLock::new();
+    *START.get_or_init(|| (Instant::now(), std::time::SystemTime::now()))
+}
+
 fn time_origin() -> Instant {
-    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-    *START.get_or_init(Instant::now)
+    origin().0
+}
+
+/// `clock_get_boottime_microtime`: the calendar time at boot, in
+/// microseconds since the epoch.
+pub(crate) fn boottime_usec() -> u64 {
+    origin().1.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64)
 }
 
 /// Time since the counter's origin.

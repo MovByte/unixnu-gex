@@ -24,6 +24,7 @@ pub mod off {
     pub const KERNEL_PAGE_SHIFT: usize = 0x037;
     pub const MEMORY_SIZE: usize = 0x038;
     pub const CPUFAMILY: usize = 0x080;
+    pub const BOOTTIME_USEC: usize = 0x0a0;
     pub const KDEBUG_ENABLE: usize = 0x100;
 }
 
@@ -74,6 +75,8 @@ pub fn page(ncpus: u8, memory: u64) -> Vec<u8> {
     put(off::KERNEL_PAGE_SHIFT, &[14]);
     put(off::MEMORY_SIZE, &memory.to_le_bytes());
     put(off::CPUFAMILY, &CPUFAMILY_ARM_HURRICANE.to_le_bytes());
+    // commpage_update_boottime.
+    put(off::BOOTTIME_USEC, &super::mach::boottime_usec().to_le_bytes());
     // kdebug tracing off: KDEBUG_ENABLE stays zero.
     p
 }
