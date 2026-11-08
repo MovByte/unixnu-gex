@@ -291,8 +291,9 @@ impl Kernel {
             return r;
         };
         match set {
-            Some(w) => Reply::err(self.machine_thread_set_state(m, tid, c, fl, &w)),
-            None => match self.machine_thread_get_state(m, tid, c, fl, count) {
+            // The thread's context is the kernel's.
+            Some(w) => Reply::err(self.machine_thread_set_state(&mut m.kernel(), tid, c, fl, &w)),
+            None => match self.machine_thread_get_state(&mut m.kernel(), tid, c, fl, count) {
                 Ok(w) => {
                     let mut out = (w.len() as u32).to_le_bytes().to_vec();
                     for x in w {

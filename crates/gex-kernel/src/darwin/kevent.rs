@@ -570,7 +570,7 @@ impl Kernel {
             return;
         }
         let offset = self.dtask.pthread.return_to_kernel_offset;
-        let tsd = m.read_u64(self.darwin_ctx_of(tid) + gex_abi::ctx::TPIDRRO as u64).unwrap_or(0);
+        let tsd = m.kernel().read_u64(self.darwin_ctx_of(tid) + gex_abi::ctx::TPIDRRO as u64).unwrap_or(0);
         if tsd == 0 || offset == 0 {
             return;
         }

@@ -118,6 +118,9 @@ impl Kernel {
     pub fn darwin_thread_calls(&mut self, m: &mut GuestMem<'_>) -> Option<Instant> {
         let out = self.darwin_thread_calls_body(m);
         self.darwin_ipc_leave();
+        // What they mapped (a workqueue thread's stack) is in force for
+        // every thread now.
+        self.darwin_flush_perms(m);
         out
     }
 

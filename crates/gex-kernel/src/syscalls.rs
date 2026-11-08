@@ -4581,8 +4581,11 @@ impl MapIo<'_> {
             match hosted {
                 Some(held) => m.discard(start + held, (len_aligned - held) as usize)?,
                 None => {
-                    let n = file.pread(offset, m.read_mut(start, len as usize)?)? as usize;
-                    m.zero_dirty(start + n as u64, len_aligned as usize - n)?;
+                    // The mapping's contents are the kernel's to fill, whatever
+                    // the program may do with its pages.
+                    let mut k = m.kernel();
+                    let n = file.pread(offset, k.read_mut(start, len as usize)?)? as usize;
+                    k.zero_dirty(start + n as u64, len_aligned as usize - n)?;
                 }
             }
             // A shared mapping is written back at `msync` and `munmap` (where
@@ -4603,7 +4606,7 @@ impl MapIo<'_> {
                 let kept = if changes != 0 { self.mem.lock().log.shared_maps.recall(&file, offset, len_aligned, changes) } else { None };
                 let pages = match kept {
                     Some(p) => p,
-                    None => page_hashes(m.read(start, len_aligned as usize)?),
+                    None => page_hashes(m.kernel().read(start, len_aligned as usize)?),
                 };
                 self.mem.lock().log.shared_maps.push(SharedMap {
                     start,
@@ -6211,19 +6214,23 @@ impl ThreadMaker<'_> {
         }
         // Numbered with the processes (`ProcTable::new_tid`).
         let tid = self.procs.new_tid(self.pid);
-        for off in (0..ctx::SIZE).step_by(8) {
-            let v = m.read_u64(parent + off as u64)?;
-            m.write_u64(child + off as u64, v)?;
-        }
-        set_result(m, child, 0)?;
-        m.write_u64(child + ctx::sp_slot(self.compat) as u64, child_stack)?;
-        m.write_u64(child + ctx::MON_SIZE as u64, 0)?;
-        m.write_u64(child + ctx::TID as u64, tid as u64)?;
-        if flags & clone_flags::SETTLS != 0 {
-            // A 32-bit thread's TLS descriptor is loaded into %gs, a 64-bit
-            // one's base into %fs.
-            let slot = if self.compat { ctx::TPIDRRO } else { ctx::TPIDR };
-            m.write_u64(child + slot as u64, tls)?;
+        {
+            // The contexts are the kernel's, not the program's memory.
+            let mut k = m.kernel();
+            for off in (0..ctx::SIZE).step_by(8) {
+                let v = k.read_u64(parent + off as u64)?;
+                k.write_u64(child + off as u64, v)?;
+            }
+            set_result(&mut k, child, 0)?;
+            k.write_u64(child + ctx::sp_slot(self.compat) as u64, child_stack)?;
+            k.write_u64(child + ctx::MON_SIZE as u64, 0)?;
+            k.write_u64(child + ctx::TID as u64, tid as u64)?;
+            if flags & clone_flags::SETTLS != 0 {
+                // A 32-bit thread's TLS descriptor is loaded into %gs, a 64-bit
+                // one's base into %fs.
+                let slot = if self.compat { ctx::TPIDRRO } else { ctx::TPIDR };
+                k.write_u64(child + slot as u64, tls)?;
+            }
         }
         if flags & clone_flags::PARENT_SETTID != 0 && parent_tid != 0 {
             m.write_u32(parent_tid, tid as u32)?;
@@ -9588,7 +9595,7 @@ impl Kernel {
             t.set_darwin_id(crate::darwin::next_thread_id());
             t.set_tsd(0);
         }
-        let _ = m.write_u64(req.ctx_addr + ctx::TPIDRRO as u64, 0);
+        let _ = m.kernel().write_u64(req.ctx_addr + ctx::TPIDRRO as u64, 0);
     }
 
     /// A thread of this process made from thread context `parent` (a
@@ -9676,7 +9683,15 @@ impl Kernel {
         if self.darwin {
             self.signals.thread().cpu.enter();
         }
+        // A Darwin call's copies of the program's memory are checked as
+        // copyin and copyout check them, against the map as it stands (a
+        // thread call may have changed it since a call last returned).
+        if self.darwin {
+            self.darwin_flush_perms(m);
+        }
+        let prev = if self.darwin { m.set_user(Some((self.ctx_addr, self.ctx_addr + ctx::SIZE as u64))) } else { None };
         let out = self.syscall_body(m, pc);
+        m.set_user(prev);
         self.darwin_ipc_leave();
         if self.darwin {
             self.darwin_flush_perms(m);
@@ -10436,7 +10451,12 @@ impl Kernel {
         if self.darwin {
             self.signals.thread().cpu.enter();
         }
+        if self.darwin {
+            self.darwin_flush_perms(m);
+        }
+        let prev = if self.darwin { m.set_user(Some((self.ctx_addr, self.ctx_addr + ctx::SIZE as u64))) } else { None };
         let out = self.finish_blocking_body(m, r);
+        m.set_user(prev);
         self.darwin_ipc_leave();
         if self.darwin {
             self.darwin_flush_perms(m);

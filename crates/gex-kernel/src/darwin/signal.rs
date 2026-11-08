@@ -1090,9 +1090,12 @@ impl Kernel {
 
         let p_uctx = sp + frame::UCTX;
         let token = p_uctx ^ self.darwin_sig().sigreturn_token;
-        m.write(sp + frame::SINFO, &info)?;
-        m.write(p_uctx, &uctx)?;
-        m.write(sp + frame::MCTX, &mc)?;
+        // The frame's copyout, held to the stack's pages as copyout is: a
+        // stack it cannot be written on is sendsig's `bad`.
+        let prev = m.set_user(Some((c, c + ctx::SIZE as u64)));
+        let copied = m.write(sp + frame::SINFO, &info).and_then(|()| m.write(p_uctx, &uctx)).and_then(|()| m.write(sp + frame::MCTX, &mc));
+        m.set_user(prev);
+        copied?;
 
         // sendsig_set_thread_state64.
         m.write_u64(c + ctx::x(0) as u64, catcher)?;

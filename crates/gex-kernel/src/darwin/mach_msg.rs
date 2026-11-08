@@ -1244,7 +1244,9 @@ impl Kernel {
                         (0, 0)
                     } else {
                         match self.darwin_vm_allocate_anywhere(m, data.len() as u64) {
-                            Ok(a) if m.write(a, &data).is_ok() => (a, data.len() as u32),
+                            // vm_map_copyout: the kernel's own copy into
+                            // the space it just made.
+                            Ok(a) if m.kernel().write(a, &data).is_ok() => (a, data.len() as u32),
                             _ => {
                                 err |= mr::MSG_VM_SPACE;
                                 (0, 0)
@@ -1268,7 +1270,7 @@ impl Kernel {
                                         Some(c) => self.copyout_object(c, disp, None, &mut err),
                                         None => raw,
                                     };
-                                    if m.write_u32(a + 4 * i as u64, name).is_err() {
+                                    if m.kernel().write_u32(a + 4 * i as u64, name).is_err() {
                                         err |= mr::MSG_VM_SPACE;
                                     }
                                 }

@@ -85,11 +85,83 @@ pub use proclive::{KernelProcSource, ProcCell};
 /// ABI's `EFAULT` checks.
 pub struct GuestMem<'a> {
     pub bytes: &'a mut [u8],
+    /// A Darwin process's call, its copies to and from the program checked
+    /// as `copyin` and `copyout` check them ([`Self::set_user`]): the
+    /// calling thread's context, which the kernel keeps in the runtime's
+    /// memory below the floor, exempt.
+    user: Option<(u64, u64)>,
 }
 
 impl<'a> GuestMem<'a> {
     pub fn new(bytes: &'a mut [u8]) -> GuestMem<'a> {
-        GuestMem { bytes }
+        GuestMem { bytes, user: None }
+    }
+
+    /// Check what is read and written from now on against the pages'
+    /// protections (`gex_abi::PERM_TABLE64`), EFAULT where a page does not
+    /// allow it, as a Darwin call's `copyin` and `copyout` fault: `ctx` is
+    /// the calling thread's context, the kernel's own. `None` checks
+    /// nothing. What was set before.
+    pub fn set_user(&mut self, ctx: Option<(u64, u64)>) -> Option<(u64, u64)> {
+        std::mem::replace(&mut self.user, ctx)
+    }
+
+    /// The same memory, unchecked: the kernel's own reads and writes in a
+    /// call ([`Self::set_user`]), not the program's buffers.
+    pub fn kernel(&mut self) -> GuestMem<'_> {
+        GuestMem { bytes: &mut *self.bytes, user: None }
+    }
+
+    /// Whether `[addr, addr + len)` may be read (`need` the read bit) or
+    /// written (the write bit) by a copy in a checked call.
+    fn user_allows(&self, addr: u64, len: usize, need: u8) -> bool {
+        let Some((cs, ce)) = self.user else { return true };
+        if len == 0 {
+            return true;
+        }
+        let end = addr.saturating_add(len as u64);
+        if addr >= cs && end <= ce {
+            return true;
+        }
+        let (first, last) = (addr >> gex_abi::PERM_PAGE_SHIFT, (end - 1) >> gex_abi::PERM_PAGE_SHIFT);
+        if last >= gex_abi::PERM_TABLE_BYTES {
+            return false;
+        }
+        let view = self.view();
+        (first..=last).all(|p| view.get((gex_abi::PERM_TABLE64 + p) as usize).is_some_and(|b| b & need == need))
+    }
+
+    /// Where a checked call's string read from `start` must stop before
+    /// `end`: the first byte of the first page from it that may not be
+    /// read (`copyinstr` faults there), else `end`.
+    fn user_readable_to(&self, start: usize, end: usize) -> usize {
+        let Some((cs, ce)) = self.user else { return end };
+        if start as u64 >= cs && end as u64 <= ce {
+            return end;
+        }
+        let page = gex_abi::PERM_PAGE as usize;
+        let mut at = start;
+        while at < end {
+            let p = at as u64 >> gex_abi::PERM_PAGE_SHIFT;
+            let ok = p < gex_abi::PERM_TABLE_BYTES && self.view().get((gex_abi::PERM_TABLE64 + p) as usize).is_some_and(|b| b & gex_abi::perm::READ != 0);
+            if !ok {
+                return at;
+            }
+            at = (at & !(page - 1)) + page;
+        }
+        end
+    }
+
+    fn range_for(&self, addr: u64, len: usize, need: u8) -> Result<std::ops::Range<usize>, Errno> {
+        let r = self.range(addr, len)?;
+        if !self.user_allows(addr, len, need) {
+            static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *TRACE.get_or_init(|| std::env::var_os("GEX_TRACE_EFAULT").is_some()) {
+                eprintln!("gex: a call's copy of {len} bytes at {addr:#x} faults (need {need:#x})\n{}", std::backtrace::Backtrace::force_capture());
+            }
+            return Err(Errno::EFAULT);
+        }
+        Ok(r)
     }
 
     /// The backing bytes, hidden from the optimiser on wasm.
@@ -157,7 +229,7 @@ impl<'a> GuestMem<'a> {
     }
 
     pub fn read(&self, addr: u64, len: usize) -> Result<&[u8], Errno> {
-        let r = self.range(addr, len)?;
+        let r = self.range_for(addr, len, gex_abi::perm::READ)?;
         Ok(&self.view()[r])
     }
 
@@ -167,12 +239,12 @@ impl<'a> GuestMem<'a> {
     /// in -- and the guest chooses the size; that made one `apt-get update`
     /// claim 117 arena spans (1,872 MiB). See task 140.
     pub fn read_mut(&mut self, addr: u64, len: usize) -> Result<&mut [u8], Errno> {
-        let r = self.range(addr, len)?;
+        let r = self.range_for(addr, len, gex_abi::perm::WRITE)?;
         Ok(&mut self.view_mut()[r])
     }
 
     pub fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), Errno> {
-        let r = self.range(addr, data.len())?;
+        let r = self.range_for(addr, data.len(), gex_abi::perm::WRITE)?;
         self.view_mut()[r].copy_from_slice(data);
         Ok(())
     }
@@ -180,7 +252,7 @@ impl<'a> GuestMem<'a> {
     #[track_caller]
     pub fn zero(&mut self, addr: u64, len: usize) -> Result<(), Errno> {
         big_op("zero", len);
-        let r = self.range(addr, len)?;
+        let r = self.range_for(addr, len, gex_abi::perm::WRITE)?;
         self.view_mut()[r].fill(0);
         Ok(())
     }
@@ -191,8 +263,8 @@ impl<'a> GuestMem<'a> {
     #[track_caller]
     pub fn copy_within(&mut self, src: u64, dst: u64, len: usize) -> Result<(), Errno> {
         big_op("copy_within", len);
-        let s = self.range(src, len)?;
-        let d = self.range(dst, len)?;
+        let s = self.range_for(src, len, gex_abi::perm::READ)?;
+        let d = self.range_for(dst, len, gex_abi::perm::WRITE)?;
         self.view_mut().copy_within(s, d.start);
         Ok(())
     }
@@ -290,13 +362,15 @@ impl<'a> GuestMem<'a> {
         if start >= limit {
             return Err(Errno::EFAULT);
         }
-        let end = (start + buf.len()).min(limit);
+        let want = (start + buf.len()).min(limit);
+        let end = self.user_readable_to(start, want);
         let slice = &self.view()[start..end];
         match slice.iter().position(|b| *b == 0) {
             Some(n) => {
                 buf[..n].copy_from_slice(&slice[..n]);
                 Ok(Some(n))
             }
+            None if end < want => Err(Errno::EFAULT),
             None if end == limit => Err(Errno::ENAMETOOLONG),
             None => Ok(None),
         }
@@ -311,10 +385,12 @@ impl<'a> GuestMem<'a> {
         // Clamped to what exists, not what the view claims: a path near the top
         // of the stack is within a page of memory's end, and scanning `max`
         // bytes ran off into pages never mapped.
-        let end = (start + max).min(limit);
+        let want = (start + max).min(limit);
+        let end = self.user_readable_to(start, want);
         let slice = &self.view()[start..end];
         match slice.iter().position(|b| *b == 0) {
             Some(n) => Ok(slice[..n].to_vec()),
+            None if end < want => Err(Errno::EFAULT),
             None => Err(Errno::ENAMETOOLONG),
         }
     }

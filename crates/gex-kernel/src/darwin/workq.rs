@@ -2035,8 +2035,10 @@ impl Kernel {
         let this = self.darwin_ctx_of(tid);
         let wqthread = self.dtask.pthread.wqthread;
         let regs = [(ctx::x(0), selfp), (ctx::x(1), u64::from(kport)), (ctx::x(2), stack_bottom), (ctx::x(3), kevent_list), (ctx::x(4), u64::from(upcall_flags)), (ctx::x(5), kevent_count as i64 as u64), (ctx::sp_slot(false), stack_top), (ctx::PC, wqthread)];
+        // The thread's context is the kernel's.
+        let mut k = m.kernel();
         for (slot, v) in regs {
-            let _ = m.write_u64(this + slot as u64, v);
+            let _ = k.write_u64(this + slot as u64, v);
         }
         if tid == self.tid {
             SyscallOutcome::Resume(wqthread)
@@ -2187,7 +2189,7 @@ impl Kernel {
         }
         // kevent_set_workq_quantum_expiry_user_tsd: at the thread's TSD.
         if flags != 0 {
-            let tsd = m.read_u64(self.darwin_ctx_of(tid) + ctx::TPIDRRO as u64).unwrap_or(0);
+            let tsd = m.kernel().read_u64(self.darwin_ctx_of(tid) + ctx::TPIDRRO as u64).unwrap_or(0);
             if tsd != 0 {
                 let _ = m.write_u64(tsd + self.dtask.pthread.wq_quantum_offset, flags);
             }

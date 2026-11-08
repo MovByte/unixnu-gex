@@ -105,7 +105,7 @@ impl Kernel {
     /// Sleep on `word` (again) until `wait`'s deadline or the next timer
     /// the kernel must fire, whichever is first.
     fn darwin_sleep(&mut self, m: &mut GuestMem<'_>, word: u64, wait: Wait) -> SyscallOutcome {
-        let val = m.read_u32(word).unwrap_or(0);
+        let val = m.kernel().read_u32(word).unwrap_or(0);
         let now = Instant::now();
         let deadline = wait.deadline.map(|t| t.saturating_duration_since(now));
         self.darwin_finish = Some(wait);
@@ -123,8 +123,9 @@ impl Kernel {
         slot.waiting = false;
         slot.result = Some(result);
         let word = slot.word;
-        let v = m.read_u32(word).unwrap_or(0).wrapping_add(1);
-        let _ = m.write_u32(word, v);
+        let mut k = m.kernel();
+        let v = k.read_u32(word).unwrap_or(0).wrapping_add(1);
+        let _ = k.write_u32(word, v);
         self.futexes.wake(word, u32::MAX);
         true
     }

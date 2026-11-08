@@ -256,7 +256,7 @@ impl crate::syscalls::Kernel {
     pub(crate) fn darwin_flush_perms(&mut self, m: &mut GuestMem<'_>) {
         let writes = self.mem.lock().take_perm_writes();
         for (page, bytes) in writes {
-            if m.write(gex_abi::PERM_TABLE64 + page, &bytes).is_err() {
+            if m.kernel().write(gex_abi::PERM_TABLE64 + page, &bytes).is_err() {
                 self.darwin_unimplemented(format!("the protection table past the guest memory's end (page {page:#x})"));
             }
         }
@@ -396,7 +396,8 @@ pub mod machdep {
 pub(crate) fn set_tsd_base(m: &mut GuestMem<'_>, ctx_addr: u64, thread: &crate::signal::ThreadSig, tsd: u64, map_max: u64) -> Result<(), Errno> {
     let tsd = if tsd > map_max { 0 } else { tsd };
     thread.set_tsd(tsd);
-    m.write_u64(ctx_addr + ctx::TPIDRRO as u64, tsd)
+    // The context is the kernel's.
+    m.kernel().write_u64(ctx_addr + ctx::TPIDRRO as u64, tsd)
 }
 
 /// A call answered here without going through the Linux dispatch: the

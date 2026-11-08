@@ -566,11 +566,13 @@ impl Kernel {
         flags &= !start::SUSPENDED;
         let c = req.ctx_addr;
         let regs = [(ctx::x(0), pthread), (ctx::x(1), u64::from(port)), (ctx::x(2), func), (ctx::x(3), arg), (ctx::x(4), stack), (ctx::x(5), flags)];
+        // The new thread's context is the kernel's.
+        let mut k = m.kernel();
         for (slot, v) in regs {
-            let _ = m.write_u64(c + slot as u64, v);
+            let _ = k.write_u64(c + slot as u64, v);
         }
-        let _ = m.write_u64(c + ctx::SP as u64, stack);
-        let _ = m.write_u64(c + ctx::PC as u64, reg.threadstart);
+        let _ = k.write_u64(c + ctx::SP as u64, stack);
+        let _ = k.write_u64(c + ctx::PC as u64, reg.threadstart);
         if flags & start::SETSCHED != 0 {
             let importance = (flags & start::IMPORTANCE_MASK) as i32;
             let policy = (flags >> start::POLICY_BITSHIFT) & start::POLICY_MASK;
