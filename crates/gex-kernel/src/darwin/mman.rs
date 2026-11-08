@@ -279,12 +279,18 @@ impl Kernel {
             cur &= !(prot::EXECUTE as u8);
         }
         attrs.max = maxprot;
+        // Anywhere: vm_map_enter's search from the rounded hint; out of
+        // space past a hint, once more from the map's first page.
+        if flags & FIXED == 0 && !jit {
+            addr = match self.darwin_locate_space(addr, size, 0) {
+                Ok(a) => a,
+                Err(_) if addr != 0 => self.darwin_locate_space(PAGE_MASK + 1, size, 0).map_err(|_| Errno::ENOMEM)?,
+                Err(_) => return Err(Errno::ENOMEM),
+            };
+        }
 
         use crate::mem::flags as lf;
-        let mut l = if flags & SHARED != 0 { lf::SHARED } else { lf::PRIVATE };
-        if flags & FIXED != 0 || jit {
-            l |= lf::FIXED;
-        }
+        let mut l = (if flags & SHARED != 0 { lf::SHARED } else { lf::PRIVATE }) | lf::FIXED;
         let (lfd, lpos) = if mapanon {
             l |= lf::ANONYMOUS;
             (u64::MAX, 0)
@@ -310,6 +316,11 @@ impl Kernel {
     fn darwin_pshm_mmap(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
         self.darwin_shm_mmap_check(a)?;
         let mut b = *a;
+        // Anywhere: vm_map_enter's search from the rounded hint.
+        if b[3] as u32 & map::FIXED == 0 {
+            b[0] = self.darwin_locate_space(round(b[0]), round(b[1]), 0).map_err(|_| Errno::ENOMEM)?;
+            b[3] |= u64::from(map::FIXED);
+        }
         let n = super::bsd::translate(super::bsd::sys::MMAP, &mut b);
         let at = self.canonical(m, n, b)?;
         let writable = self.fds.get(a[4] as i32).map(|f| f.writable).unwrap_or(false);

@@ -858,23 +858,33 @@ impl Kernel {
                 Err(_) => kr::NO_SPACE,
             };
         }
-        // Anywhere: over-allocate by the alignment and trim.
-        let Some(want) = len.checked_add(mask) else { return kr::NO_SPACE };
-        let at = match self.canonical(m, nr::MMAP, [0, want, linux_prot, mf::PRIVATE | mf::ANONYMOUS, u64::MAX, 0]) {
-            Ok(at) => at,
-            Err(_) => return kr::NO_SPACE,
+        // Anywhere: from the map's minimum (mach_vm_allocate's hint), the
+        // first fit.
+        let start = match self.darwin_locate_space(0, len, mask) {
+            Ok(s) => s,
+            Err(k) => return k,
         };
-        let start = (at + mask) & !mask;
-        if start > at {
-            let _ = self.canonical(m, nr::MUNMAP, [at, start - at, 0, 0, 0, 0]);
+        match self.canonical(m, nr::MMAP, [start, len, linux_prot, mf::PRIVATE | mf::ANONYMOUS | mf::FIXED, u64::MAX, 0]) {
+            Ok(_) => {
+                self.dtask.vm.set(start, start + len, attrs);
+                *addr = start;
+                kr::SUCCESS
+            }
+            Err(_) => kr::NO_SPACE,
         }
-        let end = at + want;
-        if end > start + len {
-            let _ = self.canonical(m, nr::MUNMAP, [start + len, end - start - len, 0, 0, 0, 0]);
+    }
+
+    /// `vm_map_locate_space` for an anywhere request without a random
+    /// address: from `hint`, raised to the effective range's start, the
+    /// first fit of `size` bytes aligned to `mask` below the range's end;
+    /// KERN_NO_SPACE without one.
+    pub(crate) fn darwin_locate_space(&self, hint: u64, size: u64, mask: u64) -> Result<u64, u64> {
+        let (min, max) = self.darwin_effective_range();
+        let hint = hint.max(min);
+        if max <= hint {
+            return Err(kr::NO_SPACE);
         }
-        self.dtask.vm.set(start, start + len, attrs);
-        *addr = start;
-        kr::SUCCESS
+        self.darwin_find_space(hint, max, size, mask).ok_or(kr::NO_SPACE)
     }
 
     /// The range a map's anywhere allocations are made in
