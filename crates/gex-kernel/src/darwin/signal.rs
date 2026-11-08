@@ -11,7 +11,9 @@
 
 use super::kern::{mask_from_linux, mask_to_linux, signal_to_linux};
 use crate::errno::Errno;
-use crate::signal::{self, sa, DefaultAction, Delivery, SigAction, Source, SIG_DFL, SIG_IGN};
+use super::reason::OsReason;
+use crate::signal::{self, sa, DefaultAction, Delivery, Note, SigAction, Source, SIG_DFL, SIG_IGN};
+use std::sync::Arc;
 use crate::syscalls::{Kernel, SyscallOutcome};
 use crate::GuestMem;
 use gex_abi::ctx;
@@ -21,6 +23,7 @@ pub const NSIG: usize = 32;
 
 /// Darwin's signal numbers (`bsd/sys/signal.h`) that this code names.
 pub mod dsig {
+    pub const SIGHUP: u32 = 1;
     pub const SIGILL: u32 = 4;
     pub const SIGABRT: u32 = 6;
     pub const SIGEMT: u32 = 7;
@@ -603,23 +606,7 @@ impl Kernel {
                 if p & prop::IGNORE != 0 {
                     continue;
                 }
-                // proc_prepareexit: a death a core signal makes is told to
-                // the EXC_CRASH handlers (task_exception_notify), its code
-                // the signal and the thread's last exception. The host's
-                // own handler takes it and nothing is seen, unless a handler
-                // was set; that one is sent it on the way out of a call.
-                if p & prop::CORE != 0 {
-                    use super::exception as exc;
-                    if self.darwin_exc_handled(exc::EXC_CRASH) {
-                        let th = self.dtask.threads.map.get(&self.tid).map(|t| (t.uu_exception, t.uu_code, t.uu_subcode)).unwrap_or_default();
-                        let code = (i64::from(d & 0xff) << 24) | (i64::from(th.0 & 0x0f) << 20) | (th.1 & 0xfffff);
-                        if self.dtask.syscall_exit {
-                            self.dtask.crash_notify = Some((code, th.2));
-                        } else {
-                            self.darwin_unimplemented(format!("telling the EXC_CRASH handler of a death by Darwin signal {d} taken outside a call"));
-                        }
-                    }
-                }
+                self.darwin_signal_exit(d);
                 return Delivery::Terminate { signal: l, core: false };
             }
             match self.darwin_postsig(m, d, handler, Some(source)) {
@@ -642,20 +629,20 @@ impl Kernel {
         // signal pending with no post recorded.
         let mut order = self.signals.process().take_to_assign();
         let mut rest = self.signals.process().shared();
-        for &l in &order {
+        for &(l, _) in &order {
             if (1..=64).contains(&l) {
                 rest &= !(1u64 << (l - 1));
             }
         }
         while rest != 0 {
-            order.push(rest.trailing_zeros() + 1);
+            order.push((rest.trailing_zeros() + 1, None));
             rest &= rest - 1;
         }
         if order.is_empty() {
             return;
         }
         let tids = self.thread_signals.tids_in_order();
-        for l in order {
+        for (l, note) in order {
             if !(1..=64).contains(&l) {
                 continue;
             }
@@ -670,6 +657,17 @@ impl Kernel {
             let tid = tids.iter().copied().find(|&t| willing(self, t, true)).or_else(|| tids.iter().copied().find(|&t| willing(self, t, false))).or_else(|| tids.first().copied());
             let Some(tid) = tid else { continue };
             let Some(ts) = self.thread_signals.get(tid) else { continue };
+            // The reason the post carries, for the thread it is given to
+            // (one the kernel posted with none: the kernel's own process
+            // sent it).
+            if let Some(d) = signal_from_linux(l) {
+                if self.darwin_signal_kills(&ts, d, false) {
+                    ts.set_exit_reason_if_none(|| note.unwrap_or_else(|| {
+                        let (pid, name) = super::reason::kernproc();
+                        Arc::new(OsReason::signal(d, pid, &name, None))
+                    }));
+                }
+            }
             match self.signals.process().take_shared(l) {
                 Some(source) => {
                     if l == crate::signal::sig::SIGCHLD {
@@ -686,6 +684,78 @@ impl Kernel {
                 None => {}
             }
             self.darwin_psignal(tid, l, false);
+        }
+    }
+
+    /// `build_signal_reason(d, NULL)` with this process the sender.
+    pub(crate) fn darwin_signal_reason(&self, d: u32) -> Note {
+        Arc::new(OsReason::signal(d, self.pid, &self.dtask.p_name.0, None))
+    }
+
+    /// `psignal_internal`'s test for giving thread `ts` an exit reason for
+    /// Darwin signal `d` (`thread_directed`: posted to it, PSIG_THREAD):
+    /// SIGKILL, or a signal neither ignored, held nor caught whose default
+    /// kills -- but a thread-directed one to a stopped process. (No thread
+    /// waits in `__sigwait`, which is not served: none takes a signal as
+    /// KERN_SIG_WAIT.)
+    pub(crate) fn darwin_signal_kills(&self, ts: &crate::signal::ThreadSig, d: u32, thread_directed: bool) -> bool {
+        if d == dsig::SIGKILL {
+            return true;
+        }
+        let ps = &self.dtask.sigacts;
+        let l = signal_to_linux(d);
+        if ps.sigignore & sigmask(d) != 0 || l == 0 || ts.blocked() & (1u64 << (l - 1)) != 0 || ps.handler[d as usize] != SIG_DFL {
+            return false;
+        }
+        if SIGPROP[d as usize] & prop::KILL == 0 {
+            return false;
+        }
+        !(thread_directed && self.procs.job(self.pid).is_some_and(|j| j.lock().unwrap_or_else(|e| e.into_inner()).stopped))
+    }
+
+    /// `psignal_uthread(thread, d)` from this process: the reason it gives
+    /// thread `tid` when the signal would kill it there.
+    pub(crate) fn darwin_thread_reason(&self, tid: i32, d: u32) {
+        let Some(ts) = self.thread_signals.get(tid) else { return };
+        if self.darwin_signal_kills(&ts, d, true) {
+            let note = self.darwin_signal_reason(d);
+            ts.set_exit_reason_if_none(|| note);
+        }
+    }
+
+    /// `exit_with_reason` for a death by Darwin signal `d`'s default action
+    /// on this thread: the thread's exit reason is the process's unless
+    /// its exit has begun; then `proc_prepareexit`'s report of a crash.
+    fn darwin_signal_exit(&mut self, d: u32) {
+        let reason = self.thread_signals.get(self.tid).and_then(|t| t.exit_reason());
+        self.procs.begin_exit(self.pid, reason);
+        self.darwin_prepareexit(d);
+    }
+
+    /// `proc_prepareexit`'s crash report for an end by Darwin signal `d`
+    /// (0 for none): unless the exit reason says no report, a core signal,
+    /// a code signing kill or a reason that asks for a report tells the
+    /// EXC_CRASH handlers (`task_exception_notify`), its code the signal
+    /// and the thread's last exception. The host's own handler takes it
+    /// and nothing is seen, unless a handler was set; that one is sent it
+    /// on the way out of a call.
+    pub(crate) fn darwin_prepareexit(&mut self, d: u32) {
+        use super::reason::flag;
+        let flags = self.procs.exit_reason(self.pid).and_then(|n| super::reason::of(&n)).map(|r| r.flags);
+        let killed = self.dtask.csflags.load(std::sync::atomic::Ordering::Acquire) & super::amfi::cs::KILLED != 0;
+        let core = d != 0 && SIGPROP[d as usize] & prop::CORE != 0;
+        if flags.is_some_and(|f| f & flag::NO_CRASH_REPORT != 0) || !(core || killed || flags.is_some_and(|f| f & flag::GENERATE_CRASH_REPORT != 0)) {
+            return;
+        }
+        use super::exception as exc;
+        if self.darwin_exc_handled(exc::EXC_CRASH) {
+            let th = self.dtask.threads.map.get(&self.tid).map(|t| (t.uu_exception, t.uu_code, t.uu_subcode)).unwrap_or_default();
+            let code = (i64::from(d & 0xff) << 24) | (i64::from(th.0 & 0x0f) << 20) | (th.1 & 0xfffff);
+            if self.dtask.syscall_exit {
+                self.dtask.crash_notify = Some((code, th.2));
+            } else {
+                self.darwin_unimplemented(format!("telling the EXC_CRASH handler of a death by Darwin signal {d} taken outside a call"));
+            }
         }
     }
 
@@ -747,11 +817,18 @@ impl Kernel {
         if let Some(ty) = ty.filter(|&t| self.darwin_exc_handled(t)) {
             self.darwin_unimplemented(format!("sending exception {ty} (Darwin signal {d}) to its exception handler (exception_triage)"));
         }
+        // threadsignal: the thread's exit reason, if it has none, is the
+        // signal, sent by this process as "exc handler".
+        if let Some(ts) = self.thread_signals.get(self.tid) {
+            let (pid, name) = (self.pid, self.dtask.p_name.0);
+            ts.set_exit_reason_if_none(|| Arc::new(OsReason::signal(d, pid, &name, Some(b"exc handler"))));
+        }
         let blocked = self.signals.blocked() & (1u64 << (l - 1)) != 0;
         let handler = self.dtask.sigacts.handler[d as usize];
         // threadsignal of a blocked or ignored fault: the thread would take
         // it again on return, so it ends the process as the default does.
         if handler == SIG_DFL || handler == SIG_IGN || blocked {
+            self.darwin_signal_exit(d);
             return Delivery::Terminate { signal: l, core: false };
         }
         if m.write_u64(self.ctx_addr + ctx::PC as u64, pc).is_err() {
@@ -802,7 +879,8 @@ impl Kernel {
                 self.darwin_sig_mirror(dsig::SIGILL);
                 let ill_l = signal_to_linux(dsig::SIGILL);
                 self.signals.set_blocked(self.signals.blocked() & !(1u64 << (ill_l - 1)));
-                self.signals.raise_shared(ill_l, None);
+                let note = self.darwin_signal_reason(dsig::SIGILL);
+                self.signals.process().raise_noted(ill_l, None, Some(note));
                 Delivery::None
             }
         }

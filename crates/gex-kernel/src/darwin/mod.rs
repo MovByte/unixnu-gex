@@ -50,6 +50,7 @@ pub mod pipe;
 pub mod priority;
 pub mod procinfo;
 pub mod psynch;
+pub mod reason;
 pub mod rlimit;
 pub mod sandbox;
 pub mod sema;
@@ -164,6 +165,10 @@ pub struct Task {
     pub uniqueid: u64,
     pub puniqueid: u64,
     pub uuid: [u8; 16],
+    /// `p_name`.
+    pub p_name: reason::PName,
+    /// `p_user_faults`: the faults `os_fault_with_payload` simulated.
+    pub user_faults: u32,
     /// `p_cputype`, `p_cpusubtype`: its image's.
     pub cputype: (u32, u32),
     /// `p_start`: when its fork made it.

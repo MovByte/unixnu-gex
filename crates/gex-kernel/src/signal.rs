@@ -180,7 +180,7 @@ pub struct ProcSig {
     /// `posted` again, for the kernel's own work at each post (Darwin's
     /// `psignal`: a thread chosen, a stop or a continue acted on), in
     /// order where the pending set keeps one bit a signal.
-    to_assign: Mutex<Vec<u32>>,
+    to_assign: Mutex<Vec<(u32, Option<Note>)>>,
     post_hook: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// What each signal does with no handler, for a personality whose
     /// defaults are not Linux's ([`default_action`] when unset).
@@ -256,21 +256,37 @@ impl ProcSig {
 
     /// The posts since the last take, in order, for the kernel's own work
     /// at each.
-    pub fn take_to_assign(&self) -> Vec<u32> {
+    pub fn take_to_assign(&self) -> Vec<(u32, Option<Note>)> {
         std::mem::take(&mut *self.to_assign.lock())
     }
 
     /// Mark a process-directed signal pending: whichever thread does not
     /// block it takes it.
     pub fn raise(&self, signal: u32, source: Option<Source>) {
+        self.raise_noted(signal, source, None);
+    }
+
+    /// [`ProcSig::raise`], with what the kernel that hears the post is to
+    /// know of it (Darwin's: the reason the signal carries).
+    pub fn raise_noted(&self, signal: u32, source: Option<Source>, note: Option<Note>) {
         if signal > 0 && signal <= sig::MAX {
             self.raise_quiet(signal, source);
             if let Some(hook) = self.post_hook.get() {
                 self.posted.lock().push(signal);
                 self.local_posted.lock().push(signal);
-                self.to_assign.lock().push(signal);
+                self.to_assign.lock().push((signal, note));
                 hook();
             }
+        }
+    }
+
+    /// Tell the post hook of a post the kernel gave one thread itself
+    /// (Darwin's PSIG_TRY_THREAD): its knotes hear of it as of any.
+    pub fn record_post(&self, signal: u32) {
+        if let Some(hook) = self.post_hook.get() {
+            self.posted.lock().push(signal);
+            self.local_posted.lock().push(signal);
+            hook();
         }
     }
 
@@ -413,7 +429,7 @@ impl ProcSig {
         }
         // Each post, as the table kept them (one a signal where it keeps
         // none), for a kernel that is told of posts.
-        let posts = procs.take_posts(pid).unwrap_or_else(|| (1..=64u32).filter(|s| inbox & (1u64 << (s - 1)) != 0).collect());
+        let posts = procs.take_posts(pid).unwrap_or_else(|| (1..=64u32).filter(|s| inbox & (1u64 << (s - 1)) != 0).map(|s| (s, None)).collect());
         // Each signal raised once, with its sender: raised twice, a thread
         // delivering between the two (without the kernel lock) would see it
         // pending again after taking it.
@@ -429,8 +445,8 @@ impl ProcSig {
             }
         }
         if let Some(hook) = self.post_hook.get() {
-            self.to_assign.lock().extend(posts.iter().copied());
-            self.posted.lock().extend(posts);
+            self.posted.lock().extend(posts.iter().map(|&(s, _)| s));
+            self.to_assign.lock().extend(posts);
             hook();
         }
         inbox
@@ -555,6 +571,9 @@ pub struct ThreadSig {
     tsd: AtomicU64,
     /// A Darwin thread's name (`uu_pth_name`), once it has been given one.
     name: Mutex<Option<Vec<u8>>>,
+    /// A Darwin thread's exit reason (`uu_exit_reason`): the first a
+    /// signal brought it, kept for the life of the thread.
+    exit_reason: Mutex<Option<Note>>,
 }
 
 impl std::fmt::Debug for ThreadSig {
@@ -579,6 +598,7 @@ impl ThreadSig {
             darwin_id: AtomicU64::new(0),
             tsd: AtomicU64::new(0),
             name: Mutex::new(None),
+            exit_reason: Mutex::new(None),
         }
     }
 
@@ -607,6 +627,20 @@ impl ThreadSig {
 
     pub fn set_name(&self, name: Option<Vec<u8>>) {
         *self.name.lock() = name;
+    }
+
+    /// The thread's exit reason, if a signal gave it one.
+    pub fn exit_reason(&self) -> Option<Note> {
+        self.exit_reason.lock().clone()
+    }
+
+    /// Give the thread `note` as its exit reason unless it has one
+    /// (`set_thread_exit_reason` where `uu_exit_reason` is null).
+    pub fn set_exit_reason_if_none(&self, note: impl FnOnce() -> Note) {
+        let mut r = self.exit_reason.lock();
+        if r.is_none() {
+            *r = Some(note());
+        }
     }
 
     /// The word the thread's exit clears ([`Self::set_clear_child_tid`]).
@@ -1053,6 +1087,10 @@ pub enum Restart {
 /// The length of [`Signals::to_bytes`]: four words a disposition, then the
 /// mask, the alternate stack's three and the two pending sets.
 const STATE_BYTES: usize = (NSIG * 4 + 6) * 8;
+
+/// What a personality's kernel is told of a signal post beyond its number
+/// (Darwin's: the reason it carries, `os_reason`).
+pub type Note = std::sync::Arc<dyn std::any::Any + Send + Sync>;
 
 /// A process that sent a signal, for its siginfo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

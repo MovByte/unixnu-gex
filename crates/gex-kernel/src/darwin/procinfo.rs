@@ -42,6 +42,8 @@ pub struct Public {
     pub persona: Option<Arc<super::persona::Persona>>,
     /// `p_csflags`.
     pub csflags: Arc<std::sync::atomic::AtomicU32>,
+    /// `p_name`, all of it.
+    pub p_name: super::reason::PName,
 }
 
 /// `p_lflag`'s termination bits.
@@ -253,6 +255,7 @@ impl Kernel {
             pcaction: Arc::clone(&self.dtask.pcaction),
             persona: self.dtask.persona.clone(),
             csflags: Arc::clone(&self.dtask.csflags),
+            p_name: self.dtask.p_name,
         }
     }
 
@@ -281,12 +284,12 @@ impl Kernel {
             call::PIDINFO => self.darwin_proc_pidinfo(m, pid, fl, arg, buf, size),
             call::DIRTYCONTROL => return self.darwin_dirtycontrol(pid, fl, arg),
             call::SETCONTROL => self.darwin_setcontrol(m, pid, fl, arg, buf, size),
-            call::TERMINATE => return self.darwin_proc_terminate(m, pid),
+            call::TERMINATE => return self.darwin_proc_terminate(pid),
             // (`flavor` is the signal, `buffer` the token.)
             call::SIGNAL_AUDITTOKEN => return self.darwin_signal_audittoken(m, buf, fl).map(|()| 0),
             call::TERMINATE_AUDITTOKEN => {
                 let pid = self.darwin_audittoken_proc(m, buf)?;
-                return self.darwin_terminate_with_proc(m, pid);
+                return self.darwin_terminate_with_proc(pid);
             }
             // proc_set_dyld_images: dyld says where its image list is
             // (`buf`, `size` bytes), which task_info(TASK_DYLD_INFO)
@@ -437,7 +440,7 @@ impl Kernel {
     /// `proc_terminate(pid)`: another process the caller may SIGKILL,
     /// marked terminated for memorystatus and in its task's policy, sent
     /// the signal `memorystatus_on_terminate` picks, which is the answer.
-    fn darwin_proc_terminate(&mut self, m: &mut GuestMem<'_>, pid: i32) -> Result<u64, Errno> {
+    fn darwin_proc_terminate(&mut self, pid: i32) -> Result<u64, Errno> {
         if pid <= 0 {
             return Err(Errno::EINVAL);
         }
@@ -445,7 +448,7 @@ impl Kernel {
         if self.darwin_public(pid).is_none_or(|(_, zombie)| zombie) {
             return Err(Errno::ESRCH);
         }
-        self.darwin_terminate_with_proc(m, pid)
+        self.darwin_terminate_with_proc(pid)
     }
 
     /// The live process an audit token names: its pid (`val[5]`, EINVAL
@@ -470,7 +473,6 @@ impl Kernel {
     /// `proc_signal_with_audittoken`: signal `signum` (1 to 31) to the
     /// process the token names, if the caller may signal it.
     fn darwin_signal_audittoken(&mut self, m: &mut GuestMem<'_>, at: u64, signum: u32) -> Result<(), Errno> {
-        use crate::syscalls::nr;
         if signum == 0 || signum >= 32 {
             return Err(Errno::EINVAL);
         }
@@ -483,12 +485,12 @@ impl Kernel {
         if !self.darwin_cansignal(pid, signum, true) {
             return Err(Errno::EPERM);
         }
-        self.canonical(m, nr::KILL, [pid as u64, u64::from(sig), 0, 0, 0, 0]).map(|_| ())
+        self.darwin_kill_post(pid, signum);
+        Ok(())
     }
 
     /// `proc_terminate_with_proc` of process `pid`.
-    fn darwin_terminate_with_proc(&mut self, m: &mut GuestMem<'_>, pid: i32) -> Result<u64, Errno> {
-        use crate::syscalls::nr;
+    fn darwin_terminate_with_proc(&mut self, pid: i32) -> Result<u64, Errno> {
         // Who may SIGKILL it may SIGTERM it too.
         if !self.darwin_cansignal(pid, super::signal::dsig::SIGKILL, true) {
             return Err(Errno::EPERM);
@@ -503,7 +505,7 @@ impl Kernel {
             p.requested.terminated = true;
             p.update(false);
         }
-        self.canonical(m, nr::KILL, [pid as u64, u64::from(super::kern::signal_to_linux(sig)), 0, 0, 0, 0])?;
+        self.darwin_kill_post(pid, sig);
         Ok(u64::from(sig))
     }
 
@@ -686,6 +688,7 @@ impl Kernel {
                 m.write(buf, &data.to_le_bytes()).map_err(fault)?;
                 Ok(4)
             }
+            EXITREASONINFO | EXITREASONBASICINFO => self.darwin_pidexitreasoninfo(m, pid, buf, fl == EXITREASONBASICINFO),
             _ => {
                 self.darwin_unimplemented(format!("proc_pidinfo flavor {fl}"));
                 Err(e::EINVAL)

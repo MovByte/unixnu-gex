@@ -328,7 +328,7 @@ impl Kernel {
                     self.darwin_unimplemented(format!("kill with Darwin signal {signum}, which Linux has no number for"));
                     neg(Errno::EINVAL)
                 } else {
-                    res(self.darwin_kill(m, pid, signum, posix != 0))
+                    res(self.darwin_kill(pid, signum, posix != 0))
                 }
             }
             sys::KQUEUE => res(<Kq as KQueue>::kqueue(self)),
@@ -364,6 +364,7 @@ impl Kernel {
                     Some(_) if workq_refuses => neg(Errno::EOPNOTSUPP),
                     Some(_) if sig == 0 => 0,
                     Some(tid) => {
+                        self.darwin_thread_reason(tid, a[1] as u32);
                         let r = self.canonical(m, nr::TGKILL, [self.pid as u64, tid as u64, u64::from(sig), 0, 0, 0]);
                         // psignal_uthread's record, for a target that takes it.
                         if r.is_ok() && self.thread_signals.get(tid).is_some_and(|t| t.blocked() & (1u64 << (sig - 1)) == 0) {
@@ -483,17 +484,16 @@ impl Kernel {
             sys::CSOPS_AUDITTOKEN if a[4] == 0 => res(Err(Errno::EINVAL)),
             sys::CSOPS_AUDITTOKEN => res(self.darwin_csops(m, a[0] as i32, a[1] as u32, a[2], a[3], Some(a[4]))),
             sys::MAC_SYSCALL => res(self.darwin_mac_syscall(m, a[0], a[1], a[2])),
-            // The reason a process aborts: said, then the process ends
-            // through the renumbering (exit status 134).
-            sys::ABORT_WITH_PAYLOAD | sys::TERMINATE_WITH_PAYLOAD => {
-                let (code, text) = if raw == sys::ABORT_WITH_PAYLOAD { (a[1], a[4]) } else { (a[2], a[5]) };
-                let mut buf = [0u8; 1024];
-                let reason = match m.read_cstr_into(text, &mut buf) {
-                    Ok(Some(n)) => String::from_utf8_lossy(&buf[..n]).into_owned(),
-                    _ => String::from("(no reason)"),
-                };
-                eprintln!("[gex:{}] darwin abort (code {code:#x}): {reason}", self.pid);
-                return None;
+            // abort_with_payload: the call itself always returns 0.
+            sys::ABORT_WITH_PAYLOAD => {
+                let _ = self.darwin_abort_with_payload(m, a, false);
+                0
+            }
+            sys::OS_FAULT_WITH_PAYLOAD => res(self.darwin_abort_with_payload(m, a, true)),
+            sys::TERMINATE_WITH_PAYLOAD => {
+                // The seventh argument, reason_flags, is in x6.
+                let flags = m.read_u64(self.ctx_addr + gex_abi::ctx::x(6) as u64).unwrap_or(0);
+                res(self.darwin_terminate_with_payload(m, a, flags))
             }
             _ => return None,
         })
@@ -617,7 +617,7 @@ impl Kernel {
     /// `kill(pid, signum, posix)`: one process (a zombie succeeds unsignalled),
     /// EPERM unless the caller may signal it; a broadcast (-1), the caller's
     /// group (0) or another group (`killpg1`).
-    fn darwin_kill(&mut self, m: &mut GuestMem<'_>, pid: i32, signum: u32, posix: bool) -> Result<u64, Errno> {
+    fn darwin_kill(&mut self, pid: i32, signum: u32, posix: bool) -> Result<u64, Errno> {
         if pid > 0 {
             // proc_find, else pzfind.
             match self.procs.listing().into_iter().find(|e| e.0 == pid) {
@@ -629,29 +629,33 @@ impl Kernel {
                 return Err(Errno::EPERM);
             }
             if signum != 0 {
-                self.darwin_kill_post(m, pid, signum);
+                self.darwin_kill_post(pid, signum);
             }
             return Ok(0);
         }
         match pid {
-            -1 => self.darwin_killpg1_all(m, signum, posix),
+            -1 => self.darwin_killpg1_all(signum, posix),
             0 => {
                 let pgid = self.procs.pgid(self.pid, self.pid)?;
-                self.darwin_killpg1_group(m, signum, pgid, posix)
+                self.darwin_killpg1_group(signum, pgid, posix)
             }
             _ => {
                 // pgrp_find: a group with members.
                 if self.procs.pgrp_members(-pid).is_empty() {
                     return Err(Errno::ESRCH);
                 }
-                self.darwin_killpg1_group(m, signum, -pid, posix)
+                self.darwin_killpg1_group(signum, -pid, posix)
             }
         }
     }
 
-    /// `psignal(p, signum)` of a signal `kill`'s rules let through.
-    fn darwin_kill_post(&mut self, m: &mut GuestMem<'_>, pid: i32, signum: u32) {
-        let _ = self.canonical(m, nr::KILL, [pid as u64, u64::from(signal_to_linux(signum)), 0, 0, 0, 0]);
+    /// `psignal(p, signum)` from this process: the signal and the reason it
+    /// carries (`build_signal_reason`), then any of it for this process
+    /// collected, as `kill` leaves it pending before it returns.
+    pub(crate) fn darwin_kill_post(&mut self, pid: i32, signum: u32) {
+        let note = self.darwin_signal_reason(signum);
+        let _ = self.procs.kill_noted(self.pid, pid, signal_to_linux(signum), Some(note));
+        self.signals.process().collect(&self.procs, self.pid, self.creds.uid());
     }
 
     /// `killpg1` broadcasting (kill's pid -1): every process past init
@@ -659,7 +663,7 @@ impl Kernel {
     /// semantics, that the caller may signal (`cansignal`; for a zombie,
     /// which counts as found but is not signalled, `cansignal_nomac`).
     /// EPERM (POSIX) or ESRCH when none was.
-    fn darwin_killpg1_all(&mut self, m: &mut GuestMem<'_>, signum: u32, posix: bool) -> Result<u64, Errno> {
+    fn darwin_killpg1_all(&mut self, signum: u32, posix: bool) -> Result<u64, Errno> {
         let mut nfound = 0;
         for (pid, _, _, zombie) in self.procs.listing() {
             if pid <= 1 || (!posix && pid == self.pid) {
@@ -672,7 +676,7 @@ impl Kernel {
             } else if self.darwin_cansignal(pid, signum, true) {
                 nfound += 1;
                 if signum != 0 {
-                    self.darwin_kill_post(m, pid, signum);
+                    self.darwin_kill_post(pid, signum);
                 }
             }
         }
@@ -686,7 +690,7 @@ impl Kernel {
     /// `killpg1` of group `pgid`: each live member but the kernel's and
     /// init (none is a system process here) that the caller may signal.
     /// EPERM (POSIX) or ESRCH when none was.
-    fn darwin_killpg1_group(&mut self, m: &mut GuestMem<'_>, signum: u32, pgid: i32, posix: bool) -> Result<u64, Errno> {
+    fn darwin_killpg1_group(&mut self, signum: u32, pgid: i32, posix: bool) -> Result<u64, Errno> {
         let mut nfound = 0;
         for (pid, _, _, live) in self.procs.pgrp_members(pgid) {
             if pid <= 1 || !live {
@@ -695,7 +699,7 @@ impl Kernel {
             if self.darwin_cansignal(pid, signum, true) {
                 nfound += 1;
                 if signum != 0 {
-                    self.darwin_kill_post(m, pid, signum);
+                    self.darwin_kill_post(pid, signum);
                 }
             }
         }
@@ -938,7 +942,8 @@ impl Kernel {
                     flags.fetch_and(!cs::VALID, Ordering::AcqRel);
                     if f & cs::KILL != 0 {
                         flags.fetch_or(cs::KILLED, Ordering::AcqRel);
-                        self.procs.post_kernel(pid, signal_to_linux(super::signal::dsig::SIGKILL));
+                        let note = self.darwin_signal_reason(super::signal::dsig::SIGKILL);
+                        self.procs.post_kernel_noted(pid, signal_to_linux(super::signal::dsig::SIGKILL), Some(note));
                     }
                 }
                 Ok(0)
@@ -950,7 +955,8 @@ impl Kernel {
             csop::MARKKILL => {
                 let f = flags.fetch_or(cs::KILL, Ordering::AcqRel);
                 if f & cs::VALID == 0 {
-                    self.procs.post_kernel(pid, signal_to_linux(super::signal::dsig::SIGKILL));
+                    let note = self.darwin_signal_reason(super::signal::dsig::SIGKILL);
+                    self.procs.post_kernel_noted(pid, signal_to_linux(super::signal::dsig::SIGKILL), Some(note));
                 }
                 Ok(0)
             }

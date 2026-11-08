@@ -267,6 +267,7 @@ impl Kernel {
             textoff: t.textoff,
             cputype: t.cputype,
             uuid: t.uuid,
+            p_name: t.p_name,
             // forkproc: the credential, and P_SUGID with the flags it keeps.
             cred: t.cred.clone(),
             sugid: t.sugid,

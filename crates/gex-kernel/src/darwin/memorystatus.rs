@@ -1133,8 +1133,10 @@ impl crate::syscalls::Kernel {
         for w in fx.ledger {
             self.darwin_footprint_limit(w);
         }
+        // memorystatus_dirty_set's psignal, from the process that set it.
         for pid in fx.kill {
-            self.procs.post_kernel(pid, super::kern::signal_to_linux(super::signal::dsig::SIGKILL));
+            let note = self.darwin_signal_reason(super::signal::dsig::SIGKILL);
+            self.procs.post_kernel_noted(pid, super::kern::signal_to_linux(super::signal::dsig::SIGKILL), Some(note));
         }
         if fx.rescheduled {
             for l in self.ipc().links.values() {

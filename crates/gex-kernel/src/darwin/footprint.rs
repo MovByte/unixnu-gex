@@ -239,9 +239,13 @@ impl Kernel {
         }
         if fatal {
             // memorystatus_kill_process_sync(kMemorystatusKilledPerProcessLimit):
-            // memorystatus_do_kill's jetsam_do_kill.
+            // memorystatus_do_kill's jetsam_do_kill, for the reason
+            // JETSAM_REASON_MEMORY_PERPROCESSLIMIT, a crash report asked for
+            // (corpse_for_fatal_memkill, and the task is not traced).
             use super::procinfo::{P_JETSAM_PID, P_LTERM_JETSAM};
-            self.procs.jetsam_kill(self.pid, P_LTERM_JETSAM | P_JETSAM_PID);
+            use super::reason::{flag, OsReason, JETSAM_REASON_MEMORY_PERPROCESSLIMIT};
+            let reason = OsReason::jetsam(JETSAM_REASON_MEMORY_PERPROCESSLIMIT, flag::GENERATE_CRASH_REPORT);
+            self.procs.jetsam_kill(self.pid, P_LTERM_JETSAM | P_JETSAM_PID, std::sync::Arc::new(reason));
         } else {
             self.procs.jetsam().hwm_candidates = true;
             self.darwin_warn_process(m, active, fatal, true);

@@ -9789,6 +9789,8 @@ impl Kernel {
                         return SyscallOutcome::Continue;
                     }
                     crate::darwin::Bsd::Nosys => {
+                        // nosys: psignal_uthread(current_thread(), SIGSYS).
+                        self.darwin_thread_reason(self.tid, crate::darwin::signal::dsig::SIGSYS);
                         let _ = self.canonical(m, nr::TGKILL, [self.pid as u64, self.tid as u64, u64::from(crate::signal::sig::SIGSYS), 0, 0, 0]);
                         let _ = crate::darwin::set_result(m, self.ctx_addr, Errno::ENOSYS.as_return());
                         return SyscallOutcome::Continue;

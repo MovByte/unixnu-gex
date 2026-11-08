@@ -452,6 +452,9 @@ impl Kernel {
         // p_uuid, p_cputype and p_cpusubtype: the image's.
         self.dtask.uuid = lr.uuid;
         self.dtask.cputype = lr.cputype;
+        // set_proc_name: the image's file name.
+        let name = l.exe_path.as_bytes().rsplit(|&c| c == b'/').next().unwrap_or_default();
+        self.dtask.p_name.set(name);
         if let Err(why) = self.darwin_exec_csflags(lr.sig, lr.csflags) {
             if self.trace {
                 eprintln!("[gex:{}] AMFI: killing {}: {why}", self.pid, l.exe_path);

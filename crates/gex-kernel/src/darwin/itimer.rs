@@ -146,9 +146,12 @@ impl Kernel {
     pub(crate) fn darwin_realitexpire(&mut self) {
         self.dtask.realtimer.call = None;
         // psignal from the kernel's thread call: posted as the kernel
-        // posts to a process, for whichever thread takes it.
+        // posts to a process, for whichever thread takes it, the kernel's
+        // own process its sender.
         let alrm = super::kern::signal_to_linux(super::signal::dsig::SIGALRM);
-        self.procs.post_kernel(self.pid, alrm);
+        let (pid, name) = super::reason::kernproc();
+        let note = std::sync::Arc::new(super::reason::OsReason::signal(super::signal::dsig::SIGALRM, pid, &name, None));
+        self.procs.post_kernel_noted(self.pid, alrm, Some(note));
         let rt = &mut self.dtask.realtimer;
         if rt.itv.interval == 0 {
             rt.rtime = 0;

@@ -103,10 +103,6 @@ pub fn translate(raw: u64, a: &mut [u64; 6]) -> u64 {
             a[0] = 0;
             nr::EXIT
         }
-        sys::ABORT_WITH_PAYLOAD | sys::TERMINATE_WITH_PAYLOAD => {
-            a[0] = 128 + 6;
-            nr::EXIT_GROUP
-        }
         sys::READ | sys::READ_NOCANCEL => nr::READ,
         sys::WRITE | sys::WRITE_NOCANCEL => nr::WRITE,
         sys::CLOSE | sys::CLOSE_NOCANCEL => nr::CLOSE,

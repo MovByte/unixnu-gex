@@ -4,7 +4,8 @@
 // unmapped are not counted; a task that nears its limit (80 %) is told by
 // its EVFILT_MEMORYSTATUS knote (NOTE_MEMORYSTATUS_PROC_LIMIT_WARN). Needs
 // the com.apple.private.memorystatus entitlement. The kill is a jetsam's:
-// PROC_PIDNOTEEXIT tells the parent NOTE_EXIT_MEMORY_PID.
+// PROC_PIDNOTEEXIT tells the parent NOTE_EXIT_MEMORY_PID, and its exit
+// reason is the jetsam's per-process limit.
 
 #include <errno.h>
 #include <mach-o/dyld.h>
@@ -102,6 +103,15 @@ static int run(const char *mode) {
     uint32_t d = 0;
     if (proc_pidinfo(pid, PROC_PIDNOTEEXIT, NOTE_EXITSTATUS | NOTE_EXIT_DETAIL, &d, sizeof d) != sizeof d) return -1;
     if (strcmp(mode, "over") == 0 && d != (SIGKILL | NOTE_EXIT_MEMORY | NOTE_EXIT_MEMORY_PID)) return -2;
+    // Its exit reason: OS_REASON_JETSAM, JETSAM_REASON_MEMORY_PERPROCESSLIMIT,
+    // a crash report asked for.
+    struct {
+        uint32_t ns;
+        uint64_t code;
+        uint64_t flags;
+        uint32_t size;
+    } __attribute__((packed)) b;
+    if (strcmp(mode, "over") == 0 && (proc_pidinfo(pid, 25, 0, &b, sizeof b) != sizeof b || b.ns != 1 || b.code != 7 || b.flags != 2 || b.size != 0)) return -4;
     if (strcmp(mode, "over") != 0 && d != 0) return -3;
     if (waitpid(pid, &st, 0) != pid) return -1;
     return st;

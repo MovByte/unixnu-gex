@@ -2504,7 +2504,11 @@ fn run_thread_loop(
                             dump_guest(&mut gm, ctx_addr, tid, &vmas);
                         }
                     }
-                    if action.handler == 0 {
+                    // A Darwin process's fault goes through its kernel's
+                    // own handling (exception triage, the thread's exit
+                    // reason, the crash report) whatever its action.
+                    let darwin = store.data_mut().with_kernel(|k| k.darwin);
+                    if action.handler == 0 && !darwin {
                         return Ok(Stopped::Exited(Exit::Signal {
                             signal: signal::SIGSEGV,
                             pc: 0,
@@ -2512,8 +2516,9 @@ fn run_thread_loop(
                             internal: false,
                         }));
                     }
-                    // A handler (a null pointer's read, which traps at the null
-                    // guard, gex_abi::NULL_GUARD): its frame goes on the
+                    // A handler, or a Darwin process (a null pointer's read,
+                    // which traps at the null guard, gex_abi::NULL_GUARD): its
+                    // frame, if it has a handler, goes on the
                     // context as the faulting code last wrote it back -- the
                     // block's start in tier-1 -- with the fault's address
                     // unknown (0, a null pointer's).

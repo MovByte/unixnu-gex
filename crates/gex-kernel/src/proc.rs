@@ -229,7 +229,7 @@ struct Proc {
     /// `pending` keeps one bit a signal), for a process that asked
     /// ([`ProcTable::record_posts`]): Darwin's knotes count each post.
     /// Under the table's lock.
-    posts: Option<Vec<u32>>,
+    posts: Option<Vec<(u32, Option<crate::signal::Note>)>>,
     /// Darwin's `p_xhighbits`, the top byte of the value it exited with,
     /// and the real uid it ended with: for its parent's record of its end.
     xhighbits: u8,
@@ -245,6 +245,8 @@ struct Proc {
     /// Darwin's `P_LEXIT`: its exit has begun (`exit()`, or a jetsam
     /// kill's `exit_with_reason`).
     lexit: bool,
+    /// Darwin's `p_exit_reason`: why it ended, set as its exit began.
+    exit_reason: Option<crate::signal::Note>,
     /// Darwin's `p_persona`'s id: the id it is counted against
     /// (`chgproccnt`) instead of its real uid.
     persona: Option<u32>,
@@ -452,6 +454,7 @@ impl ProcTable {
                     rval: None,
                     xstat: 0,
                     lexit: false,
+                    exit_reason: None,
                     persona: None,
                     child_end: None,
                     execed: false,
@@ -499,6 +502,9 @@ impl ProcTable {
         // task_create's task_policy_create from the parent's policy, with
         // resetpriority for a nice value the child inherits.
         let persona = t.procs.iter().find(|p| p.pid == ppid).and_then(|p| p.persona);
+        // A child of a process that keeps a list of its posts keeps one
+        // from the start: a post before its first thread runs is one too.
+        let posts = t.procs.iter().find(|p| p.pid == ppid).and_then(|p| p.posts.as_ref()).map(|_| Vec::new());
         let (nice, uid, policy) = match t.procs.iter().find(|p| p.pid == ppid) {
             Some(p) => {
                 let parent = *p.child.policy.lock().unwrap_or_else(|e| e.into_inner());
@@ -523,13 +529,14 @@ impl ProcTable {
             pending: Arc::new(AtomicU64::new(0)),
             killed: 0,
             senders: [0; 64],
-            posts: None,
+            posts,
             xhighbits: 0,
             uid,
             lterm: 0,
             rval: None,
             xstat: 0,
             lexit: false,
+            exit_reason: None,
             persona,
             child_end: None,
             execed: false,
@@ -1007,9 +1014,12 @@ impl ProcTable {
             if !members.iter().any(|(_, st, job)| live(st) && job.lock().is_ok_and(|j| j.stopped)) {
                 continue;
             }
+            // psignal from `by`'s context: a SIGHUP that ends a member does
+            // so for the reason `by` sent it.
+            let note = crate::darwin::reason::signal_from_record(self, by, crate::darwin::signal::dsig::SIGHUP);
             for (pid, st, _) in &members {
                 if live(st) {
-                    let _ = self.kill(by, *pid, SIGHUP);
+                    let _ = self.kill_noted(by, *pid, SIGHUP, note.clone());
                     let _ = self.kill(by, *pid, SIGCONT);
                 }
             }
@@ -1141,11 +1151,16 @@ impl ProcTable {
     /// A signal the kernel posts to `pid` (no sender): pending for it, and
     /// its waiters woken.
     pub fn post_kernel(&self, pid: i32, signo: u32) {
+        self.post_kernel_noted(pid, signo, None);
+    }
+
+    /// [`ProcTable::post_kernel`], the post carrying `note`.
+    pub fn post_kernel_noted(&self, pid: i32, signo: u32, note: Option<crate::signal::Note>) {
         {
             let mut t = self.lock();
             let Some(p) = t.procs.iter_mut().find(|p| p.pid == pid) else { return };
             if let Some(v) = &mut p.posts {
-                v.push(signo);
+                v.push((signo, note));
             }
             p.pending.fetch_or(1u64 << (signo - 1), Ordering::AcqRel);
             SIGNAL_SEQ.fetch_add(1, Ordering::Release);
@@ -1155,20 +1170,38 @@ impl ProcTable {
     }
 
     /// `jetsam_do_kill`'s `exit_with_reason(p, W_EXITCODE(0, SIGKILL))`:
-    /// unless `pid` has ended already, its `p_lflag` gains `flags` (the
-    /// jetsam bits) and it ends as SIGKILL ends it. No signal is posted,
-    /// so its knotes hear no NOTE_SIGNAL.
-    pub fn jetsam_kill(&self, pid: i32, flags: u32) {
+    /// unless `pid`'s exit has begun already, `reason` is its exit reason,
+    /// its `p_lflag` gains `flags` (the jetsam bits) and it ends as SIGKILL
+    /// ends it. No signal is posted, so its knotes hear no NOTE_SIGNAL.
+    pub fn jetsam_kill(&self, pid: i32, flags: u32, reason: crate::signal::Note) {
         let mut t = self.lock();
         let Some(p) = t.procs.iter_mut().find(|p| p.pid == pid) else { return };
         if p.lexit || p.child.status.lock().map(|s| s.is_some()).unwrap_or(true) {
             return;
         }
         p.lexit = true;
+        p.exit_reason = Some(reason);
         p.lterm |= flags;
         p.pending.fetch_or(1u64 << (SIGKILL - 1), Ordering::AcqRel);
         SIGNAL_SEQ.fetch_add(1, Ordering::Release);
         p.queue.notify();
+    }
+
+    /// `exit_with_reason`'s commitment to an exit for a signal's default
+    /// action: `reason` (the thread's) is the process's exit reason unless
+    /// its exit has begun already.
+    pub fn begin_exit(&self, pid: i32, reason: Option<crate::signal::Note>) {
+        if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
+            if !p.lexit {
+                p.lexit = true;
+                p.exit_reason = reason;
+            }
+        }
+    }
+
+    /// `pid`'s `p_exit_reason`, a zombie's too.
+    pub fn exit_reason(&self, pid: i32) -> Option<crate::signal::Note> {
+        self.lock().procs.iter().find(|p| p.pid == pid).and_then(|p| p.exit_reason.clone())
     }
 
     /// `proc_exiting(pid)`: its exit has begun, or it has ended.
@@ -1238,6 +1271,12 @@ impl ProcTable {
     /// everything. Returns how many it reached. `signo` zero sends nothing and
     /// only reports whether there was anyone -- what `kill(pid, 0)` is for.
     pub fn kill(&self, caller: i32, target: i32, signo: u32) -> Result<usize, Errno> {
+        self.kill_noted(caller, target, signo, None)
+    }
+
+    /// [`ProcTable::kill`], each post carrying `note` for the target's
+    /// kernel ([`crate::signal::ProcSig::raise_noted`]).
+    pub fn kill_noted(&self, caller: i32, target: i32, signo: u32, note: Option<crate::signal::Note>) -> Result<usize, Errno> {
         if let Some(r) = self.remote {
             return errno_or((r.kill)(caller, target, signo)).map(|n| n as usize);
         }
@@ -1283,7 +1322,7 @@ impl ProcTable {
                 p.killed |= bit;
                 p.senders[signo as usize - 1] = caller;
                 if let Some(v) = &mut p.posts {
-                    v.push(signo);
+                    v.push((signo, note.clone()));
                 }
                 p.pending.fetch_or(bit, Ordering::AcqRel);
             }
@@ -1319,7 +1358,7 @@ impl ProcTable {
             for &i in &hits {
                 let p = &mut t.procs[i];
                 if let Some(v) = &mut p.posts {
-                    v.push(signo);
+                    v.push((signo, None));
                 }
                 p.pending.fetch_or(bit, Ordering::AcqRel);
             }
@@ -1465,7 +1504,7 @@ impl ProcTable {
 
     /// The signals posted to `pid` since the last take, in order, if it
     /// keeps the list; `None` if it does not (a remote table keeps none).
-    pub fn take_posts(&self, pid: i32) -> Option<Vec<u32>> {
+    pub fn take_posts(&self, pid: i32) -> Option<Vec<(u32, Option<crate::signal::Note>)>> {
         if self.remote.is_some() {
             return None;
         }

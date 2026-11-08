@@ -510,6 +510,9 @@ impl Kernel {
             uniqueid: old.uniqueid,
             puniqueid: old.puniqueid,
             start: old.start,
+            // Written over by the image's name once it is accepted.
+            p_name: old.p_name,
+            user_faults: old.user_faults,
             // exec_handle_sugid: the credential kept (set-id images are not
             // honored on a release kernel), P_SUGID cleared, the saved ids
             // the effective ones.

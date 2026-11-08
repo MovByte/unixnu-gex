@@ -150,7 +150,8 @@ impl Kernel {
     /// `psignal(p, SIGPIPE)`.
     pub(crate) fn darwin_send_sigpipe(&mut self) {
         let source = crate::signal::Source { code: crate::signal::SI_USER, pid: self.pid, uid: self.creds.uid() };
-        self.signals.raise_shared(crate::signal::sig::SIGPIPE, Some(source));
+        let note = self.darwin_signal_reason(super::signal::dsig::SIGPIPE);
+        self.signals.process().raise_noted(crate::signal::sig::SIGPIPE, Some(source), Some(note));
     }
 
     /// `pipe_stat` for a Darwin pipe descriptor: a FIFO whose size is what
