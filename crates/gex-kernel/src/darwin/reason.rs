@@ -368,7 +368,7 @@ impl crate::syscalls::Kernel {
                 // PSIG_TRY_THREAD to this thread: told to the knotes as any
                 // post is, the reason given it if the signal would kill it.
                 self.signals.process().record_post(l);
-                if self.darwin_signal_kills(&ts, dsig::SIGABRT, false) {
+                if self.darwin_signal_kills(me, &ts, dsig::SIGABRT, false) {
                     ts.set_exit_reason_if_none(|| note);
                 }
                 let src = crate::signal::Source { code: 0, pid: self.pid, uid: self.creds.uid() };

@@ -110,6 +110,9 @@ pub(super) const SIGPROP: [u8; NSIG] = {
 };
 
 /// `sigmask(sig)`.
+/// `sigcantmask`: what no mask holds.
+const SIGCANTMASK: u32 = sigmask(dsig::SIGKILL) | sigmask(dsig::SIGSTOP);
+
 pub(super) const fn sigmask(d: u32) -> u32 {
     1 << (d - 1)
 }
@@ -661,7 +664,7 @@ impl Kernel {
             // (one the kernel posted with none: the kernel's own process
             // sent it).
             if let Some(d) = signal_from_linux(l) {
-                if self.darwin_signal_kills(&ts, d, false) {
+                if self.darwin_signal_kills(tid, &ts, d, false) {
                     ts.set_exit_reason_if_none(|| note.unwrap_or_else(|| {
                         let (pid, name) = super::reason::kernproc();
                         Arc::new(OsReason::signal(d, pid, &name, None))
@@ -687,24 +690,100 @@ impl Kernel {
         }
     }
 
+    /// `__sigwait(set, sig)` and `__sigwait_nocancel`: a signal of the set
+    /// already on some thread's list (the threads in the order they were
+    /// made) is taken from it, the lowest; else the thread masks all but the
+    /// set (SIGKILL and SIGSTOP cannot be masked) and sleeps until one is
+    /// given it (KERN_SIG_WAIT), its mask back after. EINVAL for no set, or
+    /// one of only those two.
+    pub(crate) fn darwin_sigwait(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> SyscallOutcome {
+        let done = |k: &mut Kernel, m: &mut GuestMem<'_>, r: Result<u64, Errno>| {
+            let _ = super::set_result(m, k.ctx_addr, r.unwrap_or_else(|e| e.as_return()));
+            SyscallOutcome::Continue
+        };
+        if a[0] == 0 {
+            return done(self, m, Err(Errno::EINVAL));
+        }
+        let Ok(mask) = m.read_u32(a[0]) else { return done(self, m, Err(Errno::EFAULT)) };
+        let siglist = mask & !SIGCANTMASK;
+        if siglist == 0 {
+            return done(self, m, Err(Errno::EINVAL));
+        }
+        self.collect_signals();
+        self.darwin_assign_signals();
+        for tid in self.thread_signals.tids_in_order() {
+            let Some(ts) = self.thread_signals.get(tid) else { continue };
+            let sigw = mask_from_linux(ts.pending()) & siglist;
+            if sigw != 0 {
+                let d = sigw.trailing_zeros() + 1;
+                ts.discard_mask(1u64 << (signal_to_linux(d) - 1));
+                let r = Self::darwin_sigwait_out(m, a[1], d);
+                return done(self, m, r);
+            }
+        }
+        let old = self.signals.blocked();
+        let me = self.dtask.threads.map.entry(self.tid).or_default();
+        me.sigwait = siglist;
+        me.sigwait_got = 0;
+        me.sigwait_oldmask = old;
+        self.signals.set_blocked(mask_to_linux(!(siglist | SIGCANTMASK)));
+        self.darwin_block(m, super::wait::Wait { deadline: None, cont: super::thread::Finish::Sigwait { siglist, sig: a[1] } })
+    }
+
+    /// `__sigwait`'s signal number copied out, when asked for.
+    fn darwin_sigwait_out(m: &mut GuestMem<'_>, at: u64, d: u32) -> Result<u64, Errno> {
+        if at != 0 {
+            m.write_u32(at, d)?;
+        }
+        Ok(0)
+    }
+
+    /// `__sigwait`'s sleep ended: the signal given it (what was posted while
+    /// it slept, given first), or EINTR for a signal it may take; anything
+    /// else (a signal another thread was given) leaves it asleep.
+    pub(crate) fn darwin_sigwait_done(&mut self, m: &mut GuestMem<'_>, siglist: u32, sig: u64, res: super::wait::WaitResult) -> Option<SyscallOutcome> {
+        self.collect_signals();
+        self.darwin_assign_signals();
+        let tid = self.tid;
+        let got = self.dtask.threads.map.get(&tid).map_or(0, |t| t.sigwait_got) & siglist;
+        if got == 0 && !(res == super::wait::WaitResult::Interrupted && self.signals.would_deliver()) {
+            return Some(self.darwin_block(m, super::wait::Wait { deadline: None, cont: super::thread::Finish::Sigwait { siglist, sig } }));
+        }
+        let me = self.dtask.threads.map.entry(tid).or_default();
+        let old = me.sigwait_oldmask;
+        me.sigwait = 0;
+        me.sigwait_got = 0;
+        me.sigwait_oldmask = 0;
+        self.signals.set_blocked(old);
+        let r = if got == 0 { Err(Errno::EINTR) } else { Self::darwin_sigwait_out(m, sig, got.trailing_zeros() + 1) };
+        let _ = super::set_result(m, self.ctx_addr, r.unwrap_or_else(|e| e.as_return()));
+        None
+    }
+
+    /// Whether thread `tid`'s `__sigwait` has been given a signal (its sleep
+    /// is over).
+    pub(crate) fn darwin_sigwait_given(&self, tid: i32) -> bool {
+        self.dtask.threads.map.get(&tid).is_some_and(|t| t.sigwait_got != 0)
+    }
+
     /// `build_signal_reason(d, NULL)` with this process the sender.
     pub(crate) fn darwin_signal_reason(&self, d: u32) -> Note {
         Arc::new(OsReason::signal(d, self.pid, &self.dtask.p_name.0, None))
     }
 
-    /// `psignal_internal`'s test for giving thread `ts` an exit reason for
-    /// Darwin signal `d` (`thread_directed`: posted to it, PSIG_THREAD):
-    /// SIGKILL, or a signal neither ignored, held nor caught whose default
-    /// kills -- but a thread-directed one to a stopped process. (No thread
-    /// waits in `__sigwait`, which is not served: none takes a signal as
-    /// KERN_SIG_WAIT.)
-    pub(crate) fn darwin_signal_kills(&self, ts: &crate::signal::ThreadSig, d: u32, thread_directed: bool) -> bool {
+    /// `psignal_internal`'s test for giving thread `tid` (`ts`) an exit
+    /// reason for Darwin signal `d` (`thread_directed`: posted to it,
+    /// PSIG_THREAD): SIGKILL, or a signal neither ignored, waited for
+    /// (KERN_SIG_WAIT), held nor caught whose default kills -- but a
+    /// thread-directed one to a stopped process.
+    pub(crate) fn darwin_signal_kills(&self, tid: i32, ts: &crate::signal::ThreadSig, d: u32, thread_directed: bool) -> bool {
         if d == dsig::SIGKILL {
             return true;
         }
         let ps = &self.dtask.sigacts;
         let l = signal_to_linux(d);
-        if ps.sigignore & sigmask(d) != 0 || l == 0 || ts.blocked() & (1u64 << (l - 1)) != 0 || ps.handler[d as usize] != SIG_DFL {
+        let waited = self.dtask.threads.map.get(&tid).is_some_and(|t| t.sigwait & sigmask(d) != 0);
+        if ps.sigignore & sigmask(d) != 0 || waited || l == 0 || ts.blocked() & (1u64 << (l - 1)) != 0 || ps.handler[d as usize] != SIG_DFL {
             return false;
         }
         if SIGPROP[d as usize] & prop::KILL == 0 {
@@ -717,7 +796,7 @@ impl Kernel {
     /// thread `tid` when the signal would kill it there.
     pub(crate) fn darwin_thread_reason(&self, tid: i32, d: u32) {
         let Some(ts) = self.thread_signals.get(tid) else { return };
-        if self.darwin_signal_kills(&ts, d, true) {
+        if self.darwin_signal_kills(tid, &ts, d, true) {
             let note = self.darwin_signal_reason(d);
             ts.set_exit_reason_if_none(|| note);
         }

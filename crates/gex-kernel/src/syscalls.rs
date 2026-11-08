@@ -9012,6 +9012,10 @@ impl Kernel {
         // sleep).
         if self.darwin {
             self.darwin_assign_signals();
+            // A `__sigwait` given its signal: its sleep is over.
+            if self.darwin_sigwait_given(tid) {
+                return true;
+            }
         }
         if tid == self.sig_tid {
             return self.signals.would_deliver();
@@ -10824,9 +10828,13 @@ impl Kernel {
         self.collect_signals();
         self.check_timers();
         // A Darwin process's own: each goes to the one thread psignal
-        // would give it, which alone is interrupted.
+        // would give it, which alone is interrupted (a `__sigwait` given
+        // its signal too).
         if self.darwin {
             self.darwin_assign_signals();
+            if self.darwin_sigwait_given(self.tid) {
+                return true;
+            }
         }
         let ready = self.signals.has_pending();
         if self.trace && !ready && self.signals.pending_raw() != 0 {

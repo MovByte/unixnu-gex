@@ -198,6 +198,11 @@ pub struct DThread {
     /// `thread_suspend` count. A thread made with `PTHREAD_START_SUSPENDED`
     /// starts at 1, not yet run.
     pub suspend: u32,
+    /// `uu_sigwait`: the signals `__sigwait` waits for while it sleeps;
+    /// the one given it (KERN_SIG_WAIT), and the mask to go back to.
+    pub sigwait: u32,
+    pub sigwait_got: u32,
+    pub sigwait_oldmask: u64,
     /// TH_MODE_REALTIME's time constraints, while it is in that mode.
     pub realtime: Option<super::threadpolicy::Realtime>,
     /// `thread_abort` of it while its task is held: it takes its signals.
@@ -301,6 +306,8 @@ pub enum Finish {
     Lockf(super::lockf::Cont),
     /// An exception's handler's reply (`exception_deliver`).
     Exception(super::triage::Pending),
+    /// `__sigwait`: the signals waited for, where the one taken goes.
+    Sigwait { siglist: u32, sig: u64 },
 }
 
 /// `wait_result_to_return_code` (`sys_ulock.c`).
@@ -378,6 +385,7 @@ impl Kernel {
                 Some(SyscallOutcome::Blocking(crate::syscalls::BlockOp::SigSuspend { restore_mask }))
             }
             sys::SIGRETURN => Some(self.darwin_sigreturn(m, a)),
+            sys::SIGWAIT | sys::SIGWAIT_NOCANCEL => Some(self.darwin_sigwait(m, a)),
             sys::EXECVE => Some(self.darwin_execve(m, a, false)),
             sys::MAC_EXECVE => Some(self.darwin_execve(m, a, true)),
             sys::POSIX_SPAWN => Some(self.darwin_posix_spawn(m, a)),
@@ -809,6 +817,7 @@ impl Kernel {
             Finish::Lockf(c) => return self.darwin_lockf_wait_done(m, c, res),
             Finish::Exception(p) => return self.darwin_exc_wait_done(m, p, res),
             Finish::Psynch(c) => self.darwin_psynch_wait_done(m, c, res),
+            Finish::Sigwait { siglist, sig } => return self.darwin_sigwait_done(m, siglist, sig, res),
             Finish::Ulock { addr, no_errno } => {
                 // A waiter that was not woken is still on the queue.
                 if res != WaitResult::Awakened {

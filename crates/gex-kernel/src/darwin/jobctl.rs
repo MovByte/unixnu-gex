@@ -101,8 +101,10 @@ impl Kernel {
             return;
         }
         let handler = ps.handler[d as usize];
-        let held = ts.blocked() & lbit != 0;
-        let default = !held && (handler == SIG_DFL || handler == SIG_IGN);
+        // A thread in `__sigwait` for it takes it there (KERN_SIG_WAIT).
+        let waited = self.dtask.threads.map.get(&tid).is_some_and(|t| t.sigwait & sigmask(d) != 0);
+        let held = !waited && ts.blocked() & lbit != 0;
+        let default = !waited && !held && (handler == SIG_DFL || handler == SIG_IGN);
         if p & prop::CONT != 0 {
             ts.discard_mask(linux_bits(STOPSIGMASK));
         }
@@ -115,6 +117,23 @@ impl Kernel {
         }
         let stopped = self.darwin_job_with(|j| j.stopped);
         if held && (p & prop::CONT == 0 || !stopped) {
+            return;
+        }
+        if waited {
+            // Given to the waiter, off the thread's list; a continue
+            // resumes the process.
+            ts.discard_mask(lbit);
+            if let Some(t) = self.dtask.threads.map.get_mut(&tid) {
+                t.sigwait_got = sigmask(d);
+            }
+            if p & prop::CONT != 0 {
+                let pid = self.pid;
+                self.darwin_job_with(|j| {
+                    j.continued = true;
+                    j.contproc = pid;
+                });
+                self.darwin_task_resume();
+            }
             return;
         }
         if !default {
