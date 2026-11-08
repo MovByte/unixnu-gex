@@ -13,11 +13,19 @@ pub enum Value {
     I64(i64),
     /// `struct timeval`: seconds, microseconds.
     Timeval(i64, i32),
+    /// The asking process's `user_stack`, as an `int` (`kern.usrstack`)
+    /// or whole (`kern.usrstack64`).
+    UserStack32,
+    UserStack64,
 }
 
 impl Value {
-    pub fn bytes(&self) -> Vec<u8> {
+    /// The node's value for the process whose main stack's top is
+    /// `user_stack`.
+    pub fn bytes(&self, user_stack: u64) -> Vec<u8> {
         match self {
+            Value::UserStack32 => (user_stack as i32).to_le_bytes().to_vec(),
+            Value::UserStack64 => user_stack.to_le_bytes().to_vec(),
             Value::Str(s) => {
                 let mut b = s.as_bytes().to_vec();
                 b.push(0);
@@ -65,7 +73,8 @@ pub fn table() -> Vec<(&'static str, Vec<i32>, Value)> {
         ("kern.boottime", vec![CTL_KERN, 21], Timeval(1_730_000_000, 0)),
         ("kern.maxfilesperproc", vec![CTL_KERN, 29], I32(super::rlimit::MAXFILESPERPROC as i32)),
         ("kern.maxprocperuid", vec![CTL_KERN, 30], I32(super::rlimit::MAXPROCPERUID as i32)),
-        ("kern.usrstack64", vec![CTL_KERN, 59], I64(gex_abi::STACK_TOP as i64)),
+        ("kern.usrstack", vec![CTL_KERN, 35], UserStack32),
+        ("kern.usrstack64", vec![CTL_KERN, 59], UserStack64),
         ("kern.osversion", vec![CTL_KERN, 65], Str("21H461")),
         ("hw.machine", vec![CTL_HW, 1], Str("iPad7,1")),
         ("hw.model", vec![CTL_HW, 2], Str("J120AP")),

@@ -319,6 +319,10 @@ pub struct Loaded<'a> {
     pub nano: bool,
 }
 
+/// `USRSTACK64`: where an arm64 process's main stack starts, before the
+/// image's slide (none here) moves it down (`load_main`).
+pub const USRSTACK64: u64 = 0x1_6FE0_0000;
+
 /// The main thread's stack as `create_unix_stack` allocates it and the
 /// strings copied out onto it.
 pub struct MainStack {

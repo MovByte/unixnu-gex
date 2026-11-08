@@ -4550,7 +4550,7 @@ fn place_image(
                     signature: exec.as_ref().map(|i| i.load.clone()),
                     nano: exec.as_ref().and_then(|i| i.spawn.as_ref()).is_some_and(|sp| sp.flags & gex_kernel::darwin::spawn::flag::NANO_ALLOCATOR != 0),
                 };
-                k.darwin_start(exec.map(|i| i.strings), &loaded, gex_abi::STACK_TOP)
+                k.darwin_start(exec.map(|i| i.strings), &loaded, gex_kernel::darwin::exec::USRSTACK64)
             })
             .map_err(|e| anyhow::Error::new(DarwinStartFailed(format!("starting {path}: errno {}", e.0))))?;
         let layout = gex_ld::stack::StackLayout { sp: st.sp, low: st.sp, bytes: st.bytes };

@@ -818,7 +818,7 @@ impl Kernel {
             o.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()
         } else {
             match sysctl::get(&oid) {
-                Some(v) => v.bytes(),
+                Some(v) => v.bytes(self.darwin_user_stack),
                 None => {
                     if self.trace {
                         eprintln!("[gex:{}] sysctl: no node {oid:?}", self.pid);
@@ -841,7 +841,7 @@ impl Kernel {
             }
             return Err(Errno::ENOENT);
         };
-        self.sysctl_out(m, a[2], a[3], &v.bytes())
+        self.sysctl_out(m, a[2], a[3], &v.bytes(self.darwin_user_stack))
     }
 
     /// Copy a node's value out: the size alone when `old` is null, ENOMEM
