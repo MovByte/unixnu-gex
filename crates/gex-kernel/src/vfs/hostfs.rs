@@ -973,10 +973,17 @@ mod tests {
         assert!(fs.open("ro.txt", oflags::O_RDONLY, 0).is_ok());
     }
 
+    /// The directory the walk test's file system is rooted at, which the
+    /// emulated call walks from: a path to the directory open as its root
+    /// descriptor on any host (`/proc/self/fd` is Linux's alone).
+    static WALK_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
     /// The host's call as the native shim makes it, in safe code: a
-    /// component at a time (what `openat2(RESOLVE_NO_SYMLINKS)` answers).
-    fn emulated_no_links(root: i32, rel: &str) -> bool {
-        let mut at = PathBuf::from(format!("/proc/self/fd/{root}"));
+    /// component at a time (what `openat2(RESOLVE_NO_SYMLINKS)` answers),
+    /// from the walk test's root (the directory `_root` is open on).
+    fn emulated_no_links(_root: i32, rel: &str) -> bool {
+        let Some(base) = WALK_ROOT.get() else { return false };
+        let mut at = base.clone();
         for c in rel.split('/').filter(|c| !c.is_empty()) {
             at.push(c);
             match std::fs::symlink_metadata(&at) {
@@ -1004,6 +1011,7 @@ mod tests {
         link("loop2", "loop1");
         link("loop1", "loop2");
         let fs = HostFs::new(&dir);
+        let _ = WALK_ROOT.set(dir.clone());
         host_walk::set_host_no_links(emulated_no_links);
         let paths = [
             "/a/b/c/f", "/l/c/f", "/l2/c/f", "/abs/b/c", "/a/b/up/l/c", "/a/b/up/a/b/up/abs/b", "/dangle",
