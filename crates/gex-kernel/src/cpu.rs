@@ -90,6 +90,19 @@ impl ThreadCpu {
         self.sample(if blocked { State::Blocked } else { State::User });
     }
 
+    /// Its times so far, taken: it counts again from zero (an exec's new
+    /// thread), the times rolled into its task's.
+    pub fn rollover(&self) -> Option<(u64, u64)> {
+        let t = self.times()?;
+        let mut i = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(now) = host_time(i.tid) {
+            i.last = now;
+        }
+        i.user = 0;
+        i.sys = 0;
+        Some(t)
+    }
+
     /// The thread ends; its times are final.
     pub fn end(&self) {
         self.sample(State::Ended);

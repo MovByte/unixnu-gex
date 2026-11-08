@@ -487,6 +487,8 @@ impl Kernel {
         }
         let old = std::mem::take(&mut self.dtask);
         let (realtimer, vtimers) = (old.realtimer, old.vtimers);
+        // task_copy_fields_for_exec.
+        let vtimer_bits = old.vtimer_bits;
         let kp = old.kports;
         self.dtask = super::Task {
             ipc_raw: old.ipc_raw,
@@ -498,6 +500,9 @@ impl Kernel {
             ladvlock: old.ladvlock,
             sigacts: old.sigacts,
             rlimits: old.rlimits,
+            vtimer_bits,
+            // forkproc's, for the new proc.
+            rlim_cpu: super::itimer::fork_rlim_cpu(old.rlimits.cur(super::rlimit::res::CPU)),
             dispatchqueue_serialno_offset: old.dispatchqueue_serialno_offset,
             dispatchqueue_label_offset: old.dispatchqueue_label_offset,
             policy: old.policy,
@@ -554,6 +559,15 @@ impl Kernel {
                 n.update(false);
                 *p = n;
             });
+        }
+        // The exec's new thread counts from nothing, the old one's time
+        // rolled into the task's (task_rollup_accounting_info).
+        if let Some(t) = self.signals.thread().cpu.rollover() {
+            self.procs.add_dead_cpu(self.pid, t);
+        }
+        // fork_create_child: the CPU limit's timer from the new proc's.
+        if self.dtask.rlim_cpu != (0, 0) {
+            self.darwin_vtimer_set(super::itimer::vt::RLIM);
         }
         self.darwin_inherit_itimers(realtimer, vtimers);
         self.darwin_finish = None;

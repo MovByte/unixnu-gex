@@ -100,6 +100,10 @@ pub struct Task {
     /// The real interval timer, and the virtual and profiling ones.
     pub realtimer: itimer::RealTimer,
     pub vtimers: [itimer::Itimerval; 2],
+    /// `task->vtimers` (TASK_VTIMER_*), and `p_rlim_cpu`: the processor
+    /// time left under RLIMIT_CPU (seconds, microseconds).
+    pub vtimer_bits: u32,
+    pub rlim_cpu: (i64, i32),
     pub threads: thread::Threads,
     pub waits: wait::Waits,
     pub ulocks: thread::Ulocks,

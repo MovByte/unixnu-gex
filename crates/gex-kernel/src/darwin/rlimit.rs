@@ -126,12 +126,7 @@ impl Kernel {
             return Err(Errno::EPERM);
         }
         match which {
-            res::CPU => {
-                if new[0] != RLIM_INFINITY {
-                    self.darwin_unimplemented("setrlimit(RLIMIT_CPU) to a finite limit (the task's CPU-time timer and SIGXCPU)".into());
-                    return Err(Errno::EINVAL);
-                }
-            }
+            res::CPU => self.darwin_rlimit_cpu(new[0])?,
             res::DATA | res::AS | res::MEMLOCK | res::FSIZE if new[0] != RLIM_INFINITY => {
                 let what = match which {
                     res::DATA => "RLIMIT_DATA (vm_map_set_data_limit)",

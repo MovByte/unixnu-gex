@@ -257,6 +257,10 @@ impl Kernel {
             pthread: t.pthread,
             sigacts: t.sigacts.clone(),
             rlimits: t.rlimits,
+            // forkproc: the child's RLIMIT_CPU timer runs from its limit
+            // (its threads' times start at nothing, their saves with them).
+            rlim_cpu: super::itimer::fork_rlim_cpu(t.rlimits.cur(super::rlimit::res::CPU)),
+            vtimer_bits: if super::itimer::fork_rlim_cpu(t.rlimits.cur(super::rlimit::res::CPU)) != (0, 0) { super::itimer::vt::RLIM } else { 0 },
             dispatchqueue_serialno_offset: t.dispatchqueue_serialno_offset,
             dispatchqueue_label_offset: t.dispatchqueue_label_offset,
             vm: t.vm.inherited(),

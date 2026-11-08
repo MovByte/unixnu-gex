@@ -356,19 +356,29 @@ impl crate::syscalls::Kernel {
             self.darwin_unimplemented(format!("os_fault_with_payload's simulated EXC_GUARD (task_violated_guard, a corpse) for namespace {} code {:#x}", r.namespace, r.code));
             return Err(super::errno::errno_of(16));
         }
-        let note: Note = Arc::new(r);
-        let l = super::kern::signal_to_linux(dsig::SIGABRT);
+        self.darwin_psignal_try_thread(dsig::SIGABRT, Some(Arc::new(r)));
+        Ok(0)
+    }
+
+    /// `psignal_try_thread_with_reason(p, current_thread(), d, reason)`:
+    /// Darwin signal `d` to this thread if it takes it (it may be masked,
+    /// and it has not, or it waits for it), else to whichever thread does;
+    /// with no reason given, one naming this process
+    /// (`build_signal_reason(d, NULL)`) for a signal that kills.
+    pub(crate) fn darwin_psignal_try_thread(&mut self, d: u32, note: Option<Note>) {
+        let note = note.unwrap_or_else(|| self.darwin_signal_reason(d));
+        let l = super::kern::signal_to_linux(d);
         let bit = 1u64 << (l - 1);
         let me = self.tid;
-        let no_sigmask = self.dtask.threads.map.get(&me).is_some_and(|t| t.cancel.no_sigmask);
+        let (no_sigmask, waited) = self.dtask.threads.map.get(&me).map_or((false, false), |t| (t.cancel.no_sigmask, t.sigwait & super::signal::sigmask(d) != 0));
         let ts = self.thread_signals.get(me);
-        let takes = !no_sigmask && ts.as_ref().is_some_and(|t| t.blocked() & bit == 0);
+        let takes = !no_sigmask && ts.as_ref().is_some_and(|t| t.blocked() & bit == 0 || waited);
         match ts.filter(|_| takes) {
             Some(ts) => {
-                // PSIG_TRY_THREAD to this thread: told to the knotes as any
-                // post is, the reason given it if the signal would kill it.
+                // To this thread: told to the knotes as any post is, the
+                // reason given it if the signal would kill it.
                 self.signals.process().record_post(l);
-                if self.darwin_signal_kills(me, &ts, dsig::SIGABRT, false) {
+                if self.darwin_signal_kills(me, &ts, d, false) {
                     ts.set_exit_reason_if_none(|| note);
                 }
                 let src = crate::signal::Source { code: 0, pid: self.pid, uid: self.creds.uid() };
@@ -378,7 +388,6 @@ impl crate::syscalls::Kernel {
             }
             None => self.signals.process().raise_noted(l, None, Some(note)),
         }
-        Ok(0)
     }
 
     /// `terminate_with_payload_internal(pid, namespace, code, payload,

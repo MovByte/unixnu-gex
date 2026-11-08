@@ -203,6 +203,10 @@ pub struct DThread {
     pub sigwait: u32,
     pub sigwait_got: u32,
     pub sigwait_oldmask: u64,
+    /// Its times when the task's virtual timers were last brought up to
+    /// date (`vtimer_user_save`, `vtimer_prof_save`, `vtimer_rlim_save`),
+    /// in Mach time units.
+    pub vtimer_saves: [u64; 3],
     /// TH_MODE_REALTIME's time constraints, while it is in that mode.
     pub realtime: Option<super::threadpolicy::Realtime>,
     /// `thread_abort` of it while its task is held: it takes its signals.

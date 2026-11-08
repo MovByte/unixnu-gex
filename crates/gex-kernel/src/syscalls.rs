@@ -10805,6 +10805,10 @@ impl Kernel {
     /// the caller must re-enter translated code at the returned address
     /// rather than continuing where it was.
     fn deliver_pending_body(&mut self, m: &mut GuestMem<'_>) -> Delivery {
+        // bsd_ast: its timers, then its signals.
+        if self.darwin {
+            self.darwin_vtimer_ast();
+        }
         self.collect_signals();
         self.check_timers();
         if !self.signals.has_pending() {

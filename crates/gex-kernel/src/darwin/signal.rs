@@ -41,6 +41,7 @@ pub mod dsig {
     pub const SIGTTOU: u32 = 22;
     pub const SIGCHLD: u32 = 20;
     pub const SIGALRM: u32 = 14;
+    pub const SIGXCPU: u32 = 24;
     pub const SIGVTALRM: u32 = 26;
     pub const SIGPROF: u32 = 27;
 }
