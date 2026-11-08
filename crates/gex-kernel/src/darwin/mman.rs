@@ -430,6 +430,50 @@ impl Kernel {
         }
     }
 
+    /// `minherit(addr, len, inherit)`: `mach_vm_inherit`, EACCES for a
+    /// protection failure and EINVAL for anything else that fails.
+    pub(crate) fn darwin_minherit(&mut self, a: &[u64; 6]) -> Result<u64, Errno> {
+        let (addr, size) = (a[0], a[1]);
+        if range_overflows(addr, size) {
+            return Err(Errno::EINVAL);
+        }
+        match self.darwin_vm_inherit(addr, size, a[2] as u32) {
+            kr::SUCCESS => Ok(0),
+            KERN_PROTECTION_FAILURE => Err(Errno::EACCES),
+            _ => Err(Errno::EINVAL),
+        }
+    }
+
+    /// `mach_vm_inherit(map, start, size, new_inheritance)`: KERN_INVALID_
+    /// ARGUMENT for a range that wraps or an inheritance past
+    /// VM_INHERIT_NONE; then `vm_map_inherit` over the range rounded out to
+    /// pages and held to the map, each entry in it given the inheritance
+    /// (holes left alone), but none if VM_INHERIT_COPY would reach a
+    /// submap (KERN_INVALID_ARGUMENT).
+    pub(crate) fn darwin_vm_inherit(&mut self, start: u64, size: u64, new: u32) -> u64 {
+        if start.checked_add(size).is_none() || new > u32::from(inherit::NONE) {
+            return kr::INVALID_ARGUMENT;
+        }
+        if size == 0 {
+            return kr::SUCCESS;
+        }
+        let (mut s, mut e) = (start & !PAGE_MASK, round(start + size));
+        // VM_MAP_RANGE_CHECK.
+        e = e.min(self.darwin_map_max());
+        s = s.min(e);
+        if range_overflows(s, e - s) {
+            return kr::INVALID_ADDRESS;
+        }
+        let pieces = self.darwin_pieces(s, e);
+        if new == u32::from(inherit::COPY) && pieces.iter().any(|p| p.attrs.kind == kind::SUBMAP) {
+            return kr::INVALID_ARGUMENT;
+        }
+        for p in pieces {
+            self.dtask.vm.update(p.start, p.end, |a| a.inherit = new as u8);
+        }
+        kr::SUCCESS
+    }
+
     /// The task map's highest address (`vm_map_max`).
     pub(crate) fn darwin_map_max(&self) -> u64 {
         if self.dtask.map_max != 0 { self.dtask.map_max } else { vm::MAP_MAX }
