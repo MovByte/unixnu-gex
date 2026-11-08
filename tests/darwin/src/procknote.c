@@ -6,7 +6,9 @@
 // NOTE_REAP asked for, the exit leaving the knote and the reap ending it.
 // With NOTE_EXIT_DETAIL, a code signing kill (CS_KILL, then marked invalid)
 // as NOTE_EXIT_CSERROR; proc_pidinfo(PROC_PIDNOTEEXIT) giving its parent the
-// same data, and anyone else EACCES.
+// same data, and anyone else EACCES. Of an exit(0x12345), `p_xstat` is
+// 0x1234500: the knote has its low half, PROC_PIDNOTEEXIT its low 20 bits,
+// a zombie's pbi_xstatus all of it.
 
 #include <errno.h>
 #include <limits.h>
@@ -68,6 +70,7 @@ int main(int argc, char **argv) {
         char c;
         while (read(0, &c, 1) > 0) {
         }
+        if (strcmp(argv[1], "big") == 0) _exit(0x12345);
         if (strcmp(argv[1], "cs") != 0) return 3;
         uint32_t d;
         errno = 0;
@@ -98,6 +101,17 @@ int main(int argc, char **argv) {
     if (proc_pidinfo(pid, PROC_PIDNOTEEXIT, NOTE_EXITSTATUS | NOTE_EXIT_DETAIL, &d, sizeof d) != sizeof d || d != (3 << 8)) return bad("PROC_PIDNOTEEXIT of an exit", d);
     int st;
     waitpid(pid, &st, 0);
+
+    pid = run(&wr, "big");
+    one(kq, &ev);  // its NOTE_FORK
+    add(kq, pid, NOTE_EXIT | NOTE_EXITSTATUS, &ev);
+    close(wr);
+    if (one(kq, &ev) != 1 || ev.data != 0x4500) return bad("NOTE_EXIT of exit(0x12345)", ev.data);
+    if (proc_pidinfo(pid, PROC_PIDNOTEEXIT, NOTE_EXITSTATUS, &d, sizeof d) != sizeof d || d != 0x34500) return bad("PROC_PIDNOTEEXIT of exit(0x12345)", d);
+    uint32_t bsd[34];
+    if (proc_pidinfo(pid, 3, 1, bsd, 136) != 136 || bsd[1] != 5 || bsd[2] != 0x1234500) return bad("a zombie's pbi_xstatus", bsd[2]);
+    waitpid(pid, &st, 0);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0x45) return bad("exit(0x12345)'s status", st);
 
     pid = run(&wr, "cs");
     one(kq, &ev);  // its NOTE_FORK

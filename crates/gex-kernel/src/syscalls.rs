@@ -9797,8 +9797,8 @@ impl Kernel {
             };
             if raw == crate::darwin::sysno::EXIT {
                 self.darwin_workq_mark_exiting();
-                // exit(): the top byte of the value, for the parent's record.
-                self.procs.set_end(self.pid, (a[0] as u32 >> 24) as u8, self.creds.uid());
+                // exit(): the value, for `p_xstat` and the parent's record.
+                self.procs.set_end(self.pid, a[0] as u32, self.creds.uid());
             }
             if crate::darwin::thread::CANCEL_POINTS.contains(&raw) && self.darwin_testcancel(true) {
                 let _ = crate::darwin::set_result(m, self.ctx_addr, Errno::EINTR.as_return());

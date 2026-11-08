@@ -237,6 +237,11 @@ struct Proc {
     /// Darwin's `p_lflag` termination bits: `P_LTERM_JETSAM` and the
     /// jetsam cause (`P_JETSAM_MASK`), set by a jetsam kill.
     lterm: u32,
+    /// The value a Darwin process gave `exit()`, all of it, and its
+    /// `p_xstat` once it has ended (`exit1`'s `W_EXITCODE(rval, 0)`, or the
+    /// signal that ended it).
+    rval: Option<u32>,
+    xstat: u32,
     /// Darwin's `p_persona`'s id: the id it is counted against
     /// (`chgproccnt`) instead of its real uid.
     persona: Option<u32>,
@@ -441,6 +446,8 @@ impl ProcTable {
                     xhighbits: 0,
                     uid: 0,
                     lterm: 0,
+                    rval: None,
+                    xstat: 0,
                     persona: None,
                     child_end: None,
                     execed: false,
@@ -516,6 +523,8 @@ impl ProcTable {
             xhighbits: 0,
             uid,
             lterm: 0,
+            rval: None,
+            xstat: 0,
             persona,
             child_end: None,
             execed: false,
@@ -737,12 +746,26 @@ impl ProcTable {
         // Published outside the table lock: a waiter wakes on `done` then wants
         // the table, so holding both here in the other order deadlocks.
         let detail = self.exit_detail(pid);
+        let xstat = {
+            let mut t = self.lock();
+            let p = t.procs.iter_mut().find(|p| p.pid == pid);
+            let w = status as u32;
+            let x = match p.as_ref().and_then(|p| p.rval) {
+                // Its own exit(), not a signal that came first.
+                Some(rval) if w & 0x7f == 0 && (w >> 8) & 0xff == rval & 0xff => rval.wrapping_shl(8),
+                _ => crate::darwin::exit::status_from_linux(w),
+            };
+            if let Some(p) = p {
+                p.xstat = x;
+            }
+            x
+        };
         *cell.lock().unwrap_or_else(|e| e.into_inner()) = Some(status);
         self.orphanpg(pid, &jobc_orphaned);
         done.notify_all();
-        // proc_exit's NOTE_EXIT, with the low half of the status as Darwin
-        // encodes it, and what ended it, read now while it is there.
-        crate::procnote::post_exit(pid, crate::procnote::note::EXIT | (crate::darwin::exit::status_from_linux(status as u32) & 0xffff), detail);
+        // proc_exit's NOTE_EXIT, with the low half of `p_xstat`, and what
+        // ended it, read now while it is there.
+        crate::procnote::post_exit(pid, crate::procnote::note::EXIT | (xstat & 0xffff), detail);
         // The parent is owed a SIGCHLD. A `wait4` parked on the condvar
         // doesn't need one, but a parent that polls `WNOHANG` and sleeps in
         // `sigsuspend` between polls has nothing else to wake it -- coreutils
@@ -1148,12 +1171,11 @@ impl ProcTable {
         self.lock().procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.lterm)
     }
 
-    /// `pid`'s wait status, in the table's (Linux's) encoding, once it has
-    /// ended and until it is reaped.
-    pub fn exit_status(&self, pid: i32) -> Option<i32> {
-        let cell = self.lock().procs.iter().find(|p| p.pid == pid).map(|p| Arc::clone(&p.child.status))?;
-        let s = *cell.lock().unwrap_or_else(|e| e.into_inner());
-        s
+    /// Darwin's `p_xstat` for `pid` once it has ended, until it is reaped.
+    pub fn xstat(&self, pid: i32) -> Option<u32> {
+        let (cell, x) = self.lock().procs.iter().find(|p| p.pid == pid).map(|p| (Arc::clone(&p.child.status), p.xstat))?;
+        let ended = cell.lock().map(|s| s.is_some()).unwrap_or(false);
+        ended.then_some(x)
     }
 
     /// `filt_procevent`'s NOTE_EXIT_DETAIL bits for `pid`, from its
@@ -1364,14 +1386,15 @@ impl ProcTable {
     }
 
     /// Take everything sent to `pid` since the last call.
-    /// What a Darwin process ending will say of itself: the top byte of
-    /// its exit value (`p_xhighbits`) and its real uid.
-    pub fn set_end(&self, pid: i32, xhighbits: u8, uid: u32) {
+    /// What a Darwin process ending will say of itself: the value it gave
+    /// `exit()` (whose top byte is `p_xhighbits`) and its real uid.
+    pub fn set_end(&self, pid: i32, rval: u32, uid: u32) {
         if self.remote.is_some() {
             return;
         }
         if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
-            p.xhighbits = xhighbits;
+            p.xhighbits = (rval >> 24) as u8;
+            p.rval = Some(rval);
             p.uid = uid;
         }
     }

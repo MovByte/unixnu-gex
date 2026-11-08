@@ -700,12 +700,7 @@ impl Kernel {
         }
         let mut data = 0;
         if flags & note::EXITSTATUS != 0 {
-            let xstat = if zombie {
-                self.procs.exit_status(pid).map_or(0, |w| super::exit::status_from_linux(w as u32) & 0xffff)
-            } else {
-                self.darwin_pstat(pid, false).1
-            };
-            data |= xstat & note::PDATAMASK;
+            data |= self.darwin_pstat(pid, zombie).1 & note::PDATAMASK;
         }
         if flags & note::EXIT_DETAIL != 0 {
             data |= exit_detail(self.procs.lterm(pid), p.csflags.load(std::sync::atomic::Ordering::Acquire));
@@ -713,13 +708,13 @@ impl Kernel {
         Ok(data)
     }
 
-    /// `p_stat`: SRUN, SSTOP for a stopped process, SZOMB.
+    /// `p_stat` and `p_xstat`: SRUN, SSTOP for a stopped process, SZOMB.
     fn darwin_pstat(&self, pid: i32, zombie: bool) -> (u32, u32) {
         const SRUN: u32 = 2;
         const SSTOP: u32 = 4;
         const SZOMB: u32 = 5;
         if zombie {
-            return (SZOMB, 0);
+            return (SZOMB, self.procs.xstat(pid).unwrap_or(0));
         }
         match self.procs.job(pid).map(|j| *j.lock().unwrap_or_else(|e| e.into_inner())) {
             Some(j) if j.stopped => (SSTOP, j.xstat),
