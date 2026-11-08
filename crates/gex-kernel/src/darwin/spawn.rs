@@ -120,6 +120,8 @@ pub struct Attr {
     pub pcontrol: i32,
     pub apptype: u32,
     pub cpumonitor_percent: u64,
+    /// `psa_cpumonitor_interval`, in seconds.
+    pub cpumonitor_interval: u64,
     pub jetsam_flags: u16,
     /// `psa_priority`, `psa_memlimit_active`, `psa_memlimit_inactive`.
     pub jetsam_priority: i32,
@@ -150,6 +152,7 @@ impl Attr {
             pcontrol: le32(b, 32) as i32,
             apptype: le32(b, 36),
             cpumonitor_percent: le64(b, 40),
+            cpumonitor_interval: le64(b, 48),
             jetsam_flags: le16(b, 64),
             jetsam_priority: le32(b, 68) as i32,
             memlimit_active: le32(b, 72) as i32,
@@ -181,6 +184,8 @@ pub struct After {
     pub max_addr: u64,
     /// `psa_pcontrol`, when the spawn had attributes.
     pub pcontrol: Option<i32>,
+    /// `psa_cpumonitor_percent` and `psa_cpumonitor_interval` (seconds).
+    pub cpumonitor: (u64, u64),
 }
 
 /// The `p_pcaction` a spawn's `psa_pcontrol` gives (`POSIX_SPAWN_PCONTROL_*`
@@ -566,7 +571,7 @@ impl Kernel {
     fn darwin_spawn_child(&mut self, m: &GuestMem<'_>, child: &mut Kernel, attr: Option<&Attr>, file_actions: Option<&[u8]>, port_actions: Option<&[u8]>, creds: &SpawnCreds, path: u64, argv: u64, envv: u64) -> Result<(), Errno> {
         let flags = attr.map_or(0, |a| a.flags);
         let policy = attr.map_or((0, 0, 0), |a| super::taskpolicy::spawn_attrs(a.apptype, a.qos_clamp, a.darwin_role));
-        let mut after = After { flags, policy, sigmask: attr.map_or(0, |a| a.sigmask), sigdefault: attr.map_or(0, |a| a.sigdefault), inherit: Vec::new(), max_addr: attr.map_or(0, |a| a.max_addr), pcontrol: attr.map(|a| a.pcontrol) };
+        let mut after = After { flags, policy, sigmask: attr.map_or(0, |a| a.sigmask), sigdefault: attr.map_or(0, |a| a.sigdefault), inherit: Vec::new(), max_addr: attr.map_or(0, |a| a.max_addr), pcontrol: attr.map(|a| a.pcontrol), cpumonitor: attr.map_or((0, 0), |a| (a.cpumonitor_percent, a.cpumonitor_interval)) };
         if let Some(fa) = file_actions {
             after.inherit = child.darwin_file_actions(fa, flags)?;
         }
@@ -795,7 +800,7 @@ impl Kernel {
                 let _ = copy.fds.set_clofork(fd, true);
             }
         }
-        let mut after = After { flags: at.flags, policy: super::taskpolicy::spawn_attrs(at.apptype, at.qos_clamp, at.darwin_role), sigmask: at.sigmask, sigdefault: at.sigdefault, inherit: Vec::new(), max_addr: at.max_addr, pcontrol: Some(at.pcontrol) };
+        let mut after = After { flags: at.flags, policy: super::taskpolicy::spawn_attrs(at.apptype, at.qos_clamp, at.darwin_role), sigmask: at.sigmask, sigdefault: at.sigdefault, inherit: Vec::new(), max_addr: at.max_addr, pcontrol: Some(at.pcontrol), cpumonitor: (at.cpumonitor_percent, at.cpumonitor_interval) };
         let activated = (|| {
             if let Some(fa) = file_actions {
                 after.inherit = copy.darwin_file_actions(fa, at.flags)?;
@@ -845,9 +850,6 @@ impl Kernel {
             k.darwin_unimplemented(format!("posix_spawn's {what}"));
             Err(Errno::EINVAL)
         };
-        if at.cpumonitor_percent != 0 && at.cpumonitor_percent < u64::from(u8::MAX) {
-            return no(self, "CPU usage monitor");
-        }
         if at.thread_limit > 0 {
             return no(self, "thread limit");
         }

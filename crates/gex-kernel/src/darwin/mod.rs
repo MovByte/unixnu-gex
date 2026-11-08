@@ -20,6 +20,7 @@ pub mod attrlist;
 pub mod bsd;
 pub mod codesign;
 pub mod commpage;
+pub mod cpumon;
 pub mod cred;
 pub mod errno;
 pub mod exec;
@@ -105,6 +106,8 @@ pub struct Task {
     /// time left under RLIMIT_CPU (seconds, microseconds).
     pub vtimer_bits: u32,
     pub rlim_cpu: (i64, i32),
+    /// The task's CPU usage limits (`rusage_cpu_*`).
+    pub cpuusage: cpumon::CpuUsage,
     pub threads: thread::Threads,
     pub waits: wait::Waits,
     pub ulocks: thread::Ulocks,

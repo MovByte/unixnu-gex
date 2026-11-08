@@ -591,6 +591,13 @@ impl Kernel {
             if any && sp.flags & super::spawn::flag::SETEXEC != 0 {
                 self.darwin_policy_with(|p| p.spawnpolicy(apptype, clamp, role));
             }
+            // exec_handle_spawnattr_policy's CPU usage monitor, on the new
+            // task, as entitled: whoever turns it on could as well not
+            // have. A NOTIFY_EXC monitor is always accepted.
+            let (pct, secs) = sp.cpumonitor;
+            if pct != 0 && pct < u64::from(u8::MAX) {
+                let _ = self.darwin_set_task_ruse_cpu(super::cpumon::attr::NOTIFY_EXC, pct as u8, secs.wrapping_mul(1_000_000_000), 0, true);
+            }
         }
     }
 }

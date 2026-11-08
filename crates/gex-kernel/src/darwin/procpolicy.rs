@@ -100,10 +100,7 @@ impl Kernel {
             policy::RESOURCE_STARVATION => self.darwin_policy_lowresource(act, subtype, target),
             policy::RESOURCE_USAGE => match subtype {
                 sub::RUSAGE_NONE | sub::RUSAGE_WIREDMEM | sub::RUSAGE_VIRTMEM | sub::RUSAGE_DISK | sub::RUSAGE_NETWORK | sub::RUSAGE_POWER => Err(Errno::EOPNOTSUPP),
-                sub::RUSAGE_CPU => {
-                    self.darwin_unimplemented(format!("process_policy's CPU usage monitor (handle_cpuuse, action {act}, pid {target})"));
-                    Err(Errno::EINVAL)
-                }
+                sub::RUSAGE_CPU => self.darwin_policy_cpuuse(m, act, attrp, target),
                 _ => Err(Errno::EINVAL),
             },
             policy::APP_LIFECYCLE => self.darwin_policy_applifecycle(m, act, subtype, attrp, target, target_tid),
@@ -123,6 +120,44 @@ impl Kernel {
             }
             _ => Err(Errno::EINVAL),
         }
+    }
+
+    /// `handle_cpuuse`: GET copies out the limit in force
+    /// (`proc_get_task_ruse_cpu`, its interval in seconds); APPLY, SET,
+    /// RESTORE and ENABLE turn on what the caller's privilege
+    /// (PRIV_PROC_CPUMON_OVERRIDE) lets them. Another process's limits ask
+    /// the Sandbox's system-sched first.
+    fn darwin_policy_cpuuse(&mut self, m: &mut GuestMem<'_>, act: i32, attrp: u64, target: i32) -> Result<u64, Errno> {
+        const GET: i32 = 11;
+        let known = matches!(act, GET | action::APPLY | action::SET | action::RESTORE | action::ENABLE);
+        if known && act != GET {
+            // priv_check_cred: the MAC policies' priv_check and priv_grant.
+            self.darwin_unimplemented(format!("process_policy CPU usage action {act} for pid {target}: priv_check_cred(PRIV_PROC_CPUMON_OVERRIDE) (the MAC policies' priv_check and priv_grant)"));
+            return Err(Errno::EINVAL);
+        }
+        if target != self.pid {
+            let e = self.darwin_mac_check_sched(target);
+            if e != 0 {
+                return Err(super::errno::errno_of(e as i32));
+            }
+        }
+        // REMOVE, and anything else.
+        if act != GET {
+            return Err(Errno::EINVAL);
+        }
+        if target != self.pid {
+            self.darwin_unimplemented(format!("process_policy CPU usage GET of another process (pid {target})'s limits"));
+            return Err(Errno::EINVAL);
+        }
+        // proc_policy_cpuusage_attr_t.
+        let (policy, pct, interval, deadline) = self.darwin_get_task_ruse_cpu();
+        let mut b = [0u8; 24];
+        b[0..4].copy_from_slice(&policy.to_le_bytes());
+        b[4..8].copy_from_slice(&u32::from(pct).to_le_bytes());
+        b[8..16].copy_from_slice(&(interval / 1_000_000_000).to_le_bytes());
+        b[16..24].copy_from_slice(&deadline.to_le_bytes());
+        m.write(attrp, &b)?;
+        Ok(0)
     }
 
     /// `handle_lowresource`: RESTORE is `proc_resetpcontrol` (a resource

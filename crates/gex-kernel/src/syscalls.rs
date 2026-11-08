@@ -10830,6 +10830,7 @@ impl Kernel {
         // bsd_ast: its timers, then its signals.
         if self.darwin {
             self.darwin_vtimer_ast();
+            self.darwin_ledger_ast();
         }
         self.collect_signals();
         self.check_timers();

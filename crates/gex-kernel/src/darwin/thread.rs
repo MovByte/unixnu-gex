@@ -207,6 +207,10 @@ pub struct DThread {
     /// date (`vtimer_user_save`, `vtimer_prof_save`, `vtimer_rlim_save`),
     /// in Mach time units.
     pub vtimer_saves: [u64; 3],
+    /// Its CPU time ledger (`t_threadledger`'s cpu_time) once a limit
+    /// made one, and its time (Mach units) credited to it so far.
+    pub cpu_ledger: Option<super::cpumon::CpuLedger>,
+    pub cpu_credited: u64,
     /// TH_MODE_REALTIME's time constraints, while it is in that mode.
     pub realtime: Option<super::threadpolicy::Realtime>,
     /// `thread_abort` of it while its task is held: it takes its signals.
