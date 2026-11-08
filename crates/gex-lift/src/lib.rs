@@ -4693,9 +4693,17 @@ impl<'a> Lifter<'a> {
     /// Wasm has no exclusive-access primitive, so the monitor is emulated with
     /// a compare-and-swap against the value the matching load-exclusive
     /// observed. When the monitor does not match, the compare-and-swap is
-    /// redirected to a scratch location so it cannot touch guest memory, and
+    /// redirected to the thread's scratch slot so it cannot touch guest memory, and
     /// the instruction reports failure. Spurious *failure* is architecturally
     /// permitted; spurious success is not, which is why the redirect exists.
+    /// The thread's store-exclusive scratch (`gex_abi::ctx::EXCL_SCRATCH`)
+    /// less `below`, for an access `below` bytes past its base.
+    fn excl_scratch(&mut self, below: u64) -> Value {
+        let ctx = self.b.read(GuestReg::CtxAddr);
+        let off = self.b.const_i64(gex_abi::ctx::EXCL_SCRATCH as u64 - below);
+        self.b.bin(BinOp::Add, Ty::I64, ctx, off)
+    }
+
     fn store_exclusive(&mut self, sz: MemSz, rs: RegSel, rt: RegSel, rn: RegSel) {
         let ty = if sz == MemSz::D { Ty::I64 } else { Ty::I32 };
         let width = if sz == MemSz::D { Sz::X } else { Sz::W };
@@ -4709,7 +4717,7 @@ impl<'a> Lifter<'a> {
         let size_ok = self.b.cmp(CmpOp::Eq, Ty::I64, mon_size, want_size);
         let armed = self.b.bin(BinOp::And, Ty::I32, addr_ok, size_ok);
 
-        let scratch = self.b.const_i64(gex_abi::EXCLUSIVE_SCRATCH);
+        let scratch = self.excl_scratch(0);
         let eff_addr = self.b.select(armed, addr, scratch, Ty::I64);
 
         let mon_value = self.b.read(GuestReg::MonValue);
@@ -4828,7 +4836,7 @@ impl<'a> Lifter<'a> {
         let addr_ok = self.b.cmp(CmpOp::Eq, Ty::I64, mon_addr, addr);
         let size_ok = self.b.cmp(CmpOp::Eq, Ty::I64, mon_size, want_size);
         let armed = self.b.bin(BinOp::And, Ty::I32, addr_ok, size_ok);
-        let scratch = self.b.const_i64(gex_abi::EXCLUSIVE_SCRATCH);
+        let scratch = self.excl_scratch(0);
         let eff_addr = self.b.select(armed, addr, scratch, Ty::I64);
         let expected = self.b.read(GuestReg::MonValue);
         let old = self.b.def(Expr::CmpXchg { addr: eff_addr, expected, replacement: lo, sz: gex_ir::MemSz::B8, ty: Ty::I64 });
@@ -4836,7 +4844,8 @@ impl<'a> Lifter<'a> {
         let success = self.b.bin(BinOp::And, Ty::I32, armed, swapped);
         if let Some(hi) = hi {
             // The second doubleword lands only with the first.
-            let at = self.b.select(success, addr, scratch, Ty::I64);
+            let scratch_lo = self.excl_scratch(8);
+            let at = self.b.select(success, addr, scratch_lo, Ty::I64);
             self.b.stmt(Stmt::Store { addr: at, offset: 8, val: hi, sz: gex_ir::MemSz::B8, order: Order::Relaxed });
         }
         let one = self.b.const_i32(1);

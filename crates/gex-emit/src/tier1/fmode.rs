@@ -103,6 +103,7 @@ impl<'a> FnBody<'a> {
         e.value_local = vec![None; n];
         e.value_const = vec![None; n];
         e.value_ctx = vec![false; n];
+        e.value_floored = vec![false; n];
         e.value_ty = vec![Ty::I64; n];
         e.value_fp = vec![None; n];
         FnBody { e, last: vec![usize::MAX; n], borrowed: Vec::new() }
@@ -222,6 +223,9 @@ impl<'a> FnBody<'a> {
         self.e.value_u32 = u32s;
         self.e.value_chase = chase;
         for c in self.e.value_ctx.iter_mut() {
+            *c = false;
+        }
+        for c in self.e.value_floored.iter_mut() {
             *c = false;
         }
         // Values are numbered per block: forget the last block's (a value

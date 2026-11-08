@@ -721,6 +721,11 @@ struct Emitter<'a> {
     /// below the null guard (`gex_abi::NULL_GUARD`), so these accesses skip
     /// it. Indexed like `value_const`; every `def` sets its entry.
     pub(crate) value_ctx: Vec<bool>,
+    /// The values that choose, in a Darwin process, between a guest address
+    /// and one in the thread's context (a store-exclusive's: its scratch
+    /// slot when its monitor does not match). The floor guarded the guest
+    /// address where the choice was made; the context is below it.
+    pub(crate) value_floored: Vec<bool>,
     /// The locals `alloc` made: block-local temporaries, never holding a
     /// value from one block to another (fmode's `strip_dead_tees`).
     pub(crate) temps: Vec<u32>,
@@ -813,6 +818,7 @@ impl<'a> Emitter<'a> {
             value_u32: Vec::new(),
             value_chase: Vec::new(),
             value_ctx: Vec::new(),
+            value_floored: Vec::new(),
             temps: Vec::new(),
             value_ty: Vec::new(),
             free_i32: Vec::new(),
@@ -1015,6 +1021,7 @@ impl<'a> Emitter<'a> {
         self.value_local = vec![None; n];
         self.value_const = vec![None; n];
         self.value_ctx = vec![false; n];
+        self.value_floored = vec![false; n];
         self.value_ty = vec![Ty::I64; n];
         let dying = dying_after(block);
         self.prof_entry(block);
@@ -1089,6 +1096,7 @@ impl<'a> Emitter<'a> {
         self.value_local = vec![None; n];
         self.value_const = vec![None; n];
         self.value_ctx = vec![false; n];
+        self.value_floored = vec![false; n];
         self.value_ty = vec![Ty::I64; n];
 
         let dying = dying_after(block);
@@ -1531,7 +1539,7 @@ impl<'a> Emitter<'a> {
         let null_guard = on && biased && !self.is_ctx(addr);
         // A Darwin process's floor (`gex_abi::DARWIN_GUEST_FLOOR`): always,
         // for every access but to the thread's own context.
-        let darwin_floor = gex_abi::commpage_fold() && biased && !self.is_ctx(addr);
+        let darwin_floor = gex_abi::commpage_fold() && biased && !self.is_ctx(addr) && !self.value_floored.get(addr.0 as usize).copied().unwrap_or(false);
         // A memory64 guest memory takes the guest address
         // as it stands: past the end of the memory, the engine's own check
         // traps, which is the SIGSEGV the guard below exists to produce. The
@@ -2757,6 +2765,14 @@ impl<'a> Emitter<'a> {
             self.value_ctx.resize(idx + 1, false);
         }
         self.value_ctx[idx] = is_ctx;
+        let xsel = match expr {
+            Expr::Select { cond, a, b, ty: Ty::I64 } if gex_abi::commpage_fold() && gex_abi::mem64() && self.is_ctx(*b) && !self.is_ctx(*a) => Some((*cond, *a, *b)),
+            _ => None,
+        };
+        if self.value_floored.len() <= idx {
+            self.value_floored.resize(idx + 1, false);
+        }
+        self.value_floored[idx] = xsel.is_some();
         if let Some(f) = self.value_fp.get_mut(idx) {
             *f = None;
         }
@@ -2813,6 +2829,24 @@ impl<'a> Emitter<'a> {
                 self.push(*a);
                 self.push(*b);
                 self.f.byte(cmp_op(*op, *ty));
+            }
+            Expr::Select { cond, a, b, .. } if xsel.is_some() => {
+                // The guest address wrapped and floored as `emit_address`
+                // does, then the context's when the condition is false.
+                self.push(*a);
+                self.f.i64_const(gex_abi::DARWIN_ADDR_MASK as i64);
+                self.f.byte(0x83); // i64.and
+                let t = self.scratch_floor;
+                self.f.local_set(t);
+                self.f.i64_const((u64::MAX - 15) as i64);
+                self.f.local_get(t);
+                self.f.local_get(t);
+                self.f.i64_const(gex_abi::DARWIN_GUEST_FLOOR as i64);
+                self.f.byte(code::I64_LT_U);
+                self.f.select();
+                self.push(*b);
+                self.push(*cond);
+                self.f.select();
             }
             Expr::Select { cond, a, b, .. } => {
                 self.push(*a);

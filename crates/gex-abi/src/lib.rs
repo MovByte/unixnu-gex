@@ -416,6 +416,13 @@ pub mod ctx {
     /// beside `LAST_TARGET`: a wild target is only half the story, the code
     /// that computed it is the other half.
     pub const LAST_SOURCE: usize = 46 * 8;
+    /// Where a store-exclusive whose local monitor does not match stores
+    /// instead of guest memory (`gex_lift::Lifter::store_exclusive`): the
+    /// thread's own, never guest-observable, and no address a guard on
+    /// guest addresses (the null guard, a Darwin process's floor) faults.
+    /// A pair's second doubleword lands here too, at `EXCL_SCRATCH - 8`
+    /// plus its offset of 8.
+    pub const EXCL_SCRATCH: usize = 47 * 8;
 
     /// The raw system-call number the guest last issued, saved by the kernel
     /// at entry. On x86-64 the number's register (`rax`) is also the result
@@ -600,11 +607,6 @@ pub const fn dispatch_entry_base(entry: u32) -> u32 {
 pub const fn dispatch_page(pc: u64) -> u64 {
     pc / DISPATCH_PAGE
 }
-
-/// Scratch doubleword used to neutralise a store-exclusive whose local monitor
-/// no longer matches (see `gex_lift::Lifter::store_exclusive`). In the reserved
-/// low region, 8-byte aligned, never guest-observable.
-pub const EXCLUSIVE_SCRATCH: u64 = RESERVED_END - 64;
 
 /// The lock word an x86 locked access spanning two aligned 8-byte words is
 /// done under (wasm has no atomic wider than eight bytes), and beside it a
@@ -1321,7 +1323,7 @@ mod tests {
         assert!(PATCHED_PAGES + PATCHED_PAGES_BYTES <= BODY_LIMIT);
         assert!(FCACHE + FCACHE_BYTES <= PATCHED_PAGES);
         assert!(FCACHE % 8 == 0 && FCACHE > RESERVED_BASE + 256 * ((ctx::SIZE as u64 + 63) & !63));
-        assert!(SPLIT_LOCK + 8 <= EXCLUSIVE_SCRATCH);
+        assert!(SPLIT_LOCK + 8 <= RESERVED_END - 64);
         // Every address code may occupy needs a directory entry, including the
         // mmap arena where `ld.so` maps and calls into libraries.
         assert!(DISPATCH_MAX_PAGES * DISPATCH_PAGE >= STACK_TOP);
