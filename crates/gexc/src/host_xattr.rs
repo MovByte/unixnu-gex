@@ -9,6 +9,7 @@ use std::os::unix::ffi::OsStrExt;
 
 pub fn install() {
     set_host_xattr(call);
+    gex_kernel::vfs::hostfs::host_swap::set_host_swap(swap);
     gex_kernel::vfs::hostfs::host_identity::set_host_identity(identity);
 }
 
@@ -24,6 +25,22 @@ fn identity() -> (u32, u32, Vec<u32>) {
         groups.truncate(got as usize);
         (libc::geteuid(), libc::getegid(), groups)
     }
+}
+
+/// `RENAME_SWAP` and `RENAME_EXCHANGE`: the two names exchanged at once.
+fn swap(a: &std::path::Path, b: &std::path::Path) -> Result<(), Errno> {
+    let a = CString::new(a.as_os_str().as_bytes()).map_err(|_| Errno::EINVAL)?;
+    let b = CString::new(b.as_os_str().as_bytes()).map_err(|_| Errno::EINVAL)?;
+    // SAFETY: both are live CStrings for the call.
+    #[cfg(target_os = "macos")]
+    let r = unsafe { libc::renamex_np(a.as_ptr(), b.as_ptr(), libc::RENAME_SWAP) };
+    // SAFETY: as above.
+    #[cfg(not(target_os = "macos"))]
+    let r = unsafe { libc::syscall(libc::SYS_renameat2, libc::AT_FDCWD, a.as_ptr(), libc::AT_FDCWD, b.as_ptr(), libc::RENAME_EXCHANGE) as i32 };
+    if r != 0 {
+        return Err(Errno::from_io(&std::io::Error::last_os_error()));
+    }
+    Ok(())
 }
 
 fn call(on: &On<'_>, op: XattrOp<'_>) -> Result<usize, Errno> {

@@ -786,6 +786,29 @@ impl FileSystem for HostFs {
         Ok(())
     }
 
+    fn swap_names(&self, a: &str, b: &str) -> Result<(), Errno> {
+        if self.read_only {
+            return Err(Errno::EROFS);
+        }
+        let (a, b) = (self.host_path(a)?, self.host_path(b)?);
+        let dir = |p: &PathBuf| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir());
+        let either_dir = dir(&a) || dir(&b);
+        let watched = crate::vnote::any();
+        let ids = if watched { [host_ino(&a), host_ino(&b), a.parent().and_then(host_ino), b.parent().and_then(host_ino)] } else { [None; 4] };
+        self.gate.rename(super::own_holds(), either_dir, || host_swap::call(&a, &b))?;
+        // VNOP_RENAME's notes: each object renamed, each directory written.
+        if watched {
+            use crate::vnote::note;
+            let fs = self.watch_fs();
+            for (id, what) in ids.into_iter().zip([note::RENAME, note::RENAME, note::WRITE, note::WRITE]) {
+                if let Some((ino, _)) = id {
+                    crate::vnote::post(crate::inotify::Key { fs, ino }, what);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn xattr(&self, path: &str, op: super::XattrOp<'_>) -> Result<usize, Errno> {
         if self.read_only && matches!(op, super::XattrOp::Set { .. } | super::XattrOp::Remove { .. }) {
             return Err(Errno::EROFS);
@@ -907,6 +930,24 @@ pub mod host_walk {
 
     pub(super) fn hook() -> Option<NoLinks> {
         HOOK.get().copied()
+    }
+}
+
+pub mod host_swap {
+    use crate::errno::Errno;
+
+    /// The host's atomic exchange of two names.
+    pub type Call = fn(a: &std::path::Path, b: &std::path::Path) -> Result<(), Errno>;
+
+    static CALL: std::sync::OnceLock<Call> = std::sync::OnceLock::new();
+
+    /// Install it (the native host's). The first call wins.
+    pub fn set_host_swap(call: Call) {
+        let _ = CALL.set(call);
+    }
+
+    pub fn call(a: &std::path::Path, b: &std::path::Path) -> Result<(), Errno> {
+        CALL.get().ok_or(Errno::EOPNOTSUPP)?(a, b)
     }
 }
 

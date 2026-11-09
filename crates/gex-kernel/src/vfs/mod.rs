@@ -918,6 +918,12 @@ pub trait FileSystem: Send + Sync {
     /// `rename`, refusing (`EEXIST`) a destination that exists when
     /// `noreplace` (`RENAME_NOREPLACE`). A filesystem that can make the
     /// check and the move one step does; this default checks first.
+    /// Exchange two names atomically (`RENAME_SWAP`), `EOPNOTSUPP` from a
+    /// filesystem that cannot.
+    fn swap_names(&self, _a: &str, _b: &str) -> Result<(), Errno> {
+        Err(Errno::EOPNOTSUPP)
+    }
+
     fn rename2(&self, from: &str, to: &str, noreplace: bool) -> Result<(), Errno> {
         if noreplace && self.metadata_nofollow(to).is_ok() {
             return Err(Errno::EEXIST);
@@ -1553,6 +1559,16 @@ impl Namespace {
             return Err(Errno::EXDEV);
         }
         fs.rename2(&rel_from, &rel_to, noreplace)
+    }
+
+    /// Exchange two names on one filesystem.
+    pub fn swap_names(&self, a: &str, b: &str) -> Result<(), Errno> {
+        let (fs, rel_a) = self.resolve(a)?;
+        let (fs_b, rel_b) = self.resolve(b)?;
+        if !Arc::ptr_eq(fs, fs_b) {
+            return Err(Errno::EXDEV);
+        }
+        fs.swap_names(&rel_a, &rel_b)
     }
 
     pub fn chmod(&self, path: &str, mode: u32) -> Result<(), Errno> {

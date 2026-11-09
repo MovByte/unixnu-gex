@@ -182,6 +182,27 @@ impl Kernel {
         r
     }
 
+    /// `renameatx_np`'s RENAME_SWAP: neither final link followed, both
+    /// names exchanged by the volume in one step.
+    fn darwin_rename_swap(&mut self, m: &GuestMem<'_>, a: &[u64; 6], nofollow_any: bool) -> Result<u64, Errno> {
+        if nofollow_any {
+            self.darwin_no_link_on_the_way(m, a[0], a[1])?;
+            self.darwin_no_link_on_the_way(m, a[2], a[3])?;
+        }
+        let from = self.path_io().at_path(m, dirfd(a[0]) as i32, a[1])?;
+        let to = self.path_io().at_path(m, dirfd(a[2]) as i32, a[3])?;
+        self.vfs.metadata_nofollow(&from)?;
+        self.vfs.metadata_nofollow(&to)?;
+        match self.vfs.swap_names(&from, &to) {
+            Ok(()) => Ok(0),
+            Err(Errno::EOPNOTSUPP) => {
+                self.darwin_unimplemented("RENAME_SWAP on a filesystem with no exchange of names".into());
+                Err(Errno::EOPNOTSUPP)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// `mount(type, dir, flags, data)`, of a bind mount; another file
     /// system's is reported.
     pub(crate) fn darwin_mount(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
@@ -333,10 +354,11 @@ impl Kernel {
                 let flags = a[4] as u32 as u64;
                 if flags & !(RENAME_SECLUDE | RENAME_EXCL | RENAME_SWAP | RENAME_NOFOLLOW_ANY) != 0 || flags & (RENAME_EXCL | RENAME_SWAP) == RENAME_EXCL | RENAME_SWAP {
                     Err(Errno::EINVAL)
-                } else if flags & (RENAME_SECLUDE | RENAME_SWAP) != 0 {
-                    // The filesystems here have no atomic exchange.
-                    self.darwin_unimplemented(format!("renameatx_np flags {flags:#x} (RENAME_SWAP, RENAME_SECLUDE)"));
+                } else if flags & RENAME_SECLUDE != 0 {
+                    self.darwin_unimplemented(format!("renameatx_np flags {flags:#x} (RENAME_SECLUDE)"));
                     Err(Errno::EINVAL)
+                } else if flags & RENAME_SWAP != 0 {
+                    self.darwin_rename_swap(m, a, flags & RENAME_NOFOLLOW_ANY != 0)
                 } else {
                     // RENAME_NOFOLLOW_ANY: both lookups NAMEI_NOFOLLOW_ANY,
                     // neither following its last component.
