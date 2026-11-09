@@ -289,6 +289,33 @@ fn convert_limit(limit: i32) -> i32 {
 }
 
 impl Jetsam {
+    /// `memorystatus_on_suspend`: whether the process was marked for
+    /// termination and so is to be killed.
+    pub fn on_suspend(&mut self, pid: i32) -> bool {
+        let Some(p) = self.procs.get_mut(&pid) else { return false };
+        p.state |= state::SUSPENDED;
+        p.dirty & dirty::TERMINATED != 0
+    }
+
+    /// `memorystatus_on_resume`.
+    pub fn on_resume(&mut self, pid: i32) {
+        if let Some(p) = self.procs.get_mut(&pid) {
+            p.state &= !state::SUSPENDED;
+        }
+    }
+
+    /// `memorystatus_available_memory_internal`, for a footprint of
+    /// `footprint` bytes.
+    pub fn available_memory(&self, pid: i32, footprint: u64) -> u64 {
+        let Some(p) = self.procs.get(&pid) else { return 0 };
+        if !is_app(p) {
+            return 0;
+        }
+        let limit_mb = if p.memlimit > 0 { p.memlimit } else { convert_limit(-1) };
+        let limit: i64 = if limit_mb <= 0 { i64::from(i32::MAX & !((1 << 20) - 1)) } else { i64::from(limit_mb) << 20 };
+        (limit - footprint as i64).max(0) as u64
+    }
+
     pub fn get(&self, pid: i32) -> Option<&Memstat> {
         self.procs.get(&pid)
     }

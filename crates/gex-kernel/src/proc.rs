@@ -200,6 +200,8 @@ pub struct Job {
     pub holds: u32,
     /// The task's `legacy_stop_count`: task_suspend's holds among them.
     pub legacy: u32,
+    /// `pidsuspended`: `pid_suspend`'s hold is among them.
+    pub pidsuspended: bool,
 }
 
 /// One process, as the table sees it.

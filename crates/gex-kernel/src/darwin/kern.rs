@@ -439,6 +439,10 @@ impl Kernel {
             sys::GETDTABLESIZE => self.fds.limit() as u64,
             // CONFIG_AUDIT is not in an arm64 kernel: these are its stubs.
             sys::AUDIT | sys::AUDITON | sys::GETAUID | sys::SETAUID | sys::GETAUDIT_ADDR | sys::SETAUDIT_ADDR | sys::AUDITCTL | sys::AUDIT_SESSION_SELF | sys::AUDIT_SESSION_JOIN | sys::AUDIT_SESSION_PORT => neg(Errno::ENOSYS),
+            sys::PTRACE => res(self.darwin_ptrace(a)),
+            sys::PID_SUSPEND => res(self.darwin_pid_suspend(a[0] as i32)),
+            sys::PID_RESUME => res(self.darwin_pid_resume(a[0] as i32)),
+            sys::MEMORYSTATUS_AVAILABLE_MEMORY => res(self.darwin_available_memory(m)),
             sys::CLONEFILEAT => res(self.darwin_clonefileat(m, a)),
             sys::FCLONEFILEAT => res(self.darwin_fclonefileat(m, a)),
             sys::EXCHANGEDATA => res(self.darwin_exchangedata(m, a)),

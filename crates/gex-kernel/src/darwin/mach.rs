@@ -609,7 +609,7 @@ impl Kernel {
     /// groups among its own (`kauth_cred_gid_subset`; no external resolver
     /// on iOS) unless the target is a third party's debuggable driver, and
     /// the target not having changed identity (P_SUGID).
-    fn darwin_tfp_posix_check(&mut self, pid: i32) -> bool {
+    pub(crate) fn darwin_tfp_posix_check(&mut self, pid: i32) -> bool {
         let Some((target, false)) = self.darwin_public(pid) else { return false };
         let me = self.dtask.cred.clone();
         if me.uid == 0 || pid == self.pid {

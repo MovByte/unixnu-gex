@@ -256,8 +256,11 @@ pub struct Task {
     /// `thread_guard_violation`'s pending exception of a guarded descriptor,
     /// its code and subcode, for the call's way out (`fd_guard_ast`).
     pub fd_guard: Option<(u64, u64)>,
+    /// `P_LNOATTACH` and `P_FORCEQUOTA`.
+    pub no_attach: bool,
     /// `p_debugger`.
     pub p_debugger: bool,
+    pub force_quota: bool,
     /// What has been reported as not done, so each is said once.
     said: std::collections::HashSet<String>,
     /// Under strict mode, the unimplemented thing that stops the process

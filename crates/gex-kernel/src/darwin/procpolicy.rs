@@ -389,6 +389,92 @@ impl Kernel {
         self.darwin_sb_evaluate(op::SYSTEM_SCHED, &a)
     }
 
+    /// `pid_suspend`'s and `pid_resume`'s common checks; the target's job.
+    fn darwin_pid_hold_target(&mut self, pid: i32) -> Result<std::sync::Arc<std::sync::Mutex<crate::proc::Job>>, Errno> {
+        const ENTITLEMENT: &str = "com.apple.private.process.suspend-resume.any";
+        if pid == 0 {
+            return Err(Errno::EPERM);
+        }
+        if self.darwin_public(pid).is_none_or(|(_, zombie)| zombie) {
+            return Err(Errno::ESRCH);
+        }
+        if !self.darwin_tfp_posix_check(pid) && !self.dtask.codesign.as_ref().is_some_and(|c| c.entitled(ENTITLEMENT)) {
+            return Err(Errno::EPERM);
+        }
+        if self.darwin_mac_check_suspend_resume() != 0 {
+            return Err(Errno::EPERM);
+        }
+        self.procs.job(pid).ok_or(Errno::ESRCH)
+    }
+
+    /// `pid_suspend(pid)`: a hold of its own on the task, one at a time. The
+    /// target's threads stop at their next look at the task's holds; the
+    /// call does not wait for them as `task_wait_locked` does.
+    pub(crate) fn darwin_pid_suspend(&mut self, pid: i32) -> Result<u64, Errno> {
+        let job = self.darwin_pid_hold_target(pid)?;
+        {
+            let mut j = job.lock().unwrap_or_else(|e| e.into_inner());
+            if j.pidsuspended {
+                return Err(Errno::EPERM);
+            }
+            j.pidsuspended = true;
+            j.holds += 1;
+        }
+        if self.procs.jetsam().on_suspend(pid) {
+            let _ = self.procs.kill(self.pid, pid, crate::signal::sig::SIGKILL as u32);
+        }
+        Ok(0)
+    }
+
+    /// `pid_resume(pid)`: `pid_suspend`'s hold released.
+    pub(crate) fn darwin_pid_resume(&mut self, pid: i32) -> Result<u64, Errno> {
+        let job = self.darwin_pid_hold_target(pid)?;
+        self.procs.jetsam().on_resume(pid);
+        {
+            let mut j = job.lock().unwrap_or_else(|e| e.into_inner());
+            if !j.pidsuspended {
+                return Err(Errno::EPERM);
+            }
+            j.pidsuspended = false;
+            j.holds = j.holds.saturating_sub(1);
+        }
+        // Held threads wait on the host's readiness wake.
+        self.fd_activity = true;
+        Ok(0)
+    }
+
+    /// `ptrace(req, ...)`: PT_DENY_ATTACH and PT_FORCEQUOTA. A debugger's
+    /// requests are reported (no process here is ever traced).
+    pub(crate) fn darwin_ptrace(&mut self, a: &[u64; 6]) -> Result<u64, Errno> {
+        const PT_FORCEQUOTA: i32 = 30;
+        const PT_DENY_ATTACH: i32 = 31;
+        match a[0] as i32 {
+            PT_DENY_ATTACH => {
+                self.dtask.no_attach = true;
+                Ok(0)
+            }
+            PT_FORCEQUOTA if self.dtask.cred.uid == 0 => {
+                self.dtask.force_quota = true;
+                Ok(0)
+            }
+            PT_FORCEQUOTA => Err(Errno::EPERM),
+            req => {
+                self.darwin_unimplemented(format!("ptrace request {req}"));
+                Err(Errno::EINVAL)
+            }
+        }
+    }
+
+    /// `memorystatus_available_memory()`: what this app has left under its
+    /// limit.
+    pub(crate) fn darwin_available_memory(&mut self, m: &mut GuestMem<'_>) -> Result<u64, Errno> {
+        let Some(footprint) = self.darwin_phys_footprint(m) else {
+            self.darwin_unimplemented("phys_footprint on a host that cannot say which pages are a task's".into());
+            return Err(Errno::EINVAL);
+        };
+        Ok(self.procs.jetsam().available_memory(self.pid, footprint))
+    }
+
     /// `mac_proc_check_suspend_resume` (Sandbox's system-suspend-resume,
     /// with no argument: the target and the request are not asked about;
     /// AMFI has no hook).

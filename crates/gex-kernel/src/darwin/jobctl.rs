@@ -234,7 +234,8 @@ impl Kernel {
     /// all of them.
     pub(crate) fn darwin_release_task_hold(&mut self, mode: HoldMode) -> bool {
         let ok = self.darwin_job_with(|j| {
-            if j.holds == 0 {
+            // pid_suspend's hold is released only by pid_resume.
+            if j.holds <= u32::from(j.pidsuspended) {
                 return false;
             }
             if mode == HoldMode::LegacyAll {
