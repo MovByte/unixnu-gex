@@ -22,6 +22,10 @@ extern kern_return_t mach_vm_allocate(vm_map_t, mach_vm_address_t *, mach_vm_siz
 extern kern_return_t mach_vm_deallocate(vm_map_t, mach_vm_address_t, mach_vm_size_t);
 extern kern_return_t mach_vm_protect(vm_map_t, mach_vm_address_t, mach_vm_size_t, boolean_t, vm_prot_t);
 extern kern_return_t mach_vm_inherit(vm_map_t, mach_vm_address_t, mach_vm_size_t, vm_inherit_t);
+extern kern_return_t mach_vm_read(vm_map_t, mach_vm_address_t, mach_vm_size_t, vm_offset_t *, mach_msg_type_number_t *);
+extern kern_return_t mach_vm_write(vm_map_t, mach_vm_address_t, vm_offset_t, mach_msg_type_number_t);
+extern kern_return_t mach_vm_copy(vm_map_t, mach_vm_address_t, mach_vm_size_t, mach_vm_address_t);
+extern kern_return_t mach_vm_read_overwrite(vm_map_t, mach_vm_address_t, mach_vm_size_t, mach_vm_address_t, mach_vm_size_t *);
 extern kern_return_t mach_vm_behavior_set(vm_map_t, mach_vm_address_t, mach_vm_size_t, vm_behavior_t);
 extern kern_return_t mach_vm_region(vm_map_t, mach_vm_address_t *, mach_vm_size_t *, vm_region_flavor_t, vm_region_info_t, mach_msg_type_number_t *, mach_port_t *);
 
@@ -160,6 +164,40 @@ int main(void) {
     if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) return bad("a child's shared entry", st, 0);
     a = (mach_vm_address_t)p;
     if (region(&a, &size, &info) != KERN_SUCCESS || !info.shared) return bad("the parent's shared entry", info.shared, 1);
+
+    // Reading memory: the bytes, out of line, in new pages of ours.
+    b = alloc_at(4 * K);
+    char *src = (char *)b;
+    memcpy(src + 5, "hello", 6);
+    vm_offset_t data = 0;
+    mach_msg_type_number_t got = 0;
+    if ((kr = mach_vm_read(mach_task_self(), b + 5, 6, &data, &got)) != KERN_SUCCESS) return bad("mach_vm_read", kr, 0);
+    if (got != 6 || memcmp((char *)data, "hello", 6) != 0) return bad("what mach_vm_read gave", got, 6);
+    if (data == b + 5) return bad("a read that did not copy", 1, 0);
+    mach_vm_deallocate(mach_task_self(), data & ~(K - 1), K);
+
+    // Over a hole and a page that cannot be read.
+    kr = mach_vm_read(mach_task_self(), b + 4 * K, K, &data, &got);
+    if (kr != KERN_INVALID_ADDRESS) return bad("reading a hole", kr, KERN_INVALID_ADDRESS);
+    mach_vm_protect(mach_task_self(), b + 3 * K, K, FALSE, VM_PROT_NONE);
+    kr = mach_vm_read(mach_task_self(), b + 3 * K, K, &data, &got);
+    if (kr != KERN_PROTECTION_FAILURE) return bad("reading a page with no access", kr, KERN_PROTECTION_FAILURE);
+    mach_vm_protect(mach_task_self(), b + 3 * K, K, FALSE, VM_PROT_READ | VM_PROT_WRITE);
+
+    // Writing, copying and reading into a buffer.
+    char msg[] = "world";
+    if ((kr = mach_vm_write(mach_task_self(), b + K, (vm_offset_t)msg, 6)) != KERN_SUCCESS) return bad("mach_vm_write", kr, 0);
+    if (memcmp(src + K, "world", 6) != 0) return bad("what mach_vm_write wrote", 1, 0);
+    mach_vm_protect(mach_task_self(), b + 2 * K, K, FALSE, VM_PROT_READ);
+    kr = mach_vm_write(mach_task_self(), b + 2 * K, (vm_offset_t)msg, 6);
+    if (kr != KERN_PROTECTION_FAILURE) return bad("writing a read-only page", kr, KERN_PROTECTION_FAILURE);
+    mach_vm_protect(mach_task_self(), b + 2 * K, K, FALSE, VM_PROT_READ | VM_PROT_WRITE);
+    if ((kr = mach_vm_copy(mach_task_self(), b + K, 6, b + 2 * K)) != KERN_SUCCESS) return bad("mach_vm_copy", kr, 0);
+    if (memcmp(src + 2 * K, "world", 6) != 0) return bad("what mach_vm_copy made", 1, 0);
+    char into[8];
+    mach_vm_size_t outsize = 0;
+    if ((kr = mach_vm_read_overwrite(mach_task_self(), b + 2 * K, 6, (mach_vm_address_t)into, &outsize)) != KERN_SUCCESS) return bad("mach_vm_read_overwrite", kr, 0);
+    if (outsize != 6 || memcmp(into, "world", 6) != 0) return bad("what read_overwrite gave", (long long)outsize, 6);
 
     // The image's own text: an entry of the file, read and execute.
     a = (mach_vm_address_t)&_mh_execute_header;

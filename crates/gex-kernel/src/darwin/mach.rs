@@ -1009,6 +1009,74 @@ impl Kernel {
         Ok((e.start, e.end - e.start, info))
     }
 
+    /// `vm_map_copyin` from this task's map: a copy of `[addr, addr + size)`.
+    /// A page with no entry is KERN_INVALID_ADDRESS, an entry that cannot be
+    /// read KERN_PROTECTION_FAILURE.
+    pub(crate) fn darwin_vm_copyin(&self, addr: u64, size: u64) -> Result<Vec<u8>, i32> {
+        const KERN_INVALID_ADDRESS: i32 = 1;
+        const KERN_PROTECTION_FAILURE: i32 = 2;
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        let end = addr.checked_add(size).ok_or(KERN_INVALID_ADDRESS)?;
+        {
+            let mm = self.mem.lock();
+            let mut at = addr & !PAGE_MASK;
+            let stop = (end + PAGE_MASK) & !PAGE_MASK;
+            while at < stop {
+                let v = mm.vma_at(at).ok_or(KERN_INVALID_ADDRESS)?;
+                if v.prot & crate::mem::prot::READ == 0 {
+                    return Err(KERN_PROTECTION_FAILURE);
+                }
+                at = v.end;
+            }
+        }
+        let peer = self.procs.vm(self.pid).map_err(|_| KERN_INVALID_ADDRESS)?;
+        let mut data = vec![0u8; size as usize];
+        if !peer.mem.read(addr, &mut data) {
+            return Err(KERN_INVALID_ADDRESS);
+        }
+        Ok(data)
+    }
+
+    /// `vm_map_copy_overwrite` of this task's map at `dst`: the range must
+    /// be mapped (KERN_INVALID_ADDRESS) and writable
+    /// (KERN_PROTECTION_FAILURE). Returns the `kern_return_t`.
+    pub(crate) fn darwin_vm_copy_overwrite(&mut self, dst: u64, data: &[u8]) -> i32 {
+        const KERN_INVALID_ADDRESS: i32 = 1;
+        const KERN_PROTECTION_FAILURE: i32 = 2;
+        if data.is_empty() {
+            return 0;
+        }
+        let Some(end) = dst.checked_add(data.len() as u64) else { return KERN_INVALID_ADDRESS };
+        let mut code = false;
+        {
+            let mm = self.mem.lock();
+            let mut at = dst & !PAGE_MASK;
+            let stop = (end + PAGE_MASK) & !PAGE_MASK;
+            while at < stop {
+                let Some(v) = mm.vma_at(at) else { return KERN_INVALID_ADDRESS };
+                if v.prot & crate::mem::prot::WRITE == 0 {
+                    return KERN_PROTECTION_FAILURE;
+                }
+                code |= v.prot & crate::mem::prot::EXEC != 0;
+                at = v.end;
+            }
+        }
+        let Ok(peer) = self.procs.vm(self.pid) else { return KERN_INVALID_ADDRESS };
+        if !peer.mem.write(dst, data) {
+            return KERN_INVALID_ADDRESS;
+        }
+        if code {
+            let mut pm = peer.mm.lock();
+            let (start, stop) = (pm.down(dst), pm.up(end));
+            pm.log.retired_code.push((start, stop));
+            drop(pm);
+            crate::note_code_change();
+        }
+        0
+    }
+
     /// `vm_map_enter` of anonymous memory at a place already chosen, the
     /// entry below looked at for its protection (`cur`).
     pub(crate) fn darwin_vm_enter_anon(&mut self, start: u64, end: u64, attrs: super::vm::Attrs, cur: u64) {

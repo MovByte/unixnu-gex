@@ -553,6 +553,8 @@ pub enum PortOut {
     /// An array of rights of one type (an out-of-line ports descriptor),
     /// each a right or a name carried as it is.
     Array(Vec<(Option<Carried>, u32)>, u32),
+    /// Out-of-line memory (an out `pointer_t`), a copy of the task's bytes.
+    Ool(Vec<u8>),
 }
 
 /// What a MIG routine answers: its return code and out data, or the rights
@@ -597,7 +599,7 @@ impl Reply {
                         ipc.object_destroy(c, t);
                     }
                 }
-                PortOut::Raw(_) => {}
+                PortOut::Raw(_) | PortOut::Ool(_) => {}
             }
         }
     }
@@ -615,6 +617,15 @@ impl Reply {
                 let (right, raw, t) = match p {
                     PortOut::Right(c, t) => (Some(c), 0, t),
                     PortOut::Raw(n) => (None, n, msgt::PORT_SEND),
+                    // MIG's template: deallocate TRUE, MACH_MSG_VIRTUAL_COPY.
+                    PortOut::Ool(data) => {
+                        const MACH_MSG_OOL_DESCRIPTOR: u8 = 1;
+                        const VIRTUAL_COPY: u8 = 1;
+                        b.extend_from_slice(&[0u8; 16]);
+                        b[off + 11] = MACH_MSG_OOL_DESCRIPTOR;
+                        descs.push(Desc::Ool { off, data, copy: VIRTUAL_COPY });
+                        continue;
+                    }
                     // MIG's template: deallocate FALSE, MACH_MSG_PHYSICAL_COPY.
                     PortOut::Array(rights, t) => {
                         const MACH_MSG_OOL_PORTS_DESCRIPTOR: u8 = 2;
