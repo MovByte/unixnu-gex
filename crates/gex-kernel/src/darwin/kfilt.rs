@@ -119,6 +119,9 @@ enum WlOp {
     Drop,
 }
 
+/// The weight in `pipe_watch` of a knote no event announces.
+const POLLED_KNOTE: usize = 1 << 32;
+
 /// A filter's id, by its `EVFILT_*`.
 fn id(f: i16) -> u8 {
     (!f) as u8
@@ -162,7 +165,7 @@ impl Kernel {
             f if f == id(evfilt::WORKLOOP) => self.filt_wldetach(n),
             filtid::MACH_PORT | filtid::MACH_PORT_SET => self.filt_machportdetach(n),
             filtid::KQREAD => self.filt_kqdetach(n),
-            filtid::PIPE_N | filtid::PIPE_R | filtid::PIPE_W => self.filt_pipedetach(n),
+            filtid::PIPE_N | filtid::PIPE_R | filtid::PIPE_W | filtid::SO_R | filtid::SO_W => self.filt_pipedetach(n),
             filtid::VN => {
                 if let Some(id) = self.knote(n).vnote.take() {
                     crate::vnote::unlisten(id);
@@ -193,6 +196,8 @@ impl Kernel {
             filtid::PIPE_N => self.filt_pipe_draincommon(n),
             filtid::PIPE_R => self.filt_piperead_common(n, None),
             filtid::PIPE_W => self.filt_pipewrite_common(n, None),
+            filtid::SO_R => self.filt_soread_common(n, None),
+            filtid::SO_W => self.filt_sowrite_common(n, None),
             filtid::VN => self.filt_vnode_common(n, hint as u32, None),
             f if f == id(evfilt::MEMORYSTATUS) => self.filt_memorystatus(n, hint),
             f if f == id(evfilt::SIGNAL) => {
@@ -229,6 +234,16 @@ impl Kernel {
                     filtid::PIPE_N => self.filt_pipe_draincommon(n),
                     filtid::PIPE_R => self.filt_piperead_common(n, None),
                     _ => self.filt_pipewrite_common(n, None),
+                }
+            }
+            filtid::SO_R | filtid::SO_W => {
+                let k = self.knote(n);
+                k.sdata = kev.data;
+                k.sfflags = kev.fflags;
+                if k.filtid == filtid::SO_R {
+                    self.filt_soread_common(n, None)
+                } else {
+                    self.filt_sowrite_common(n, None)
                 }
             }
             filtid::VN => {
@@ -270,6 +285,8 @@ impl Kernel {
             }
             filtid::PIPE_R => self.filt_piperead_common(n, Some(kev)),
             filtid::PIPE_W => self.filt_pipewrite_common(n, Some(kev)),
+            filtid::SO_R => self.filt_soread_common(n, Some(kev)),
+            filtid::SO_W => self.filt_sowrite_common(n, Some(kev)),
             filtid::VN => self.filt_vnode_common(n, 0, Some(kev)),
             // filt_procprocess: the collected events, the exit status as
             // the data.
@@ -1278,6 +1295,9 @@ impl Kernel {
             return self.pipe_kqfilter(n, &fp);
         }
         let file_type = fp.handle.metadata().map(|md| md.file_type);
+        if file_type == Ok(crate::vfs::FileType::Socket) && fp.handle.so_state().is_some() {
+            return self.soo_kqfilter(n, &fp);
+        }
         if matches!(file_type, Ok(crate::vfs::FileType::Regular | crate::vfs::FileType::Directory | crate::vfs::FileType::Symlink)) {
             return self.vn_kqfilter(n, &fp, file_type.unwrap());
         }
@@ -1327,11 +1347,130 @@ impl Kernel {
     }
 
     fn filt_pipedetach(&mut self, n: KnId) {
+        let polled = self.dtask.kevents.polled_knotes.remove(&n);
         let list = &mut self.dtask.kevents.pipe_klist;
         if let Some(i) = list.iter().position(|&x| x == n) {
             list.remove(i);
-            self.dtask.kevents.pipe_watch.fetch_sub(1, std::sync::atomic::Ordering::Release);
+            self.dtask.kevents.pipe_watch.fetch_sub(if polled { 1 + POLLED_KNOTE } else { 1 }, std::sync::atomic::Ordering::Release);
         }
+    }
+
+    /// `soo_kqfilter`: a socket's read and write filters, on the list of
+    /// descriptors the process looks at when they may have changed.
+    fn soo_kqfilter(&mut self, n: KnId, fp: &std::sync::Arc<crate::file::OpenFile>) -> u32 {
+        let fid = match self.knote(n).filter {
+            evfilt::READ => filtid::SO_R,
+            evfilt::WRITE => filtid::SO_W,
+            evfilt::SOCK => {
+                self.darwin_unimplemented("kevent EVFILT_SOCK (filt_sockev: a connection's state changes)".into());
+                self.knote(n).set_error(Errno::EOPNOTSUPP);
+                return 0;
+            }
+            evfilt::EXCEPT => {
+                self.darwin_unimplemented("kevent EVFILT_EXCEPT on a socket (out-of-band data)".into());
+                self.knote(n).set_error(Errno::EOPNOTSUPP);
+                return 0;
+            }
+            _ => {
+                self.knote(n).set_error(Errno::EINVAL);
+                return 0;
+            }
+        };
+        let polled = fp.handle.wait_queue() == 0;
+        let k = self.knote(n);
+        k.filtid = fid;
+        k.seen = fp.handle.wakes();
+        self.dtask.kevents.pipe_klist.push(n);
+        if polled {
+            self.dtask.kevents.polled_knotes.insert(n);
+        }
+        self.dtask.kevents.pipe_watch.fetch_add(if polled { 1 + POLLED_KNOTE } else { 1 }, std::sync::atomic::Ordering::Release);
+        if fid == filtid::SO_R {
+            self.filt_soread_common(n, None)
+        } else {
+            self.filt_sowrite_common(n, None)
+        }
+    }
+
+    fn knote_so(&mut self, n: KnId) -> crate::vfs::SoState {
+        let fp = self.knote(n).fp.clone().expect("a socket knote's file");
+        fp.handle.so_state().expect("a socket knote's socket")
+    }
+
+    /// `filt_soread_common`.
+    fn filt_soread_common(&mut self, n: KnId, kev: Option<&mut Kev>) -> u32 {
+        const NOTE_LOWAT: u32 = 0x1;
+        let so = self.knote_so(n);
+        let (mut retval, data);
+        if let Some(qlen) = so.qlen {
+            retval = qlen != 0;
+            data = qlen as i64;
+        } else {
+            data = so.rcv as i64;
+            if so.cantrcv {
+                let k = self.knote(n);
+                k.flags |= ev::EOF;
+                k.fflags = so.error as u32;
+                retval = true;
+            } else if so.error != 0 {
+                retval = true;
+            } else {
+                let k = self.knote(n);
+                let mut lowwat = 1i64;
+                if k.sfflags & NOTE_LOWAT != 0 {
+                    if k.sdata > so.hiwat.0 as i64 {
+                        lowwat = so.hiwat.0 as i64;
+                    } else if k.sdata > lowwat {
+                        lowwat = k.sdata;
+                    }
+                }
+                retval = so.rcv as i64 >= lowwat;
+            }
+        }
+        let _ = &mut retval;
+        if retval {
+            if let Some(kev) = kev {
+                *kev = self.knote(n).fill_kevent(data);
+            }
+        }
+        u32::from(retval)
+    }
+
+    /// `filt_sowrite_common`: `sbspace` of the send buffer, which for a unix
+    /// stream is the room left in the peer's receive buffer.
+    fn filt_sowrite_common(&mut self, n: KnId, kev: Option<&mut Kev>) -> u32 {
+        const NOTE_LOWAT: u32 = 0x1;
+        const MCLBYTES: i64 = 2048;
+        let so = self.knote_so(n);
+        let hiwat = so.hiwat.1 as i64;
+        let data = (hiwat - so.snd_used as i64).max(0);
+        let ret = if so.cantsend {
+            let k = self.knote(n);
+            k.flags |= ev::EOF;
+            k.fflags = so.error as u32;
+            true
+        } else if so.error != 0 {
+            true
+        } else if !so.can_write {
+            false
+        } else {
+            let k = self.knote(n);
+            let mut lowwat = MCLBYTES.min(hiwat);
+            if k.sfflags & NOTE_LOWAT != 0 {
+                if k.sdata > hiwat {
+                    lowwat = hiwat;
+                } else if k.sdata > lowwat {
+                    lowwat = k.sdata;
+                }
+            }
+            data > 0 && data >= lowwat
+        };
+        if ret {
+            if let Some(kev) = kev {
+                *kev = self.knote(n).fill_kevent(data);
+            }
+        }
+        u32::from(ret)
     }
 
     fn knote_pipe(&mut self, n: KnId) -> crate::vfs::PipeState {

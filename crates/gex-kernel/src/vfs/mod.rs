@@ -29,6 +29,28 @@ pub use procfs::{ProcFs, ProcSource, SysCpuFs};
 pub use remote::RemoteFs;
 pub use tmpfs::TmpFs;
 
+/// What a kqueue's socket filters read of a socket
+/// ([`FileHandle::so_state`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SoState {
+    /// A listener's completed connections waiting (`so_qlen`); `None` for a
+    /// socket that is not listening.
+    pub qlen: Option<u64>,
+    /// Bytes waiting to be received (`sb_cc`).
+    pub rcv: u64,
+    /// `SS_CANTRCVMORE` and `SS_CANTSENDMORE`.
+    pub cantrcv: bool,
+    pub cantsend: bool,
+    /// `so_error`, as a Darwin error number.
+    pub error: i32,
+    /// `socanwrite`: connected, or a protocol that needs no connection.
+    pub can_write: bool,
+    /// Bytes queued on the way out that count against the send space.
+    pub snd_used: u64,
+    /// The buffers' `sb_hiwat`: receive, send.
+    pub hiwat: (u64, u64),
+}
+
 /// What a kqueue's pipe filters read of an anonymous pipe end
 /// ([`FileHandle::pipe_state`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -417,6 +439,12 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     /// An anonymous pipe end's state, for a kqueue's pipe filters; `None`
     /// for anything else.
     fn pipe_state(&self) -> Option<PipeState> {
+        None
+    }
+
+    /// A socket's state, for a kqueue's socket filters; `None` for
+    /// anything else.
+    fn so_state(&self) -> Option<SoState> {
         None
     }
 

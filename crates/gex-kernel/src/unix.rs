@@ -692,6 +692,24 @@ impl FileHandle for UnixSocket {
         })
     }
 
+    /// `PIPSIZ` both ways, and a connected stream's send space is what the
+    /// peer's receive buffer has left.
+    fn so_state(&self) -> Option<crate::vfs::SoState> {
+        let mut st = crate::vfs::SoState { qlen: None, rcv: 0, cantrcv: false, cantsend: false, error: 0, can_write: false, snd_used: 0, hiwat: (PIPSIZ, PIPSIZ) };
+        match &*self.role.lock().unwrap() {
+            Role::Listening { backlog, .. } => st.qlen = Some(backlog.lock().unwrap().len() as u64),
+            Role::Connected { rx, tx, .. } => {
+                st.rcv = rx.available();
+                st.cantrcv = rx.is_closed();
+                st.cantsend = tx.is_closed();
+                st.can_write = true;
+                st.snd_used = tx.available();
+            }
+            _ => {}
+        }
+        Some(st)
+    }
+
     fn poll_writable(&self) -> bool {
         match &*self.role.lock().unwrap() {
             Role::Connected { tx, .. } => tx.writable(),
@@ -702,6 +720,9 @@ impl FileHandle for UnixSocket {
         }
     }
 }
+
+/// `PIPSIZ`: a unix stream socket's `sb_hiwat` on Darwin.
+const PIPSIZ: u64 = 8192;
 
 /// Where listening sockets are found by name. Deliberately not the VFS: a bound
 /// socket is not a file anything reads, and a VFS entry would make it openable.
@@ -1066,6 +1087,13 @@ impl FileHandle for UnixDgram {
 
     fn available(&self) -> Option<u64> {
         Some(self.inbox.lock().unwrap().front().map_or(0, |(d, _)| d.len() as u64))
+    }
+
+    /// `unpdg_recvspace` and `unpdg_sendspace`; a datagram waits in no send
+    /// buffer.
+    fn so_state(&self) -> Option<crate::vfs::SoState> {
+        let rcv = self.inbox.lock().unwrap().iter().map(|(d, _)| d.len() as u64).sum();
+        Some(crate::vfs::SoState { qlen: None, rcv, cantrcv: false, cantsend: false, error: 0, can_write: true, snd_used: 0, hiwat: (4096, 2048) })
     }
 
     fn as_unix_dgram(self: Arc<Self>) -> Option<Arc<UnixDgram>> {
@@ -2159,6 +2187,17 @@ impl crate::vfs::FileHandle for RemoteUnix {
 
     fn poll_rdhup(&self) -> bool {
         !self.listening && (self.remote.hup)(self.id) & 2 != 0
+    }
+
+    /// The far end is another memory's, which says how full it is only as
+    /// writable or not.
+    fn so_state(&self) -> Option<crate::vfs::SoState> {
+        if self.listening {
+            return Some(crate::vfs::SoState { qlen: Some(self.has_pending().into()), rcv: 0, cantrcv: false, cantsend: false, error: 0, can_write: false, snd_used: 0, hiwat: (PIPSIZ, PIPSIZ) });
+        }
+        let hup = (self.remote.hup)(self.id);
+        let full = (self.remote.writable)(self.id) == 0;
+        Some(crate::vfs::SoState { qlen: None, rcv: (self.remote.available)(self.id).max(0) as u64, cantrcv: hup & 2 != 0, cantsend: hup & 1 != 0, error: 0, can_write: true, snd_used: if full { PIPSIZ } else { 0 }, hiwat: (PIPSIZ, PIPSIZ) })
     }
 
     fn available(&self) -> Option<u64> {

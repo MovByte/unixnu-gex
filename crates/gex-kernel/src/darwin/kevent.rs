@@ -57,6 +57,8 @@ pub mod filtid {
     pub const PIPE_N: u8 = 19;
     pub const PIPE_R: u8 = 20;
     pub const PIPE_W: u8 = 21;
+    pub const SO_R: u8 = 22;
+    pub const SO_W: u8 = 23;
     pub const VN: u8 = 34;
     pub const MACH_PORT: u8 = 37;
     pub const MACH_PORT_SET: u8 = 38;
@@ -407,6 +409,10 @@ pub struct Kevents {
     /// changed.
     pub pipe_klist: Vec<KnId>,
     pub pipe_watch: Arc<std::sync::atomic::AtomicUsize>,
+    /// The knotes on [`pipe_klist`](Self::pipe_klist) whose descriptor no
+    /// event announces (a socket the host carries): counted in `pipe_watch`
+    /// above bit 32, for it to be looked at on a timer.
+    pub polled_knotes: std::collections::HashSet<KnId>,
     /// The vnode notes posted to the process's vnode knotes, to tell them.
     pub vnote_inbox: Arc<Mutex<Vec<(KnId, u32)>>>,
     /// The process notes posted to the process's EVFILT_PROC knotes.

@@ -1726,6 +1726,56 @@ impl FileHandle for Socket {
         }
     }
 
+    /// `tcp_sendspace` and `tcp_recvspace` or `udp_sendspace` and
+    /// `udp_recvspace`. How much of a connection's send queue the host still
+    /// holds is not visible here, so it counts as empty until the transport
+    /// refuses more.
+    fn so_state(&self) -> Option<crate::vfs::SoState> {
+        const TCP_HIWAT: (u64, u64) = (1448 * 384, 1448 * 256);
+        const UDP_HIWAT: (u64, u64) = (786896, 9216);
+        const ECONNREFUSED: i32 = 61;
+        if self.kind == Kind::Udp {
+            let rcv = self.available().unwrap_or(0);
+            return Some(crate::vfs::SoState { qlen: None, rcv, cantrcv: false, cantsend: false, error: 0, can_write: true, snd_used: 0, hiwat: UDP_HIWAT });
+        }
+        let mut st = crate::vfs::SoState { qlen: None, rcv: 0, cantrcv: false, cantsend: false, error: 0, can_write: false, snd_used: 0, hiwat: TCP_HIWAT };
+        if let (Some(id), Some(r)) = (*self.remote_listener.lock().unwrap(), self.remote) {
+            st.qlen = Some(((r.pending)(id) != 0).into());
+            return Some(st);
+        }
+        if let Some(q) = &*self.backlog.lock().unwrap() {
+            st.qlen = Some(q.len() as u64);
+            return Some(st);
+        }
+        if let Some(t) = self.transport.lock().unwrap().as_ref() {
+            match t.status() {
+                Status::Connecting => {}
+                Status::Open => {
+                    st.can_write = true;
+                    st.rcv = t.available() as u64;
+                }
+                Status::Closed => {
+                    st.can_write = true;
+                    st.rcv = t.available() as u64;
+                    st.cantrcv = true;
+                    st.cantsend = true;
+                }
+                Status::Refused => {
+                    st.cantrcv = true;
+                    st.cantsend = true;
+                    st.error = ECONNREFUSED;
+                }
+            }
+        }
+        Some(st)
+    }
+
+    /// Changes as the bytes waiting or the connection do.
+    fn wakes(&self) -> Option<u64> {
+        let st = self.so_state()?;
+        Some((st.rcv << 8) | (u64::from(st.cantrcv) << 2) | (u64::from(st.can_write) << 1) | st.qlen.unwrap_or(0) << 3 | u64::from(st.error != 0))
+    }
+
     /// In a page, a listener's and a loopback connection's ends are in the
     /// global kernel, and so is the queue their changes are announced on: a
     /// thread parked in `accept`, `poll` or `read` on one had none, and slept

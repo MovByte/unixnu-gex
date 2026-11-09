@@ -2661,8 +2661,11 @@ fn start_darwin_thread_calls(kernel: std::sync::Weak<Mutex<Kernel>>, memory: gex
             if kernel.strong_count() == 0 {
                 return;
             }
-            crate::ready::wait(seen, std::time::Duration::from_secs(60));
-            if pipes.load(std::sync::atomic::Ordering::Acquire) > 0 && crate::ready::seq() != seen {
+            // A socket the host carries changes with no announcement: while
+            // one has a knote it is looked at often.
+            let polled = pipes.load(std::sync::atomic::Ordering::Acquire) >> 32 != 0;
+            crate::ready::wait(seen, std::time::Duration::from_millis(if polled { 10 } else { 60_000 }));
+            if pipes.load(std::sync::atomic::Ordering::Acquire) > 0 && (polled || crate::ready::seq() != seen) {
                 bell.ring();
             }
         });
