@@ -24,6 +24,7 @@ pub mod cpumon;
 pub mod cred;
 pub mod errno;
 pub mod exec;
+pub mod fileport;
 pub mod footprint;
 pub mod xattr;
 pub mod exit;

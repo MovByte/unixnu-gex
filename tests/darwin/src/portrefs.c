@@ -76,6 +76,23 @@ int main(void) {
     if ((kr = mach_msg(&r.m.h, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof r, n, 0, MACH_PORT_NULL)) || r.m.h.msgh_id != MACH_NOTIFY_PORT_DESTROYED) return bad("the notification", kr ? kr : r.m.h.msgh_id, MACH_NOTIFY_PORT_DESTROYED);
     if (r.m.d.name != p || (kr = mach_port_type(task, p, &t)) || t != MACH_PORT_TYPE_SEND_RECEIVE) return bad("the right back from it", kr ? kr : t, MACH_PORT_TYPE_SEND_RECEIVE);
     if (works(p, "the name after the notification")) return 1;
+    // A service port is launchd's to make; a connection port needs one.
+    mach_port_options_t sp_opts = {.flags = MPO_SERVICE_PORT};
+    mach_port_t made = MACH_PORT_NULL;
+    if ((kr = mach_port_construct(mach_task_self(), &sp_opts, 0, &made)) != KERN_DENIED) {
+        printf("portrefs: a service port by anyone else: %d\n", kr);
+        return 1;
+    }
+    mach_port_options_t conn_opts = {.flags = MPO_CONNECTION_PORT};
+    if ((kr = mach_port_construct(mach_task_self(), &conn_opts, 0, &made)) != KERN_INVALID_ARGUMENT) {
+        printf("portrefs: a connection port of nothing: %d\n", kr);
+        return 1;
+    }
+    mach_port_options_t both_opts = {.flags = MPO_SERVICE_PORT | MPO_CONNECTION_PORT};
+    if ((kr = mach_port_construct(mach_task_self(), &both_opts, 0, &made)) != KERN_INVALID_ARGUMENT) {
+        printf("portrefs: both kinds at once: %d\n", kr);
+        return 1;
+    }
     printf("portrefs ok\n");
     return 0;
 }

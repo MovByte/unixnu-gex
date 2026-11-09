@@ -164,10 +164,6 @@ pub mod kr {
     pub const NOT_WAITING: u64 = 48;
     pub const ALREADY_IN_SET: u64 = 11;
     pub const DENIED: u64 = 53;
-    /// Service and connection ports (`MPO_SERVICE_PORT`,
-    /// `MPO_CONNECTION_PORT`) need launchd's service labels, which are not
-    /// here yet: the kernel reports it and answers `KERN_FAILURE`.
-    pub const UNIMPLEMENTED_SERVICE_PORT: u64 = 0x1_0000_0005;
 }
 
 /// `IPR_SOR_*_MASK`: a request's send-possible bits.
@@ -244,6 +240,8 @@ pub enum Kobject {
     /// IKOT_UX_HANDLER: the kernel's handler that makes an exception a
     /// signal (`ux_handler_port`).
     UxHandler,
+    /// IKOT_FILEPORT: a file port ([`super::fileport`]), by its number.
+    FilePort(u32),
     /// A thread's kernel reply port (`ith_rpc_reply`): the reply to an RPC
     /// the kernel made for it.
     RpcReply(i32),
@@ -329,6 +327,11 @@ pub struct Port {
     pub bootstrap_port: bool,
     /// A libxpc connection port (`ip_is_libxpc_connection_port`).
     pub connection_port: bool,
+    /// `ip_splabel` of a service port.
+    pub splabel: Option<ServiceLabel>,
+    /// `IPC_PORT_INIT_FILTER_MESSAGE`. Only a Sandbox profile of a task's
+    /// own filters messages, and tasks have none yet.
+    pub filter_msg: bool,
     /// `ip_sprequests`: a send-possible request is armed.
     pub sprequests: bool,
     /// `ip_nsrequest`: the send-once right a no-senders notification goes
@@ -388,6 +391,8 @@ impl Port {
             service_port: false,
             bootstrap_port: false,
             connection_port: false,
+            splabel: None,
+            filter_msg: false,
             sprequests: false,
             nsrequest: None,
             nsrequest_kobject: false,
@@ -501,6 +506,8 @@ pub struct Ipc {
     pub others: HashMap<TaskKey, Space>,
     /// This task's key among the spaces (0: none taken yet).
     pub task: TaskKey,
+    /// The task is the system's first (`initproc`).
+    pub initproc: bool,
     /// The system's table, once this task has taken it.
     cell: Option<Arc<IpcCell>>,
     /// Whether this task holds the table now.
@@ -514,6 +521,9 @@ pub struct Ipc {
     /// The kernel's own objects every task names alike (the host, host
     /// privilege and clock ports), while this task holds the table.
     globals: Vec<(Kobject, ObjId)>,
+    /// `realhost.special`: the send rights launchd stored, while this task
+    /// holds the table.
+    pub host_special: Vec<(i32, ObjId)>,
     /// The host's exception actions (`realhost.exc_actions`), while this
     /// task holds the table.
     pub host_exc: super::exception::ExcActions,
@@ -538,6 +548,23 @@ impl Drop for Ipc {
 
 /// A task's key among the system's spaces.
 pub type TaskKey = u64;
+
+/// `struct ipc_service_port_label`, and `ISPL_FLAGS_*`.
+#[derive(Clone, Debug, Default)]
+pub struct ServiceLabel {
+    pub name: Vec<u8>,
+    pub domain: u8,
+    pub flags: u32,
+    pub launchd_name: u32,
+    pub launchd_context: u64,
+}
+
+pub mod ispl {
+    pub const SPECIAL_PDREQUEST: u32 = 1;
+    pub const SEND_PD_NOTIFICATION: u32 = 1 << 1;
+    pub const BOOTSTRAP_PORT: u32 = 1 << 2;
+    pub const THROTTLED: u32 = 1 << 3;
+}
 
 /// A thread waiting on a queue, as every task names it: its task's key
 /// and its thread id.
@@ -598,6 +625,7 @@ pub struct IpcShared {
     links: HashMap<TaskKey, Arc<TaskLink>>,
     globals: Vec<(Kobject, ObjId)>,
     host_exc: super::exception::ExcActions,
+    host_special: Vec<(i32, ObjId)>,
 }
 
 /// The system's IPC table, taken by one task at a time for the length of a
@@ -677,6 +705,7 @@ impl Ipc {
         self.links = std::mem::take(&mut s.links);
         self.globals = std::mem::take(&mut s.globals);
         self.host_exc = s.host_exc;
+        self.host_special = std::mem::take(&mut s.host_special);
         self.held = true;
         if !self.globals.iter().any(|(g, _)| *g == Kobject::UxHandler) {
             self.ux_handler_setup();
@@ -693,7 +722,7 @@ impl Ipc {
         let cell = Arc::clone(self.cell.as_ref().expect("a held table has its cell"));
         let mut spaces = std::mem::take(&mut self.others);
         spaces.insert(self.task, std::mem::take(&mut self.space));
-        let s = IpcShared { objects: std::mem::take(&mut self.objects), next_id: self.next_id, timestamp: self.timestamp, spaces, next_task: self.next_task_hint, queues: std::mem::take(&mut self.queues), links: std::mem::take(&mut self.links), globals: std::mem::take(&mut self.globals), host_exc: std::mem::take(&mut self.host_exc) };
+        let s = IpcShared { objects: std::mem::take(&mut self.objects), next_id: self.next_id, timestamp: self.timestamp, spaces, next_task: self.next_task_hint, queues: std::mem::take(&mut self.queues), links: std::mem::take(&mut self.links), globals: std::mem::take(&mut self.globals), host_special: std::mem::take(&mut self.host_special), host_exc: std::mem::take(&mut self.host_exc) };
         self.held = false;
         cell.put(s);
     }
@@ -710,7 +739,7 @@ impl Ipc {
         self.held = false;
         if let Some(cell) = cell {
             let spaces = std::mem::take(&mut self.others);
-            let s = IpcShared { objects: std::mem::take(&mut self.objects), next_id: self.next_id, timestamp: self.timestamp, spaces, next_task: self.next_task_hint, queues: std::mem::take(&mut self.queues), links: std::mem::take(&mut self.links), globals: std::mem::take(&mut self.globals), host_exc: std::mem::take(&mut self.host_exc) };
+            let s = IpcShared { objects: std::mem::take(&mut self.objects), next_id: self.next_id, timestamp: self.timestamp, spaces, next_task: self.next_task_hint, queues: std::mem::take(&mut self.queues), links: std::mem::take(&mut self.links), globals: std::mem::take(&mut self.globals), host_special: std::mem::take(&mut self.host_special), host_exc: std::mem::take(&mut self.host_exc) };
             cell.put(s);
         }
     }
@@ -1098,6 +1127,17 @@ impl Ipc {
         let pdrequest = if !p.specialreply { p.pdrequest.take() } else { None };
         if pdrequest.is_some() {
             p.tempowner = true;
+            // The notification carries a service port home to launchd.
+            if p.service_port {
+                if let Some(l) = p.splabel.as_mut().filter(|l| l.flags & ispl::SPECIAL_PDREQUEST != 0) {
+                    l.flags |= ispl::SEND_PD_NOTIFICATION;
+                }
+            }
+        } else {
+            // A port that dies has no label left to speak of.
+            p.splabel = None;
+            p.service_port = false;
+            p.connection_port = false;
         }
         let should_destroy = pdrequest.is_none();
         self.clear_receiver_pub(port, should_destroy);

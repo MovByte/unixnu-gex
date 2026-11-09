@@ -368,6 +368,8 @@ impl Kernel {
             sys::FREMOVEXATTR => res(self.darwin_removexattr(m, true, a)),
             sys::LISTXATTR => res(self.darwin_listxattr(m, false, a)),
             sys::FLISTXATTR => res(self.darwin_listxattr(m, true, a)),
+            sys::FILEPORT_MAKEPORT => res(self.darwin_fileport_makeport(m, a[0] as i32, a[1])),
+            sys::FILEPORT_MAKEFD => res(self.darwin_fileport_makefd(a[0] as u32)),
             sys::FSCTL => res(self.darwin_fsctl(m, a)),
             sys::FFSCTL => res(self.darwin_ffsctl(m, a)),
             sys::GETRUSAGE => res(self.darwin_getrusage(m, a[0] as i32, a[1])),

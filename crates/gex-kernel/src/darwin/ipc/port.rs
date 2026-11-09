@@ -480,11 +480,15 @@ impl Ipc {
                 if !name_valid(name) {
                     return Err(kr::INVALID_RIGHT);
                 }
+                if count < 1 {
+                    return Err(kr::FAILURE);
+                }
                 let p = self.port(self.translate_receive(name)?);
                 if !p.service_port {
                     return Err(kr::INVALID_CAPABILITY);
                 }
-                Err(kr::FAILURE)
+                let label = p.splabel.as_ref().expect("a service port's label");
+                Ok(vec![u32::from(label.flags & super::ispl::THROTTLED != 0)])
             }
             _ => Err(kr::INVALID_ARGUMENT),
         }
@@ -542,9 +546,20 @@ impl Ipc {
                 if !name_valid(name) {
                     return kr::INVALID_RIGHT;
                 }
+                if info.is_empty() {
+                    return kr::FAILURE;
+                }
                 match self.translate_receive(name) {
                     Ok(port) if !self.port(port).service_port => kr::INVALID_CAPABILITY,
-                    Ok(_) => kr::FAILURE,
+                    Ok(port) => {
+                        let l = self.port_mut(port).splabel.as_mut().expect("a service port's label");
+                        if info[0] != 0 {
+                            l.flags |= super::ispl::THROTTLED;
+                        } else {
+                            l.flags &= !super::ispl::THROTTLED;
+                        }
+                        kr::SUCCESS
+                    }
                     Err(e) => e,
                 }
             }
@@ -649,7 +664,7 @@ impl Ipc {
     /// `mach_port_construct(options, context)`: a new receive right shaped
     /// by `options` (flags, qlimit). `hardened`: the task is a platform
     /// binary or has the hardened runtime (`task_is_hardened_binary`).
-    pub fn mach_port_construct(&mut self, flags: u32, qlimit: u32, context: u64, hardened: bool) -> Result<u32, u64> {
+    pub fn mach_port_construct(&mut self, flags: u32, qlimit: u32, union_word: u64, context: u64, hardened: bool, initproc: bool, read_info: impl FnOnce(u64) -> Option<Vec<u8>>) -> Result<u32, u64> {
         let one_of = |m: u32| {
             let f = flags & m;
             f & f.wrapping_sub(1) != 0
@@ -664,8 +679,47 @@ impl Ipc {
             // Only a graphics server's task may; no task here is one.
             return Err(kr::DENIED);
         }
-        if flags & (mpo::SERVICE_PORT | mpo::CONNECTION_PORT) != 0 {
-            return Err(kr::UNIMPLEMENTED_SERVICE_PORT);
+        self.initproc = initproc;
+        let mut label = None;
+        let mut filter = flags & mpo::FILTER_MSG != 0;
+        if flags & mpo::SERVICE_PORT != 0 {
+            // task_is_in_privileged_coalition(COALITION_TYPE_JETSAM): the
+            // coalitions are not modelled, and only launchd's is privileged
+            // when the system starts.
+            if !initproc {
+                return Err(kr::DENIED);
+            }
+            if union_word == 0 {
+                return Err(kr::INVALID_ARGUMENT);
+            }
+            const STRING_NAME_MAX_BUF_LEN: usize = 255;
+            let Some(info) = read_info(union_word) else { return Err(crate::darwin::mach::kr2::MEMORY_ERROR) };
+            let Some(n) = info[..STRING_NAME_MAX_BUF_LEN].iter().position(|&c| c == 0) else { return Err(kr::INVALID_ARGUMENT) };
+            // The sandbox label the policy would allocate is what a message
+            // filter asks about; it has none to ask for yet.
+            let mut l = super::ServiceLabel { name: info[..n].to_vec(), domain: info[STRING_NAME_MAX_BUF_LEN], ..Default::default() };
+            const XPC_DOMAIN_PORT: u8 = 7;
+            if l.domain == XPC_DOMAIN_PORT {
+                l.flags |= super::ispl::BOOTSTRAP_PORT;
+            }
+            label = Some(l);
+            filter = true;
+        }
+        let connection = flags & mpo::CONNECTION_PORT != 0;
+        if connection {
+            let service_port_name = union_word as u32;
+            if service_port_name == 0 {
+                return Err(kr::INVALID_ARGUMENT);
+            }
+            // ipc_service_port_derive_sblabel.
+            if !name_valid(service_port_name) {
+                return Err(kr::INVALID_NAME);
+            }
+            let sp = self.translate_send(service_port_name)?;
+            let p = self.port(sp);
+            if p.kobject.is_some() || !p.service_port {
+                return Err(kr::INVALID_CAPABILITY);
+            }
         }
         if flags & mpo::QLIMIT != 0 && qlimit > super::QLIMIT_MAX {
             return Err(kr::INVALID_VALUE);
@@ -704,6 +758,19 @@ impl Ipc {
                 p.tempowner = true;
             }
         }
+        let service = label.is_some();
+        let p = self.port_mut(port);
+        p.filter_msg = filter;
+        if let Some(l) = label {
+            p.service_port = true;
+            p.bootstrap_port = l.flags & super::ispl::BOOTSTRAP_PORT != 0;
+            p.splabel = Some(l);
+        }
+        if connection {
+            p.connection_port = true;
+            p.immovable_send = true;
+            p.immovable_receive = true;
+        }
         if flags & mpo::CONTEXT_AS_GUARD != 0 {
             let mut g = 0;
             if flags & mpo::STRICT != 0 {
@@ -713,10 +780,27 @@ impl Ipc {
                 g |= mpg::IMMOVABLE_RECEIVE;
             }
             self.guard_locked(port, context, g);
+            if service {
+                self.service_label_set_attr(port, name, context);
+            }
         } else {
             self.port_mut(port).context = context;
+            if service {
+                self.service_label_set_attr(port, name, 0);
+            }
         }
         Ok(name)
+    }
+
+    /// `ipc_service_port_label_set_attr`: the name and guard launchd gave
+    /// the service port, for when its receive right comes back.
+    fn service_label_set_attr(&mut self, port: ObjId, name: u32, context: u64) {
+        let l = self.port_mut(port).splabel.as_mut().expect("a service port's label");
+        l.launchd_name = name;
+        l.launchd_context = context;
+        if context != 0 {
+            l.flags |= super::ispl::SPECIAL_PDREQUEST;
+        }
     }
 
     /// `mach_port_destruct`.

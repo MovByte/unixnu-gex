@@ -345,15 +345,14 @@ impl Kernel {
                 if !self.darwin_name_is_task(w(0)) {
                     return Some(kr2::SEND_INVALID_DEST);
                 }
-                let Ok(opts) = m.read(a[1], 8).map(|b| b.to_vec()) else { return Some(kr2::MEMORY_ERROR) };
-                let (flags, qlimit) = (u32::from_le_bytes(opts[0..4].try_into().unwrap()), u32::from_le_bytes(opts[4..8].try_into().unwrap()));
-                let hardened = self.darwin_hardened();
-                match self.ipc().mach_port_construct(flags, qlimit, a[2], hardened) {
+                // mach_port_options_t: flags, mpl_qlimit, and a union at 8.
+                let Ok(opts) = m.read(a[1], 16).map(|b| b.to_vec()) else { return Some(kr2::MEMORY_ERROR) };
+                let word = |at: usize| u32::from_le_bytes(opts[at..at + 4].try_into().unwrap());
+                let (flags, qlimit, union_word) = (word(0), word(4), u64::from(word(8)) | u64::from(word(12)) << 32);
+                let (hardened, initproc) = (self.darwin_hardened(), self.pid == crate::proc::INIT_PID);
+                let read = |at: u64| m.read(at, 256).ok().map(<[u8]>::to_vec);
+                match self.ipc().mach_port_construct(flags, qlimit, union_word, a[2], hardened, initproc, read) {
                     Ok(name) => copyout32(m, a[3], name),
-                    Err(kr::UNIMPLEMENTED_SERVICE_PORT) => {
-                        self.darwin_unimplemented("mach_port_construct of a service or connection port".into());
-                        kr::FAILURE
-                    }
                     Err(e) => e,
                 }
             }

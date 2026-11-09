@@ -138,6 +138,32 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             Some(_) => Reply::err(KERN_INVALID_ARGUMENT),
             None => bad(),
         },
+        // host_create_mach_voucher(host, recipes) -> voucher: the raw
+        // recipes, counted and padded (MIG's `_WALIGN_`).
+        (Kobject::Host | Kobject::HostPriv, 225) => {
+            const MAX_RAW_RECIPE_ARRAY_SIZE: usize = 5120;
+            let Some(n) = arg(req, 0) else { return bad() };
+            let n = n as u32 as usize;
+            let at = NDR + 4;
+            let padded = (n + 3) & !3;
+            if n > MAX_RAW_RECIPE_ARRAY_SIZE || req.body.len() != at + padded {
+                return bad();
+            }
+            let raw = req.body[at..at + n].to_vec();
+            match k.host_create_mach_voucher(&raw) {
+                Ok(Some(v)) => {
+                    let p = k.convert_voucher_to_port(v);
+                    Reply::port(Carried::Port(p))
+                }
+                Ok(None) => Reply { ret: KERN_SUCCESS, defer: None, out: Vec::new(), ports: Vec::new(), unimplemented: None }.with_null_port(0),
+                Err(kr) => Reply::err(kr as i32),
+            }
+        }
+        // host_set_special_port(host_priv, which, port)
+        (Kobject::Host | Kobject::HostPriv, 413) => match (desc_port(req, 0), arg_after(req, 1, 0)) {
+            (Some((right, _)), Some(which)) => host_set_special_port(k, obj, req.dest, which, right),
+            _ => bad(),
+        },
         // host_get_special_port(host_priv, node, which) -> port
         (Kobject::Host | Kobject::HostPriv, 412) => match (arg(req, 0), arg(req, 1)) {
             (Some(_node), Some(which)) => host_get_special_port(k, obj, req.dest, which),
@@ -1030,6 +1056,41 @@ fn host_get_special_port(k: &mut Kernel, obj: &Kobject, port: super::ipc::ObjId,
     };
     k.ipc().copy_send(p);
     Reply::port(Carried::Port(p))
+}
+
+/// `host_set_special_port_from_user`, then `host_set_special_port`: a user
+/// port, not an immovable right, and only launchd may. Its Sandbox check is
+/// no check for launchd, which has no profile.
+fn host_set_special_port(k: &mut Kernel, obj: &Kobject, _port: super::ipc::ObjId, id: i32, right: Option<Carried>) -> Reply {
+    const HOST_MAX_SPECIAL_KERNEL_PORT: i32 = 7;
+    const HOST_MAX_SPECIAL_PORT: i32 = 7 + 27;
+    const KERN_NO_ACCESS: i32 = 8;
+    const KERN_INVALID_RIGHT: i32 = 17;
+    let port = match right {
+        Some(Carried::Port(p)) => Some(p),
+        _ => None,
+    };
+    if !matches!(obj, Kobject::HostPriv) || id <= HOST_MAX_SPECIAL_KERNEL_PORT || id > HOST_MAX_SPECIAL_PORT {
+        return Reply::err(KERN_INVALID_ARGUMENT);
+    }
+    if let Some(p) = port {
+        let port = k.ipc().port(p);
+        if port.immovable_receive || port.immovable_send {
+            return Reply::err(KERN_INVALID_RIGHT);
+        }
+    }
+    if k.pid != crate::proc::INIT_PID {
+        return Reply::err(KERN_NO_ACCESS);
+    }
+    let ipc = k.ipc();
+    let old = ipc.host_special.iter().position(|&(w, _)| w == id).map(|i| ipc.host_special.remove(i).1);
+    if let Some(p) = port {
+        ipc.host_special.push((id, p));
+    }
+    if let Some(p) = old {
+        ipc.release_send(p);
+    }
+    Reply::ok(Vec::new())
 }
 
 /// `task_set_special_port`: KERNEL and HOST are refused (no CSR on iOS);

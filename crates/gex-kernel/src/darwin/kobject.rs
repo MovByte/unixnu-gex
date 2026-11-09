@@ -429,6 +429,7 @@ impl Kernel {
                 }
             }
             Some(Kobject::Voucher(v)) => self.ipc_voucher_no_senders(v),
+            Some(Kobject::FilePort(id)) => super::fileport::fileport_no_senders(id),
             Some(Kobject::TaskRead | Kobject::TaskInspect | Kobject::ThreadRead(_) | Kobject::ThreadInspect(_)) => self.darwin_flavor_port_no_senders(port),
             other => self.darwin_unimplemented(format!("no-senders for kernel object {other:?}")),
         }

@@ -422,6 +422,29 @@ impl Ipc {
                 let p = self.port_mut(port);
                 p.receiver = Receiver::Space(name);
                 p.owner = task;
+                if p.connection_port {
+                    p.immovable_receive = true;
+                }
+                // `ipc_right_copyout`: only a port-destroyed notification
+                // brings launchd back a service port's receive right with
+                // its guard, under the name it had.
+                let initproc = self.initproc;
+                let p = self.port_mut(port);
+                if p.service_port {
+                    if let Some(l) = p.splabel.as_mut().filter(|l| l.flags & super::ispl::SEND_PD_NOTIFICATION != 0) {
+                        l.flags &= !super::ispl::SEND_PD_NOTIFICATION;
+                        if initproc {
+                            assert_eq!(name, l.launchd_name, "a service port's name in launchd");
+                            let context = l.launchd_context;
+                            if context != 0 {
+                                p.guarded = true;
+                                p.strict_guard = true;
+                                p.context = context;
+                            }
+                        }
+                    }
+                }
+                let p = self.port_mut(port);
                 if let Some((gf, ctx, recv_addr)) = guard {
                     if *gf & guard_flags::IMMOVABLE_RECEIVE != 0 {
                         p.guarded = true;
