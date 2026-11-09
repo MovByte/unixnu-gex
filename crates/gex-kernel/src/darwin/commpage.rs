@@ -37,6 +37,7 @@ pub mod off {
     pub const KDEBUG_ENABLE: usize = 0x100;
     pub const NEWTIMEOFDAY_DATA: usize = 0x120;
     pub const REMOTETIME_PARAMS: usize = 0x148;
+    pub const DYLD_FLAGS: usize = 0x160;
     pub const CPU_QUIESCENT_COUNTER: usize = 0x180;
     pub const ASB_TARGET_VALUE: usize = 0x320;
     pub const ASB_TARGET_ADDRESS: usize = 0x328;
@@ -185,7 +186,22 @@ static QUIESCE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// forward, and the quiescent counter. A CPU running a program is outside
 /// any kernel SMR section, so each tick the whole system has quiesced and
 /// the generation advances. This tick is the process's one writer of both.
+/// `dyld_flags`, the system's, kept for `commpage_update_dyld_flags`.
+static DYLD_FLAGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The value of `kern.dyld_flags`.
+pub fn dyld_flags() -> u64 {
+    DYLD_FLAGS.load(Ordering::Relaxed)
+}
+
+/// `commpage_update_dyld_flags`: every process's page has it at its next
+/// [`tick`].
+pub fn set_dyld_flags(v: u64) {
+    DYLD_FLAGS.store(v, Ordering::Relaxed);
+}
+
 pub fn tick(mem: &mut [u8], abstime: u64) {
+    set_word(mem, off::DYLD_FLAGS, DYLD_FLAGS.load(Ordering::Relaxed));
     if word(mem, off::APPROX_TIME) < abstime {
         set_word(mem, off::APPROX_TIME, abstime);
     }

@@ -14,6 +14,8 @@ use crate::errno::Errno;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     Str(&'static str),
+    /// Bytes as they are, with no terminator added.
+    Data(&'static [u8]),
     I32(i32),
     I64(i64),
     /// `struct timeval`: seconds, microseconds.
@@ -38,6 +40,7 @@ impl Value {
                 b.push(0);
                 b
             }
+            Value::Data(d) => d.to_vec(),
             Value::I32(v) => v.to_le_bytes().to_vec(),
             Value::I64(v) => v.to_le_bytes().to_vec(),
             Value::Timeval(s, us) => {
@@ -96,6 +99,9 @@ pub fn value(path: &str) -> Option<Value> {
         "kern.uuid" => Str("D6F6E0D2-FE60-38A0-9214-556B7FAF8951"),
         "kern.osbuildconfig" => Str("release"),
         "kern.willshutdown" => I32(0),
+        // The `-minimalboot` boot argument, and a dark boot's: neither given.
+        "kern.minimalboot" => I32(0),
+        "kern.darkboot" => I32(0),
         "kern.memorystatus_level" => I32(100),
         "hw.machine" => Str("iPad7,1"),
         "hw.model" => Str("J120AP"),
@@ -116,6 +122,13 @@ pub fn value(path: &str) -> Option<Value> {
         // ARMv8.1 and later features an A10X does not have.
         "hw.optional.armv8_1_atomics" | "hw.optional.neon_fp16" | "hw.optional.armv8_2_fhm" | "hw.optional.armv8_2_sha3" | "hw.optional.armv8_2_sha512" | "hw.optional.armv8_3_compnum" | "hw.optional.arm.FEAT_LSE" | "hw.optional.arm.FEAT_LSE2" | "hw.optional.arm.FEAT_RDM" | "hw.optional.arm.FEAT_FP16" | "hw.optional.arm.FEAT_FHM" | "hw.optional.arm.FEAT_DotProd" | "hw.optional.arm.FEAT_FCMA" | "hw.optional.arm.FEAT_JSCVT" | "hw.optional.arm.FEAT_LRCPC" | "hw.optional.arm.FEAT_LRCPC2" | "hw.optional.arm.FEAT_FRINTTS" | "hw.optional.arm.FEAT_FlagM" | "hw.optional.arm.FEAT_FlagM2" | "hw.optional.arm.FEAT_I8MM" | "hw.optional.arm.FEAT_BF16" | "hw.optional.arm.FEAT_SHA3" | "hw.optional.arm.FEAT_SHA512" | "hw.optional.arm.FEAT_PAuth" | "hw.optional.arm.FEAT_PAuth2" | "hw.optional.arm.FEAT_FPAC" | "hw.optional.arm.FEAT_BTI" | "hw.optional.arm.FEAT_DPB" | "hw.optional.arm.FEAT_DPB2" | "hw.optional.arm.FEAT_SB" | "hw.optional.arm.FEAT_SPECRES" | "hw.optional.arm.FEAT_RPRES" | "hw.optional.arm.FEAT_SME" | "hw.optional.arm.FEAT_SME2" => I32(0),
         "hw.targettype" => Str("J120"),
+        // The platform expert's names (`PEGetTargetName`,
+        // `PEGetProductName`): the board and the product.
+        "hw.target" => Str("J120AP"),
+        "hw.product" => Str("iPad7,1"),
+        // /chosen/osenvironment: 32 bytes the boot loader leaves zero on
+        // a normal boot.
+        "hw.osenvironment" => Data(&[0; 32]),
         // /chosen/ephemeral-storage.
         "hw.ephemeral_storage" => I32(0),
         "security.mac.amfi.developer_mode_status" => I32(1),

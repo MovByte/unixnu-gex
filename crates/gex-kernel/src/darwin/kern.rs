@@ -996,6 +996,8 @@ impl Kernel {
             p if p.starts_with("kern.proc.") => self.darwin_sysctl_proc(m, p, tail, req),
             "kern.procargs2" => self.darwin_sysctl_procargs2(m, tail, req),
             "kern.osreleasetype" => self.darwin_sysctl_osreleasetype(m, req),
+            "kern.initproc_spawned" => self.darwin_sysctl_initproc_spawned(m, req),
+            "kern.dyld_flags" => self.darwin_sysctl_dyld_flags(m, req),
             _ => match sysctl::value(node.path) {
                 Some(_) if req.new != 0 => {
                     self.darwin_unimplemented(format!("sysctl write of {}", node.path));
@@ -1025,6 +1027,34 @@ impl Kernel {
         let new = req.io_string(m, &name, sysctl::MAXHOSTNAMELEN, true)?;
         if let Some(v) = new {
             sysctl::set_hostname(v);
+        }
+        Ok(())
+    }
+
+    /// `sysctl_dyld_flags`: launchd's to set, and the commpage says it.
+    fn darwin_sysctl_dyld_flags(&mut self, m: &mut GuestMem<'_>, req: &mut SysctlReq) -> Result<(), Errno> {
+        if req.new != 0 && self.pid != 1 {
+            return Err(Errno::EPERM);
+        }
+        req.out(m, &super::commpage::dyld_flags().to_le_bytes())?;
+        if req.new != 0 {
+            let b = req.input(m, 8)?;
+            super::commpage::set_dyld_flags(u64::from_le_bytes(b[..8].try_into().unwrap()));
+        }
+        Ok(())
+    }
+
+    /// `sysctl_initproc_spawned`: launchd says it has reached main, once.
+    fn darwin_sysctl_initproc_spawned(&mut self, m: &mut GuestMem<'_>, req: &mut SysctlReq) -> Result<(), Errno> {
+        use std::sync::atomic::Ordering::Relaxed;
+        static SPAWNED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+        if req.new != 0 && (self.pid != 1 || SPAWNED.load(Relaxed) != 0) {
+            return Err(Errno::EPERM);
+        }
+        req.out(m, &SPAWNED.load(Relaxed).to_le_bytes())?;
+        if req.new != 0 {
+            let b = req.input(m, 4)?;
+            SPAWNED.store(i32::from_le_bytes([b[0], b[1], b[2], b[3]]), Relaxed);
         }
         Ok(())
     }
