@@ -255,6 +255,7 @@ mod tests {
             needed: Vec::new(),
             runpath: Vec::new(),
             bias: 0,
+            page_zero: 0,
             entry: 0x400000,
             code: vec![(0x400000, 0x400010)],
             segments: vec![Segment {

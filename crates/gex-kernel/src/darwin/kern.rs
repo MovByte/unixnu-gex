@@ -354,6 +354,7 @@ impl Kernel {
             sys::SETRLIMIT => res(self.darwin_setrlimit(m, a[0], a[1])),
             sys::MMAP => res(self.darwin_mmap(m, a)),
             sys::MADVISE => res(self.darwin_madvise(m, a)),
+            sys::MSYNC | sys::MSYNC_NOCANCEL => res(self.darwin_msync(m, a)),
             sys::GETRUSAGE => res(self.darwin_getrusage(m, a[0] as i32, a[1])),
             sys::THREAD_SELFUSAGE => res(self.darwin_thread_selfusage()),
             sys::MINHERIT => res(self.darwin_minherit(a)),

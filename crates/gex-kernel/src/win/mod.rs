@@ -139,6 +139,7 @@ pub fn trampoline_input(class32: bool) -> (gex_ld::Image, Vec<u64>) {
         soname: None,
         needed: Vec::new(),
         runpath: Vec::new(),
+        page_zero: 0,
         bias: TRAMPOLINES,
         entry: starts[0],
         code: vec![(TRAMPOLINES, TRAMPOLINES_END)],

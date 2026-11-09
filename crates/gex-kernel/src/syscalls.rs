@@ -4781,6 +4781,43 @@ impl MapIo<'_> {
         Ok(())
     }
 
+    /// `[addr, addr + len)` of the shared mappings as their files hold it
+    /// now, stores not written back gone: what `msync`'s invalidate leaves
+    /// the next access to fault in. The pages past the end of a file stay.
+    pub fn reload_shared(&self, m: &mut GuestMem<'_>, addr: u64, len: u64) -> Result<(), Errno> {
+        let (lo, hi) = (addr, addr.saturating_add(len));
+        let maps: Vec<SharedMap> = {
+            let mm = self.mem.lock();
+            mm.log.shared_maps.iter().filter(|map| map.start.max(lo) < (map.start + map.len).min(hi)).cloned().collect()
+        };
+        const P: u64 = crate::mem::PAGE_SIZE;
+        for map in maps {
+            let from = map.start.max(lo);
+            let size = map.file.handle.metadata_changes().map_or(u64::MAX, |(md, _)| md.size);
+            let to = (map.start + map.len).min(hi).min(map.start + size.saturating_sub(map.offset));
+            if from >= to {
+                continue;
+            }
+            let at = map.offset + (from - map.start);
+            let mut k = m.kernel();
+            map.file.pread(at, k.read_mut(from, (to - from) as usize)?)?;
+            self.retire_code_why(from, to - from, "msync", 0);
+            // The pages are the file's again: only stores after this are
+            // written back.
+            let mut page = (from - map.start + P - 1) / P;
+            while map.start + page * P < to {
+                let whole = map.start + page * P;
+                if let Some(slot) = map.pages.get(page as usize) {
+                    let h = page_hash(m.read(whole, (P as usize).min((map.start + map.len - whole) as usize))?);
+                    slot.store(h, std::sync::atomic::Ordering::Relaxed);
+                }
+                page += 1;
+            }
+            map.changes.store(0, std::sync::atomic::Ordering::Release);
+        }
+        Ok(())
+    }
+
     /// Note that `[addr, addr + len)` no longer holds the code it did.
     ///
     /// Only ranges that overlap an executable mapping are worth reporting:
@@ -12646,6 +12683,9 @@ mod tests {
                 b[a..a + data.len()].copy_from_slice(data);
                 true
             }
+        }
+        fn with_guest(&self, f: &mut dyn FnMut(&mut GuestMem<'_>)) {
+            f(&mut GuestMem::new(&mut self.0.lock().unwrap()))
         }
     }
 

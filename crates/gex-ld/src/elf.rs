@@ -376,6 +376,7 @@ pub fn build_id(bytes: &[u8]) -> Option<String> {
 pub fn headers_only(phdr_vaddr: u64, phentsize: u64, phnum: u64, entry: u64) -> Image {
     Image {
         bias: 0,
+        page_zero: 0,
         class32: false,
         entry,
         segments: Vec::new(),
@@ -405,6 +406,8 @@ pub fn headers_only(phdr_vaddr: u64, phentsize: u64, phnum: u64, entry: u64) -> 
 pub struct Image {
     /// Load bias applied to every `p_vaddr` (zero for `ET_EXEC`).
     pub bias: u64,
+    /// Where a Mach-O `__PAGEZERO` ends: the task map's lowest address.
+    pub page_zero: u64,
     /// A 32-bit (ELFCLASS32, i386) image: its code is decoded in
     /// compatibility mode and its initial stack laid out with 4-byte words.
     pub class32: bool,
@@ -703,6 +706,7 @@ impl Headers {
     fn image(&self, segments: Vec<Segment>, interp: Option<String>) -> Image {
         Image {
             bias: self.bias,
+            page_zero: 0,
             class32: self.class32,
             entry: self.entry,
             segments,

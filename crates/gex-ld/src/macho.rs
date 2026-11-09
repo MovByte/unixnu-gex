@@ -417,6 +417,13 @@ impl MachO {
         let entry = self.entry_pc().map_or(0, |pc| pc.wrapping_add(slide));
         let mut img = headers_only(0, 0, 0, entry);
         img.bias = slide;
+        // A page zero at address 0 raises the map's minimum, a position
+        // independent image's by its slide as well (`load_segment`).
+        img.page_zero = self
+            .segments
+            .iter()
+            .find(|s| s.vmaddr == 0 && s.vmsize != 0 && s.is_guard())
+            .map_or(0, |s| (s.vmsize + slide + 0x3fff) & !0x3fff);
         img.pie = self.is_pie();
         img.interp = self.dylinker.clone();
         img.soname = self.install_name.clone();

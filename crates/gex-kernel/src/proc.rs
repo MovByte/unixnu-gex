@@ -298,6 +298,8 @@ struct Proc {
 pub trait PeerMem: Send + Sync {
     fn read(&self, addr: u64, out: &mut [u8]) -> bool;
     fn write(&self, addr: u64, data: &[u8]) -> bool;
+    /// `f` with all of the memory as the kernel's own view of it.
+    fn with_guest(&self, f: &mut dyn FnMut(&mut crate::GuestMem<'_>));
 }
 
 /// A process's address space as another process reaches it: its memory map,

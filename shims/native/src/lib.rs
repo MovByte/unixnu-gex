@@ -2823,6 +2823,10 @@ impl gex_kernel::proc::PeerMem for PeerMemory {
             _ => false,
         }
     }
+
+    fn with_guest(&self, f: &mut dyn FnMut(&mut gex_kernel::GuestMem<'_>)) {
+        f(&mut gex_kernel::GuestMem::new(self.0.bytes()))
+    }
 }
 
 /// Publish `k`'s process's address space, `memory` and its map, for other
@@ -4532,6 +4536,10 @@ fn place_image(
                 k.darwin_image_segment(seg.vaddr, seg.bytes.len() as u64, seg.mem_size, seg.file_offset + k.darwin_exec.as_ref().map_or(0, |i| i.arch_offset), seg.max_prot);
             }
         });
+    }
+
+    if opts.darwin {
+        store.data_mut().with_kernel(|k| k.dtask.map_min = image.page_zero);
     }
 
     // A Darwin program's shared cache, where the kernel maps it.

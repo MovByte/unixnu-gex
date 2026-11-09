@@ -217,6 +217,9 @@ pub struct Task {
     /// Its map's highest address when an entitlement or a spawn raised it
     /// (`vm_map_set_max_addr`); 0 for [`vm::MAP_MAX`].
     pub map_max: u64,
+    /// Its map's lowest address (`vm_map_min`): the end of the image's
+    /// page zero.
+    pub map_min: u64,
     /// Signals are being taken on the way out of a call, which can wait.
     pub syscall_exit: bool,
     /// The EXC_CRASH code and subcode a death owes its handlers.

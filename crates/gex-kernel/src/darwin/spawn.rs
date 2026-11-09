@@ -277,6 +277,7 @@ impl Kernel {
             dispatchqueue_label_offset: t.dispatchqueue_label_offset,
             vm: t.vm.inherited(),
             map_max: t.map_max,
+            map_min: t.map_min,
             // The child runs this image, with this credential's
             // entitlements, and its code signing flags but CS_KILLED.
             codesign: t.codesign.clone(),

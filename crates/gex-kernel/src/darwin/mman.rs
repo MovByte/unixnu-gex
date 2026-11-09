@@ -101,11 +101,14 @@ struct Piece {
     attrs: Attrs,
 }
 
-/// `vm_sync_t`'s flags `vm_map_msync` takes from advice.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Sync {
-    Deactivate,
-    KillPages,
+/// `vm_sync_t` (`mach/vm_sync.h`).
+mod sync {
+    pub const ASYNCHRONOUS: u32 = 0x01;
+    pub const SYNCHRONOUS: u32 = 0x02;
+    pub const INVALIDATE: u32 = 0x04;
+    pub const KILLPAGES: u32 = 0x08;
+    pub const DEACTIVATE: u32 = 0x10;
+    pub const CONTIGUOUS: u32 = 0x20;
 }
 
 impl Kernel {
@@ -412,39 +415,6 @@ impl Kernel {
         self.darwin_vm_behavior_set(m, s, e, new)
     }
 
-    /// `mach_vm_behavior_set` from a message, which has no thread's view
-    /// of memory: the behaviors an entry keeps. Those acting on the memory
-    /// itself are reported.
-    pub(crate) fn darwin_behavior_set_kept(&mut self, start: u64, size: u64, new: i32) -> Option<u64> {
-        const DEFAULT: i32 = behavior::DEFAULT as i32;
-        const RSEQNTL: i32 = behavior::RSEQNTL as i32;
-        if !matches!(new, DEFAULT..=RSEQNTL | act::ZERO_WIRED_PAGES) {
-            return None;
-        }
-        if start.checked_add(size).is_none() {
-            return Some(kr::INVALID_ARGUMENT);
-        }
-        if size == 0 {
-            return Some(kr::SUCCESS);
-        }
-        let (s, e) = (start & !PAGE_MASK, round(start + size));
-        if s > e || e > self.darwin_map_max() {
-            return Some(kr::NO_SPACE);
-        }
-        if range_overflows(s, e - s) {
-            return Some(kr::INVALID_ADDRESS);
-        }
-        if !Self::darwin_range_mapped(&self.darwin_pieces(s, e), s, e) {
-            return Some(kr::INVALID_ADDRESS);
-        }
-        if new == act::ZERO_WIRED_PAGES {
-            self.dtask.vm.update(s, e, |a| a.zero_wired = true);
-        } else {
-            self.dtask.vm.update(s, e, |a| a.behavior = new as u8);
-        }
-        Some(kr::SUCCESS)
-    }
-
     /// `vm_map_behavior_set(map, start, end, new_behavior)`.
     fn darwin_vm_behavior_set(&mut self, m: &mut GuestMem<'_>, start: u64, end: u64, new: i32) -> u64 {
         if start > end || end > self.darwin_map_max() {
@@ -469,8 +439,8 @@ impl Kernel {
                 kr::SUCCESS
             }
             act::WILLNEED => self.darwin_willneed(m, start, end),
-            act::DONTNEED => self.darwin_msync_advice(m, start, end, Sync::Deactivate),
-            act::FREE => self.darwin_msync_advice(m, start, end, Sync::KillPages),
+            act::DONTNEED => self.darwin_vm_msync(m, start, end - start, sync::DEACTIVATE | sync::CONTIGUOUS),
+            act::FREE => self.darwin_vm_msync(m, start, end - start, sync::KILLPAGES | sync::CONTIGUOUS),
             act::REUSABLE => self.darwin_reusable_pages(m, start, end),
             act::REUSE => self.darwin_reuse_pages(m, start, end),
             act::CAN_REUSE => self.darwin_can_reuse(start, end),
@@ -577,43 +547,111 @@ impl Kernel {
         matches!(p.attrs.kind, kind::ANON | kind::SHM) && !p.attrs.cow
     }
 
-    /// `vm_map_msync(map, start, end - start, sync | VM_SYNC_CONTIGUOUS)`
-    /// for `MADV_DONTNEED` (deactivate) and `MADV_FREE` (kill pages).
-    fn darwin_msync_advice(&mut self, m: &mut GuestMem<'_>, start: u64, end: u64, sync: Sync) -> u64 {
-        let pieces = self.darwin_pieces(start, end);
+    /// `msync(addr, len, flags)`.
+    pub(crate) fn darwin_msync(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
+        const MS_ASYNC: i32 = 0x01;
+        const MS_INVALIDATE: i32 = 0x02;
+        const MS_KILLPAGES: i32 = 0x04;
+        const MS_DEACTIVATE: i32 = 0x08;
+        const MS_SYNC: i32 = 0x10;
+        let (addr, size, flags) = (a[0], a[1], a[2] as i32);
+        if range_overflows(addr, size) || addr & PAGE_MASK != 0 || size == 0 {
+            return Err(Errno::EINVAL);
+        }
+        if flags & (MS_SYNC | MS_ASYNC) == MS_SYNC | MS_ASYNC {
+            return Err(Errno::EINVAL);
+        }
+        let mut s = 0;
+        if flags & MS_KILLPAGES != 0 {
+            s |= sync::KILLPAGES;
+        }
+        if flags & MS_DEACTIVATE != 0 {
+            s |= sync::DEACTIVATE;
+        }
+        if flags & MS_INVALIDATE != 0 {
+            s |= sync::INVALIDATE;
+        }
+        if flags & (MS_KILLPAGES | MS_DEACTIVATE) == 0 {
+            s |= if flags & MS_ASYNC != 0 { sync::ASYNCHRONOUS } else { sync::SYNCHRONOUS };
+        }
+        match self.darwin_vm_msync(m, addr, size, s | sync::CONTIGUOUS) {
+            kr::SUCCESS => Ok(0),
+            kr::INVALID_ADDRESS => Err(Errno::ENOMEM),
+            kr::FAILURE => Err(Errno::EIO),
+            _ => Err(Errno::EINVAL),
+        }
+    }
+
+    /// `vm_map_msync(map, address, size, sync_flags)`.
+    pub(crate) fn darwin_vm_msync(&mut self, m: &mut GuestMem<'_>, address: u64, size: u64, flags: u32) -> u64 {
+        if flags & sync::ASYNCHRONOUS != 0 && flags & sync::SYNCHRONOUS != 0 {
+            return kr::INVALID_ARGUMENT;
+        }
+        if range_overflows(address, size) {
+            return kr::INVALID_ADDRESS;
+        }
+        let (start, end) = (address & !PAGE_MASK, round(address.wrapping_add(size)));
+        if start == end {
+            return kr::SUCCESS;
+        }
+        let kill = flags & sync::KILLPAGES != 0;
+        let write_back = flags & (sync::SYNCHRONOUS | sync::ASYNCHRONOUS) != 0;
         let mut at = start;
-        let mut had_hole = false;
-        for p in &pieces {
+        let mut had_hole = end < start;
+        for p in &self.darwin_pieces(start, end) {
             if p.start > at {
                 had_hole = true;
                 // No pages are killed past a hole: someone else could map
                 // there.
-                if sync == Sync::KillPages {
+                if kill {
                     break;
                 }
             }
             at = p.end;
-            // The shared region's objects are every task's.
+            // The shared region's objects are every task's, its files'
+            // pages never dirty.
             if p.attrs.kind == kind::SUBMAP {
                 continue;
             }
-            match sync {
-                Sync::Deactivate => {
-                    if p.attrs.kind == kind::ANON {
-                        self.darwin_host_advise(m, p, p.start, p.end, HostAdvice::Deactivate);
-                    }
-                }
-                Sync::KillPages => {
+            if flags & (sync::KILLPAGES | sync::DEACTIVATE) != 0 {
+                if kill {
                     if Self::darwin_kills(p) {
                         self.darwin_host_advise(m, p, p.start, p.end, HostAdvice::Free);
                     }
+                } else if p.attrs.kind == kind::ANON {
+                    self.darwin_host_advise(m, p, p.start, p.end, HostAdvice::Deactivate);
                 }
+                continue;
+            }
+            // `vm_object_sync`, which has only a vnode's object to do it to:
+            // a private mapping's writes are in an internal shadow. A POSIX
+            // shared memory object is internal too, but here each mapping
+            // of one is a copy that only this makes agree with the rest.
+            // What a failed write does never reaches msync's caller.
+            let n = p.end - p.start;
+            match p.attrs.kind {
+                kind::FILE_SHARED => {
+                    let io = self.map_io();
+                    if write_back {
+                        let _ = io.flush_shared(m, p.start, n);
+                    }
+                    if flags & sync::INVALIDATE != 0 {
+                        let _ = io.reload_shared(m, p.start, n);
+                    }
+                }
+                kind::SHM if write_back => {
+                    let _ = self.map_io().flush_shared(m, p.start, n);
+                }
+                _ => {}
             }
         }
         if at < end {
             had_hole = true;
         }
-        if had_hole { kr::INVALID_ADDRESS } else { kr::SUCCESS }
+        if had_hole && flags & sync::CONTIGUOUS != 0 {
+            return kr::INVALID_ADDRESS;
+        }
+        kr::SUCCESS
     }
 
     /// `vm_map_willneed`: anonymous memory faulted in (`vm_pre_fault`, for

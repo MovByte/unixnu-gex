@@ -627,7 +627,7 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
                         r.ports.push(PortOut::Ool(data));
                         r
                     }
-                    Err(e) => Reply::err(e),
+                    Err(r) => r,
                 }
             }
             _ => bad(),
@@ -640,28 +640,36 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             match (req.body.get(ADDRESS..ADDRESS + 8), req.descs.first()) {
                 (Some(a), Some(Desc::Ool { data, .. })) => {
                     let address = u64::from_le_bytes(a.try_into().unwrap());
-                    Reply { ret: k.darwin_vm_copy_overwrite(address, data), defer: None, out: Vec::new(), ports: Vec::new(), unimplemented: None }
+                    k.darwin_vm_copy_overwrite(address, data).map_or_else(|r| r, |()| Reply::ok(Vec::new()))
                 }
                 _ => bad(),
             }
         }
         // mach_vm_copy and vm_copy.
         (Kobject::Task, 4807 | 3808) => match (arg64(req, 0), arg64(req, 2), arg64(req, 4)) {
-            (Some(src), Some(size), Some(dst)) => match k.darwin_vm_copyin(src, size) {
-                Ok(data) => Reply { ret: k.darwin_vm_copy_overwrite(dst, &data), defer: None, out: Vec::new(), ports: Vec::new(), unimplemented: None },
-                Err(e) => Reply::err(e),
-            },
+            (Some(src), Some(size), Some(dst)) => k.darwin_vm_copyin(src, size).and_then(|d| k.darwin_vm_copy_overwrite(dst, &d)).map_or_else(|r| r, |()| Reply::ok(Vec::new())),
             _ => bad(),
         },
         // mach_vm_read_overwrite and vm_read_overwrite: into this task's
         // memory at `data`.
         (Kobject::Task, 4808 | 3809) => match (arg64(req, 0), arg64(req, 2), arg64(req, 4)) {
-            (Some(address), Some(size), Some(data)) => match k.darwin_vm_copyin(address, size) {
-                Ok(bytes) => match k.darwin_vm_copy_overwrite(data, &bytes) {
-                    0 => Reply::ok(size.to_le_bytes().to_vec()),
-                    e => Reply::err(e),
-                },
-                Err(e) => Reply::err(e),
+            (Some(address), Some(size), Some(data)) => k.darwin_vm_copyin(address, size).and_then(|b| k.darwin_vm_copy_overwrite(data, &b)).map_or_else(|r| r, |()| Reply::ok(size.to_le_bytes().to_vec())),
+            _ => bad(),
+        },
+        // mach_vm_msync and vm_msync.
+        (Kobject::Task, 4809 | 3810) => match (arg64(req, 0), arg64(req, 2), arg(req, 4)) {
+            (Some(address), Some(size), Some(flags)) => match k.darwin_own_memory(|k, m| k.darwin_vm_msync(m, address, size, flags as u32)) {
+                Ok(ret) => Reply { ret: ret as i32, defer: None, out: Vec::new(), ports: Vec::new(), unimplemented: None },
+                Err(r) => r,
+            },
+            _ => bad(),
+        },
+        // mach_vm_machine_attribute and vm_machine_attribute: the value
+        // comes back as it went.
+        (Kobject::Task, 4812 | 3813) => match (arg64(req, 0), arg64(req, 2), arg(req, 4), arg(req, 5)) {
+            (Some(address), Some(size), Some(attribute), Some(value)) => match k.darwin_vm_machine_attribute(address, size, attribute) {
+                0 => Reply::ok(value.to_le_bytes().to_vec()),
+                e => Reply::err(e),
             },
             _ => bad(),
         },
@@ -672,13 +680,9 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         },
         // mach_vm_behavior_set and vm_behavior_set.
         (Kobject::Task, 4810 | 3811) => match (arg64(req, 0), arg64(req, 2), arg(req, 4)) {
-            (Some(address), Some(size), Some(new)) => match k.darwin_behavior_set_kept(address, size, new) {
-                Some(ret) => Reply { ret: ret as i32, defer: None, out: Vec::new(), ports: Vec::new(), unimplemented: None },
-                None => {
-                    let mut r = Reply::err(KERN_INVALID_ARGUMENT);
-                    r.unimplemented = Some(format!("mach_vm_behavior_set behavior {new} (it acts on the memory; madvise has it)"));
-                    r
-                }
+            (Some(address), Some(size), Some(new)) => match k.darwin_own_memory(|k, m| k.darwin_behavior_set(m, address, size, new)) {
+                Ok(ret) => Reply { ret: ret as i32, defer: None, out: Vec::new(), ports: Vec::new(), unimplemented: None },
+                Err(r) => r,
             },
             _ => bad(),
         },
@@ -819,7 +823,7 @@ fn task_routine_flavor(id: i32) -> Option<u8> {
         3405 => NAME,
         3402 | 3409 | 3421 => INSPECT,
         4816 | 3824 | 3800 | 4804 | 3805 | 4808 | 3809 => READ,
-        4803 | 3804 | 4810 | 3811 | 4806 | 3807 | 4807 | 3808 => CONTROL,
+        4803 | 3804 | 4810 | 3811 | 4806 | 3807 | 4807 | 3808 | 4809 | 3810 | 4812 | 3813 => CONTROL,
         3403 | 3404 | 3410 | 3413 | 3414 | 3415 | 3418 | 3419 | 3420 | 3203 | 3207 | 5404 | 8000 => CONTROL,
         _ => return None,
     })

@@ -1099,6 +1099,7 @@ pub fn pe_input(pe: &gex_ld::pe::PeImage, base: u64) -> Result<(Image, PeSeeds),
     }
     let entry = if pe.entry_rva != 0 { base + pe.entry_rva as u64 } else { base };
     let image = Image {
+        page_zero: 0,
         soname: None,
         needed: Vec::new(),
         runpath: Vec::new(),
