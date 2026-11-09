@@ -145,6 +145,43 @@ impl Kernel {
         Ok(total)
     }
 
+    /// `__pthread_chdir(path)`: this thread's own working directory
+    /// (`uu_cdir`), which a failed call leaves unset.
+    pub(crate) fn darwin_pthread_chdir(&mut self, m: &mut GuestMem<'_>, path: u64) -> Result<u64, Errno> {
+        let me = self.ctx_addr;
+        let had = self.thread_fs.of(me).is_some();
+        if !had {
+            self.thread_fs.set(me, Some(std::sync::Arc::new(self.proc_fs.copy())));
+        }
+        let r = self.canonical(m, nr::CHDIR, [path, 0, 0, 0, 0, 0]);
+        if r.is_err() && !had {
+            self.thread_fs.set(me, None);
+        }
+        r
+    }
+
+    /// `__pthread_fchdir(fd)`: this thread's directory set from a
+    /// descriptor, or with -1 back to the process's, EBADF if it had none.
+    pub(crate) fn darwin_pthread_fchdir(&mut self, m: &mut GuestMem<'_>, fd: i32) -> Result<u64, Errno> {
+        let me = self.ctx_addr;
+        let had = self.thread_fs.of(me).is_some();
+        if fd == -1 {
+            if !had {
+                return Err(Errno::EBADF);
+            }
+            self.thread_fs.set(me, None);
+            return Ok(0);
+        }
+        if !had {
+            self.thread_fs.set(me, Some(std::sync::Arc::new(self.proc_fs.copy())));
+        }
+        let r = self.canonical(m, nr::FCHDIR, [fd as u64, 0, 0, 0, 0, 0]);
+        if r.is_err() && !had {
+            self.thread_fs.set(me, None);
+        }
+        r
+    }
+
     /// `mount(type, dir, flags, data)`, of a bind mount; another file
     /// system's is reported.
     pub(crate) fn darwin_mount(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {

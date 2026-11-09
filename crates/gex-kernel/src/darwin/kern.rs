@@ -434,6 +434,8 @@ impl Kernel {
             sys::FPATHCONF => res(self.darwin_fpathconf(a[0] as i32, a[1] as i32)),
             sys::FREADLINK => res(self.darwin_freadlink(m, a[0] as i32, a[1], a[2])),
             sys::GETDTABLESIZE => self.fds.limit() as u64,
+            sys::PTHREAD_CHDIR => res(self.darwin_pthread_chdir(m, a[0])),
+            sys::PTHREAD_FCHDIR => res(self.darwin_pthread_fchdir(m, a[0] as i32)),
             sys::MLOCK => res(self.darwin_mlock(a[0], a[1])),
             sys::MUNLOCK => res(self.darwin_munlock(a[0], a[1])),
             // mlockall and munlockall are unimplemented in the kernel.

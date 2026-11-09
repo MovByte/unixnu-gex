@@ -3070,7 +3070,7 @@ impl ThreadFs {
         self.by_ctx.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
-    fn set(&self, ctx: u64, fs: Option<Arc<FsCwd>>) {
+    pub(crate) fn set(&self, ctx: u64, fs: Option<Arc<FsCwd>>) {
         let mut m = self.by_ctx.lock().unwrap_or_else(|e| e.into_inner());
         match fs {
             Some(fs) => {
@@ -9675,8 +9675,10 @@ impl Kernel {
     }
 
     /// A new Darwin thread's own (`thread_create_internal`): the next thread
-    /// id, and no TSD base (`machine_thread_create`) until one is set.
+    /// id, no TSD base (`machine_thread_create`) until one is set, and no
+    /// working directory of its own (`uu_cdir`).
     fn darwin_thread_made(&mut self, m: &mut GuestMem<'_>, req: &SpawnRequest) {
+        self.thread_fs.set(req.ctx_addr, None);
         if let Some(t) = self.thread_signals.get(req.tid) {
             t.set_darwin_id(crate::darwin::next_thread_id());
             t.set_tsd(0);
