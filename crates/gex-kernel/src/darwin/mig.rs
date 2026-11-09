@@ -86,6 +86,40 @@ pub(crate) fn arg_after(req: &Kmsg, ndesc: usize, i: usize) -> Option<i32> {
     i32_at(&req.body, 4 + 12 * ndesc + NDR + 4 * i)
 }
 
+/// An out `io_name_t` as MIG sends it: an unused offset, the count with its
+/// terminator, the characters padded.
+fn io_name_reply(name: &str) -> Vec<u8> {
+    let bytes = name.as_bytes();
+    let n = (bytes.len() + 1) as u32;
+    let mut o = 0u32.to_le_bytes().to_vec();
+    o.extend_from_slice(&n.to_le_bytes());
+    o.extend_from_slice(bytes);
+    o.push(0);
+    o.resize((o.len() + 3) & !3, 0);
+    o
+}
+
+/// `IOKIT_SERVER_VERSION`.
+const IOKIT_SERVER_VERSION: u64 = 20210810;
+
+/// The inline C string at the `i`th argument after the NDR record (MIG's
+/// `offset`, `count`, then the characters in a buffer of `max`), and the
+/// body offset past its padded characters.
+fn inline_cstr(req: &Kmsg, i: usize, max: usize) -> Option<(&[u8], usize)> {
+    inline_cstr_at(req, NDR + 4 * i, max)
+}
+
+/// [`inline_cstr`] at a body offset already known.
+fn inline_cstr_at(req: &Kmsg, at: usize, max: usize) -> Option<(&[u8], usize)> {
+    let count = i32_at(&req.body, at + 4)? as u32 as usize;
+    if count > max {
+        return None;
+    }
+    let bytes = req.body.get(at + 8..at + 8 + count)?;
+    let end = bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len());
+    Some((&bytes[..end], at + 8 + ((count + 3) & !3)))
+}
+
 /// Answer request `req` sent to kernel object `obj`.
 pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
     let bad = || Reply::err(MIG_BAD_ARGUMENTS);
@@ -127,6 +161,12 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         },
         // host_page_size(host) -> vm_size_t
         (Kobject::Host | Kobject::HostPriv, 202) => Reply::ok(u64::from(machine::PAGE_SIZE).to_le_bytes().to_vec()),
+        // host_get_io_main(host) -> io_main_t.
+        (Kobject::Host | Kobject::HostPriv, 205) => {
+            let p = k.ipc().global_port(Kobject::IoMain);
+            k.ipc().copy_send(p);
+            Reply::port(Carried::Port(p))
+        }
         // host_get_clock_service(host, clock_id) -> clock_serv_t: the system
         // clock (SYSTEM_CLOCK) or the calendar (CALENDAR_CLOCK).
         (Kobject::Host | Kobject::HostPriv, 206) => match arg(req, 0) {
@@ -163,6 +203,253 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         (Kobject::Host | Kobject::HostPriv, 413) => match (desc_port(req, 0), arg_after(req, 1, 0)) {
             (Some((right, _)), Some(which)) => host_set_special_port(k, obj, req.dest, which, right),
             _ => bad(),
+        },
+        // io_server_version(main_port) -> version.
+        (Kobject::IoMain, 2877) => Reply::ok(IOKIT_SERVER_VERSION.to_le_bytes().to_vec()),
+        // io_registry_entry_from_path(main_port, path) -> registry_entry.
+        (Kobject::IoMain, 2809) => {
+            let Some(path) = inline_cstr(req, 0, 512) else { return bad() };
+            let p = String::from_utf8_lossy(path.0).into_owned();
+            match super::iokit::from_path(super::iokit::tree(), &p) {
+                Ok(Some(i)) => {
+                    let port = k.ipc().global_port(Kobject::IoEntry(i));
+                    k.ipc().copy_send(port);
+                    Reply::port(Carried::Port(port))
+                }
+                Ok(None) => Reply { ret: KERN_SUCCESS, defer: None, out: Vec::new(), ports: Vec::new(), unimplemented: None }.with_null_port(0),
+                Err(what) => {
+                    let mut r = Reply { ret: KERN_SUCCESS, defer: None, out: Vec::new(), ports: Vec::new(), unimplemented: None }.with_null_port(0);
+                    r.unimplemented = Some(format!("IORegistryEntry::fromPath: {what}"));
+                    r
+                }
+            }
+        }
+        // io_registry_entry_get_property_bytes(entry, name, dataCnt) ->
+        // data: the property's own bytes, kIOReturnNoResources for none,
+        // kIOReturnIPCError for too little room.
+        (Kobject::IoEntry(i), 2812) => {
+            const K_IO_RETURN_NO_RESOURCES: i32 = 0xe00002be_u32 as i32;
+            const K_IO_RETURN_IPC_ERROR: i32 = 0xe00002bf_u32 as i32;
+            const IO_STRUCT_INBAND_MAX: usize = 4096;
+            let Some((name, next)) = inline_cstr(req, 0, 128) else { return bad() };
+            let Some(cnt) = i32_at(&req.body, next) else { return bad() };
+            let Some(node) = super::iokit::tree().get(*i as usize) else { return bad() };
+            let name = String::from_utf8_lossy(name);
+            let Some((_, value)) = node.props.iter().find(|(k, _)| *k == name) else { return Reply::err(K_IO_RETURN_NO_RESOURCES) };
+            if (cnt as u32 as usize).min(IO_STRUCT_INBAND_MAX) < value.len() {
+                return Reply::err(K_IO_RETURN_IPC_ERROR);
+            }
+            let mut o = (value.len() as u32).to_le_bytes().to_vec();
+            o.extend_from_slice(value);
+            o.resize((o.len() + 3) & !3, 0);
+            Reply::ok(o)
+        }
+        // io_registry_entry_get_property_bin_buf(entry, plane, name, options,
+        // buf, bufsize) -> properties, bufsize: the property serialized in
+        // OSSerializeBinary, into `buf` when it fits, else out of line.
+        (Kobject::IoEntry(i), 2889) => {
+            const K_IO_RETURN_NOT_FOUND: i32 = 0xe00002f0_u32 as i32;
+            const K_IO_REGISTRY_ITERATE_RECURSIVELY: u32 = 1;
+            let Some((plane, next)) = inline_cstr(req, 0, 128) else { return bad() };
+            let Some((name, next)) = inline_cstr_at(req, next, 128) else { return bad() };
+            let (Some(options), Some(buf), Some(bufsize)) = (i32_at(&req.body, next), req.body.get(next + 4..next + 12), req.body.get(next + 12..next + 20)) else { return bad() };
+            let (buf, bufsize) = (u64::from_le_bytes(buf.try_into().unwrap()), u64::from_le_bytes(bufsize.try_into().unwrap()));
+            let Some(node) = super::iokit::tree().get(*i as usize) else { return bad() };
+            let name = String::from_utf8_lossy(name).into_owned();
+            if options as u32 & K_IO_REGISTRY_ITERATE_RECURSIVELY != 0 && !plane.is_empty() || name == "IORegistryEntryPropertyKeys" {
+                let mut r = Reply::err(K_IO_RETURN_NOT_FOUND);
+                r.unimplemented = Some(format!("io_registry_entry_get_property_bin_buf of {name} (recursion or the property keys)"));
+                return r;
+            }
+            let bin = if let Some((_, p)) = node.service_props.iter().find(|(k, _)| *k == name) {
+                super::iokit::serialize_prop(p)
+            } else if let Some((_, value)) = node.props.iter().find(|(k, _)| *k == name) {
+                super::iokit::serialize_data(value)
+            } else {
+                let mut r = Reply::err(K_IO_RETURN_NOT_FOUND);
+                if !node.class.is_empty() {
+                    r.unimplemented = Some(format!("the {} property {name:?}", node.class));
+                }
+                return r;
+            };
+            let mut out = NDR_RECORD.to_vec();
+            if buf != 0 && bin.len() as u64 <= bufsize {
+                match k.darwin_vm_copy_overwrite(buf, &bin) {
+                    Ok(()) => {}
+                    Err(r) => return r,
+                }
+                out.extend_from_slice(&(bin.len() as u64).to_le_bytes());
+                out.extend_from_slice(&0u32.to_le_bytes());
+                let mut r = Reply::ok(out);
+                r.ports.push(PortOut::Ool(Vec::new()));
+                r
+            } else {
+                out.extend_from_slice(&0u64.to_le_bytes());
+                out.extend_from_slice(&(bin.len() as u32).to_le_bytes());
+                let mut r = Reply::ok(out);
+                r.ports.push(PortOut::Ool(bin));
+                r
+            }
+        }
+        // io_service_get_matching_services_bin(main_port, matching, cnt) ->
+        // existing: an iterator of what the dictionary matches.
+        (Kobject::IoMain, 2881) => {
+            const K_IO_RETURN_NOT_READY: i32 = 0xe00002d8_u32 as i32;
+            let Some(n) = arg(req, 0) else { return bad() };
+            let n = n as u32 as usize;
+            let Some(bytes) = req.body.get(NDR + 4..NDR + 4 + n) else { return bad() };
+            let Some(dict) = super::iokit::unserialize_dict(bytes) else {
+                let mut r = Reply::err(K_IO_RETURN_NOT_READY);
+                r.unimplemented = Some(format!("a matching dictionary of nested or other kinds: {:x?}", &bytes[..bytes.len().min(160)]));
+                return r;
+            };
+            match super::iokit::matching(super::iokit::tree(), &dict) {
+                Ok(items) => {
+                    let id = super::iokit::iterator_new(items);
+                    let port = k.ipc().global_port(Kobject::IoIterator(id));
+                    k.ipc().copy_send(port);
+                    Reply::port(Carried::Port(port))
+                }
+                Err(what) => {
+                    let mut r = Reply::err(K_IO_RETURN_NOT_READY);
+                    r.unimplemented = Some(format!("IOService matching: {what}"));
+                    r
+                }
+            }
+        }
+        // io_registry_entry_get_registry_entry_id(entry) -> id. The kernel's
+        // ids are the entries' own; these name the same entries for as long.
+        (Kobject::IoEntry(i), 2871) => Reply::ok((0x1_0000_0000u64 + u64::from(*i)).to_le_bytes().to_vec()),
+        // io_registry_entry_get_parent_iterator(entry, plane) -> iterator.
+        (Kobject::IoEntry(i), 2814) => {
+            let Some((plane, _)) = inline_cstr(req, 0, 128) else { return bad() };
+            let Some(node) = super::iokit::tree().get(*i as usize) else { return bad() };
+            let wanted = if node.class.is_empty() { b"IODeviceTree".as_slice() } else { b"IOService".as_slice() };
+            let parents = node.parent.filter(|_| plane == wanted).map_or(Vec::new(), |p| vec![p]);
+            let id = super::iokit::iterator_new(parents);
+            let port = k.ipc().global_port(Kobject::IoIterator(id));
+            k.ipc().copy_send(port);
+            Reply::port(Carried::Port(port))
+        }
+        // io_service_get_matching_service_bin(main_port, matching) -> first
+        // service, of the dictionary's matches.
+        (Kobject::IoMain, 2880) => {
+            const K_IO_RETURN_NOT_READY: i32 = 0xe00002d8_u32 as i32;
+            let Some(n) = arg(req, 0) else { return bad() };
+            let n = n as u32 as usize;
+            let Some(bytes) = req.body.get(NDR + 4..NDR + 4 + n) else { return bad() };
+            let Some(dict) = super::iokit::unserialize_dict(bytes) else {
+                let mut r = Reply::err(K_IO_RETURN_NOT_READY);
+                r.unimplemented = Some(format!("a matching dictionary of nested or other kinds: {:x?}", &bytes[..bytes.len().min(300)]));
+                return r;
+            };
+            match super::iokit::matching(super::iokit::tree(), &dict) {
+                Ok(items) => match items.first() {
+                    Some(&i) => {
+                        let port = k.ipc().global_port(Kobject::IoEntry(i));
+                        k.ipc().copy_send(port);
+                        Reply::port(Carried::Port(port))
+                    }
+                    None => Reply { ret: KERN_SUCCESS, defer: None, out: Vec::new(), ports: Vec::new(), unimplemented: None }.with_null_port(0),
+                },
+                Err(what) => {
+                    let mut r = Reply::err(K_IO_RETURN_NOT_READY);
+                    r.unimplemented = Some(format!("IOService matching: {what}"));
+                    r
+                }
+            }
+        }
+        // io_registry_entry_get_child_iterator(entry, plane) -> iterator.
+        (Kobject::IoEntry(i), 2813) => {
+            let Some((plane, _)) = inline_cstr(req, 0, 128) else { return bad() };
+            let Some(node) = super::iokit::tree().get(*i as usize) else { return bad() };
+            let wanted = if node.class.is_empty() { b"IODeviceTree".as_slice() } else { b"IOService".as_slice() };
+            let children = if plane == wanted { node.children.clone() } else { Vec::new() };
+            let id = super::iokit::iterator_new(children);
+            let port = k.ipc().global_port(Kobject::IoIterator(id));
+            k.ipc().copy_send(port);
+            Reply::port(Carried::Port(port))
+        }
+        // io_object_conforms_to(object, className) -> conforms.
+        (Kobject::IoEntry(i), 2801) => {
+            let Some((name, _)) = inline_cstr(req, 0, 128) else { return bad() };
+            let Some(node) = super::iokit::tree().get(*i as usize) else { return bad() };
+            let yes = super::iokit::conforms(node, &String::from_utf8_lossy(name));
+            Reply::ok(u32::from(yes).to_le_bytes().to_vec())
+        }
+        // io_object_get_class(object) -> className.
+        (Kobject::IoEntry(i), 2800) => {
+            let Some(node) = super::iokit::tree().get(*i as usize) else { return bad() };
+            let name = if node.class.is_empty() { "IOPlatformDevice" } else { node.class };
+            Reply::ok(io_name_reply(name))
+        }
+        // io_registry_entry_get_name(entry) -> name.
+        (Kobject::IoEntry(i), 2810) => {
+            let Some(node) = super::iokit::tree().get(*i as usize) else { return bad() };
+            Reply::ok(io_name_reply(&node.name))
+        }
+        // io_registry_entry_get_location_in_plane(entry, plane) -> location:
+        // a volume's index in its container.
+        (Kobject::IoEntry(i), 2854) => {
+            let Some(node) = super::iokit::tree().get(*i as usize) else { return bad() };
+            match super::iokit::location(node) {
+                Some(l) => Reply::ok(io_name_reply(&l)),
+                None => Reply::err(0xe00002f0_u32 as i32),
+            }
+        }
+        // io_service_open_extended(service, owningTask, type, ndr,
+        // properties) -> connection, result: the user client, whose methods
+        // are reported when they are called.
+        (Kobject::IoEntry(i), 2862) => {
+            let port = k.ipc().global_port(Kobject::IoConnect(*i));
+            k.ipc().copy_send(port);
+            let mut r = Reply::port(Carried::Port(port));
+            r.out = NDR_RECORD.to_vec();
+            r.out.extend_from_slice(&0i32.to_le_bytes());
+            r
+        }
+        // io_service_close(connection).
+        (Kobject::IoConnect(_), 2816) => Reply::ok(Vec::new()),
+        // io_connect_method(connection, selector, scalars, inband, ool...):
+        // a driver's own protocol. Of AppleAPFSContainer's, selector 9: a
+        // volume's information by its index, which APFSVolumeRoleFind reads
+        // the role from (the first two bytes).
+        (Kobject::IoConnect(i), 2865) => {
+            let Some(selector) = arg(req, 0) else { return bad() };
+            let scalars = arg(req, 1).unwrap_or(0) as u32 as usize;
+            let in_cnt_at = NDR + 8 + 8 * scalars;
+            let inband = i32_at(&req.body, in_cnt_at).unwrap_or(0) as u32 as usize;
+            let bytes = req.body.get(in_cnt_at + 4..in_cnt_at + 4 + inband).unwrap_or(&[]).to_vec();
+            let class = super::iokit::tree().get(*i as usize).map_or("?", |n| n.class);
+            // After the inband input (padded), the ool in address and size.
+            let after = in_cnt_at + 4 + ((inband + 3) & !3) + 16;
+            let out_cnt = i32_at(&req.body, after).unwrap_or(0) as u32 as usize;
+            if class == "AppleAPFSContainer" && selector == 9 && bytes.len() == 8 {
+                let index = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+                let Some(role) = super::iokit::volume_role(index) else { return Reply::err(0xe00002f0_u32 as i32) };
+                let mut info = vec![0u8; out_cnt.min(4096)];
+                if info.len() >= 2 {
+                    info[..2].copy_from_slice(&role.to_le_bytes());
+                }
+                let mut o = (info.len() as u32).to_le_bytes().to_vec();
+                o.extend_from_slice(&info);
+                o.resize((o.len() + 3) & !3, 0);
+                o.extend_from_slice(&0u32.to_le_bytes());
+                o.extend_from_slice(&0u64.to_le_bytes());
+                return Reply::ok(o);
+            }
+            let mut r = Reply::err(0xe00002c7_u32 as i32);
+            r.unimplemented = Some(format!("IOConnectCallMethod on {class}: selector {selector}, {scalars} scalars, {inband} bytes in: {:x?}", &bytes[..bytes.len().min(64)]));
+            r
+        }
+        // io_iterator_next(iterator) -> object, or none left.
+        (Kobject::IoIterator(id), 2802) => match super::iokit::iterator_next(*id) {
+            Some(i) => {
+                let port = k.ipc().global_port(Kobject::IoEntry(i));
+                k.ipc().copy_send(port);
+                Reply::port(Carried::Port(port))
+            }
+            None => Reply { ret: KERN_SUCCESS, defer: None, out: Vec::new(), ports: Vec::new(), unimplemented: None }.with_null_port(0),
         },
         // host_get_special_port(host_priv, node, which) -> port
         (Kobject::Host | Kobject::HostPriv, 412) => match (arg(req, 0), arg(req, 1)) {
@@ -1043,15 +1330,16 @@ fn host_get_special_port(k: &mut Kernel, obj: &Kobject, port: super::ipc::ObjId,
     let p = match id {
         HOST_PORT => k.darwin_host_port(),
         HOST_PRIV_PORT => k.darwin_host_priv_port(),
-        HOST_IO_MAIN_PORT => {
-            let mut r = Reply::err(KERN_INVALID_ARGUMENT);
-            r.unimplemented = Some("the IOKit main port (HOST_IO_MAIN_PORT)".into());
-            return r;
-        }
+        HOST_IO_MAIN_PORT => k.ipc().global_port(Kobject::IoMain),
         _ => {
-            // realhost.special: launchd's ports, which no task here has
-            // set (host_set_special_port).
-            return Reply::ok(Vec::new()).with_null_port(0);
+            // realhost.special: what launchd set.
+            match k.ipc().host_special.iter().find(|&&(w, _)| w == id).map(|&(_, p)| p) {
+                Some(p) => {
+                    k.ipc().copy_send(p);
+                    return Reply::port(Carried::Port(p));
+                }
+                None => return Reply::ok(Vec::new()).with_null_port(0),
+            }
         }
     };
     k.ipc().copy_send(p);

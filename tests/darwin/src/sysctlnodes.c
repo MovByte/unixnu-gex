@@ -79,6 +79,29 @@ int main(void) {
     len = sizeof q;
     if (sysctlbyname("hw.cachelinesize", &q, &len, NULL, 0) != 0 || len != 8 || q != 64) return bad("hw.cachelinesize", (long)len, 8);
 
+    // The device tree's zeroed bytes, whole.
+    unsigned char env[64];
+    memset(env, 0xff, sizeof env);
+    len = sizeof env;
+    if (sysctlbyname("hw.osenvironment", env, &len, NULL, 0) != 0 || len != 32 || env[0] != 0 || env[31] != 0 || env[32] != 0xff) return bad("hw.osenvironment", (long)len, 32);
+
+    // The platform's names, and what only launchd may say.
+    len = sizeof buf;
+    if (sysctlbyname("hw.target", buf, &len, NULL, 0) != 0 || strcmp(buf, "J120AP") != 0) return bad("hw.target", errno, 0);
+    len = sizeof buf;
+    if (sysctlbyname("hw.product", buf, &len, NULL, 0) != 0 || strcmp(buf, "iPad7,1") != 0) return bad("hw.product", errno, 0);
+    int spawned = 1;
+    errno = 0;
+    if (sysctlbyname("kern.initproc_spawned", NULL, NULL, &spawned, sizeof spawned) != -1 || errno != EPERM) return bad("setting kern.initproc_spawned", errno, EPERM);
+
+    // The A10X's features: crypto, and none of ARMv8.1's atomics.
+    w = 7;
+    len = sizeof w;
+    if (sysctlbyname("hw.optional.arm.FEAT_AES", &w, &len, NULL, 0) != 0 || w != 1) return bad("FEAT_AES", w, 1);
+    w = 7;
+    len = sizeof w;
+    if (sysctlbyname("hw.optional.armv8_1_atomics", &w, &len, NULL, 0) != 0 || w != 0) return bad("armv8_1_atomics", w, 0);
+
     // The name of a node that does not exist.
     errno = 0;
     len = sizeof buf;

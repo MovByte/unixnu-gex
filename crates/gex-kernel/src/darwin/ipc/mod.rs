@@ -240,8 +240,16 @@ pub enum Kobject {
     /// IKOT_UX_HANDLER: the kernel's handler that makes an exception a
     /// signal (`ux_handler_port`).
     UxHandler,
+    /// IKOT_MAIN_DEVICE: IOKit's main port, `main_device_port`.
+    IoMain,
+    /// IKOT_IOKIT_OBJECT: a registry entry, by its place in the device tree.
+    IoEntry(u32),
     /// IKOT_FILEPORT: a file port ([`super::fileport`]), by its number.
     FilePort(u32),
+    /// An `io_iterator_t`.
+    IoIterator(u32),
+    /// IKOT_IOKIT_CONNECT: a user client of service `0`.
+    IoConnect(u32),
     /// A thread's kernel reply port (`ith_rpc_reply`): the reply to an RPC
     /// the kernel made for it.
     RpcReply(i32),

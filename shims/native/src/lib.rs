@@ -1168,7 +1168,8 @@ fn run_program_with(
         };
         let tc = read("TrustCache")?;
         let sandbox = read("sandbox_profile.bin")?;
-        gex_kernel::darwin::boot(tc.as_deref(), sandbox).map_err(|e| anyhow!("the boot payload: {e}"))?;
+        let device_tree = read("DeviceTree")?;
+        gex_kernel::darwin::boot(tc.as_deref(), sandbox, device_tree.as_deref()).map_err(|e| anyhow!("the boot payload: {e}"))?;
         // The run's first process: of the user it runs as.
         kernel.dtask.cred = gex_kernel::darwin::cred::Cred::of(uid, gid);
         kernel.dtask.uniqueid = gex_kernel::darwin::next_uniqueid();

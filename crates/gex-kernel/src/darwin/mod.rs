@@ -27,6 +27,7 @@ pub mod exec;
 pub mod fileport;
 pub mod footprint;
 pub mod xattr;
+pub mod iokit;
 pub mod exit;
 pub mod exception;
 pub mod execve;
@@ -85,7 +86,10 @@ pub mod workq;
 /// load is the kernel's panic), without which there are no trust caches;
 /// and the Sandbox kext's platform profile, which the kernelcache
 /// carries. Once per system.
-pub fn boot(trust_cache: Option<&[u8]>, sandbox_platform: Option<Vec<u8>>) -> Result<(), String> {
+pub fn boot(trust_cache: Option<&[u8]>, sandbox_platform: Option<Vec<u8>>, device_tree: Option<&[u8]>) -> Result<(), String> {
+    if let Some(t) = device_tree {
+        iokit::set_tree(t)?;
+    }
     let m = match trust_cache {
         Some(b) => Some(trustcache::load_bundle(b).map_err(|e| format!("failed to load static trust cache module: 0 ({e:?})"))?),
         None => None,

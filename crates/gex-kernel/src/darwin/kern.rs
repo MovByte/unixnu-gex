@@ -1004,6 +1004,16 @@ impl Kernel {
             "kern.procargs2" => self.darwin_sysctl_procargs2(m, tail, req),
             "kern.osreleasetype" => self.darwin_sysctl_osreleasetype(m, req),
             "kern.initproc_spawned" => self.darwin_sysctl_initproc_spawned(m, req),
+            // sysctl_bootobjectspath: on an embedded platform, the boot
+            // manifest's hash in hexadecimal.
+            "kern.bootobjectspath" => match super::iokit::boot_manifest_hash() {
+                Some(h) => {
+                    let mut s: Vec<u8> = h.iter().flat_map(|b| format!("{b:02X}").into_bytes()).collect();
+                    s.push(0);
+                    req.out(m, &s)
+                }
+                None => Err(Errno::ENOENT),
+            },
             "kern.dyld_flags" => self.darwin_sysctl_dyld_flags(m, req),
             _ => match sysctl::value(node.path) {
                 Some(_) if req.new != 0 => {
