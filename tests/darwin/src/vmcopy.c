@@ -1,10 +1,12 @@
 // vm_protect with VM_PROT_COPY: a read-only private mapping and one of a
 // shared file become the task's own copy, writable, the file untouched; an
-// executable copy is refused.
+// executable copy is refused. Also a port's context read and set by the
+// mach_port routines.
 
 #include <errno.h>
 #include <fcntl.h>
 #include <mach/mach.h>
+#include <mach/mach_port.h>
 #include <mach/vm_map.h>
 #include <stdio.h>
 #include <string.h>
@@ -74,6 +76,15 @@ int main(void) {
     munmap(hole, PAGE);
     kr = vm_protect(mach_task_self(), (vm_address_t)hole, PAGE, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
     if (kr != KERN_INVALID_ADDRESS) return bad("a hole", kr, KERN_INVALID_ADDRESS);
+
+    // A port's context.
+    mach_port_t port;
+    if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &port)) return bad("allocate", 1, 0);
+    mach_port_context_t ctx = 77;
+    if (mach_port_get_context(mach_task_self(), port, &ctx) || ctx != 0) return bad("an empty context", ctx, 0);
+    if (mach_port_set_context(mach_task_self(), port, 0x1234567890abcdefull)) return bad("set context", 1, 0);
+    if (mach_port_get_context(mach_task_self(), port, &ctx) || ctx != 0x1234567890abcdefull) return bad("the context", ctx, 0);
+    if (mach_port_get_context(mach_task_self(), 0x12345, &ctx) != KERN_INVALID_NAME) return bad("no such name", 1, 0);
 
     close(ro);
     close(fd);

@@ -607,6 +607,19 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             }
             _ => bad(),
         },
+        // mach_port_get_context_from_user(task, name) -> context.
+        (Kobject::Task | Kobject::TaskRead, 3228) => match arg(req, 0) {
+            Some(name) => match k.ipc().mach_port_get_context(name as u32) {
+                Ok(c) => Reply::ok(c.to_le_bytes().to_vec()),
+                Err(e) => Reply::err(e as i32),
+            },
+            _ => bad(),
+        },
+        // mach_port_set_context(task, name, context).
+        (Kobject::Task, 3229) => match (arg(req, 0), arg64(req, 1)) {
+            (Some(name), Some(c)) => Reply::err(k.ipc().mach_port_set_context(name as u32, c) as i32),
+            _ => bad(),
+        },
         (Kobject::Task, 5404) => Reply::err(KERN_NOT_SUPPORTED),
         // clock_get_time(clock) -> mach_timespec_t
         (Kobject::Clock, 1000) => {
