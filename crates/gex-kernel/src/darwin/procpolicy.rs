@@ -124,6 +124,9 @@ impl Kernel {
                 _ => return Err(Errno::EINVAL),
             }
         }
+        if self.dtask.policy.is_none() {
+            self.dtask.policy = self.procs.task_policy(self.pid);
+        }
         let Some(tp) = self.dtask.policy.clone() else {
             self.darwin_unimplemented("iopolicysys without the task's policy".into());
             return Err(Errno::EINVAL);
