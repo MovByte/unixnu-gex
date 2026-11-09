@@ -837,6 +837,10 @@ impl Kernel {
         let linux_prot = (p & 1) | (p & 2) | (p & 4);
         let attrs = super::vm::Attrs { alias: (flags >> 24) as u8, no_cache: flags & vmf::NO_CACHE != 0, ..Default::default() };
         if fixed {
+            // ... the address is within bounds (`vm_map_enter`).
+            if start < self.dtask.map_min || start.checked_add(len).is_none_or(|e| e > self.darwin_map_max()) {
+                return kr::INVALID_ADDRESS;
+            }
             // Without VM_FLAGS_OVERWRITE a fixed request over anything
             // mapped fails.
             if flags & vmf::OVERWRITE == 0 && self.mem.lock().vmas().iter().any(|v| v.start < start + len && start < v.end) {
@@ -900,10 +904,11 @@ impl Kernel {
     }
 
     /// The range a map's anywhere allocations are made in
-    /// (`vm_map_get_range` of a map without user ranges: from its first
-    /// page to its end), within the memory gex backs, its high arena.
+    /// (`vm_map_get_range` of a map without user ranges: from its minimum
+    /// or its first page to its end), within the memory gex backs, its high
+    /// arena.
     pub(crate) fn darwin_effective_range(&self) -> (u64, u64) {
-        (gex_abi::HIGH_ARENA_BASE.max(PAGE_MASK + 1), self.darwin_map_max().min(gex_abi::LIMIT64))
+        (gex_abi::HIGH_ARENA_BASE.max(self.dtask.map_min).max(PAGE_MASK + 1), self.darwin_map_max().min(gex_abi::LIMIT64))
     }
 
     /// `vm_map_random_address_for_size`: up to 1000 random page-aligned

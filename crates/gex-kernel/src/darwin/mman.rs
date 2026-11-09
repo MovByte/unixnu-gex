@@ -282,6 +282,10 @@ impl Kernel {
             cur &= !(prot::EXECUTE as u8);
         }
         attrs.max = maxprot;
+        // KERN_INVALID_ADDRESS, as mmap says it: the map has no such place.
+        if flags & FIXED != 0 && (addr < self.dtask.map_min || addr.checked_add(size).is_none_or(|e| e > self.darwin_map_max())) {
+            return Err(Errno::ENOMEM);
+        }
         // Anywhere: vm_map_enter's search from the rounded hint; out of
         // space past a hint, once more from the map's first page.
         if flags & FIXED == 0 && !jit {
