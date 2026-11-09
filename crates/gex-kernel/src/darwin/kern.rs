@@ -306,6 +306,9 @@ impl Kernel {
         if let Some(r) = self.darwin_fs_call(m, raw, a) {
             return Some(res(r));
         }
+        if let Some(r) = self.darwin_fixed_call(m, raw, a) {
+            return Some(res(r));
+        }
         if let Some(write) = super::fsops::vectored(raw) {
             if let Err(e) = self.darwin_uio_check(m, write, a) {
                 return Some(neg(e));
@@ -434,6 +437,8 @@ impl Kernel {
             sys::FPATHCONF => res(self.darwin_fpathconf(a[0] as i32, a[1] as i32)),
             sys::FREADLINK => res(self.darwin_freadlink(m, a[0] as i32, a[1], a[2])),
             sys::GETDTABLESIZE => self.fds.limit() as u64,
+            // CONFIG_AUDIT is not in an arm64 kernel: these are its stubs.
+            sys::AUDIT | sys::AUDITON | sys::GETAUID | sys::SETAUID | sys::GETAUDIT_ADDR | sys::SETAUDIT_ADDR | sys::AUDITCTL | sys::AUDIT_SESSION_SELF | sys::AUDIT_SESSION_JOIN | sys::AUDIT_SESSION_PORT => neg(Errno::ENOSYS),
             sys::CLONEFILEAT => res(self.darwin_clonefileat(m, a)),
             sys::FCLONEFILEAT => res(self.darwin_fclonefileat(m, a)),
             sys::EXCHANGEDATA => res(self.darwin_exchangedata(m, a)),

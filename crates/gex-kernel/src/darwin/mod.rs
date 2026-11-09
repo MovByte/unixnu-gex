@@ -34,6 +34,7 @@ pub mod exception;
 pub mod execve;
 pub mod fsops;
 pub mod ioctl;
+pub mod fixedcalls;
 pub mod clonefile;
 pub mod pathconf;
 pub mod itimer;
@@ -255,6 +256,8 @@ pub struct Task {
     /// `thread_guard_violation`'s pending exception of a guarded descriptor,
     /// its code and subcode, for the call's way out (`fd_guard_ast`).
     pub fd_guard: Option<(u64, u64)>,
+    /// `p_debugger`.
+    pub p_debugger: bool,
     /// What has been reported as not done, so each is said once.
     said: std::collections::HashSet<String>,
     /// Under strict mode, the unimplemented thing that stops the process
