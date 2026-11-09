@@ -1161,10 +1161,9 @@ impl Kernel {
         if size == 0 {
             return kr::SUCCESS;
         }
-        if new & prot::COPY != 0 {
-            // A copy-on-write remapping of the range (vm_map_remap).
-            self.darwin_unimplemented("mach_vm_protect VM_PROT_COPY".into());
-            return kr::FAILURE;
+        // VM_MAP_POLICY_WX_FAIL: code signing's map takes no executable copy.
+        if new & prot::COPY != 0 && new & prot::EXECUTE != 0 {
+            return kr2::PROTECTION_FAILURE;
         }
         let (s, e) = (start & !PAGE_MASK, (start + size + PAGE_MASK) & !PAGE_MASK);
         let vmas: Vec<(u64, u64, u64)> = {
@@ -1182,6 +1181,21 @@ impl Kernel {
         }
         if at < e {
             return kr::INVALID_ADDRESS;
+        }
+        if new & prot::COPY != 0 {
+            // vm_map_remap in place, copy on write: the range's entries
+            // become this task's own memory, with write access allowed,
+            // their file-backed pages no longer written back. The shared
+            // region's entry is cut around the copy.
+            self.mem.lock().log.shared_maps.cut(s, e - s);
+            self.dtask.vm.clip_range(s, e);
+            self.dtask.vm.update(s, e, |a| {
+                a.kind = super::vm::kind::ANON;
+                a.max |= prot::WRITE as u8;
+                a.cow = false;
+                a.jit = false;
+                a.shared = false;
+            });
         }
         let new = new & prot::ALL;
         let pieces = self.dtask.vm.pieces(s, e);
