@@ -105,6 +105,8 @@ pub fn translate(raw: u64, a: &mut [u64; 6]) -> u64 {
         }
         sys::READ | sys::READ_NOCANCEL => nr::READ,
         sys::WRITE | sys::WRITE_NOCANCEL => nr::WRITE,
+        sys::READV | sys::READV_NOCANCEL => nr::READV,
+        sys::WRITEV | sys::WRITEV_NOCANCEL => nr::WRITEV,
         sys::CLOSE | sys::CLOSE_NOCANCEL => nr::CLOSE,
         sys::DUP => nr::DUP,
         sys::PREAD | sys::PREAD_NOCANCEL => nr::PREAD64,

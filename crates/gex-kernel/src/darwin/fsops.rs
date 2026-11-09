@@ -47,6 +47,15 @@ fn dirent_len(namlen: usize) -> usize {
     (264 + (namlen + 1) - 256 + 3) & !3
 }
 
+/// Whether `raw` is a vectored read (false) or write (true).
+pub(crate) fn vectored(raw: u64) -> Option<bool> {
+    match raw {
+        sys::READV | sys::READV_NOCANCEL | sys::PREADV | sys::PREADV_NOCANCEL => Some(false),
+        sys::WRITEV | sys::WRITEV_NOCANCEL | sys::PWRITEV | sys::PWRITEV_NOCANCEL => Some(true),
+        _ => None,
+    }
+}
+
 impl Kernel {
     /// `kdebug_typefilter(addr, size)`: the filter's page, read-only, its
     /// zeros saying no event passes (ktrace is off here, and the memory
@@ -61,6 +70,79 @@ impl Kernel {
         self.dtask.vm.update(at, at + TYPEFILTER_ALLOC_SIZE, |a| a.inherit = super::vm::inherit::SHARE);
         m.write_u64(addr, at)?;
         Ok(0)
+    }
+
+    /// `readv_uio`'s and `writev_uio`'s count and copyin of the vector.
+    pub(crate) fn darwin_uio_copyin(&self, m: &GuestMem<'_>, iov: u64, cnt: i32) -> Result<Vec<(u64, u64)>, Errno> {
+        const UIO_MAXIOV: i32 = 1024;
+        if cnt <= 0 || cnt > UIO_MAXIOV {
+            return Err(Errno::EINVAL);
+        }
+        let mut v = Vec::with_capacity(cnt as usize);
+        for i in 0..u64::from(cnt as u32) {
+            v.push((m.read_u64(iov + 16 * i)?, m.read_u64(iov + 16 * i + 8)?));
+        }
+        Ok(v)
+    }
+
+    /// A vectored call's way in: its vector, the descriptor and its access
+    /// (`preparefileread`, `preparefilewrite`), then
+    /// `uio_calculateresid_user`'s limit on its lengths.
+    pub(crate) fn darwin_uio_check(&mut self, m: &GuestMem<'_>, write: bool, a: &[u64; 6]) -> Result<(), Errno> {
+        let vecs = self.darwin_uio_copyin(m, a[1], a[2] as i32)?;
+        let file = self.fds.get(a[0] as i32)?;
+        if !(if write { file.writable } else { file.readable }) {
+            return Err(Errno::EBADF);
+        }
+        let mut resid = 0u64;
+        for (_, len) in vecs {
+            if len > i64::MAX as u64 {
+                return Err(Errno::EINVAL);
+            }
+            resid += len;
+            if resid > i64::MAX as u64 {
+                return Err(Errno::EINVAL);
+            }
+        }
+        Ok(())
+    }
+
+    /// `sys_preadv` and `sys_pwritev`: `valid_for_random_access`, then each
+    /// vector transferred at the offset the ones before it reached. Bytes
+    /// already moved make an interrupted call a short one (`fp_readv`).
+    pub(crate) fn darwin_prwv(&mut self, m: &mut GuestMem<'_>, write: bool, a: &[u64; 6]) -> Result<u64, Errno> {
+        let fd = a[0] as i32;
+        let file = self.fds.get(fd)?;
+        if !(if write { file.writable } else { file.readable }) {
+            return Err(Errno::EBADF);
+        }
+        let random_access = !matches!(file.handle.metadata().map(|md| md.file_type), Err(_) | Ok(crate::vfs::FileType::Socket | crate::vfs::FileType::Fifo))
+            && std::sync::Arc::clone(&file.handle).as_kqueue().is_none()
+            && std::sync::Arc::clone(&file.handle).as_posix_shm().is_none();
+        if !random_access {
+            return Err(Errno::ESPIPE);
+        }
+        if file.is_tty() {
+            return Err(Errno::ENXIO);
+        }
+        let call = if write { nr::PWRITE64 } else { nr::PREAD64 };
+        let mut total = 0u64;
+        for (base, len) in self.darwin_uio_copyin(m, a[1], a[2] as i32)? {
+            if len == 0 {
+                continue;
+            }
+            match self.canonical(m, call, [a[0], base, len, a[3].wrapping_add(total), 0, 0]) {
+                Ok(n) => {
+                    total += n;
+                    if n < len {
+                        break;
+                    }
+                }
+                Err(e) if total > 0 && matches!(e, Errno::EINTR | Errno::EAGAIN) => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(total)
     }
 
     /// `mount(type, dir, flags, data)`, of a bind mount; another file

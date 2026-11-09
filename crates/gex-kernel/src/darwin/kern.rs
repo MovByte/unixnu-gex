@@ -324,6 +324,11 @@ impl Kernel {
         if let Some(r) = self.darwin_fs_call(m, raw, a) {
             return Some(res(r));
         }
+        if let Some(write) = super::fsops::vectored(raw) {
+            if let Err(e) = self.darwin_uio_check(m, write, a) {
+                return Some(neg(e));
+            }
+        }
         Some(match raw {
             // dyld asks where the shared cache is mapped; the kernel mapped
             // it before the process started.
@@ -544,6 +549,8 @@ impl Kernel {
             {
                 neg(self.darwin_shm_io(a[0], true))
             }
+            sys::PREADV | sys::PREADV_NOCANCEL => res(self.darwin_prwv(m, false, a)),
+            sys::PWRITEV | sys::PWRITEV_NOCANCEL => res(self.darwin_prwv(m, true, a)),
             // A family or an option this kernel has no Linux counterpart for
             // is refused where the caller is told, and said.
             sys::SOCKET | sys::SOCKETPAIR if !matches!(a[0], 0..=2) => {
