@@ -1713,6 +1713,17 @@ impl ProcTable {
         self.virtual_init.store(on, Ordering::Release);
     }
 
+    /// A program started as pid 1 on Darwin: `bsd_utaskbootstrap` clones it
+    /// from the kernel's process, whose group and session are 0, and it
+    /// leads neither until it calls `setsid`.
+    pub fn darwin_initproc_in_kernel_group(&self) {
+        let mut t = self.lock();
+        if let Some(p) = t.procs.iter_mut().find(|p| p.pid == INIT_PID) {
+            p.pgid = 0;
+            p.sid = 0;
+        }
+    }
+
     /// The exit code the machine is halting with, if it is.
     pub fn halt_code(&self) -> Option<i32> {
         if let Some(r) = self.remote {
@@ -1914,6 +1925,16 @@ mod tests {
         assert_eq!(t.pgid(a, 0), Ok(INIT_PID));
         assert_eq!(t.sid(a, 0), Ok(INIT_PID));
         assert_eq!(t.ppid(a), INIT_PID);
+    }
+
+    #[test]
+    fn a_darwin_initproc_starts_in_the_kernels_group() {
+        let t = ProcTable::new();
+        t.darwin_initproc_in_kernel_group();
+        assert_eq!(t.pgid(INIT_PID, 0), Ok(0));
+        assert_eq!(t.sid(INIT_PID, 0), Ok(0));
+        assert_eq!(t.setsid(INIT_PID), Ok(INIT_PID));
+        assert_eq!(t.pgid(INIT_PID, 0), Ok(INIT_PID));
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub mod rflag {
     pub const PERTHR_LIMIT: u32 = 0x02;
     pub const DEADLINE: u32 = 0x04;
     pub const FATAL_CPUMON: u32 = 0x08;
+    pub const FATAL_WAKEUPSMON: u32 = 0x10;
 }
 
 /// `TASK_POLICY_RESOURCE_ATTRIBUTE_*` (as `PROC_POLICY_RSRCACT_*`).
@@ -44,6 +45,29 @@ const MINIMUM_CPULIMIT_INTERVAL: u64 = 1_000_000;
 
 /// `LEDGER_LIMIT_INFINITY`.
 const LIMIT_INFINITY: i64 = i64::MAX;
+
+/// `TASK_WAKEUPS_MONITOR_DEFAULT_LIMIT` (per second) and
+/// `TASK_WAKEUPS_MONITOR_DEFAULT_INTERVAL` (in seconds).
+const WAKEUPS_DEFAULT_RATE: i32 = 150;
+const WAKEUPS_INTERVAL: i64 = 300;
+
+/// The limit on a task's `interrupt_wakeups` ledger entry, which is what
+/// the wakeups monitor is. The entry's count is not kept: no task is told
+/// of crossing it, and turning the monitor to a rate of a task's own is
+/// reported.
+#[derive(Clone, Copy, Debug)]
+pub struct WakeupsMonitor {
+    pub limit: i64,
+    pub period: u64,
+    pub callback: bool,
+}
+
+impl Default for WakeupsMonitor {
+    /// `task_create_internal`: every task starts with the defaults on.
+    fn default() -> WakeupsMonitor {
+        WakeupsMonitor { limit: i64::from(WAKEUPS_DEFAULT_RATE) * WAKEUPS_INTERVAL, period: WAKEUPS_INTERVAL as u64 * NSEC_PER_SEC, callback: true }
+    }
+}
 
 /// A task's CPU usage limits (`task->rusage_cpu_*`, `policy_ru_cpu*`).
 #[derive(Clone, Copy, Debug, Default)]
@@ -139,6 +163,95 @@ fn abs_to_ns(abs: u64) -> u64 {
 }
 
 impl Kernel {
+    /// `proc_rlimit_control(pid, flavor, arg)`.
+    pub(crate) fn darwin_proc_rlimit_control(&mut self, m: &mut crate::GuestMem<'_>, a: &[u64; 6]) -> Result<u64, crate::errno::Errno> {
+        use crate::errno::Errno;
+        const RLIMIT_WAKEUPS_MONITOR: i32 = 1;
+        const RLIMIT_CPU_USAGE_MONITOR: i32 = 2;
+        const RLIMIT_THREAD_CPULIMITS: i32 = 3;
+        const CPUMON_MAKE_FATAL: u32 = 0x1000;
+        let (pid, flavor, arg) = (a[0] as i32, a[1] as i32, a[2]);
+        if pid != -1 && pid != self.pid {
+            if !self.procs.exists(pid) {
+                return Err(Errno::ESRCH);
+            }
+            self.darwin_unimplemented(format!("proc_rlimit_control flavor {flavor} of another process"));
+            return Err(Errno::EINVAL);
+        }
+        match flavor {
+            RLIMIT_WAKEUPS_MONITOR => {
+                let (mut flags, mut rate) = (m.read_u32(arg)?, m.read_u32(arg + 4)? as i32);
+                if !self.darwin_wakeups_monitor_ctl(&mut flags, &mut rate) {
+                    return Err(Errno::EINVAL);
+                }
+                m.write_u32(arg, flags)?;
+                m.write_u32(arg + 4, rate as u32)?;
+                Ok(0)
+            }
+            RLIMIT_CPU_USAGE_MONITOR => {
+                if arg as u32 & CPUMON_MAKE_FATAL == 0 {
+                    return Err(Errno::EINVAL);
+                }
+                self.dtask.cpuusage.flags |= rflag::FATAL_CPUMON;
+                Ok(0)
+            }
+            RLIMIT_THREAD_CPULIMITS => {
+                if pid != -1 || !(1..100).contains(&(arg as u32 & 0xff)) {
+                    return Err(Errno::EINVAL);
+                }
+                self.darwin_unimplemented("proc_rlimit_control RLIMIT_THREAD_CPULIMITS (a thread blocked at its limit)".into());
+                Err(Errno::EINVAL)
+            }
+            // CONFIG_LEDGER_INTERVAL_MAX is not in a device's kernel, and so
+            // not RLIMIT_FOOTPRINT_INTERVAL.
+            _ => Err(Errno::EINVAL),
+        }
+    }
+
+    /// `task_wakeups_monitor_ctl`; false for KERN_INVALID_ARGUMENT.
+    fn darwin_wakeups_monitor_ctl(&mut self, flags: &mut u32, rate: &mut i32) -> bool {
+        const WAKEMON_ENABLE: u32 = 0x01;
+        const WAKEMON_DISABLE: u32 = 0x02;
+        const WAKEMON_GET_PARAMS: u32 = 0x04;
+        const WAKEMON_SET_DEFAULTS: u32 = 0x08;
+        const WAKEMON_MAKE_FATAL: u32 = 0x10;
+        let w = self.dtask.wakeups;
+        if *flags & WAKEMON_GET_PARAMS != 0 {
+            if w.limit != LIMIT_INFINITY {
+                *rate = (w.limit / (w.period / NSEC_PER_SEC) as i64) as i32;
+                *flags = WAKEMON_ENABLE;
+                if self.dtask.cpuusage.flags & rflag::FATAL_WAKEUPSMON != 0 {
+                    *flags |= WAKEMON_MAKE_FATAL;
+                }
+            } else {
+                *flags = WAKEMON_DISABLE;
+                *rate = -1;
+            }
+            return true;
+        }
+        if *flags & WAKEMON_ENABLE != 0 {
+            let defaults = *flags & WAKEMON_SET_DEFAULTS != 0;
+            if defaults {
+                *rate = WAKEUPS_DEFAULT_RATE;
+            }
+            if *flags & WAKEMON_MAKE_FATAL != 0 {
+                self.dtask.cpuusage.flags |= rflag::FATAL_WAKEUPSMON;
+            }
+            if *rate <= 0 {
+                return false;
+            }
+            if !defaults {
+                self.darwin_unimplemented(format!("the wakeups monitor at {} per second (the task's interrupt wakeups are not counted)", *rate));
+            }
+            self.dtask.wakeups = WakeupsMonitor { limit: i64::from(*rate) * WAKEUPS_INTERVAL, period: WAKEUPS_INTERVAL as u64 * NSEC_PER_SEC, callback: true };
+        } else if *flags & WAKEMON_DISABLE != 0 {
+            // The refill and callback go; the limit stays, and a later
+            // WAKEMON_GET_PARAMS still reports it.
+            self.dtask.wakeups.callback = false;
+        }
+        true
+    }
+
     /// `proc_set_task_ruse_cpu(task, policy, percentage, interval,
     /// deadline, cpumon_entitled)` on this task: the policy's scope (a
     /// percentage for THROTTLE and NOTIFY_EXC, a deadline for SUSPEND,

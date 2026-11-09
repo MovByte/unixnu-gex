@@ -182,6 +182,8 @@ pub struct After {
     pub inherit: Vec<i32>,
     /// `psa_max_addr`: the highest address the new map is to have.
     pub max_addr: u64,
+    /// The crash behavior a spawn of an entitled parent asked for.
+    pub crash_behavior: u32,
     /// `psa_pcontrol`, when the spawn had attributes.
     pub pcontrol: Option<i32>,
     /// `psa_cpumonitor_percent` and `psa_cpumonitor_interval` (seconds).
@@ -515,10 +517,6 @@ impl Kernel {
             }
         }
         if let Some(at) = &attr {
-            if at.crash_behavior != 0 && self.dtask.codesign.as_ref().is_some_and(|c| c.entitled("com.apple.private.spawn-panic-crash-behavior")) {
-                self.darwin_unimplemented("posix_spawn's panic-on-crash behavior".into());
-                return Err(Errno::EINVAL);
-            }
             // exec_validate_spawnattr_policy.
             if at.apptype & PROC_TYPE_MASK == PROC_TYPE_DRIVER && !self.dtask.codesign.as_ref().is_some_and(|c| c.entitled("com.apple.private.spawn-driver")) {
                 return Err(Errno::EPERM);
@@ -579,7 +577,7 @@ impl Kernel {
     fn darwin_spawn_child(&mut self, m: &GuestMem<'_>, child: &mut Kernel, attr: Option<&Attr>, file_actions: Option<&[u8]>, port_actions: Option<&[u8]>, creds: &SpawnCreds, path: u64, argv: u64, envv: u64) -> Result<(), Errno> {
         let flags = attr.map_or(0, |a| a.flags);
         let policy = attr.map_or((0, 0, 0), |a| super::taskpolicy::spawn_attrs(a.apptype, a.qos_clamp, a.darwin_role));
-        let mut after = After { flags, policy, sigmask: attr.map_or(0, |a| a.sigmask), sigdefault: attr.map_or(0, |a| a.sigdefault), inherit: Vec::new(), max_addr: attr.map_or(0, |a| a.max_addr), pcontrol: attr.map(|a| a.pcontrol), cpumonitor: attr.map_or((0, 0), |a| (a.cpumonitor_percent, a.cpumonitor_interval)) };
+        let mut after = After { flags, policy, sigmask: attr.map_or(0, |a| a.sigmask), sigdefault: attr.map_or(0, |a| a.sigdefault), inherit: Vec::new(), max_addr: attr.map_or(0, |a| a.max_addr), crash_behavior: if self.dtask.codesign.as_ref().is_some_and(|c| c.entitled("com.apple.private.spawn-panic-crash-behavior")) { attr.map_or(0, |a| a.crash_behavior) } else { 0 }, pcontrol: attr.map(|a| a.pcontrol), cpumonitor: attr.map_or((0, 0), |a| (a.cpumonitor_percent, a.cpumonitor_interval)) };
         if let Some(fa) = file_actions {
             after.inherit = child.darwin_file_actions(fa, flags)?;
         }
@@ -808,7 +806,7 @@ impl Kernel {
                 let _ = copy.fds.set_clofork(fd, true);
             }
         }
-        let mut after = After { flags: at.flags, policy: super::taskpolicy::spawn_attrs(at.apptype, at.qos_clamp, at.darwin_role), sigmask: at.sigmask, sigdefault: at.sigdefault, inherit: Vec::new(), max_addr: at.max_addr, pcontrol: Some(at.pcontrol), cpumonitor: (at.cpumonitor_percent, at.cpumonitor_interval) };
+        let mut after = After { flags: at.flags, policy: super::taskpolicy::spawn_attrs(at.apptype, at.qos_clamp, at.darwin_role), sigmask: at.sigmask, sigdefault: at.sigdefault, inherit: Vec::new(), max_addr: at.max_addr, crash_behavior: if self.dtask.codesign.as_ref().is_some_and(|c| c.entitled("com.apple.private.spawn-panic-crash-behavior")) { at.crash_behavior } else { 0 }, pcontrol: Some(at.pcontrol), cpumonitor: (at.cpumonitor_percent, at.cpumonitor_interval) };
         let activated = (|| {
             if let Some(fa) = file_actions {
                 after.inherit = copy.darwin_file_actions(fa, at.flags)?;

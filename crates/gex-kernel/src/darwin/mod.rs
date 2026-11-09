@@ -114,6 +114,10 @@ pub struct Task {
     pub rlim_cpu: (i64, i32),
     /// The task's CPU usage limits (`rusage_cpu_*`).
     pub cpuusage: cpumon::CpuUsage,
+    /// `p_vfs_iopolicy`.
+    pub vfs_iopolicy: u32,
+    /// The task's wakeups monitor.
+    pub wakeups: cpumon::WakeupsMonitor,
     pub threads: thread::Threads,
     pub waits: wait::Waits,
     pub ulocks: thread::Ulocks,
@@ -219,6 +223,8 @@ pub struct Task {
     /// Its map's highest address when an entitlement or a spawn raised it
     /// (`vm_map_set_max_addr`); 0 for [`vm::MAP_MAX`].
     pub map_max: u64,
+    /// `p_crash_behavior`, from a spawn of a parent entitled to set it.
+    pub crash_behavior: u32,
     /// Its map's lowest address (`vm_map_min`): the end of the image's
     /// page zero.
     pub map_min: u64,
@@ -463,7 +469,7 @@ pub fn bsd_call(m: &GuestMem<'_>, ctx_addr: u64, raw: u64) -> Bsd {
     } else {
         (m.read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(0) as u16 as u64, 1)
     };
-    if code >= sysno::NSYSENT {
+    if code == 0 || code >= sysno::NSYSENT {
         Bsd::Nosys
     } else if sysno::ENOSYS.contains(&code) {
         Bsd::Enosys

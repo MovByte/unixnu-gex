@@ -48,6 +48,21 @@ fn dirent_len(namlen: usize) -> usize {
 }
 
 impl Kernel {
+    /// `kdebug_typefilter(addr, size)`: the filter's page, read-only, its
+    /// zeros saying no event passes (ktrace is off here, and the memory
+    /// entry of the real thing would be shared with it).
+    pub(crate) fn darwin_kdebug_typefilter(&mut self, m: &mut GuestMem<'_>, addr: u64, size: u64) -> Result<u64, Errno> {
+        const TYPEFILTER_ALLOC_SIZE: u64 = 16384;
+        if addr == 0 || size == 0 {
+            return Err(Errno::EINVAL);
+        }
+        let at = self.darwin_vm_allocate_anywhere(m, TYPEFILTER_ALLOC_SIZE).map_err(|_| Errno::ENOMEM)?;
+        self.vm_protect(m, at, TYPEFILTER_ALLOC_SIZE, false, super::mach::prot::READ);
+        self.dtask.vm.update(at, at + TYPEFILTER_ALLOC_SIZE, |a| a.inherit = super::vm::inherit::SHARE);
+        m.write_u64(addr, at)?;
+        Ok(0)
+    }
+
     /// `mount(type, dir, flags, data)`, of a bind mount; another file
     /// system's is reported.
     pub(crate) fn darwin_mount(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {

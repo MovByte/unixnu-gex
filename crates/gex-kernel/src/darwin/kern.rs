@@ -358,6 +358,7 @@ impl Kernel {
             // VFS_SYNC of each mount: what a process writes goes through to
             // its file already.
             sys::SYNC => 0,
+            sys::IOPOLICYSYS => res(self.darwin_iopolicysys(m, a[0] as i32, a[1])),
             sys::FSYNC | sys::FSYNC_NOCANCEL | sys::FDATASYNC => res(self.darwin_fsync(m, a[0] as i32)),
             sys::MOUNT => res(self.darwin_mount(m, a)),
             sys::GETXATTR => res(self.darwin_getxattr(m, false, a)),
@@ -370,7 +371,11 @@ impl Kernel {
             sys::FLISTXATTR => res(self.darwin_listxattr(m, true, a)),
             sys::FILEPORT_MAKEPORT => res(self.darwin_fileport_makeport(m, a[0] as i32, a[1])),
             sys::FILEPORT_MAKEFD => res(self.darwin_fileport_makefd(a[0] as u32)),
+            // kdebug_enable is off, so the events go nowhere (kdebug.c).
+            sys::KDEBUG_TRACE | sys::KDEBUG_TRACE64 | sys::KDEBUG_TRACE_STRING => 0,
+            sys::KDEBUG_TYPEFILTER => res(self.darwin_kdebug_typefilter(m, a[0], a[1])),
             sys::FSCTL => res(self.darwin_fsctl(m, a)),
+            sys::PROC_RLIMIT_CONTROL => res(self.darwin_proc_rlimit_control(m, a)),
             sys::FFSCTL => res(self.darwin_ffsctl(m, a)),
             sys::GETRUSAGE => res(self.darwin_getrusage(m, a[0] as i32, a[1])),
             sys::THREAD_SELFUSAGE => res(self.darwin_thread_selfusage()),

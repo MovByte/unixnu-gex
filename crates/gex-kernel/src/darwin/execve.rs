@@ -529,6 +529,7 @@ impl Kernel {
             },
             // Until the image's policies make it (`vm_map_set_max_addr`).
             map_max: spawn.map_or(0, |s| s.max_addr),
+            crash_behavior: spawn.map_or(0, |s| s.crash_behavior),
             map_min: 0,
             // The new proc's p_pcaction is clear (forkproc), and its
             // P_LVMRSRCOWNER; a spawn's child has what its spawn set.

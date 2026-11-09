@@ -61,6 +61,102 @@ pub mod sub {
 }
 
 impl Kernel {
+    /// `iopolicysys(cmd, arg)`, of the disk's policy; the file system's
+    /// policies each keep a bit of their own, which are not kept here.
+    pub(crate) fn darwin_iopolicysys(&mut self, m: &mut crate::GuestMem<'_>, cmd: i32, arg: u64) -> Result<u64, crate::errno::Errno> {
+        use crate::errno::Errno;
+        const IOPOL_CMD_GET: i32 = 1;
+        const IOPOL_CMD_SET: i32 = 2;
+        const IOPOL_TYPE_DISK: u32 = 0;
+        const IOPOL_TYPE_VFS_ALLOW_LOW_SPACE_WRITES: u32 = 9;
+        const IOPOL_SCOPE_PROCESS: u32 = 0;
+        const IOPOL_SCOPE_THREAD: u32 = 1;
+        const IOPOL_SCOPE_DARWIN_BG: u32 = 2;
+        const IOPOL_DEFAULT: u32 = 0;
+        const IOPOL_IMPORTANT: u32 = 1;
+        const IOPOL_PASSIVE: u32 = 2;
+        const IOPOL_THROTTLE: u32 = 3;
+        const IOPOL_UTILITY: u32 = 4;
+        const IOPOL_STANDARD: u32 = 5;
+        let (scope, iotype, mut policy) = (m.read_u32(arg)?, m.read_u32(arg + 4)?, m.read_u32(arg + 8)?);
+        if iotype == IOPOL_TYPE_VFS_ALLOW_LOW_SPACE_WRITES {
+            // iopolicysys_vfs_allow_lowspace_writes: this process's alone.
+            const ENTITLEMENT: &str = "com.apple.private.vfs.allow-low-space-writes";
+            const P_VFS_IOPOLICY_ALLOW_LOW_SPACE_WRITES: u32 = 0x010;
+            const OFF: u32 = 0;
+            const ON: u32 = 1;
+            if scope != IOPOL_SCOPE_PROCESS {
+                return Err(Errno::EINVAL);
+            }
+            if cmd == IOPOL_CMD_GET {
+                let v = if self.dtask.vfs_iopolicy & P_VFS_IOPOLICY_ALLOW_LOW_SPACE_WRITES != 0 { ON } else { OFF };
+                m.write_u32(arg + 8, v)?;
+                return Ok(0);
+            }
+            if !self.darwin_task_entitled(ENTITLEMENT) {
+                return Err(Errno::EPERM);
+            }
+            match policy {
+                OFF => self.dtask.vfs_iopolicy &= !P_VFS_IOPOLICY_ALLOW_LOW_SPACE_WRITES,
+                ON => self.dtask.vfs_iopolicy |= P_VFS_IOPOLICY_ALLOW_LOW_SPACE_WRITES,
+                _ => {}
+            }
+            return Ok(0);
+        }
+        if iotype != IOPOL_TYPE_DISK {
+            self.darwin_unimplemented(format!("iopolicysys type {iotype} (the file system's I/O policies)"));
+            return Err(Errno::EINVAL);
+        }
+        match scope {
+            IOPOL_SCOPE_PROCESS => {}
+            IOPOL_SCOPE_THREAD => {
+                self.darwin_unimplemented("iopolicysys of a thread (a thread's own I/O tier)".into());
+                return Err(Errno::EINVAL);
+            }
+            // A platform other than the Mac has none: BG is always throttled.
+            IOPOL_SCOPE_DARWIN_BG => return Err(Errno::EOPNOTSUPP),
+            _ => return Err(Errno::EINVAL),
+        }
+        if cmd == IOPOL_CMD_SET {
+            match policy {
+                IOPOL_DEFAULT => policy = IOPOL_IMPORTANT,
+                IOPOL_UTILITY | IOPOL_THROTTLE | IOPOL_IMPORTANT | IOPOL_STANDARD | IOPOL_PASSIVE => {}
+                _ => return Err(Errno::EINVAL),
+            }
+        }
+        let Some(tp) = self.dtask.policy.clone() else {
+            self.darwin_unimplemented("iopolicysys without the task's policy".into());
+            return Err(Errno::EINVAL);
+        };
+        let mut tp = tp.lock().unwrap_or_else(|e| e.into_inner());
+        match cmd {
+            IOPOL_CMD_SET => {
+                let (tier, passive) = match policy {
+                    IOPOL_PASSIVE => (0, true),
+                    IOPOL_STANDARD => (1, false),
+                    IOPOL_UTILITY => (2, false),
+                    IOPOL_THROTTLE => (3, false),
+                    _ => (0, false),
+                };
+                tp.set_int_iopol(tier, passive);
+                Ok(0)
+            }
+            IOPOL_CMD_GET => {
+                let got = match (tp.requested.int_iotier, tp.requested.int_iopassive) {
+                    (0, true) => IOPOL_PASSIVE,
+                    (0, false) => IOPOL_DEFAULT,
+                    (1, _) => IOPOL_STANDARD,
+                    (2, _) => IOPOL_UTILITY,
+                    _ => IOPOL_THROTTLE,
+                };
+                drop(tp);
+                m.write_u32(arg + 8, got)?;
+                Ok(0)
+            }
+            _ => Err(Errno::EINVAL),
+        }
+    }
+
     /// `process_policy(scope, action, policy, policy_subtype, attrp,
     /// target_pid, target_threadid)`: the target (0 or the caller's pid is
     /// the caller) found (ESRCH), the caller allowed it (iOS: root, a

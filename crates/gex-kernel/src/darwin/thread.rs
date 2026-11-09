@@ -874,6 +874,11 @@ impl Kernel {
         self.darwin_kevent_ast(m);
     }
 
+    /// The BSD call the thread last made.
+    pub(crate) fn darwin_uu_syscall_code(&mut self) -> u64 {
+        self.darwin_me().syscall_code
+    }
+
     /// The BSD call the thread is in (`uu_syscall_code`).
     pub(crate) fn darwin_set_syscall_code(&mut self, code: u64) {
         self.darwin_me().syscall_code = code;

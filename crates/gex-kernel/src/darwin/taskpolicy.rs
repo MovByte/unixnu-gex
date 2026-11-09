@@ -280,6 +280,13 @@ impl TaskPolicy {
         self.update(false);
     }
 
+    /// `proc_set_task_policy(TASK_POLICY_INTERNAL, TASK_POLICY_IOPOL)`.
+    pub fn set_int_iopol(&mut self, tier: u8, passive: bool) {
+        self.requested.int_iotier = tier;
+        self.requested.int_iopassive = passive;
+        self.update(false);
+    }
+
     /// `proc_set_task_policy(TASK_POLICY_ROLE)`.
     pub fn set_role(&mut self, r: u8) {
         self.requested.role = r;

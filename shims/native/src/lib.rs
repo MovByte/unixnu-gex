@@ -1139,7 +1139,8 @@ fn run_program_with(
     };
     // Report the host's identity: with hostfs passthrough, a guest that
     // stats a file and then calls getuid must see a consistent answer.
-    let (uid, gid) = opts.identity.unwrap_or_else(host_identity);
+    // Darwin's first process is cloned from the kernel's, and is root.
+    let (uid, gid) = if opts.darwin && opts.exe.as_deref() == Some("/sbin/launchd") { (0, 0) } else { opts.identity.unwrap_or_else(host_identity) };
     let mut kernel = Kernel {
         trace: opts.trace,
         creds: gex_kernel::syscalls::Creds::new(uid, gid),
@@ -1195,6 +1196,8 @@ fn run_program_with(
         let pid = kernel.procs.spawn(gex_kernel::proc::INIT_PID);
         kernel.pid = pid;
         kernel.tid = pid;
+    } else if opts.darwin && fresh && kernel.pid == gex_kernel::proc::INIT_PID {
+        kernel.procs.darwin_initproc_in_kernel_group();
     }
     if opts.darwin {
         kernel.darwin_signals_init();

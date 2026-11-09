@@ -10256,8 +10256,10 @@ impl Kernel {
                 }
             }
             if self.darwin {
-                let name = crate::darwin::sysno::name(raw).unwrap_or("?");
-                self.darwin_unimplemented(format!("BSD call {raw} ({name})"));
+                // The call itself: an indirect one (x16 zero) names it in x0.
+                let code = self.darwin_uu_syscall_code();
+                let name = crate::darwin::sysno::name(code).unwrap_or("?");
+                self.darwin_unimplemented(format!("BSD call {code} ({name})"));
             }
             r
         } else {

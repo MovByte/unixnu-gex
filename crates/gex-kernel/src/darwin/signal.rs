@@ -838,6 +838,9 @@ impl Kernel {
     /// and nothing is seen, unless a handler was set; that one is sent it
     /// on the way out of a call.
     pub(crate) fn darwin_prepareexit(&mut self, d: u32) {
+        if self.dtask.crash_behavior != 0 {
+            self.darwin_unimplemented(format!("a process spawned with crash behavior {:#x} ending (signal {d}): the system would panic", self.dtask.crash_behavior));
+        }
         use super::reason::flag;
         let flags = self.procs.exit_reason(self.pid).and_then(|n| super::reason::of(&n)).map(|r| r.flags);
         let killed = self.dtask.csflags.load(std::sync::atomic::Ordering::Acquire) & super::amfi::cs::KILLED != 0;
