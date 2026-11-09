@@ -4281,7 +4281,8 @@ impl MapIo<'_> {
                             maps.remember(s);
                         }
                     }
-                    maps.retain(|s| s.start + s.len <= a[0] || s.start >= a[0] + a[1]);
+                    let len = mm.up(a[1]);
+                    mm.log.shared_maps.cut(a[0], len);
                 }
                 self.retire_code_why(a[0], a[1], "munmap", 0);
                 let mapped: Vec<(u64, u64)> = {
@@ -4440,7 +4441,11 @@ impl MapIo<'_> {
             // And a shared file mapping it replaces ends as an unmap ends
             // it: written back, and no longer handed to the next mapper.
             self.flush_shared(m, addr, len)?;
-            self.mem.lock().log.shared_maps.retain(|s| s.start + s.len <= addr || s.start >= addr + len);
+            {
+                let mut mm = self.mem.lock();
+                let aligned = mm.up(len);
+                mm.log.shared_maps.cut(addr, aligned);
+            }
         }
         if flags & mflags::ANONYMOUS == 0 && fd >= 0 {
             // A private file mapping is an eager copy, which is exactly
@@ -8771,6 +8776,49 @@ impl SharedMaps {
         s.holders.remove(h);
         self.publish();
         Unalias::Keep
+    }
+
+    /// The mappings over `[addr, addr + len)` (page aligned) end there:
+    /// what an `munmap` or a fixed mapping leaves of one either side of the
+    /// range is still a mapping, written back with its own pages' hashes.
+    /// A mapping with aliases goes whole, the holders' addresses being its
+    /// own and not a part of it.
+    pub fn cut(&mut self, addr: u64, len: u64) {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        const P: u64 = crate::mem::PAGE_SIZE;
+        let end = addr.saturating_add(len);
+        let mut changed = false;
+        let mut out = Vec::with_capacity(self.list.len());
+        for s in self.list.drain(..) {
+            let s_end = s.start + s.len;
+            if s_end <= addr || s.start >= end {
+                out.push(s);
+                continue;
+            }
+            changed = true;
+            if s.holders.len() != 1 {
+                continue;
+            }
+            for (lo, hi) in [(s.start, addr.min(s_end)), (end.max(s.start), s_end)] {
+                if lo >= hi {
+                    continue;
+                }
+                let pages = s.pages.iter().skip(((lo - s.start) / P) as usize).take(((hi - lo) / P) as usize).map(|h| AtomicU64::new(h.load(Relaxed))).collect();
+                out.push(SharedMap {
+                    start: lo,
+                    len: hi - lo,
+                    file: Arc::clone(&s.file),
+                    offset: s.offset + (lo - s.start),
+                    holders: vec![(lo, hi - lo)],
+                    pages,
+                    changes: Arc::new(AtomicU64::new(s.changes.load(Relaxed))),
+                });
+            }
+        }
+        self.list = out;
+        if changed {
+            self.publish();
+        }
     }
 
     /// Keep the mappings `keep` says to; publishes only on a change.
@@ -16607,6 +16655,27 @@ mod tests {
     /// was the old program's: the new one's mapping of the same file was
     /// handed the old address (and saw whatever the new image had there), and
     /// its exit wrote that memory into the file.
+    #[test]
+    fn a_partial_unmap_leaves_the_rest_of_a_shared_mapping_written_back() {
+        use crate::mem::{flags as mf, prot, PAGE_SIZE as P};
+        let (_, mut k) = setup();
+        let mut buf = vec![0u8; 0x0708_0000];
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        let rw = (prot::READ | prot::WRITE) as u64;
+        m.write(0x20000, b"/x\0").unwrap();
+        let fd = sys_locked(&mut m, &mut k, at, nr::OPENAT, &[(-100i64) as u64, 0x20000, (oflags::O_RDWR | oflags::O_CREAT) as u64, 0o644]) as u64;
+        assert_eq!(sys_locked(&mut m, &mut k, at, nr::FTRUNCATE, &[fd, 3 * P]), 0);
+        assert_eq!(sys_locked(&mut m, &mut k, at, nr::MMAP, &[0x07010000, 3 * P, rw, mf::SHARED | mf::FIXED, fd, 0]), 0x07010000);
+        assert_eq!(sys_locked(&mut m, &mut k, at, nr::MUNMAP, &[0x07010000 + P, P]), 0);
+        let maps: Vec<(u64, u64, u64)> = k.mem.lock().log.shared_maps.iter().map(|s| (s.start, s.len, s.offset)).collect();
+        assert_eq!(maps, vec![(0x07010000, P, 0), (0x07010000 + 2 * P, P, 2 * P)]);
+        m.write(0x07010000 + 2 * P, b"tail").unwrap();
+        k.map_io().flush_shared(&m, 0x07010000 + 2 * P, P).unwrap();
+        assert_eq!(sys_locked(&mut m, &mut k, at, nr::PREAD64, &[fd, 0x21000, 4, 2 * P]), 4);
+        assert_eq!(m.read(0x21000, 4).unwrap(), b"tail");
+    }
+
     #[test]
     fn an_exec_leaves_no_shared_mapping_behind() {
         use crate::mem::{flags as mf, prot};
