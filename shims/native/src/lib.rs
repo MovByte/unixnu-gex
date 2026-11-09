@@ -295,6 +295,9 @@ struct HostState {
     /// thread rather than the process live in `thread` and are installed
     /// under the lock; see [`ThreadState`].
     kernel: Arc<Mutex<Kernel>>,
+    /// This thread's processor time (a Darwin thread's), which the host's
+    /// translating its code is kept out of.
+    cpu: Option<gex_kernel::cpu::ThreadCpu>,
     /// This thread's identity.
     thread: ThreadState,
     memory: Option<gex_mem::GuestMemory>,
@@ -1295,6 +1298,7 @@ fn run_program_with(
             jit: None,
             spawn: None,
             pending_spawn: None,
+            cpu: None,
             pending_fork: None,
             pending_exec: None,
             store_limits: store_limits(),
@@ -2398,7 +2402,8 @@ fn run_thread_loop(
     let gate = store.data().spawn.as_ref().map(|s| Arc::clone(&s.gate));
     let memory = store.data().memory.clone();
     // The thread's processor time counts from here, on this host thread.
-    store.data_mut().with_kernel(|k| k.thread_cpu_start());
+    let cpu = store.data_mut().with_kernel(|k| k.thread_cpu_start());
+    store.data_mut().cpu = cpu;
     loop {
         // A Darwin thread made, or about to resume, while its task is held
         // waits first (thread_create's thread_hold, thread_apc_ast).
@@ -3093,6 +3098,7 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             jit: None,
             spawn: Some(Arc::clone(&cx)),
             pending_spawn: None,
+            cpu: None,
             pending_fork: None,
             pending_exec: None,
             store_limits: store_limits(),
@@ -3519,6 +3525,7 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option
             jit: None,
             spawn: Some(Arc::clone(&cx)),
             pending_spawn: None,
+            cpu: None,
             pending_fork: None,
             pending_exec: None,
             store_limits: store_limits(),
@@ -5936,6 +5943,20 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
 /// table, so freshly translated code shares state with everything already
 /// running and can branch into it through the table.
 fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<bool> {
+    // The host's work, not the guest thread's: its time is not the
+    // thread's processor time.
+    let cpu = caller.data().cpu.as_ref().map(|c| c.handle());
+    if let Some(c) = &cpu {
+        c.pause();
+    }
+    let r = translate_and_install_body(caller, pc);
+    if let Some(c) = &cpu {
+        c.resume();
+    }
+    r
+}
+
+fn translate_and_install_body(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<bool> {
     // No translator in this build: nothing is ever translated.
     if cfg!(not(feature = "translate")) {
         return Ok(false);

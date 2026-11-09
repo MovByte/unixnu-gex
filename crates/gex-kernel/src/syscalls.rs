@@ -9702,11 +9702,14 @@ impl Kernel {
 
     /// The calling thread begins to run its program on this host thread:
     /// its processor time is counted from now.
-    pub fn thread_cpu_start(&mut self) {
+    pub fn thread_cpu_start(&mut self) -> Option<crate::cpu::ThreadCpu> {
         if self.darwin {
             let tid = self.tid;
-            self.signals.thread().cpu.start(tid);
+            let t = self.signals.thread();
+            t.cpu.start(tid);
+            return Some(t.cpu.handle());
         }
+        None
     }
 
     /// Handle one system call (`svc #0`, or `syscall`).

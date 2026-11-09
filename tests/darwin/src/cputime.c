@@ -1,5 +1,7 @@
 // Processor time: a thread's clock (CLOCK_THREAD_CPUTIME_ID, from
-// thread_selfusage) runs while it computes and not while it sleeps; the
+// thread_selfusage) runs while it computes and not while it sleeps (nor
+// while the host translates its code: a new process's main thread has
+// used little of it by main); the
 // process's (getrusage RUSAGE_SELF) holds the same time; a child's, reaped,
 // is its parent's RUSAGE_CHILDREN, a child killed as it computes too.
 
@@ -43,6 +45,7 @@ static void spin(uint64_t ns) {
 int main(void) {
     const uint64_t ms = 1000000;
     uint64_t t0 = thread_ns(), u0 = usage_ns(RUSAGE_SELF);
+    if (t0 > 500 * ms) return bad("the main thread's time by main", (long)(t0 / ms), 0);
     spin(100 * ms);
     uint64_t t1 = thread_ns(), u1 = usage_ns(RUSAGE_SELF);
     if (t1 - t0 < 100 * ms) return bad("the thread's clock", (long)((t1 - t0) / ms), 100);

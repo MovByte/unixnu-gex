@@ -23,6 +23,9 @@ enum State {
     Kernel,
     /// In a call that blocked: the host's wait is not the thread's time.
     Blocked,
+    /// The host translating the thread's code: the runtime's work, which
+    /// the device has no counterpart of.
+    Host,
     Ended,
 }
 
@@ -34,6 +37,10 @@ struct Inner {
     last: u64,
     state: State,
     tid: i32,
+    /// How deep the host's work on the thread is ([`ThreadCpu::pause`]),
+    /// and the state it interrupted.
+    paused: u32,
+    resumes: State,
 }
 
 /// One guest thread's processor time.
@@ -65,7 +72,7 @@ impl ThreadCpu {
             State::Unstarted => {}
             State::User => i.user += now.saturating_sub(i.last),
             State::Kernel => i.sys += now.saturating_sub(i.last),
-            State::Blocked | State::Ended => {}
+            State::Blocked | State::Host | State::Ended => {}
         }
         if i.state != State::Ended {
             i.last = now;
@@ -101,6 +108,48 @@ impl ThreadCpu {
         i.user = 0;
         i.sys = 0;
         Some(t)
+    }
+
+    /// Another handle on the same thread's time (the host's, for
+    /// [`Self::pause`]).
+    pub fn handle(&self) -> ThreadCpu {
+        ThreadCpu(Arc::clone(&self.0))
+    }
+
+    /// The host begins work of its own on the thread (translating its
+    /// code): not the thread's time, until [`Self::resume`]. Nests.
+    pub fn pause(&self) {
+        let state = {
+            let mut i = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            i.paused += 1;
+            if i.paused > 1 {
+                return;
+            }
+            i.state
+        };
+        if matches!(state, State::User | State::Kernel) {
+            self.0.lock().unwrap_or_else(|e| e.into_inner()).resumes = state;
+            self.sample(State::Host);
+        } else {
+            self.0.lock().unwrap_or_else(|e| e.into_inner()).resumes = state;
+        }
+    }
+
+    /// The host's work on the thread is done: its time counts again, in
+    /// the state it was in.
+    pub fn resume(&self) {
+        let back = {
+            let mut i = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            if i.paused == 0 {
+                return;
+            }
+            i.paused -= 1;
+            if i.paused > 0 || i.state != State::Host {
+                return;
+            }
+            i.resumes
+        };
+        self.sample(back);
     }
 
     /// The thread ends; its times are final.
