@@ -252,6 +252,7 @@ fn flavor_size(f: u32) -> Option<(u32, bool)> {
 /// `proc_info`'s and `proc_pidinfo`'s errors as Darwin numbers them.
 mod e {
     pub const EPERM: i32 = 1;
+    pub const EBADF: i32 = 9;
     pub const EACCES: i32 = 13;
     pub const EFAULT: i32 = 14;
     pub const ENAMETOOLONG: i32 = 63;
@@ -317,6 +318,7 @@ impl Kernel {
             // (`pid` is the list's type, `flavor` its argument.)
             call::LISTPIDS => self.darwin_listpids(m, pid as u32, fl, buf, size),
             call::PIDINFO => self.darwin_proc_pidinfo(m, pid, fl, arg, buf, size),
+            call::PIDFDINFO => self.darwin_proc_pidfdinfo(m, pid, fl, arg as i32, buf, size),
             call::DIRTYCONTROL => return self.darwin_dirtycontrol(pid, fl, arg),
             call::SETCONTROL => self.darwin_setcontrol(m, pid, fl, arg, buf, size),
             call::TERMINATE => return self.darwin_proc_terminate(pid),
@@ -343,9 +345,9 @@ impl Kernel {
                 Ok(0)
             }
             call::PIDORIGINATORINFO => self.darwin_pidoriginatorinfo(m, pid, fl, buf, size),
-            // PIDFDINFO, KERNMSGBUF, PIDFILEPORTINFO, PIDRUSAGE,
-            // LISTCOALITIONS, CANUSEFGHW, PIDDYNKQUEUEINFO, TERMINATE_RSR.
-            3 | 4 | 6 | 9 | 11..=13 | 16 => {
+            // KERNMSGBUF, PIDFILEPORTINFO, PIDRUSAGE, LISTCOALITIONS,
+            // CANUSEFGHW, PIDDYNKQUEUEINFO, TERMINATE_RSR.
+            4 | 6 | 9 | 11..=13 | 16 => {
                 self.darwin_unimplemented(format!("proc_info call {callnum} (flavor {fl})"));
                 Err(e::EINVAL)
             }
@@ -613,6 +615,80 @@ impl Kernel {
             return Err(e::EPERM);
         }
         Ok(())
+    }
+
+    /// `proc_pidfdinfo(pid, flavor, fd, buffer, buffersize)`, of a vnode.
+    fn darwin_proc_pidfdinfo(&mut self, m: &mut GuestMem<'_>, pid: i32, fl: u32, fd: i32, buf: u64, bufsize: u32) -> Result<u64, i32> {
+        const PIDFDVNODEINFO: u32 = 1;
+        const PIDFDVNODEPATHINFO: u32 = 2;
+        const VNODE: u32 = 1;
+        const MAXPATHLEN: usize = 1024;
+        let size: u32 = match fl {
+            PIDFDVNODEINFO => 176,
+            PIDFDVNODEPATHINFO => 1200,
+            3..=10 => {
+                self.darwin_unimplemented(format!("proc_pidfdinfo flavor {fl} (a socket, semaphore, shared memory object, pipe, kqueue or channel)"));
+                return Err(e::EINVAL);
+            }
+            _ => return Err(e::EINVAL),
+        };
+        if bufsize < size {
+            return Err(e::ENOMEM);
+        }
+        let Some((target, _)) = self.darwin_public(pid) else { return Err(e::ESRCH) };
+        self.darwin_proc_info_policy(Some(&target), call::PIDFDINFO, true)?;
+        let Some(fds) = target.fds.as_ref() else {
+            self.darwin_unimplemented("proc_pidfdinfo of a process in another memory".into());
+            return Err(e::EINVAL);
+        };
+        let Ok(file) = fds.get(fd) else { return Err(e::EBADF) };
+        if fdtype(&file) != VNODE {
+            return Err(e::EBADF);
+        }
+        let Ok(md) = file.metadata() else { return Err(e::EBADF) };
+        let mut out = Vec::with_capacity(size as usize);
+        // fill_fileinfo: the file's flags as fg_flag has them (FFLAGS), one
+        // descriptor's own state, and its guard's.
+        let lflags = file.darwin_lflags.load(std::sync::atomic::Ordering::Acquire) & (super::lockf::FWASLOCKED | super::ioctl::fflag::FNOCACHE | super::ioctl::fflag::FNORDAHEAD | super::ioctl::fflag::FNODIRECT | super::ioctl::fflag::FSINGLE_WRITER);
+        let openflags = (super::bsd::open_flags_back(file.flags()) + 1) as u32 | lflags;
+        let mut status: u32 = 0;
+        // This lookup holds one reference, and the table another.
+        if Arc::strong_count(&file) > 2 {
+            status |= 1;
+        }
+        if fds.cloexec(fd).unwrap_or(false) {
+            status |= 2;
+        }
+        if fds.clofork(fd) {
+            status |= 8;
+        }
+        let mut guardflags: u32 = 0;
+        if let Some(g) = fds.guard(fd) {
+            use super::guarded::attr;
+            status |= 4;
+            for (a, bit) in [(attr::CLOSE, 1), (attr::DUP, 2), (attr::SOCKET_IPC, 4), (attr::FILEPORT, 8)] {
+                if g.has(a) {
+                    guardflags |= bit;
+                }
+            }
+        }
+        out.extend_from_slice(&openflags.to_le_bytes());
+        out.extend_from_slice(&status.to_le_bytes());
+        out.extend_from_slice(&file.offset().to_le_bytes());
+        out.extend_from_slice(&VNODE.to_le_bytes());
+        out.extend_from_slice(&guardflags.to_le_bytes());
+        let path = self.vfs.canonical(&file.path);
+        let mnt = super::kern::mount_of(&path);
+        let st = crate::fs::Stat { uid: self.creds.uid(), gid: self.creds.gid(), dev: u64::from(mnt.fsid as u32), ..Kernel::stat_from(&md) }.encode_darwin();
+        out.extend_from_slice(&vnode_info(&st, md.file_type, mnt.fsid as u32, super::kern::vfsstat::APFS_TYPENUM));
+        if fl == PIDFDVNODEPATHINFO {
+            let mut p = [0u8; MAXPATHLEN];
+            let n = path.len().min(MAXPATHLEN - 1);
+            p[..n].copy_from_slice(&path.as_bytes()[..n]);
+            out.extend_from_slice(&p);
+        }
+        m.write(buf, &out).map_err(|_| 14)?;
+        Ok(u64::from(size))
     }
 
     /// `proc_pidinfo(pid, 0, 0, flavor, arg, buffer, buffersize)`.
@@ -906,6 +982,32 @@ impl Kernel {
 }
 
 /// A descriptor's `PROX_FDTYPE_*` (its file glob's `DTYPE_*`).
+/// `fill_vnodeinfo`'s `struct vnode_info`: `vinfo_stat` from the descriptor's
+/// `stat64`, as `munge_vinfo_stat` lays it out, then the vnode's type and
+/// its mount's `f_fsid`.
+fn vnode_info(st: &[u8], ty: crate::vfs::FileType, fsid: u32, fsid2: u32) -> [u8; 152] {
+    use crate::vfs::FileType as T;
+    let mut v = [0u8; 152];
+    v[..24].copy_from_slice(&st[..24]);
+    // The times, then size and blocks.
+    v[24..104].copy_from_slice(&st[32..112]);
+    // blksize, flags, gen, then rdev.
+    v[104..116].copy_from_slice(&st[112..124]);
+    v[116..120].copy_from_slice(&st[24..28]);
+    let vtype: u32 = match ty {
+        T::Regular => 1,
+        T::Directory => 2,
+        T::CharDevice => 4,
+        T::Symlink => 5,
+        T::Socket => 6,
+        T::Fifo => 7,
+    };
+    v[136..140].copy_from_slice(&vtype.to_le_bytes());
+    v[144..148].copy_from_slice(&fsid.to_le_bytes());
+    v[148..152].copy_from_slice(&fsid2.to_le_bytes());
+    v
+}
+
 fn fdtype(f: &Arc<crate::file::OpenFile>) -> u32 {
     const VNODE: u32 = 1;
     const SOCKET: u32 = 2;
