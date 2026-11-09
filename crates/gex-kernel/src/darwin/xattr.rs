@@ -79,6 +79,16 @@ impl Kernel {
         }
     }
 
+    /// `setattrlist_setfinderinfo`: `vn_setxattr` with XATTR_NOSECURITY.
+    pub(crate) fn darwin_set_finderinfo(&mut self, fd: i32, path: Option<&str>, follow: bool, info: &[u8; 32]) -> Result<(), Errno> {
+        let target = match path {
+            Some(p) => Target::Path(p.to_string(), follow),
+            None => Target::File(self.fds.get(fd)?),
+        };
+        let name = format!("{PREFIX}com.apple.FinderInfo");
+        self.darwin_xattr_op(&target, XattrOp::Set { name: &name, value: info, flags: 0 }).map(|_| ()).map_err(xattr_errno)
+    }
+
     /// `getxattr` and `fgetxattr`: the value or, with no buffer, its size.
     pub(crate) fn darwin_getxattr(&mut self, m: &mut GuestMem<'_>, by_fd: bool, a: &[u64; 6]) -> Result<u64, Errno> {
         let (value, size, position, options) = (a[2], a[3], a[4] as u32, a[5] as u32 as u64);

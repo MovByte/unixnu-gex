@@ -290,7 +290,217 @@ fn deliver(m: &mut GuestMem<'_>, buf: u64, r: &Reply) -> Result<u64, Errno> {
     Ok(0)
 }
 
+/// `ATTR_CMN_SETMASK` and the other groups', `ATTR_MAX_BUFFER`.
+const CMN_SETMASK: u32 = 0x51c7_ff00;
+const CMN_VOLSETMASK: u32 = 0x0000_6700;
+const VOL_SETMASK: u32 = 0x8000_2000;
+const VOL_INFO: u32 = 0x8000_0000;
+const FILE_SETMASK: u32 = 0x0000_0020;
+const FILE_DEVTYPE: u32 = 0x0000_0020;
+const MAX_BUFFER: u64 = 8192;
+const FSOPT_UTIMES_NULL: u64 = 0x2;
+const S_IWUSR: u32 = 0o200;
+const ALLPERMS: u32 = 0o7777;
+
+/// What `setattrlist_internal` unpacks and this kernel applies.
+#[derive(Default)]
+struct SetAttrs {
+    modtime: Option<(i64, u32)>,
+    acctime: Option<(i64, u32)>,
+    mode: Option<u32>,
+    finderinfo: Option<[u8; 32]>,
+    /// The attributes the filesystems here cannot keep, by name.
+    missing: Vec<&'static str>,
+}
+
+/// `attrlist_unpack_fixed` over the caller's buffer.
+struct Unpack<'a> {
+    buf: &'a [u8],
+    at: usize,
+}
+
+impl Unpack<'_> {
+    fn take(&mut self, n: usize) -> Result<&[u8], Errno> {
+        if self.at + n > self.buf.len() {
+            return Err(Errno::EINVAL);
+        }
+        let s = &self.buf[self.at..self.at + n];
+        self.at += n;
+        Ok(s)
+    }
+
+    fn u32(&mut self) -> Result<u32, Errno> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    /// `ATTR_UNPACK_TIME` of a 64-bit process.
+    fn time(&mut self) -> Result<(i64, u32), Errno> {
+        let b = self.take(16)?;
+        Ok((i64::from_le_bytes(b[..8].try_into().unwrap()), i64::from_le_bytes(b[8..].try_into().unwrap()) as u32))
+    }
+}
+
+/// `setattrlist_internal`'s validation and unpacking.
+fn unpack_setattrs(alist: &AttrList, buf: &[u8]) -> Result<SetAttrs, Errno> {
+    use al::cmn;
+    let set = &alist.set;
+    let mut c = Unpack { buf, at: 0 };
+    let mut out = SetAttrs::default();
+    if set.common & cmn::SCRIPT != 0 {
+        c.u32()?;
+        out.missing.push("ATTR_CMN_SCRIPT");
+    }
+    if set.common & cmn::CRTIME != 0 {
+        c.time()?;
+        out.missing.push("ATTR_CMN_CRTIME");
+    }
+    if set.common & cmn::MODTIME != 0 {
+        out.modtime = Some(c.time()?);
+    }
+    // Quietly ignored: the change time is advisory.
+    if set.common & cmn::CHGTIME != 0 {
+        c.time()?;
+    }
+    if set.common & cmn::ACCTIME != 0 {
+        out.acctime = Some(c.time()?);
+    }
+    if set.common & cmn::BKUPTIME != 0 {
+        c.time()?;
+        out.missing.push("ATTR_CMN_BKUPTIME");
+    }
+    if set.common & cmn::FNDRINFO != 0 {
+        out.finderinfo = Some(c.take(32)?.try_into().unwrap());
+    }
+    if set.common & cmn::OWNERID != 0 {
+        c.u32()?;
+        out.missing.push("ATTR_CMN_OWNERID");
+    }
+    if set.common & cmn::GRPID != 0 {
+        c.u32()?;
+        out.missing.push("ATTR_CMN_GRPID");
+    }
+    if set.common & cmn::ACCESSMASK != 0 {
+        out.mode = Some(c.u32()?);
+    }
+    if set.common & cmn::FLAGS != 0 {
+        c.u32()?;
+        out.missing.push("ATTR_CMN_FLAGS");
+    }
+    if set.common & cmn::EXTENDED_SECURITY != 0 {
+        c.take(8)?;
+        out.missing.push("ATTR_CMN_EXTENDED_SECURITY");
+    }
+    if set.common & cmn::UUID != 0 {
+        c.take(16)?;
+        out.missing.push("ATTR_CMN_UUID");
+    }
+    if set.common & cmn::GRPUUID != 0 {
+        c.take(16)?;
+        out.missing.push("ATTR_CMN_GRPUUID");
+    }
+    if set.common & cmn::ADDEDTIME != 0 {
+        c.time()?;
+        out.missing.push("ATTR_CMN_ADDEDTIME");
+    }
+    // The class is ignored, as F_SETPROTECTIONCLASS's is.
+    if set.common & cmn::DATA_PROTECT_FLAGS != 0 {
+        c.u32()?;
+    }
+    if set.vol & vol::NAME != 0 {
+        out.missing.push("ATTR_VOL_NAME");
+    }
+    if set.file & FILE_DEVTYPE != 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(out)
+}
+
 impl Kernel {
+    /// `setattrlist(path, alist, attributeBuffer, bufferSize, options)`.
+    pub(crate) fn darwin_setattrlist(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
+        self.darwin_setattrlist_at(m, dirfd(super::bsd::AT_FDCWD as u64) as i32, a[0], a[1], a[2], a[3], a[4])
+    }
+
+    /// `setattrlistat(fd, path, alist, attributeBuffer, bufferSize, options)`.
+    pub(crate) fn darwin_setattrlistat(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
+        self.darwin_setattrlist_at(m, dirfd(a[0]) as i32, a[1], a[2], a[3], a[4], a[5])
+    }
+
+    /// `fsetattrlist(fd, alist, attributeBuffer, bufferSize, options)`.
+    pub(crate) fn darwin_fsetattrlist(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
+        let file = self.fds.get(a[0] as i32)?;
+        if self.darwin_vnode_of(&file).is_none() {
+            return Err(Errno::EINVAL);
+        }
+        self.darwin_setattrlist_at(m, a[0] as i32, 0, a[1], a[2], a[3], a[4])
+    }
+
+    /// `setattrlist_internal`. A `path` of zero means the open descriptor
+    /// `dir`.
+    #[allow(clippy::too_many_arguments)]
+    fn darwin_setattrlist_at(&mut self, m: &mut GuestMem<'_>, dir: i32, path: u64, alist: u64, buf: u64, size: u64, options: u64) -> Result<u64, Errno> {
+        let follow = options & (fsopt::NOFOLLOW | fsopt::NOFOLLOW_ANY) == 0;
+        // The vnode first, as namei finds it before the attributes are read.
+        let target = if path == 0 {
+            None
+        } else {
+            let p = self.path_io().at_path(m, dir, path)?;
+            let md = if follow { self.vfs.metadata(&p) } else { self.vfs.metadata_nofollow(&p) }?;
+            Some((p, md))
+        };
+        let alist = read_alist(m, alist)?;
+        if alist.bitmapcount != al::BIT_MAP_COUNT {
+            return Err(Errno::EINVAL);
+        }
+        let set = alist.set;
+        let bad = if set.vol != 0 {
+            set.vol & !VOL_SETMASK != 0 || set.common & !CMN_VOLSETMASK != 0 || set.file != 0 || set.fork != 0
+        } else {
+            set.common & !CMN_SETMASK != 0 || set.file & !FILE_SETMASK != 0 || set.dir != 0 || set.fork != 0
+        };
+        if bad {
+            return Err(Errno::EINVAL);
+        }
+        if set.common == 0 && set.vol & !VOL_INFO == 0 && set.dir == 0 && set.file == 0 && set.fork == 0 {
+            return Ok(0);
+        }
+        if size > MAX_BUFFER {
+            return Err(Errno::ENOMEM);
+        }
+        let bytes = m.read(buf, size as usize)?.to_vec();
+        let attrs = unpack_setattrs(&alist, &bytes)?;
+        if let Some(what) = attrs.missing.first() {
+            self.darwin_unimplemented(format!("setattrlist of {what} (the filesystems here do not keep it)"));
+            return Err(Errno::EINVAL);
+        }
+        let _ = options & FSOPT_UTIMES_NULL;
+        // Finder Info goes first when the owner is losing write access, so
+        // that the mode change does not stop it.
+        let finder_first = attrs.mode.is_some_and(|mode| mode & S_IWUSR == 0);
+        if finder_first {
+            if let Some(info) = &attrs.finderinfo {
+                self.darwin_set_finderinfo(dir, target.as_ref().map(|(p, _)| p.as_str()), follow, info)?;
+            }
+        }
+        if attrs.modtime.is_some() || attrs.acctime.is_some() {
+            self.path_io().set_times_at(m, dir, path, attrs.acctime, attrs.modtime, follow)?;
+        }
+        if let Some(mode) = attrs.mode {
+            let mode = u64::from(mode & ALLPERMS);
+            if path == 0 {
+                self.canonical(m, crate::syscalls::nr::FCHMOD, [dir as u64, mode, 0, 0, 0, 0])?;
+            } else {
+                self.canonical(m, crate::syscalls::nr::FCHMODAT, [dir as i64 as u64, path, mode, if follow { 0 } else { 0x100 }, 0, 0])?;
+            }
+        }
+        if !finder_first {
+            if let Some(info) = &attrs.finderinfo {
+                self.darwin_set_finderinfo(dir, target.as_ref().map(|(p, _)| p.as_str()), follow, info)?;
+            }
+        }
+        Ok(0)
+    }
+
     /// `getattrlist(path, alist, attributeBuffer, bufferSize, options)`.
     pub(crate) fn darwin_getattrlist(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
         self.attrlist_path(m, -100, a[0], a[1], a[2], a[3], a[4])
