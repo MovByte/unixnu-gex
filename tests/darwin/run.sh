@@ -57,8 +57,7 @@ check() {
 }
 
 # check_root NAME WANT_OUT WANT_STATUS [ARGS...]: a dynamic program, run
-# from the root's /var/tmp (its /tmp is the guest's own, in memory, so a
-# program there could not see its own file).
+# from the root's /var/tmp.
 check_root() {
     name=$1 want_out=$2 want_status=$3
     shift 3

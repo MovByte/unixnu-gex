@@ -3917,8 +3917,10 @@ fn mount_filesystems(
     // (whose count `GEX_CPUS` may differ from), as glibc's get_nprocs and
     // Wine's topology read them.
     kernel.vfs.mount("/sys/devices/system/cpu", Arc::new(gex_kernel::vfs::SysCpuFs));
-    if opts.sysroot.is_some() {
-        // A sysroot has no host /tmp behind it, so give the guest one.
+    if opts.sysroot.as_ref().is_some_and(|root| !std::path::Path::new(root).join("tmp").is_symlink()) {
+        // A sysroot has no host /tmp behind it, so give the guest one. One
+        // whose /tmp links elsewhere (an iOS root's, to private/var/tmp) has
+        // it there.
         kernel.vfs.mount("/tmp", Arc::new(TmpFs::new()));
     }
     // Start where the host process is, so relative paths on the command line
