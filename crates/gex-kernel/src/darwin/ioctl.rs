@@ -21,6 +21,10 @@ const IOC_IN: u64 = 0x8000_0000;
 
 /// `bsd/sys/filio.h`, `bsd/sys/ttycom.h`.
 pub mod cmd {
+    pub const TIOCGETA: u64 = 0x4048_7413;
+    pub const SIOCSIFFLAGS: u64 = 0x8020_6910;
+    pub const SIOCAIFADDR: u64 = 0x8040_691a;
+    pub const SIOCGIFFLAGS: u64 = 0xc020_6911;
     pub const FIOCLEX: u64 = 0x2000_6601;
     pub const FIONCLEX: u64 = 0x2000_6602;
     pub const FIONREAD: u64 = 0x4004_667f;
@@ -56,7 +60,67 @@ fn put_int(data: &mut [u8], v: i32) {
     data[..4].copy_from_slice(&v.to_le_bytes());
 }
 
+/// A `struct termios` of a 64-bit process: flags as `TTYDEF_*` with
+/// `kmopen`'s CLOCAL, `ttydefchars`, and `TTYDEF_SPEED`.
+fn console_termios(out: &mut [u8]) {
+    const TTYDEF_IFLAG: u64 = 0x2 | 0x100 | 0x2000 | 0x200 | 0x800;
+    const TTYDEF_OFLAG: u64 = 0x1 | 0x2;
+    const KM_CFLAG: u64 = 0x800 | 0x300 | 0x8000;
+    const TTYDEF_LFLAG: u64 = 0x8 | 0x100 | 0x80 | 0x400 | 0x2 | 0x1 | 0x40;
+    const TTYDEF_SPEED: u64 = 9600;
+    // VEOF..VSTATUS and the spare: _POSIX_VDISABLE is 0xff.
+    const CHARS: [u8; 20] = [4, 0xff, 0xff, 0x7f, 23, 21, 18, 0xff, 3, 0o34, 26, 25, 17, 19, 22, 15, 1, 0, 20, 0xff];
+    out[..72].fill(0);
+    for (i, v) in [TTYDEF_IFLAG, TTYDEF_OFLAG, KM_CFLAG, TTYDEF_LFLAG].iter().enumerate() {
+        out[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    out[32..52].copy_from_slice(&CHARS);
+    out[56..64].copy_from_slice(&TTYDEF_SPEED.to_le_bytes());
+    out[64..72].copy_from_slice(&TTYDEF_SPEED.to_le_bytes());
+}
+
+/// `lo0`'s `if_flags`, the system's: `loopattach` sets IFF_LOOPBACK and
+/// IFF_MULTICAST, and `SIOCSIFADDR` adds IFF_UP and IFF_RUNNING.
+static LO0_FLAGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x8008);
+
 impl Kernel {
+    /// `SIOCAIFADDR` on an AF_INET socket: an address for `lo0`, which
+    /// `lo_ioctl`'s SIOCSIFADDR brings up. The address itself is not kept:
+    /// no call here reads an interface's addresses back.
+    fn darwin_ifaddr_add(&mut self, data: &mut [u8]) -> Result<(), Errno> {
+        use std::sync::atomic::Ordering::Relaxed;
+        const AF_INET: u8 = 2;
+        const IFF_UP_RUNNING: u32 = 0x1 | 0x40;
+        let len = data[..16].iter().position(|&c| c == 0).unwrap_or(16);
+        if &data[..len] != b"lo0" || data[17] != AF_INET {
+            self.darwin_unimplemented(format!("SIOCAIFADDR on {:?}, family {}", String::from_utf8_lossy(&data[..len]), data[17]));
+            return Err(Errno::EOPNOTSUPP);
+        }
+        LO0_FLAGS.fetch_or(IFF_UP_RUNNING, Relaxed);
+        Ok(())
+    }
+
+    /// `SIOCGIFFLAGS` and `SIOCSIFFLAGS` (root's, already checked) of an
+    /// interface by name; `ifunit`'s ENXIO for a name no interface has, and
+    /// only the loopback interface is modelled.
+    fn darwin_ifflags(&mut self, com: u64, data: &mut [u8]) -> Result<(), Errno> {
+        use std::sync::atomic::Ordering::Relaxed;
+        const IFF_CANTCHANGE: u32 = 0x2 | 0x10 | 0x40 | 0x400 | 0x800 | 0x8000 | 0x200;
+        let len = data[..16].iter().position(|&c| c == 0).unwrap_or(16);
+        if &data[..len] != b"lo0" {
+            self.darwin_unimplemented(format!("interface {:?} (only lo0 is modelled)", String::from_utf8_lossy(&data[..len])));
+            return Err(Errno::ENXIO);
+        }
+        if com == cmd::SIOCGIFFLAGS {
+            data[16..18].copy_from_slice(&(LO0_FLAGS.load(Relaxed) as u16).to_le_bytes());
+        } else {
+            let new = u32::from(u16::from_le_bytes([data[16], data[17]]));
+            let keep = LO0_FLAGS.load(Relaxed) & IFF_CANTCHANGE;
+            LO0_FLAGS.store(keep | (new & !IFF_CANTCHANGE & 0xffff), Relaxed);
+        }
+        Ok(())
+    }
+
     fn darwin_file_kind(&self, file: &Arc<OpenFile>) -> Kind {
         if let Some((pipe, write)) = file.handle.pipe_end() {
             if file.path.starts_with("pipe:[") {
@@ -199,6 +263,12 @@ impl Kernel {
             Kind::Socket => match com {
                 cmd::FIONBIO => Ok(()),
                 cmd::FIOASYNC if int(data) == 0 => Ok(()),
+                cmd::SIOCGIFFLAGS | cmd::SIOCSIFFLAGS if com == cmd::SIOCGIFFLAGS || self.darwin_suser().is_ok() => self.darwin_ifflags(com, data),
+                cmd::SIOCSIFFLAGS => Err(Errno::EPERM),
+                cmd::SIOCAIFADDR => {
+                    self.darwin_suser()?;
+                    self.darwin_ifaddr_add(data)
+                }
                 _ => {
                     self.darwin_unimplemented(format!("ioctl {com:#x} on a socket (soo_ioctl)"));
                     Err(Errno::EOPNOTSUPP)
@@ -239,6 +309,16 @@ impl Kernel {
                 cmd::FIONBIO | cmd::FIOASYNC => Ok(()),
                 _ => Err(Errno::ENOTTY),
             },
+            // The console device, as `kmopen` sets it up (`bsd/dev/arm/km.c`).
+            Kind::Vnode(FileType::CharDevice) if file.path == "/dev/console" && com == cmd::FIODTYPE => {
+                const D_TTY: i32 = 3;
+                put_int(data, D_TTY);
+                Ok(())
+            }
+            Kind::Vnode(FileType::CharDevice) if file.path == "/dev/console" && com == cmd::TIOCGETA => {
+                console_termios(data);
+                Ok(())
+            }
             Kind::Vnode(FileType::Fifo | FileType::CharDevice) => {
                 self.darwin_unimplemented(format!("ioctl {com:#x} on {} (a device's or fifofs's VNOP_IOCTL)", file.path));
                 Err(Errno::EOPNOTSUPP)
