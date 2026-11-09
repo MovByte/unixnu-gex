@@ -28,6 +28,7 @@ pub mod fileport;
 pub mod footprint;
 pub mod xattr;
 pub mod iokit;
+pub mod guarded;
 pub mod exit;
 pub mod exception;
 pub mod execve;
@@ -249,6 +250,9 @@ pub struct Task {
     /// A fatal guard exception was raised: the task is killed when the call
     /// returns.
     pub guard_kill: bool,
+    /// `thread_guard_violation`'s pending exception of a guarded descriptor,
+    /// its code and subcode, for the call's way out (`fd_guard_ast`).
+    pub fd_guard: Option<(u64, u64)>,
     /// What has been reported as not done, so each is said once.
     said: std::collections::HashSet<String>,
     /// Under strict mode, the unimplemented thing that stops the process

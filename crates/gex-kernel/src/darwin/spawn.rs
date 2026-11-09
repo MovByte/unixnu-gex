@@ -553,7 +553,12 @@ impl Kernel {
         child.thread_sig(pid);
         child.forget_own_pidfds();
         child.darwin_publish();
-        match self.darwin_spawn_child(m, &mut child, attr.as_ref(), file_actions.as_deref(), port_actions.as_deref(), &creds, path, argv, envv) {
+        let spawned = self.darwin_spawn_child(m, &mut child, attr.as_ref(), file_actions.as_deref(), port_actions.as_deref(), &creds, path, argv, envv);
+        // A guard the file actions tripped is the spawning thread's.
+        if child.dtask.fd_guard.is_some() {
+            self.dtask.fd_guard = child.dtask.fd_guard.take();
+        }
+        match spawned {
             Ok(()) => Ok(Spawned::Child(Box::new(child))),
             Err(e) => {
                 // exit1 with P_LIST_DEADPARENT: gone, unseen by its parent,
@@ -801,7 +806,7 @@ impl Kernel {
         copy.tid = self.tid;
         // An exec's fdt_fork: the FP_CLOEXEC descriptors are not copied,
         // so no file action sees them, and the FP_CLOFORK ones a fork's
-        // drops are.
+        // drops are, with their guards.
         for (fd, f, cloexec) in self.fds.entries() {
             if cloexec {
                 let _ = copy.fds.close(fd);
@@ -810,6 +815,12 @@ impl Kernel {
             if self.fds.clofork(fd) && copy.fds.get(fd).is_err() {
                 let _ = copy.fds.install(fd, f, cloexec);
                 let _ = copy.fds.set_clofork(fd, true);
+            }
+            if let Some(g) = self.fds.guard(fd) {
+                let _ = copy.fds.change_guard(fd, |slot, _, _| {
+                    *slot = Some(g);
+                    Ok(())
+                });
             }
         }
         let mut after = After { flags: at.flags, policy: super::taskpolicy::spawn_attrs(at.apptype, at.qos_clamp, at.darwin_role), sigmask: at.sigmask, sigdefault: at.sigdefault, inherit: Vec::new(), max_addr: at.max_addr, crash_behavior: if self.dtask.codesign.as_ref().is_some_and(|c| c.entitled("com.apple.private.spawn-panic-crash-behavior")) { at.crash_behavior } else { 0 }, pcontrol: Some(at.pcontrol), cpumonitor: (at.cpumonitor_percent, at.cpumonitor_interval) };
@@ -821,6 +832,9 @@ impl Kernel {
             let binprefs = Some(at.binprefs).filter(|b| b[0].0 != 0);
             copy.darwin_exec_activate_with(m, path, argv, envv, binprefs)
         })();
+        if copy.dtask.fd_guard.is_some() {
+            self.dtask.fd_guard = copy.dtask.fd_guard.take();
+        }
         // On a failure, what the actions opened goes with the copy (never
         // its close_all_fds, which would end this process's locks).
         let mut img = activated?;
@@ -940,7 +954,12 @@ impl Kernel {
                     return Err(Errno::EINVAL);
                 }
                 psfa::CLOSE => self.darwin_close(fd)?,
-                psfa::INHERIT => self.fds.set_cloexec(fd, false)?,
+                psfa::INHERIT => {
+                    if let Some(g) = self.fds.guard(fd) {
+                        return Err(self.darwin_fp_guard_exception(fd, g, super::guarded::flavor::NOCLOEXEC));
+                    }
+                    self.fds.set_cloexec(fd, false)?
+                }
                 psfa::CHDIR => {
                     let mut s = Scratch::path(&b[o + 8..o + 8 + PATH_MAX]);
                     let mut gm = GuestMem::new(&mut s.0);
@@ -972,6 +991,7 @@ impl Kernel {
     /// the limit; the same descriptor is left as it is.
     fn darwin_dup2(&mut self, old: i32, new: i32) -> Result<(), Errno> {
         self.fds.get(old)?;
+        self.darwin_dup2_guards(old, new)?;
         if new < 0 || new as usize >= self.fds.limit() {
             return Err(Errno::EBADF);
         }
@@ -985,6 +1005,7 @@ impl Kernel {
 
     /// `close_nocancel` in the child.
     fn darwin_close(&mut self, fd: i32) -> Result<(), Errno> {
+        self.darwin_close_guard(fd)?;
         let mut s = Scratch(vec![0u8; 16]);
         let mut gm = GuestMem::new(&mut s.0);
         self.canonical(&mut gm, nr::CLOSE, [fd as u64, 0, 0, 0, 0, 0]).map(|_| ())

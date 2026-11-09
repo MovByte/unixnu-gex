@@ -9552,6 +9552,7 @@ impl Kernel {
                     let _ = child.fds.close(fd);
                 }
             }
+            child.fds.clear_guards();
         }
         child
     }
@@ -9946,6 +9947,13 @@ impl Kernel {
                 let _ = crate::darwin::set_result(m, self.ctx_addr, Errno::EINTR.as_return());
                 return SyscallOutcome::Continue;
             }
+            raw = match self.darwin_fd_guards(m, raw, &mut a) {
+                Ok(raw) => raw,
+                Err(e) => {
+                    let _ = crate::darwin::set_result(m, self.ctx_addr, e.as_return());
+                    return SyscallOutcome::Continue;
+                }
+            };
             if let Some(out) = self.darwin_psynch_call(m, raw, &a) {
                 if self.trace {
                     eprintln!("[gex:{}] pc=0x{pc:x} darwin {}({:#x}, {:#x}, {:#x}) -> {}", self.pid, crate::darwin::sysno::name(raw).unwrap_or("?"), a[0], a[1], a[2], if matches!(out, SyscallOutcome::Blocking(_)) { "blocks" } else { "done" });

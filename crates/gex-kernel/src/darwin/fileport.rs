@@ -34,6 +34,9 @@ impl Kernel {
         if Arc::clone(&file.handle).as_kqueue().is_some() {
             return Err(Errno::EINVAL);
         }
+        if let Some(g) = self.fds.guard(fd).filter(|g| g.has(super::guarded::attr::FILEPORT)) {
+            return Err(self.darwin_fp_guard_exception(fd, g, super::guarded::flavor::FILEPORT));
+        }
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
         files().lock().unwrap_or_else(|e| e.into_inner()).insert(id, file);
         let ipc = &mut self.ipc();

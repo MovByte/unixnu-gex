@@ -445,6 +445,9 @@ impl Kernel {
                 }
             }
             sys::KQUEUE => res(<Kq as KQueue>::kqueue(self)),
+            sys::GUARDED_KQUEUE_NP => res(self.darwin_guarded_kqueue(m, a)),
+            sys::GUARDED_CLOSE_NP => res(self.darwin_guarded_close(m, a)),
+            sys::CHANGE_FDGUARD_NP => res(self.darwin_change_fdguard(m, a)),
             sys::KQUEUE_WORKLOOP_CTL => {
                 let r = <Kq as KQueue>::workloop_ctl(self, m, a);
                 <Kq as KQueue>::settle(self, m);

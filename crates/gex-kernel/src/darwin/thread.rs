@@ -403,18 +403,8 @@ impl Kernel {
             sys::FCNTL | sys::FCNTL_NOCANCEL if super::lockf::is_lock_cmd(a[1]) => Some(self.darwin_fcntl_lock(m, a)),
             sys::FLOCK => Some(self.darwin_flock(m, a)),
             // open1's O_EXLOCK and O_SHLOCK: the open, then the lock.
-            sys::OPEN | sys::OPEN_NOCANCEL | sys::OPENAT | sys::OPENAT_NOCANCEL if (if raw == sys::OPEN || raw == sys::OPEN_NOCANCEL { a[1] } else { a[2] }) & 0x30 != 0 => {
-                let dflags = if raw == sys::OPEN || raw == sys::OPEN_NOCANCEL { a[1] } else { a[2] };
-                let mut la = *a;
-                let n = super::bsd::translate(raw, &mut la);
-                match self.canonical(m, n, la) {
-                    Ok(fd) => Some(self.darwin_open_lock(m, fd as i32, dflags)),
-                    Err(e) => {
-                        let _ = super::set_result(m, self.ctx_addr, e.as_return());
-                        Some(SyscallOutcome::Continue)
-                    }
-                }
-            }
+            sys::OPEN | sys::OPEN_NOCANCEL | sys::OPENAT | sys::OPENAT_NOCANCEL if (if raw == sys::OPEN || raw == sys::OPEN_NOCANCEL { a[1] } else { a[2] }) & 0x30 != 0 => Some(self.darwin_open_finish(m, raw, *a, None)),
+            sys::GUARDED_OPEN_NP | sys::GUARDED_OPEN_DPROTECTED_NP | sys::OPEN_DPROTECTED_NP | sys::OPENAT_DPROTECTED_NP => Some(self.darwin_open_protected(m, raw, a)),
             sys::WRITE | sys::WRITE_NOCANCEL | sys::WRITEV | sys::WRITEV_NOCANCEL if self.darwin_pipe_of(a[0]).is_some() => Some(self.darwin_pipe_write(m, raw, a)),
             sys::KEVENT => Some(<Kq as KQueue>::kevent_legacy(self, m, a, false)),
             sys::POLL | sys::POLL_NOCANCEL => Some(self.darwin_poll(m, a)),
@@ -863,6 +853,7 @@ impl Kernel {
     /// for is spent, the knotes of descriptors it closed are gone
     /// (`knote_fdclose`), and kevent's ASTs are taken.
     pub(crate) fn darwin_syscall_exit(&mut self, m: &mut GuestMem<'_>) {
+        self.darwin_fd_guard_ast();
         let c = &mut self.darwin_me().cancel;
         c.notcancelpt = false;
         c.abort_safely = false;

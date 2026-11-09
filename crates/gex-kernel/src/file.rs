@@ -388,6 +388,21 @@ impl OpenFile {
     }
 }
 
+/// A guarded descriptor's `fp_guard` and `fp_guard_attrs`
+/// (`bsd/kern/kern_guarded.c`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FdGuard {
+    pub guard: u64,
+    pub attrs: u16,
+}
+
+impl FdGuard {
+    /// `fp_isguarded`.
+    pub fn has(&self, attrs: u16) -> bool {
+        self.attrs & attrs == attrs
+    }
+}
+
 /// The descriptors themselves: what one published snapshot of an
 /// [`FdTable`] holds.
 #[derive(Clone, Default)]
@@ -397,6 +412,9 @@ struct Table {
     /// XNU's `FP_CLOFORK` (a Darwin open's O_CLOFORK): the descriptor is
     /// not a fork's or a spawn's child's.
     clofork: Vec<bool>,
+    /// The guard on a Darwin descriptor. A descriptor's number going to
+    /// another file takes its slot back to none.
+    guards: Vec<Option<FdGuard>>,
     /// XNU's `fd_nfiles`, the size its descriptor array has grown to (a
     /// Darwin process's `proc_bsdinfo` reports it; Linux has no use for it).
     nfiles: usize,
@@ -552,6 +570,7 @@ impl FdTable {
                 t.entries.push(None);
                 t.cloexec.push(false);
                 t.clofork.push(false);
+                t.guards.push(None);
             }
             let slot = t.entries[min..]
                 .iter()
@@ -567,12 +586,14 @@ impl FdTable {
                     t.entries.push(None);
                     t.cloexec.push(false);
                     t.clofork.push(false);
+                    t.guards.push(None);
                     t.entries.len() - 1
                 }
             };
             t.entries[idx] = Some(file);
             t.cloexec[idx] = cloexec;
             t.clofork[idx] = false;
+            t.guards[idx] = None;
             t.grow_to(idx, limit);
             Ok(idx as u64)
         })
@@ -596,10 +617,12 @@ impl FdTable {
                 t.entries.push(None);
                 t.cloexec.push(false);
                 t.clofork.push(false);
+                t.guards.push(None);
             }
             t.entries[fd] = Some(file);
             t.cloexec[fd] = cloexec;
             t.clofork[fd] = false;
+            t.guards[fd] = None;
             t.grow_to(fd, limit);
             Ok::<_, Errno>(fd as u64)
         })
@@ -612,6 +635,7 @@ impl FdTable {
             t.entries.clear();
             t.cloexec.clear();
             t.clofork.clear();
+            t.guards.clear();
             Ok::<_, ()>(())
         });
     }
@@ -674,6 +698,35 @@ impl FdTable {
     /// Whether descriptor `fd` is close-on-fork.
     pub fn clofork(&self, fd: i32) -> bool {
         self.read(|t| fd >= 0 && t.clofork.get(fd as usize).copied().unwrap_or(false))
+    }
+
+    /// The guard on open descriptor `fd`.
+    pub fn guard(&self, fd: i32) -> Option<FdGuard> {
+        if fd < 0 {
+            return None;
+        }
+        self.read(|t| if t.entries.get(fd as usize).is_some_and(|e| e.is_some()) { t.guards[fd as usize] } else { None })
+    }
+
+    /// Change open descriptor `fd`'s guard, close-on-exec and close-on-fork
+    /// flags in one step (`change_fdguard_np`); an error changes none.
+    pub fn change_guard<R>(&self, fd: i32, f: impl FnOnce(&mut Option<FdGuard>, &mut bool, &mut bool) -> Result<R, Errno>) -> Result<R, Errno> {
+        self.update(|t| {
+            if fd < 0 || t.entries.get(fd as usize).is_none_or(|e| e.is_none()) {
+                return Err(Errno::EBADF);
+            }
+            let i = fd as usize;
+            f(&mut t.guards[i], &mut t.cloexec[i], &mut t.clofork[i])
+        })
+    }
+
+    /// Take every descriptor's guard off, as `fdt_fork` leaves a fork's
+    /// copy.
+    pub fn clear_guards(&self) {
+        let _ = self.update(|t| {
+            t.guards.iter_mut().for_each(|g| *g = None);
+            Ok::<_, ()>(())
+        });
     }
 
     pub fn set_cloexec(&self, fd: i32, on: bool) -> Result<(), Errno> {

@@ -11,6 +11,8 @@ use std::sync::Arc;
 pub mod ns {
     pub const JETSAM: u32 = 1;
     pub const SIGNAL: u32 = 2;
+    /// `OS_REASON_GUARD`.
+    pub const GUARD: u32 = 23;
 }
 
 /// `OS_REASON_FLAG_*`.
