@@ -343,7 +343,24 @@ impl Kernel {
     }
 
     /// The Linux side of signal `d`'s disposition, from `sigacts`.
+    /// `kern.proc`'s view of the dispositions: what is ignored
+    /// (`p_sigignore`) and what is caught (`p_sigcatch`).
+    pub(crate) fn darwin_live_sigmasks(&self) {
+        let ps = &self.dtask.sigacts;
+        let mut catch = 0u32;
+        for d in 1..NSIG as u32 {
+            let h = ps.handler[d as usize];
+            if h != SIG_DFL && h != SIG_IGN {
+                catch |= sigmask(d);
+            }
+        }
+        let live = &self.dtask.live;
+        live.sigignore.store(ps.sigignore, std::sync::atomic::Ordering::Relaxed);
+        live.sigcatch.store(catch, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn darwin_sig_mirror(&mut self, d: u32) {
+        self.darwin_live_sigmasks();
         let l = signal_to_linux(d);
         if l == 0 {
             return;

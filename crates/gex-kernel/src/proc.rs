@@ -1186,6 +1186,11 @@ impl ProcTable {
     }
 
     /// `pid`'s `P_NOCLDSTOP`, kept from its SIGCHLD action.
+    /// Process `pid`'s `P_NOCLDSTOP` and `P_NOCLDWAIT`.
+    pub fn nocld(&self, pid: i32) -> (bool, bool) {
+        self.lock().procs.iter().find(|p| p.pid == pid).map_or((false, false), |p| (p.nocldstop, p.nocldwait))
+    }
+
     pub fn set_nocldstop(&self, pid: i32, on: bool) {
         if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
             p.nocldstop = on;

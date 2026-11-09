@@ -157,7 +157,12 @@ fn logins() -> &'static std::sync::Mutex<std::collections::HashMap<i32, Vec<u8>>
 impl Kernel {
     /// `suser`: the credential is root's.
     pub(crate) fn darwin_suser(&self) -> Result<(), Errno> {
-        if self.dtask.cred.uid == 0 { Ok(()) } else { Err(Errno::EPERM) }
+        if self.dtask.cred.uid != 0 {
+            return Err(Errno::EPERM);
+        }
+        // proc_suser: the process has used its privilege.
+        self.dtask.live.acflag.fetch_or(super::kinfo::ac::ASU, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 
     /// `kauth_cred_proc_update(p, PROC_SETTOKEN_SETUGID, ...)` with a

@@ -509,6 +509,11 @@ impl Kernel {
         self.dtask.custom_stack = custom;
         self.darwin_apple_strings(&mut s, l, [user_stack, stack_size, alloc, alloc_size])?;
         let (mut sp, mut bytes) = s.copyout(user_stack)?;
+        // exec_copyout_strings: for sysctl_procargs to find them by.
+        let live = &self.dtask.live;
+        live.argc.store(s.argc as u32, std::sync::atomic::Ordering::Relaxed);
+        live.argslen.store(s.buf.len() as u32, std::sync::atomic::Ordering::Relaxed);
+        live.user_stack.store(user_stack, std::sync::atomic::Ordering::Relaxed);
         if l.dylinker.is_some() {
             sp -= PTR as u64;
             let mut b = l.mach_header.to_le_bytes().to_vec();

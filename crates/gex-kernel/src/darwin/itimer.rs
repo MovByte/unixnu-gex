@@ -122,6 +122,7 @@ impl Kernel {
             } else {
                 self.dtask.realtimer.rtime = 0;
             }
+            self.darwin_live_realtimer();
         } else {
             let bit = if which == 1 { vt::USER } else { vt::PROF };
             if value != 0 {
@@ -132,6 +133,12 @@ impl Kernel {
             self.dtask.vtimers[which as usize - 1] = v;
         }
         Ok(0)
+    }
+
+    /// `kern.proc`'s view of the real timer.
+    pub(crate) fn darwin_live_realtimer(&self) {
+        let rt = self.dtask.realtimer;
+        *self.dtask.live.realtimer.lock().unwrap_or_else(|e| e.into_inner()) = (rt.itv, rt.rtime);
     }
 
     /// The real timer's thread call, at its deadline.
@@ -170,6 +177,7 @@ impl Kernel {
             }
         }
         self.darwin_realtimer_arm();
+        self.darwin_live_realtimer();
     }
 
     /// `proc_inherit_itimers` at an exec: the real timer runs on from now
@@ -188,6 +196,7 @@ impl Kernel {
             self.dtask.realtimer.rtime = microuptime() + real.itv.value;
             self.darwin_realtimer_arm();
         }
+        self.darwin_live_realtimer();
     }
 }
 

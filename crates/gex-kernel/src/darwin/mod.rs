@@ -60,6 +60,7 @@ pub mod shm;
 pub mod signal;
 pub mod sockaddr;
 pub mod spawn;
+pub mod kinfo;
 pub mod sysctl;
 mod sysctl_nodes;
 pub mod sysno;
@@ -100,6 +101,8 @@ pub struct Task {
     pub pthread: thread::Registration,
     /// Kernel replies waiting for a thread to go off its CPU.
     pub pending_replies: Vec<kobject::PendingReply>,
+    /// What other processes read of this one (`kern.proc`).
+    pub live: std::sync::Arc<kinfo::Live>,
     /// The real interval timer, and the virtual and profiling ones.
     pub realtimer: itimer::RealTimer,
     pub vtimers: [itimer::Itimerval; 2],

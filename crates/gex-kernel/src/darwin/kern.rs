@@ -230,10 +230,10 @@ fn oid_bytes(oid: &[i32]) -> Vec<u8> {
 
 /// A sysctl request (`struct sysctl_req`): the caller's buffers and how far
 /// each has been used.
-struct SysctlReq {
-    old: u64,
-    oldlen: u64,
-    oldidx: u64,
+pub(crate) struct SysctlReq {
+    pub(crate) old: u64,
+    pub(crate) oldlen: u64,
+    pub(crate) oldidx: u64,
     new: u64,
     newlen: u64,
     newidx: u64,
@@ -977,6 +977,8 @@ impl Kernel {
                 req.out(m, &f)
             }
             "kern.hostname" => self.darwin_sysctl_hostname(m, req),
+            p if p.starts_with("kern.proc.") => self.darwin_sysctl_proc(m, p, tail, req),
+            "kern.procargs2" => self.darwin_sysctl_procargs2(m, tail, req),
             "kern.osreleasetype" => self.darwin_sysctl_osreleasetype(m, req),
             _ => match sysctl::value(node.path) {
                 Some(_) if req.new != 0 => {

@@ -531,6 +531,11 @@ impl Kernel {
             map_max: spawn.map_or(0, |s| s.max_addr),
             // The new proc's p_pcaction is clear (forkproc), and its
             // P_LVMRSRCOWNER; a spawn's child has what its spawn set.
+            // (exec_mach_imgact: the process has exec'd.)
+            live: {
+                old.live.acflag.fetch_and(!super::kinfo::ac::AFORK, std::sync::atomic::Ordering::Relaxed);
+                std::sync::Arc::clone(&old.live)
+            },
             pcaction: match spawn {
                 Some(sp) if sp.flags & super::spawn::flag::SETEXEC == 0 => old.pcaction,
                 _ => Default::default(),

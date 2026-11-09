@@ -257,6 +257,13 @@ impl Kernel {
         let t = &self.dtask;
         let (special, registered, exc) = t.child_ports.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
         super::Task {
+            live: std::sync::Arc::new(super::kinfo::Live {
+                acflag: super::kinfo::ac::AFORK.into(),
+                argc: t.live.argc.load(std::sync::atomic::Ordering::Relaxed).into(),
+                argslen: t.live.argslen.load(std::sync::atomic::Ordering::Relaxed).into(),
+                user_stack: t.live.user_stack.load(std::sync::atomic::Ordering::Relaxed).into(),
+                ..Default::default()
+            }),
             kports: super::kobject::Kports { special, registered, exc, ..Default::default() },
             strict: t.strict,
             pthread: t.pthread,

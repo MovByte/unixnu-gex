@@ -44,6 +44,38 @@ pub struct Public {
     pub csflags: Arc<std::sync::atomic::AtomicU32>,
     /// `p_name`, all of it.
     pub p_name: super::reason::PName,
+    /// Its signal dispositions, real timer and accounting flags.
+    pub live: Arc<super::kinfo::Live>,
+}
+
+impl Public {
+    /// The kernel's own process (`bsd_init`'s `kernproc`): `kernel_task`,
+    /// root's, started at boot.
+    pub fn kernel() -> Public {
+        let boot = super::mach::boottime_usec();
+        Public {
+            cred: Default::default(),
+            sugid: false,
+            comm: b"kernel_task".to_vec(),
+            name: b"kernel_task".to_vec(),
+            start: (boot / 1_000_000, boot % 1_000_000),
+            uuid: [0; 16],
+            uniqueid: 0,
+            puniqueid: 0,
+            pidversion: 0,
+            platform: 0,
+            cputype: 0,
+            cpusubtype: 0,
+            path: Vec::new(),
+            fds: None,
+            threads: None,
+            pcaction: Default::default(),
+            persona: None,
+            csflags: Default::default(),
+            p_name: Default::default(),
+            live: Default::default(),
+        }
+    }
 }
 
 /// `p_lflag`'s termination bits.
@@ -256,11 +288,14 @@ impl Kernel {
             persona: self.dtask.persona.clone(),
             csflags: Arc::clone(&self.dtask.csflags),
             p_name: self.dtask.p_name,
+            live: Arc::clone(&self.dtask.live),
         }
     }
 
     /// Publish this process's record for the others.
     pub fn darwin_publish(&mut self) {
+        self.darwin_live_sigmasks();
+        self.darwin_live_realtimer();
         let r: Arc<dyn std::any::Any + Send + Sync> = Arc::new(self.darwin_public_now());
         self.procs.set_darwin(self.pid, r);
     }
@@ -716,7 +751,7 @@ impl Kernel {
     }
 
     /// `p_stat` and `p_xstat`: SRUN, SSTOP for a stopped process, SZOMB.
-    fn darwin_pstat(&self, pid: i32, zombie: bool) -> (u32, u32) {
+    pub(crate) fn darwin_pstat(&self, pid: i32, zombie: bool) -> (u32, u32) {
         const SRUN: u32 = 2;
         const SSTOP: u32 = 4;
         const SZOMB: u32 = 5;
