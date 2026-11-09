@@ -431,6 +431,10 @@ impl Kernel {
             sys::FPATHCONF => res(self.darwin_fpathconf(a[0] as i32, a[1] as i32)),
             sys::FREADLINK => res(self.darwin_freadlink(m, a[0] as i32, a[1], a[2])),
             sys::GETDTABLESIZE => self.fds.limit() as u64,
+            sys::MLOCK => res(self.darwin_mlock(a[0], a[1])),
+            sys::MUNLOCK => res(self.darwin_munlock(a[0], a[1])),
+            // mlockall and munlockall are unimplemented in the kernel.
+            sys::MLOCKALL | sys::MUNLOCKALL => neg(Errno::ENOSYS),
             sys::GUARDED_KQUEUE_NP => res(self.darwin_guarded_kqueue(m, a)),
             sys::GUARDED_CLOSE_NP => res(self.darwin_guarded_close(m, a)),
             sys::CHANGE_FDGUARD_NP => res(self.darwin_change_fdguard(m, a)),

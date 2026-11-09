@@ -499,6 +499,8 @@ impl Kernel {
             pidversion: old.pidversion,
             ladvlock: old.ladvlock,
             sigacts: old.sigacts,
+            // exec's vm_map_set_user_wire_limit.
+            vm: super::vm::Entries::with_user_wire_limit(old.rlimits.cur(super::rlimit::res::MEMLOCK)),
             rlimits: old.rlimits,
             vtimer_bits,
             // forkproc's, for the new proc.

@@ -127,11 +127,11 @@ impl Kernel {
         }
         match which {
             res::CPU => self.darwin_rlimit_cpu(new[0])?,
-            res::DATA | res::AS | res::MEMLOCK | res::FSIZE if new[0] != RLIM_INFINITY => {
+            res::MEMLOCK => self.dtask.vm.user_wire_limit = Some(new[0]),
+            res::DATA | res::AS | res::FSIZE if new[0] != RLIM_INFINITY => {
                 let what = match which {
                     res::DATA => "RLIMIT_DATA (vm_map_set_data_limit)",
                     res::AS => "RLIMIT_AS (vm_map_set_size_limit)",
-                    res::MEMLOCK => "RLIMIT_MEMLOCK (vm_map_set_user_wire_limit)",
                     _ => "RLIMIT_FSIZE (the write paths' EFBIG and SIGXFSZ)",
                 };
                 self.darwin_unimplemented(format!("setrlimit({what}) to a finite limit"));

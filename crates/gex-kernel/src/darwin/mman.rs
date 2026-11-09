@@ -551,6 +551,46 @@ impl Kernel {
         matches!(p.attrs.kind, kind::ANON | kind::SHM) && !p.attrs.cow
     }
 
+    /// `vm_map_range_overflows` for a 16 KiB page map.
+    fn darwin_range_overflows(addr: u64, size: u64) -> bool {
+        const MASK: u64 = 0x3fff;
+        size != 0 && (addr.checked_add(size).is_none() || (addr.wrapping_add(size).wrapping_add(MASK) & !MASK) <= (addr & !MASK))
+    }
+
+    /// `mlock(addr, len)`: the pages are always resident here, so the
+    /// wiring's only effect is its count and the limit on it.
+    pub(crate) fn darwin_mlock(&mut self, addr: u64, len: u64) -> Result<u64, Errno> {
+        const MASK: u64 = 0x3fff;
+        const KERN_RESOURCE_SHORTAGE: u64 = 6;
+        if Self::darwin_range_overflows(addr, len) {
+            return Err(Errno::EINVAL);
+        }
+        if len == 0 {
+            return Ok(0);
+        }
+        let start = addr & !MASK;
+        let end = (addr + len + MASK) & !MASK;
+        match self.dtask.vm.wire(start, end) {
+            0 => Ok(0),
+            KERN_RESOURCE_SHORTAGE => Err(Errno::EAGAIN),
+            _ => Err(Errno::ENOMEM),
+        }
+    }
+
+    /// `munlock(addr, len)`.
+    pub(crate) fn darwin_munlock(&mut self, addr: u64, len: u64) -> Result<u64, Errno> {
+        const MASK: u64 = 0x3fff;
+        if Self::darwin_range_overflows(addr, len) {
+            return Err(Errno::EINVAL);
+        }
+        let start = addr & !MASK;
+        let end = (addr + len + MASK) & !MASK;
+        match self.dtask.vm.unwire(start, end) {
+            0 => Ok(0),
+            _ => Err(Errno::ENOMEM),
+        }
+    }
+
     /// `msync(addr, len, flags)`.
     pub(crate) fn darwin_msync(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
         const MS_ASYNC: i32 = 0x01;

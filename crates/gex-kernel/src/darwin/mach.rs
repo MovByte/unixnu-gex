@@ -1007,9 +1007,9 @@ impl Kernel {
         if basic64 {
             info.push((e.offset >> 32) as u32);
         }
-        // behavior; user_wired_count (no wiring is kept per entry).
+        // behavior; user_wired_count.
         info.push(u32::from(e.attrs.behavior));
-        info.push(0);
+        info.push(u32::from(e.attrs.user_wired));
         Ok((e.start, e.end - e.start, info))
     }
 

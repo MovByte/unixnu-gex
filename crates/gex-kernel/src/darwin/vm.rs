@@ -69,6 +69,20 @@ pub mod region {
     pub const BASIC_INFO_COUNT: u32 = 8;
 }
 
+/// `KERN_*` of the wiring calls.
+mod kr {
+    pub const SUCCESS: u64 = 0;
+    pub const INVALID_ADDRESS: u64 = 1;
+    pub const FAILURE: u64 = 5;
+    pub const RESOURCE_SHORTAGE: u64 = 6;
+}
+
+/// `MAX_WIRE_COUNT`.
+const MAX_WIRE_COUNT: u16 = 65535;
+/// `vm_per_task_user_wire_limit` as `kmem_set_user_wire_limits` makes it for
+/// 4 GiB and a jetsam kernel: 80% of it.
+const PER_TASK_USER_WIRE_LIMIT: u64 = (4 << 30) * 80 / 100;
+
 /// `ANON_CHUNK_SIZE`: anonymous memory is entered in entries of at most this.
 pub const ANON_CHUNK_SIZE: u64 = 128 << 20;
 
@@ -101,11 +115,14 @@ pub struct Attrs {
     pub jit: bool,
     /// `is_shared`: another map has the entry too.
     pub shared: bool,
+    /// `wired_count` and `user_wired_count`.
+    pub wired: u16,
+    pub user_wired: u16,
 }
 
 impl Default for Attrs {
     fn default() -> Attrs {
-        Attrs { kind: kind::ANON, max: PROT_ALL, alias: 0, inherit: inherit::DEFAULT, behavior: behavior::DEFAULT, zero_wired: false, no_cache: false, cow: false, jit: false, shared: false }
+        Attrs { kind: kind::ANON, max: PROT_ALL, alias: 0, inherit: inherit::DEFAULT, behavior: behavior::DEFAULT, zero_wired: false, no_cache: false, cow: false, jit: false, shared: false, wired: 0, user_wired: 0 }
     }
 }
 
@@ -134,9 +151,18 @@ pub struct Entries {
     /// `jit_entry_exists`: the map has had its JIT region (it stays set
     /// once the region is unmapped).
     pub jit_entry_exists: bool,
+    /// `user_wire_limit`, none being the unlimited one a new map starts
+    /// with, and `user_wire_size`.
+    pub user_wire_limit: Option<u64>,
+    user_wire_size: u64,
 }
 
 impl Entries {
+    /// A new image's map, with `vm_map_set_user_wire_limit`'s limit.
+    pub fn with_user_wire_limit(limit: u64) -> Entries {
+        Entries { user_wire_limit: Some(limit), ..Entries::default() }
+    }
+
     /// `vm_map_clip_start`: no entry crosses `at`; the upper half's offset
     /// moves with it.
     pub fn clip(&mut self, at: u64) {
@@ -161,7 +187,11 @@ impl Entries {
         self.clip_range(start, end);
         let inside: Vec<u64> = self.ranges.range(start..end).map(|(&s, _)| s).collect();
         for s in inside {
-            self.ranges.remove(&s);
+            if let Some(e) = self.ranges.remove(&s) {
+                if e.attrs.user_wired > 0 {
+                    self.user_wire_size -= e.end - s;
+                }
+            }
         }
     }
 
@@ -216,6 +246,7 @@ impl Entries {
             && p.inherit == attrs.inherit
             && p.no_cache == attrs.no_cache
             && !p.zero_wired
+            && p.wired == 0
             && !p.jit
             && (prev.end - s) + (end - start) <= ANON_CHUNK_SIZE;
         if joins {
@@ -239,6 +270,74 @@ impl Entries {
         for (_, e) in self.ranges.range_mut(first..end) {
             f(&mut e.attrs);
         }
+    }
+
+    /// `vm_map_wire_nested` for the user, access unstated (`mlock`): every
+    /// entry in `[start, end)` gets a wiring (`add_wire_counts`), the ones
+    /// before a hole or a limit none. The kernel's return code.
+    pub fn wire(&mut self, start: u64, end: u64) -> u64 {
+        if start == end {
+            return kr::SUCCESS;
+        }
+        self.clip_range(start, end);
+        let mut s = start;
+        let mut rc = kr::SUCCESS;
+        while s < end {
+            let Some(e) = self.ranges.get_mut(&s) else {
+                rc = kr::INVALID_ADDRESS;
+                break;
+            };
+            let size = e.end - s;
+            let next = e.end;
+            if e.attrs.user_wired == 0 {
+                let limit = self.user_wire_limit.unwrap_or(u64::MAX).min(PER_TASK_USER_WIRE_LIMIT);
+                if size + self.user_wire_size > limit {
+                    rc = kr::RESOURCE_SHORTAGE;
+                    break;
+                }
+                if e.attrs.wired == MAX_WIRE_COUNT {
+                    rc = kr::FAILURE;
+                    break;
+                }
+                e.attrs.wired += 1;
+                self.user_wire_size += size;
+            }
+            if e.attrs.user_wired == MAX_WIRE_COUNT {
+                rc = kr::FAILURE;
+                break;
+            }
+            e.attrs.user_wired += 1;
+            s = next;
+        }
+        if rc != kr::SUCCESS {
+            self.unwire(start, s);
+        }
+        rc
+    }
+
+    /// `vm_map_unwire_nested` for the user: `[start, end)` loses a wiring
+    /// where it has one. Only a start in no entry is an error.
+    pub fn unwire(&mut self, start: u64, end: u64) -> u64 {
+        if start == end {
+            return kr::SUCCESS;
+        }
+        if !self.ranges.range(..=start).next_back().is_some_and(|(_, e)| e.end > start) {
+            return kr::INVALID_ADDRESS;
+        }
+        self.clip_range(start, end);
+        let mut released = 0;
+        for (&s, e) in self.ranges.range_mut(start..end) {
+            if e.attrs.wired == 0 || e.attrs.user_wired == 0 {
+                continue;
+            }
+            if e.attrs.user_wired == 1 {
+                e.attrs.wired -= 1;
+                released += e.end - s;
+            }
+            e.attrs.user_wired -= 1;
+        }
+        self.user_wire_size -= released;
+        kr::SUCCESS
     }
 
     /// The pieces of `[start, end)` and the attributes of each: the default
@@ -294,10 +393,13 @@ impl Entries {
     /// The child's entries from a map [`Entries::fork`] has marked: those
     /// inherited by copy or share; one not inherited is absent.
     pub fn inherited(&self) -> Entries {
-        let mut child = Entries::default();
+        let mut child = Entries { user_wire_limit: self.user_wire_limit, ..Entries::default() };
         for (&s, &entry) in &self.ranges {
             let mut a = entry.attrs;
             if a.inherit != inherit::NONE {
+                // A wiring is the map's own.
+                a.wired = 0;
+                a.user_wired = 0;
                 // vm_map_entry_copy_code_signing: an iOS map allows no copy
                 // of a JIT region (VM_MAP_POLICY_ALLOW_JIT_COPY): the copy
                 // loses execute access and is no JIT region.
