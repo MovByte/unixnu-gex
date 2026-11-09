@@ -4529,7 +4529,7 @@ fn place_image(
                 .lock()
                 .insert(seg.vaddr, seg.vaddr + seg.mem_size, p, "[image]");
             if k.darwin {
-                k.darwin_image_segment(seg.vaddr, seg.bytes.len() as u64, seg.mem_size);
+                k.darwin_image_segment(seg.vaddr, seg.bytes.len() as u64, seg.mem_size, seg.file_offset + k.darwin_exec.as_ref().map_or(0, |i| i.arch_offset), seg.max_prot);
             }
         });
     }

@@ -1,13 +1,12 @@
-//! The parts of a Darwin task's VM map entries the host's mappings do not
-//! carry: each entry's maximum protection (`max_protection`), user tag
-//! (`VME_ALIAS`), inheritance, paging behavior, `zero_wired_pages` and
-//! `no_cache`, and whether a fork left it copy-on-write (`needs_copy`).
+//! A Darwin task's VM map entries, what the host's mappings do not carry:
+//! where each `vm_map_entry` starts and ends, as `vm_map_enter` makes them
+//! and clipping splits them, its object offset, maximum protection, user
+//! tag (`VME_ALIAS`), inheritance, paging behavior, `zero_wired_pages` and
+//! `no_cache`, and whether a fork left it copy-on-write (`needs_copy`) or
+//! shared.
 //!
-//! A range holds the attributes of the mapping made over it last; one
-//! nothing was said about (or that was unmapped) has the defaults a plain
-//! `vm_map_enter` gives. (A shared mapping of a file opened read-only,
-//! whose maximum lacks write, is refused write by the host's `mprotect`
-//! as XNU refuses it.)
+//! (A shared mapping of a file opened read-only, whose maximum lacks write,
+//! is refused write by the host's `mprotect` as XNU refuses it.)
 
 use std::collections::BTreeMap;
 
@@ -56,6 +55,23 @@ pub mod kind {
     pub const SUBMAP: u8 = 4;
 }
 
+/// `MACH_VM_MAX_ADDRESS` on iOS, `VM_MAX_ADDRESS` here.
+pub const MACH_VM_MAX_ADDRESS: u64 = 0xf_c000_0000;
+
+/// `vm_region_flavor_t`.
+pub mod region {
+    pub const BASIC_INFO_64: i32 = 9;
+    pub const BASIC_INFO: i32 = 10;
+    pub const EXTENDED_INFO_LEGACY: i32 = 7;
+    pub const TOP_INFO: i32 = 12;
+    pub const EXTENDED_INFO: i32 = 13;
+    pub const BASIC_INFO_COUNT_64: u32 = 9;
+    pub const BASIC_INFO_COUNT: u32 = 8;
+}
+
+/// `ANON_CHUNK_SIZE`: anonymous memory is entered in entries of at most this.
+pub const ANON_CHUNK_SIZE: u64 = 128 << 20;
+
 /// The `VM_MEMORY_*` tags a malloc region carries.
 pub mod tag {
     pub const MALLOC: u8 = 1;
@@ -83,96 +99,164 @@ pub struct Attrs {
     /// `used_for_jit`: the map's JIT region, writable and executable at
     /// once.
     pub jit: bool,
+    /// `is_shared`: another map has the entry too.
+    pub shared: bool,
 }
 
 impl Default for Attrs {
     fn default() -> Attrs {
-        Attrs { kind: kind::ANON, max: PROT_ALL, alias: 0, inherit: inherit::DEFAULT, behavior: behavior::DEFAULT, zero_wired: false, no_cache: false, cow: false, jit: false }
+        Attrs { kind: kind::ANON, max: PROT_ALL, alias: 0, inherit: inherit::DEFAULT, behavior: behavior::DEFAULT, zero_wired: false, no_cache: false, cow: false, jit: false, shared: false }
     }
 }
 
-/// Ranges `[start, end)` whose attributes are not the defaults.
+/// One entry past its start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Entry {
+    end: u64,
+    attrs: Attrs,
+    /// `VME_OFFSET`.
+    offset: u64,
+}
+
+/// What `mach_vm_region` reports of an entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EntryInfo {
+    pub start: u64,
+    pub end: u64,
+    pub attrs: Attrs,
+    pub offset: u64,
+}
+
+/// A task's map entries, by start.
 #[derive(Debug, Default)]
 pub struct Entries {
-    ranges: BTreeMap<u64, (u64, Attrs)>,
+    ranges: BTreeMap<u64, Entry>,
     /// `jit_entry_exists`: the map has had its JIT region (it stays set
     /// once the region is unmapped).
     pub jit_entry_exists: bool,
 }
 
 impl Entries {
-    /// Split a range at `at`, so that no range crosses it.
-    fn split(&mut self, at: u64) {
-        let Some((&s, &(e, a))) = self.ranges.range(..at).next_back() else { return };
-        if e > at {
-            self.ranges.insert(s, (at, a));
-            self.ranges.insert(at, (e, a));
+    /// `vm_map_clip_start`: no entry crosses `at`; the upper half's offset
+    /// moves with it.
+    pub fn clip(&mut self, at: u64) {
+        let Some((&s, &entry)) = self.ranges.range(..at).next_back() else { return };
+        if entry.end > at {
+            self.ranges.insert(s, Entry { end: at, ..entry });
+            self.ranges.insert(at, Entry { offset: entry.offset + (at - s), ..entry });
         }
     }
 
-    /// `[start, end)` back to the defaults.
+    /// Clip at both ends of `[start, end)`.
+    pub fn clip_range(&mut self, start: u64, end: u64) {
+        self.clip(start);
+        self.clip(end);
+    }
+
+    /// `[start, end)` no longer mapped.
     pub fn clear(&mut self, start: u64, end: u64) {
         if start >= end {
             return;
         }
-        self.split(start);
-        self.split(end);
+        self.clip_range(start, end);
         let inside: Vec<u64> = self.ranges.range(start..end).map(|(&s, _)| s).collect();
         for s in inside {
             self.ranges.remove(&s);
         }
     }
 
-    /// `[start, end)` takes `attrs`, as a new mapping over it does.
-    pub fn set(&mut self, start: u64, end: u64, attrs: Attrs) {
+    /// `[start, end)` becomes one new entry, as a new mapping over it does.
+    pub fn enter(&mut self, start: u64, end: u64, attrs: Attrs, offset: u64) {
         self.clear(start, end);
-        if start < end && attrs != Attrs::default() {
-            self.ranges.insert(start, (end, attrs));
+        if start < end {
+            self.ranges.insert(start, Entry { end, attrs, offset });
         }
     }
 
-    /// Change each piece of `[start, end)` by `f`, as a clip of the
-    /// entries there and an update of each would.
+    /// `vm_map_enter` of anonymous memory, `prev_same_prot` saying whether
+    /// the entry below has the new one's current protection: entries of at
+    /// most [`ANON_CHUNK_SIZE`] (unless the maximum protection is none), the
+    /// first extending the entry below when it can.
+    pub fn enter_anon(&mut self, start: u64, end: u64, attrs: Attrs, prev_same_prot: bool) {
+        self.clear(start, end);
+        if start >= end {
+            return;
+        }
+        let size = end - start;
+        let chunked = size > ANON_CHUNK_SIZE && attrs.max != 0;
+        let first_end = if chunked { start + ANON_CHUNK_SIZE } else { end };
+        if !self.coalesce(start, first_end, attrs, prev_same_prot) {
+            self.ranges.insert(start, Entry { end: first_end, attrs, offset: 0 });
+        }
+        let mut at = first_end;
+        while at < end {
+            let e = if end - at > ANON_CHUNK_SIZE { at + ANON_CHUNK_SIZE } else { end };
+            self.ranges.insert(at, Entry { end: e, attrs, offset: 0 });
+            at = e;
+        }
+    }
+
+    /// `vm_map_enter`'s extension of the entry below over `[start, end)`.
+    /// `NO_COALESCE_LIMIT` is zero on this platform, so only a
+    /// `VM_MEMORY_REALLOC` request can extend one (up to
+    /// [`ANON_CHUNK_SIZE`]). The object must be its entry's alone
+    /// (`vm_object_coalesce`): none since a fork left it shared.
+    fn coalesce(&mut self, start: u64, end: u64, attrs: Attrs, prev_same_prot: bool) -> bool {
+        if attrs.alias != tag::REALLOC || attrs.jit || !prev_same_prot {
+            return false;
+        }
+        let Some((&s, prev)) = self.ranges.range_mut(..start).next_back() else { return false };
+        let p = prev.attrs;
+        let joins = prev.end == start
+            && !p.shared
+            && p.kind == kind::ANON
+            && !p.cow
+            && p.behavior == behavior::DEFAULT
+            && p.max == attrs.max
+            && p.inherit == attrs.inherit
+            && p.no_cache == attrs.no_cache
+            && !p.zero_wired
+            && !p.jit
+            && (prev.end - s) + (end - start) <= ANON_CHUNK_SIZE;
+        if joins {
+            prev.end = end;
+        }
+        joins
+    }
+
+    /// Change each entry of `[start, end)` by `f`, clipped to it.
     pub fn update(&mut self, start: u64, end: u64, f: impl Fn(&mut Attrs)) {
-        for (s, e, mut a) in self.pieces(start, end) {
-            f(&mut a);
-            self.set(s, e, a);
-        }
-        self.merge(start, end);
-    }
-
-    /// Join equal neighbours in and around `[start, end)` into one range.
-    fn merge(&mut self, start: u64, end: u64) {
-        let mut at = self.ranges.range(..start).next_back().map_or(start, |(&s, _)| s);
-        while let Some((&s, &(e, a))) = self.ranges.range(at..).next() {
-            if s > end {
-                break;
-            }
-            match self.ranges.get(&e) {
-                Some(&(e1, a1)) if a1 == a => {
-                    self.ranges.remove(&e);
-                    self.ranges.insert(s, (e1, a));
-                }
-                _ => at = s + 1,
-            }
+        self.clip_range(start, end);
+        for (_, e) in self.ranges.range_mut(start..end) {
+            f(&mut e.attrs);
         }
     }
 
-    /// The pieces of `[start, end)` and the attributes of each.
+    /// Change every entry overlapping `[start, end)` whole, unclipped, as
+    /// the reusable-pages calls retag an entry.
+    pub fn update_whole(&mut self, start: u64, end: u64, f: impl Fn(&mut Attrs)) {
+        let first = self.ranges.range(..=start).next_back().filter(|(_, e)| e.end > start).map_or(start, |(&s, _)| s);
+        for (_, e) in self.ranges.range_mut(first..end) {
+            f(&mut e.attrs);
+        }
+    }
+
+    /// The pieces of `[start, end)` and the attributes of each: the default
+    /// ones for what no entry covers.
     pub fn pieces(&self, start: u64, end: u64) -> Vec<(u64, u64, Attrs)> {
         let mut out = Vec::new();
         if start >= end {
             return out;
         }
         let mut at = start;
-        let first = self.ranges.range(..=start).next_back().filter(|(_, &(e, _))| e > start).map(|(&s, _)| s).unwrap_or(start);
-        for (&s, &(e, a)) in self.ranges.range(first..end) {
-            let (s, e) = (s.max(start), e.min(end));
+        let first = self.ranges.range(..=start).next_back().filter(|(_, e)| e.end > start).map_or(start, |(&s, _)| s);
+        for (&s, e) in self.ranges.range(first..end) {
+            let (s, stop) = (s.max(start), e.end.min(end));
             if s > at {
                 out.push((at, s, Attrs::default()));
             }
-            out.push((s, e, a));
-            at = e;
+            out.push((s, stop, e.attrs));
+            at = stop;
         }
         if at < end {
             out.push((at, end, Attrs::default()));
@@ -180,15 +264,23 @@ impl Entries {
         out
     }
 
+    /// `vm_map_lookup_entry` then `vme_next`: the entry at `addr`, or the
+    /// first past it.
+    pub fn at_or_after(&self, addr: u64) -> Option<EntryInfo> {
+        let hit = self.ranges.range(..=addr).next_back().filter(|(_, e)| e.end > addr);
+        let (&start, e) = hit.or_else(|| self.ranges.range(addr..).next())?;
+        Some(EntryInfo { start, end: e.end, attrs: e.attrs, offset: e.offset })
+    }
+
     /// `vm_map_fork`'s mark on the forking task's map, over its mapped
     /// ranges `mapped`: an entry inherited by copy is copy-on-write
-    /// afterwards, in both maps.
+    /// afterwards, in both maps, and one inherited by share is shared.
     pub fn fork(&mut self, mapped: &[(u64, u64)]) {
         for &(s, e) in mapped {
-            self.update(s, e, |a| {
-                if a.inherit == inherit::COPY {
-                    a.cow = true;
-                }
+            self.update(s, e, |a| match a.inherit {
+                inherit::COPY => a.cow = true,
+                inherit::SHARE => a.shared = true,
+                _ => {}
             });
         }
     }
@@ -196,14 +288,15 @@ impl Entries {
     /// The JIT region's ranges a fork's child inherits (`vm_inherit` made
     /// it so): its copy is to lose execute access.
     pub fn inherited_jit(&self) -> Vec<(u64, u64)> {
-        self.ranges.iter().filter(|(_, (_, a))| a.jit && a.inherit != inherit::NONE).map(|(&s, &(e, _))| (s, e)).collect()
+        self.ranges.iter().filter(|(_, e)| e.attrs.jit && e.attrs.inherit != inherit::NONE).map(|(&s, e)| (s, e.end)).collect()
     }
 
     /// The child's entries from a map [`Entries::fork`] has marked: those
     /// inherited by copy or share; one not inherited is absent.
     pub fn inherited(&self) -> Entries {
         let mut child = Entries::default();
-        for (&s, &(e, mut a)) in &self.ranges {
+        for (&s, &entry) in &self.ranges {
+            let mut a = entry.attrs;
             if a.inherit != inherit::NONE {
                 // vm_map_entry_copy_code_signing: an iOS map allows no copy
                 // of a JIT region (VM_MAP_POLICY_ALLOW_JIT_COPY): the copy
@@ -212,7 +305,7 @@ impl Entries {
                     a.jit = false;
                     a.max &= !4;
                 }
-                child.ranges.insert(s, (e, a));
+                child.ranges.insert(s, Entry { attrs: a, ..entry });
             }
         }
         child
@@ -247,49 +340,79 @@ pub fn reusable(a: &Attrs, prot: u8) -> Option<bool> {
 mod tests {
     use super::*;
 
+    const K: u64 = 0x4000;
+
     fn max(m: u8) -> Attrs {
         Attrs { max: m, ..Attrs::default() }
     }
 
-    #[test]
-    fn a_lowered_maximum_splits_and_clears_by_range() {
-        let mut m = Entries::default();
-        m.set(0x1000, 0x5000, max(1));
-        let maxes = |m: &Entries, s, e| m.pieces(s, e).into_iter().map(|(s, e, a)| (s, e, a.max)).collect::<Vec<_>>();
-        assert_eq!(maxes(&m, 0, 0x6000), vec![(0, 0x1000, 7), (0x1000, 0x5000, 1), (0x5000, 0x6000, 7)]);
-        m.clear(0x2000, 0x3000);
-        assert_eq!(maxes(&m, 0x1000, 0x5000), vec![(0x1000, 0x2000, 1), (0x2000, 0x3000, 7), (0x3000, 0x5000, 1)]);
-        m.set(0x4000, 0x6000, max(0));
-        assert_eq!(maxes(&m, 0x3000, 0x6000), vec![(0x3000, 0x4000, 1), (0x4000, 0x6000, 0)]);
+    fn entry_starts(e: &Entries, end: u64) -> Vec<u64> {
+        let mut out = Vec::new();
+        let mut at = 0;
+        while let Some(i) = e.at_or_after(at).filter(|i| i.start < end) {
+            out.push(i.start);
+            at = i.end;
+        }
+        out
     }
 
     #[test]
-    fn an_update_changes_one_field_and_rejoins_what_matches() {
-        let mut m = Entries::default();
-        m.set(0x4000, 0x8000, Attrs { alias: tag::MALLOC_LARGE, ..Attrs::default() });
-        m.update(0x0, 0x8000, |a| a.behavior = behavior::RANDOM);
-        let p = m.pieces(0, 0x8000);
-        assert_eq!(p.len(), 2);
-        assert_eq!((p[0].2.alias, p[0].2.behavior), (0, behavior::RANDOM));
-        assert_eq!((p[1].2.alias, p[1].2.behavior), (tag::MALLOC_LARGE, behavior::RANDOM));
-        m.update(0x0, 0x4000, |a| a.alias = tag::MALLOC_LARGE);
-        assert_eq!(m.pieces(0, 0x8000), vec![(0, 0x8000, Attrs { alias: tag::MALLOC_LARGE, behavior: behavior::RANDOM, ..Attrs::default() })]);
-        assert_eq!(m.ranges.len(), 1);
+    fn a_clip_splits_and_nothing_rejoins() {
+        let mut e = Entries::default();
+        e.enter(0, 4 * K, Attrs::default(), 0);
+        e.update(K, 2 * K, |a| a.max = 1);
+        assert_eq!(entry_starts(&e, 4 * K), vec![0, K, 2 * K]);
+        e.update(K, 2 * K, |a| a.max = 7);
+        assert_eq!(entry_starts(&e, 4 * K), vec![0, K, 2 * K], "a clip is not undone");
+    }
+
+    #[test]
+    fn the_offset_moves_with_the_upper_half() {
+        let mut e = Entries::default();
+        e.enter(4 * K, 8 * K, Attrs { kind: kind::FILE_PRIVATE, ..Attrs::default() }, 0x1000);
+        e.clip(5 * K);
+        assert_eq!(e.at_or_after(5 * K).unwrap().offset, 0x1000 + K);
+        assert_eq!(e.at_or_after(4 * K).unwrap().offset, 0x1000);
+    }
+
+    #[test]
+    fn only_realloc_memory_extends_the_entry_below() {
+        let mut e = Entries::default();
+        e.enter_anon(0, K, Attrs::default(), false);
+        e.enter_anon(K, 2 * K, Attrs::default(), true);
+        assert_eq!(entry_starts(&e, 2 * K), vec![0, K], "NO_COALESCE_LIMIT is zero");
+        let r = Attrs { alias: tag::REALLOC, ..Attrs::default() };
+        let mut e = Entries::default();
+        e.enter_anon(0, K, r, false);
+        e.enter_anon(K, 2 * K, r, true);
+        assert_eq!(entry_starts(&e, 2 * K), vec![0]);
+        e.enter_anon(2 * K, 3 * K, r, false);
+        assert_eq!(entry_starts(&e, 3 * K), vec![0, 2 * K], "another protection");
+    }
+
+    #[test]
+    fn large_anonymous_memory_is_entered_in_chunks() {
+        let mut e = Entries::default();
+        let size = 3 * ANON_CHUNK_SIZE - K;
+        e.enter_anon(0, size, Attrs::default(), false);
+        assert_eq!(entry_starts(&e, size), vec![0, ANON_CHUNK_SIZE, 2 * ANON_CHUNK_SIZE]);
+        let mut e = Entries::default();
+        e.enter_anon(0, size, max(0), false);
+        assert_eq!(entry_starts(&e, size), vec![0], "no chunks for what can never be touched");
     }
 
     #[test]
     fn a_fork_copies_by_inheritance() {
-        let mut m = Entries::default();
-        m.set(0x4000, 0x8000, Attrs { inherit: inherit::SHARE, ..Attrs::default() });
-        m.set(0x8000, 0xc000, Attrs { inherit: inherit::NONE, ..Attrs::default() });
-        m.fork(&[(0, 0xc000)]);
-        let c = m.inherited();
-        assert!(m.pieces(0, 0x4000)[0].2.cow);
-        assert!(!m.pieces(0x4000, 0x8000)[0].2.cow);
-        assert_eq!(c.pieces(0, 0x4000)[0].2, Attrs { cow: true, ..Attrs::default() });
-        assert_eq!(c.pieces(0x4000, 0x8000)[0].2.inherit, inherit::SHARE);
-        // Not inherited: the child has nothing there (the defaults).
-        assert_eq!(c.pieces(0x8000, 0xc000)[0].2, Attrs::default());
+        let mut e = Entries::default();
+        e.enter(0, K, Attrs::default(), 0);
+        e.enter(K, 2 * K, Attrs { inherit: inherit::SHARE, ..Attrs::default() }, 0);
+        e.enter(2 * K, 3 * K, Attrs { inherit: inherit::NONE, ..Attrs::default() }, 0);
+        e.fork(&[(0, 3 * K)]);
+        let c = e.inherited();
+        assert_eq!(entry_starts(&c, 3 * K), vec![0, K]);
+        assert!(c.at_or_after(0).unwrap().attrs.cow);
+        assert!(c.at_or_after(K).unwrap().attrs.shared);
+        assert!(e.at_or_after(K).unwrap().attrs.shared, "the parent's is shared too");
     }
 
     #[test]

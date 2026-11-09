@@ -522,7 +522,7 @@ impl Kernel {
         }
         // create_unix_stack's mach_vm_allocate_kernel(VM_MEMORY_STACK).
         const VM_MEMORY_STACK: u8 = 30;
-        self.dtask.vm.set(alloc, alloc + size, super::vm::Attrs { alias: VM_MEMORY_STACK, ..Default::default() });
+        self.dtask.vm.enter_anon(alloc, alloc + size, super::vm::Attrs { alias: VM_MEMORY_STACK, ..Default::default() }, false);
         Ok(MainStack { sp, bytes, alloc, size, guard })
     }
 }

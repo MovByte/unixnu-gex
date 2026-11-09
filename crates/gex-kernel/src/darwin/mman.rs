@@ -303,7 +303,12 @@ impl Kernel {
             Err(Errno::EACCES) => return Err(Errno::EACCES),
             Err(_) => return Err(Errno::EINVAL),
         };
-        self.dtask.vm.set(at, at + size, attrs);
+        if attrs.kind == kind::ANON {
+            let below = self.mem.lock().vma_at(at.wrapping_sub(1)).map(|v| u64::from(v.prot)) == Some(u64::from(cur));
+            self.dtask.vm.enter_anon(at, at + size, attrs, below);
+        } else {
+            self.dtask.vm.enter(at, at + size, attrs, if mapanon { 0 } else { file_pos });
+        }
         if jit {
             self.dtask.vm.jit_entry_exists = true;
         }
@@ -326,7 +331,7 @@ impl Kernel {
         let writable = self.fds.get(a[4] as i32).map(|f| f.writable).unwrap_or(false);
         let max = if writable { prot::READ | prot::WRITE } else { prot::READ } as u8;
         let end = round(at.saturating_add(a[1]));
-        self.dtask.vm.set(at & !PAGE_MASK, end, Attrs { kind: kind::SHM, max, inherit: inherit::SHARE, ..Attrs::default() });
+        self.dtask.vm.enter(at & !PAGE_MASK, end, Attrs { kind: kind::SHM, max, inherit: inherit::SHARE, ..Attrs::default() }, a[5] & !PAGE_MASK);
         Ok(at)
     }
 
@@ -405,6 +410,39 @@ impl Kernel {
         }
         let (s, e) = (start & !PAGE_MASK, round(start + size));
         self.darwin_vm_behavior_set(m, s, e, new)
+    }
+
+    /// `mach_vm_behavior_set` from a message, which has no thread's view
+    /// of memory: the behaviors an entry keeps. Those acting on the memory
+    /// itself are reported.
+    pub(crate) fn darwin_behavior_set_kept(&mut self, start: u64, size: u64, new: i32) -> Option<u64> {
+        const DEFAULT: i32 = behavior::DEFAULT as i32;
+        const RSEQNTL: i32 = behavior::RSEQNTL as i32;
+        if !matches!(new, DEFAULT..=RSEQNTL | act::ZERO_WIRED_PAGES) {
+            return None;
+        }
+        if start.checked_add(size).is_none() {
+            return Some(kr::INVALID_ARGUMENT);
+        }
+        if size == 0 {
+            return Some(kr::SUCCESS);
+        }
+        let (s, e) = (start & !PAGE_MASK, round(start + size));
+        if s > e || e > self.darwin_map_max() {
+            return Some(kr::NO_SPACE);
+        }
+        if range_overflows(s, e - s) {
+            return Some(kr::INVALID_ADDRESS);
+        }
+        if !Self::darwin_range_mapped(&self.darwin_pieces(s, e), s, e) {
+            return Some(kr::INVALID_ADDRESS);
+        }
+        if new == act::ZERO_WIRED_PAGES {
+            self.dtask.vm.update(s, e, |a| a.zero_wired = true);
+        } else {
+            self.dtask.vm.update(s, e, |a| a.behavior = new as u8);
+        }
+        Some(kr::SUCCESS)
     }
 
     /// `vm_map_behavior_set(map, start, end, new_behavior)`.
@@ -492,11 +530,11 @@ impl Kernel {
 
     /// A segment the loader mapped for the image (`load_segment`): its
     /// file's pages copy-on-write, the zero fill past them anonymous.
-    pub fn darwin_image_segment(&mut self, vaddr: u64, filesize: u64, memsize: u64) {
+    pub fn darwin_image_segment(&mut self, vaddr: u64, filesize: u64, memsize: u64, file_off: u64, maxprot: u8) {
         let (start, end) = (vaddr & !PAGE_MASK, round(vaddr + memsize));
         let file_end = round(vaddr + filesize).min(end);
-        self.dtask.vm.set(start, file_end, Attrs { kind: kind::FILE_PRIVATE, ..Attrs::default() });
-        self.dtask.vm.clear(file_end, end);
+        self.dtask.vm.enter(start, file_end, Attrs { kind: kind::FILE_PRIVATE, max: maxprot, ..Attrs::default() }, file_off);
+        self.dtask.vm.enter_anon(file_end, end, Attrs { max: maxprot, ..Attrs::default() }, false);
     }
 
     /// The new image's map, as `proc_apply_jit_and_vm_policies` makes it
@@ -507,7 +545,7 @@ impl Kernel {
     pub(crate) fn darwin_vm_policies(&mut self) {
         let (base, size) = self.darwin_region;
         if base != 0 {
-            self.dtask.vm.set(base, base + size, Attrs { kind: kind::SUBMAP, ..Attrs::default() });
+            self.dtask.vm.enter(base, base + size, Attrs { kind: kind::SUBMAP, ..Attrs::default() }, 0);
         }
         // A JIT-entitled image (mac_proc_check_map_anon's MAP_JIT probe)
         // gets a jumbo map; vm_map_set_jit_entitled's pmap_set_jit_entitled
@@ -630,7 +668,7 @@ impl Kernel {
             // an entry with no object yet, one never touched, which only
             // a region query would tell apart.)
             if matches!(p.attrs.alias, vm::tag::MALLOC_LARGE | vm::tag::MALLOC_LARGE_REUSED) {
-                self.dtask.vm.update(p.start, p.end, |a| a.alias = vm::tag::MALLOC_LARGE_REUSABLE);
+                self.dtask.vm.update_whole(p.start, p.end, |a| a.alias = vm::tag::MALLOC_LARGE_REUSABLE);
             }
         }
         kr::SUCCESS
@@ -650,7 +688,7 @@ impl Kernel {
                 self.darwin_host_advise(m, p, p.start, p.end, HostAdvice::Reuse);
             }
             if p.attrs.alias == vm::tag::MALLOC_LARGE_REUSABLE {
-                self.dtask.vm.update(p.start, p.end, |a| a.alias = vm::tag::MALLOC_LARGE_REUSED);
+                self.dtask.vm.update_whole(p.start, p.end, |a| a.alias = vm::tag::MALLOC_LARGE_REUSED);
             }
         }
         kr::SUCCESS

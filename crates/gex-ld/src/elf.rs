@@ -153,6 +153,10 @@ pub struct Segment {
     pub bytes: Vec<u8>,
     /// Total size of the mapping, zero-filled beyond `bytes`.
     pub mem_size: u64,
+    /// Where the file part starts in its file (a Mach-O segment's `fileoff`).
+    pub file_offset: u64,
+    /// The segment's maximum protection (a Mach-O segment's `maxprot`).
+    pub max_prot: u8,
     pub readable: bool,
     pub writable: bool,
     pub executable: bool,
@@ -666,7 +670,7 @@ fn headers(r: &Reader, pie_base: u64) -> Result<Headers, LoadError> {
                     Segment {
                         vaddr,
                         bytes: Vec::new(),
-                        mem_size: p_memsz,
+                        mem_size: p_memsz, file_offset: 0, max_prot: 7,
                         readable: p_flags & PF_R != 0,
                         writable: p_flags & PF_W != 0,
                         executable,

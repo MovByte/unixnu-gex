@@ -17,6 +17,7 @@ pub const NDR_RECORD: [u8; 8] = [0, 0, 0, 0, 1, 0, 0, 0];
 
 /// `kern_return_t`s as MIG return codes.
 const KERN_SUCCESS: i32 = 0;
+const KERN_INVALID_ADDRESS: i32 = 1;
 const KERN_INVALID_ARGUMENT: i32 = 4;
 const KERN_FAILURE: i32 = 5;
 const KERN_TERMINATED: i32 = 37;
@@ -64,6 +65,11 @@ fn words(w: &[u32]) -> Vec<u8> {
 /// The `i`th in argument after the NDR record of a simple request.
 pub(crate) fn arg(req: &Kmsg, i: usize) -> Option<i32> {
     i32_at(&req.body, NDR + 4 * i)
+}
+
+/// The 64-bit in argument at the `i`th word.
+fn arg64(req: &Kmsg, i: usize) -> Option<u64> {
+    Some(u64::from(arg(req, i)? as u32) | (u64::from(arg(req, i + 1)? as u32) << 32))
 }
 
 /// The right in a complex request's `i`th port descriptor.
@@ -584,6 +590,46 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             }
             Reply::ok(Vec::new())
         }
+        // mach_vm_region, and vm_region_64 of the older subsystem: the
+        // legacy flavor is the 64-bit one; vm_region takes what it asks for.
+        (Kobject::Task, id @ (4816 | 3824 | 3800)) => match (arg64(req, 0), arg(req, 2), arg(req, 3)) {
+            (Some(address), Some(flavor), Some(count)) => {
+                let flavor = if id != 3800 && flavor == super::vm::region::BASIC_INFO { super::vm::region::BASIC_INFO_64 } else { flavor };
+                match k.darwin_vm_map_region(address, flavor, count as u32) {
+                    Ok((start, size, info)) => {
+                        // vm_region_64 and vm_region answer in vm_address_t:
+                        // past VM_MAX_ADDRESS the call fails after the walk.
+                        if id != 4816 && start + size > super::vm::MACH_VM_MAX_ADDRESS {
+                            return Reply::err(KERN_INVALID_ADDRESS);
+                        }
+                        let mut out = NDR_RECORD.to_vec();
+                        out.extend_from_slice(&start.to_le_bytes());
+                        out.extend_from_slice(&size.to_le_bytes());
+                        out.extend_from_slice(&words(&info));
+                        Reply::ok(out).with_null_port(0)
+                    }
+                    Err(e) => e,
+                }
+            }
+            _ => bad(),
+        },
+        // mach_vm_inherit and vm_inherit.
+        (Kobject::Task, 4803 | 3804) => match (arg64(req, 0), arg64(req, 2), arg(req, 4)) {
+            (Some(address), Some(size), Some(new)) => Reply { ret: k.darwin_vm_inherit(address, size, new as u32) as i32, defer: None, out: Vec::new(), ports: Vec::new(), unimplemented: None },
+            _ => bad(),
+        },
+        // mach_vm_behavior_set and vm_behavior_set.
+        (Kobject::Task, 4810 | 3811) => match (arg64(req, 0), arg64(req, 2), arg(req, 4)) {
+            (Some(address), Some(size), Some(new)) => match k.darwin_behavior_set_kept(address, size, new) {
+                Some(ret) => Reply { ret: ret as i32, defer: None, out: Vec::new(), ports: Vec::new(), unimplemented: None },
+                None => {
+                    let mut r = Reply::err(KERN_INVALID_ARGUMENT);
+                    r.unimplemented = Some(format!("mach_vm_behavior_set behavior {new} (it acts on the memory; madvise has it)"));
+                    r
+                }
+            },
+            _ => bad(),
+        },
         (o, id) => {
             let mut r = Reply::err(MIG_BAD_ID);
             r.unimplemented = Some(format!("MIG routine {id} on {o:?}"));
@@ -720,6 +766,8 @@ fn task_routine_flavor(id: i32) -> Option<u8> {
         // or better), task_policy_get (task_policy_get_t: inspect).
         3405 => NAME,
         3402 | 3409 | 3421 => INSPECT,
+        4816 | 3824 | 3800 => READ,
+        4803 | 3804 | 4810 | 3811 => CONTROL,
         3403 | 3404 | 3410 | 3413 | 3414 | 3415 | 3418 | 3419 | 3420 | 3203 | 3207 | 5404 | 8000 => CONTROL,
         _ => return None,
     })

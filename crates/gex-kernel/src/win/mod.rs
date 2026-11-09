@@ -145,6 +145,8 @@ pub fn trampoline_input(class32: bool) -> (gex_ld::Image, Vec<u64>) {
         segments: vec![gex_ld::elf::Segment {
             vaddr: TRAMPOLINES,
             mem_size: bytes.len() as u64,
+            file_offset: 0,
+            max_prot: 7,
             bytes,
             readable: true,
             writable: false,

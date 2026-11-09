@@ -844,7 +844,7 @@ impl Kernel {
             }
             return match self.canonical(m, nr::MMAP, [start, len, linux_prot, mf::PRIVATE | mf::ANONYMOUS | mf::FIXED, u64::MAX, 0]) {
                 Ok(_) => {
-                    self.dtask.vm.set(start, start + len, attrs);
+                    self.darwin_vm_enter_anon(start, start + len, attrs, p);
                     *addr = start;
                     kr::SUCCESS
                 }
@@ -863,7 +863,7 @@ impl Kernel {
             let Some(start) = self.darwin_find_space(hint, limit, len, mask) else { return kr::NO_SPACE };
             return match self.canonical(m, nr::MMAP, [start, len, linux_prot, mf::PRIVATE | mf::ANONYMOUS | mf::FIXED, u64::MAX, 0]) {
                 Ok(_) => {
-                    self.dtask.vm.set(start, start + len, attrs);
+                    self.darwin_vm_enter_anon(start, start + len, attrs, p);
                     *addr = start;
                     kr::SUCCESS
                 }
@@ -878,7 +878,7 @@ impl Kernel {
         };
         match self.canonical(m, nr::MMAP, [start, len, linux_prot, mf::PRIVATE | mf::ANONYMOUS | mf::FIXED, u64::MAX, 0]) {
             Ok(_) => {
-                self.dtask.vm.set(start, start + len, attrs);
+                self.darwin_vm_enter_anon(start, start + len, attrs, p);
                 *addr = start;
                 kr::SUCCESS
             }
@@ -970,6 +970,52 @@ impl Kernel {
         }
     }
 
+    /// `vm_map_region`'s entry reports. The `*_COUNT` a caller has too
+    /// little room for is KERN_INVALID_ARGUMENT, as is another flavor.
+    pub(crate) fn darwin_vm_map_region(&mut self, addr: u64, flavor: i32, count: u32) -> Result<(u64, u64, Vec<u32>), super::kobject::Reply> {
+        use super::kobject::Reply;
+        use super::vm::{kind, region};
+        const KERN_INVALID_ADDRESS: i32 = 1;
+        const KERN_INVALID_ARGUMENT: i32 = 4;
+        let (need, basic64) = match flavor {
+            region::BASIC_INFO_64 => (region::BASIC_INFO_COUNT_64, true),
+            region::BASIC_INFO => (region::BASIC_INFO_COUNT, false),
+            // VM_REGION_EXTENDED_INFO and TOP_INFO count an entry's pages
+            // (`vm_map_region_walk`), which take a per-page model.
+            region::EXTENDED_INFO | region::EXTENDED_INFO_LEGACY | region::TOP_INFO => {
+                let mut r = Reply::err(KERN_INVALID_ARGUMENT);
+                r.unimplemented = Some(format!("mach_vm_region flavor {flavor} (its resident and shared page counts)"));
+                return Err(r);
+            }
+            _ => return Err(Reply::err(KERN_INVALID_ARGUMENT)),
+        };
+        if count < need {
+            return Err(Reply::err(KERN_INVALID_ARGUMENT));
+        }
+        let Some(e) = self.dtask.vm.at_or_after(addr) else { return Err(Reply::err(KERN_INVALID_ADDRESS)) };
+        // The shared region's entry is a submap: entered read-only
+        // (`vm_shared_region_enter`), its own pages' protections apart.
+        let submap = e.attrs.kind == kind::SUBMAP;
+        let cur = if submap { prot::READ as u32 } else { self.mem.lock().vma_at(e.start).map_or(0, |v| v.prot) };
+        let max = if submap { prot::READ as u32 } else { u32::from(e.attrs.max) };
+        let mut info = vec![cur, max, u32::from(e.attrs.inherit), u32::from(e.attrs.shared && !submap), u32::from(submap)];
+        info.push(e.offset as u32);
+        if basic64 {
+            info.push((e.offset >> 32) as u32);
+        }
+        // behavior; user_wired_count (no wiring is kept per entry).
+        info.push(u32::from(e.attrs.behavior));
+        info.push(0);
+        Ok((e.start, e.end - e.start, info))
+    }
+
+    /// `vm_map_enter` of anonymous memory at a place already chosen, the
+    /// entry below looked at for its protection (`cur`).
+    pub(crate) fn darwin_vm_enter_anon(&mut self, start: u64, end: u64, attrs: super::vm::Attrs, cur: u64) {
+        let below = self.mem.lock().vma_at(start.wrapping_sub(1)).map(|v| u64::from(v.prot)) == Some(cur);
+        self.dtask.vm.enter_anon(start, end, attrs, below);
+    }
+
     /// `mach_vm_deallocate`: unmapped parts of the range are skipped
     /// (`vm_map_delete` raises a non-fatal `kGUARD_EXC_DEALLOC_GAP`, which a
     /// task without VM guard behavior drops).
@@ -1027,6 +1073,8 @@ impl Kernel {
         if pieces.iter().any(|(_, _, a)| new & u64::from(a.max) != new) {
             return kr2::PROTECTION_FAILURE;
         }
+        // vm_map_protect clips what it is about to change.
+        self.dtask.vm.clip_range(s, e);
         let wx = new & prot::WRITE != 0 && new & prot::EXECUTE != 0;
         let entry_prot = |jit: bool| if wx && !jit { new & !prot::EXECUTE } else { new };
         if set_max {

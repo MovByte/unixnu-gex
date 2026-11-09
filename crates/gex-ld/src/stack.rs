@@ -260,7 +260,7 @@ mod tests {
             segments: vec![Segment {
                 vaddr: 0x400000,
                 bytes: vec![0; 16],
-                mem_size: 16,
+                mem_size: 16, file_offset: 0, max_prot: 7,
                 readable: true,
                 writable: false,
                 executable: true,

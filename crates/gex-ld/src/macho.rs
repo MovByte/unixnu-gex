@@ -443,6 +443,8 @@ impl MachO {
                 vaddr,
                 bytes,
                 mem_size: s.vmsize,
+                file_offset: s.fileoff,
+                max_prot: (s.maxprot & 7) as u8,
                 readable: s.initprot & PROT_READ != 0,
                 writable: s.initprot & PROT_WRITE != 0,
                 executable: exec,

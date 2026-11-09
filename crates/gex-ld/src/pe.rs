@@ -1413,7 +1413,7 @@ impl PeImage {
             while bytes.last() == Some(&0) {
                 bytes.pop();
             }
-            Segment { vaddr: base + start, bytes, mem_size: 0, readable: r, writable: w, executable: x }
+            Segment { vaddr: base + start, bytes, mem_size: 0, file_offset: 0, max_prot: 7, readable: r, writable: w, executable: x }
         };
         if (self.section_align as u64) < PAGE {
             let mut s = seg(0, size, true, true, true);
