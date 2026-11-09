@@ -303,24 +303,6 @@ impl Kernel {
         if let Some(r) = self.darwin_cred_syscall(m, raw, a) {
             return Some(res(r));
         }
-        // O_CLOFORK: the open's descriptor is FP_CLOFORK, one a fork's or a
-        // spawn's child does not get.
-        const O_CLOFORK: u64 = 0x0800_0000;
-        let at = match raw {
-            sys::OPEN | sys::OPEN_NOCANCEL => Some(1),
-            sys::OPENAT | sys::OPENAT_NOCANCEL => Some(2),
-            _ => None,
-        };
-        if let Some(i) = at.filter(|&i| a[i] & O_CLOFORK != 0) {
-            let mut b = *a;
-            b[i] &= !O_CLOFORK;
-            let n = super::bsd::translate(raw, &mut b);
-            let r = self.canonical(m, n, b);
-            if let Ok(fd) = r {
-                let _ = self.fds.set_clofork(fd as i32, true);
-            }
-            return Some(res(r));
-        }
         if let Some(r) = self.darwin_fs_call(m, raw, a) {
             return Some(res(r));
         }
@@ -445,6 +427,10 @@ impl Kernel {
                 }
             }
             sys::KQUEUE => res(<Kq as KQueue>::kqueue(self)),
+            sys::PATHCONF => res(self.darwin_pathconf(m, a[0], a[1] as i32)),
+            sys::FPATHCONF => res(self.darwin_fpathconf(a[0] as i32, a[1] as i32)),
+            sys::FREADLINK => res(self.darwin_freadlink(m, a[0] as i32, a[1], a[2])),
+            sys::GETDTABLESIZE => self.fds.limit() as u64,
             sys::GUARDED_KQUEUE_NP => res(self.darwin_guarded_kqueue(m, a)),
             sys::GUARDED_CLOSE_NP => res(self.darwin_guarded_close(m, a)),
             sys::CHANGE_FDGUARD_NP => res(self.darwin_change_fdguard(m, a)),

@@ -34,6 +34,7 @@ pub mod exception;
 pub mod execve;
 pub mod fsops;
 pub mod ioctl;
+pub mod pathconf;
 pub mod itimer;
 pub mod jobctl;
 pub mod ipc;

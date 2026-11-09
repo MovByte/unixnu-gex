@@ -49,6 +49,13 @@ const O_RDWR: u64 = 0x2;
 const O_CREAT: u64 = 0x200;
 const O_CLOEXEC: u64 = 0x0100_0000;
 const O_CLOFORK: u64 = 0x0800_0000;
+const O_NOFOLLOW: u64 = 0x100;
+const O_SYMLINK: u64 = 0x0020_0000;
+const O_NOFOLLOW_ANY: u64 = 0x2000_0000;
+const O_LOCKS: u64 = 0x30;
+/// The open flags a plain renumbering does not carry: an open with one
+/// goes through [`Kernel::darwin_open_finish`].
+pub(crate) const OPEN_FINISHED: u64 = O_LOCKS | O_CLOFORK | O_SYMLINK | O_NOFOLLOW_ANY;
 const O_DP_GETRAWENCRYPTED: u64 = 0x1;
 const O_DP_GETRAWUNENCRYPTED: u64 = 0x2;
 const O_DP_AUTHENTICATE: u64 = 0x4;
@@ -228,15 +235,28 @@ impl Kernel {
         Ok(FdGuard { guard, attrs: guardflags as u16 })
     }
 
-    /// `open1`'s end for an `open` or `openat` a plain renumbering cannot
-    /// do: O_CLOFORK, the guard set before the descriptor is seen, and
-    /// O_EXLOCK or O_SHLOCK taken after.
+    /// `open1` for an `open` or `openat` a plain renumbering cannot do:
+    /// `vn_open_auth`'s O_NOFOLLOW_ANY and O_SYMLINK, O_CLOFORK, the guard
+    /// set before the descriptor is seen, and O_EXLOCK or O_SHLOCK taken
+    /// after.
     pub(crate) fn darwin_open_finish(&mut self, m: &mut GuestMem<'_>, raw: u64, a: [u64; 6], guard: Option<FdGuard>) -> SyscallOutcome {
         let at = if raw == sys::OPEN || raw == sys::OPEN_NOCANCEL { 1 } else { 2 };
         let dflags = a[at];
+        let symlink = match self.darwin_open_links(m, at, &a) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = super::set_result(m, self.ctx_addr, e.as_return());
+                return SyscallOutcome::Continue;
+            }
+        };
         let mut la = a;
-        la[at] &= !O_CLOFORK;
+        la[at] &= !OPEN_FINISHED;
         let n = super::bsd::translate(raw, &mut la);
+        if symlink {
+            // The translated call is openat's. The name is opened, not
+            // what it names.
+            la[2] = (la[2] & !3) | crate::fs::oflags::O_PATH | 0x8000;
+        }
         match self.canonical(m, n, la) {
             Ok(fd) => {
                 let fd = fd as i32;
@@ -249,7 +269,7 @@ impl Kernel {
                         Ok(())
                     });
                 }
-                if dflags & 0x30 != 0 {
+                if dflags & O_LOCKS != 0 {
                     return self.darwin_open_lock(m, fd, dflags);
                 }
                 let _ = super::set_result(m, self.ctx_addr, fd as u64);
@@ -259,6 +279,36 @@ impl Kernel {
             }
         }
         SyscallOutcome::Continue
+    }
+
+    /// `vn_open_auth`'s walk of an open's path for O_NOFOLLOW_ANY (ELOOP at
+    /// the first link in it), and whether O_SYMLINK finds a link at its end.
+    fn darwin_open_links(&mut self, m: &GuestMem<'_>, at: usize, a: &[u64; 6]) -> Result<bool, Errno> {
+        const MAXPATHLEN: usize = 1024;
+        let flags = a[at];
+        if flags & (O_SYMLINK | O_NOFOLLOW_ANY) == 0 {
+            return Ok(false);
+        }
+        if flags & O_NOFOLLOW_ANY != 0 && flags & (O_SYMLINK | O_NOFOLLOW) != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let (dir, path) = if at == 1 { (super::bsd::AT_FDCWD as u64, a[0]) } else { (a[0], a[1]) };
+        let raw = m.read_cstr(path, MAXPATHLEN)?;
+        let given = std::str::from_utf8(&raw).map_err(|_| Errno::EINVAL)?;
+        let abs = self.path_io().at_path_str(super::bsd::dirfd(dir) as i32, given)?;
+        if flags & O_NOFOLLOW_ANY != 0 {
+            let mut prefix = String::new();
+            for part in abs.split('/').filter(|p| !p.is_empty()) {
+                prefix.push('/');
+                prefix.push_str(part);
+                match self.vfs.metadata_nofollow(&prefix) {
+                    Ok(md) if md.file_type == crate::vfs::FileType::Symlink => return Err(Errno::ELOOP),
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        }
+        Ok(flags & O_SYMLINK != 0 && self.vfs.metadata_nofollow(&abs).is_ok_and(|md| md.file_type == crate::vfs::FileType::Symlink))
     }
 
     /// `guarded_open_np`, `guarded_open_dprotected_np`,
