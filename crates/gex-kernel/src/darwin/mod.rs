@@ -25,6 +25,7 @@ pub mod cred;
 pub mod errno;
 pub mod exec;
 pub mod footprint;
+pub mod xattr;
 pub mod exit;
 pub mod exception;
 pub mod execve;

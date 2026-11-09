@@ -48,6 +48,125 @@ fn dirent_len(namlen: usize) -> usize {
 }
 
 impl Kernel {
+    /// `mount(type, dir, flags, data)`, of a bind mount; another file
+    /// system's is reported.
+    pub(crate) fn darwin_mount(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
+        const MFSNAMELEN: usize = 15;
+        const MAXPATHLEN: usize = 1024;
+        const MNT_UPDATE: u64 = 0x0001_0000;
+        const BINDFS_ENTITLEMENT: &str = "com.apple.private.bindfs-allow";
+        let fstype = m.read_cstr(a[0], MFSNAMELEN)?;
+        let dir = String::from_utf8_lossy(&m.read_cstr(a[1], MAXPATHLEN)?).into_owned();
+        let at = self.path_io().at_path_str(dirfd(super::bsd::AT_FDCWD as u64) as i32, &dir)?;
+        if self.vfs.metadata(&at)?.file_type != crate::vfs::FileType::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+        self.darwin_suser()?;
+        if fstype != b"bindfs" {
+            self.darwin_unimplemented(format!("mount of {:?} at {dir}", String::from_utf8_lossy(&fstype)));
+            return Err(Errno::EOPNOTSUPP);
+        }
+        if a[2] & MNT_UPDATE != 0 {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        if !self.darwin_task_entitled(BINDFS_ENTITLEMENT) {
+            return Err(Errno::EPERM);
+        }
+        let from = String::from_utf8_lossy(&m.read_cstr(a[3], MAXPATHLEN - 1)?).into_owned();
+        let from = self.path_io().at_path_str(dirfd(super::bsd::AT_FDCWD as u64) as i32, &from)?;
+        self.vfs.metadata(&from)?;
+        match self.vfs.bound_subtree(&from)? {
+            Some(fs) => {
+                self.vfs.mount(&at, fs);
+                Ok(0)
+            }
+            None => {
+                self.darwin_unimplemented(format!("a bind mount of {from}, which is on a file system with no subtree to give"));
+                Err(Errno::EOPNOTSUPP)
+            }
+        }
+    }
+
+    /// `fsctl(path, cmd, data, options)`.
+    pub(crate) fn darwin_fsctl(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
+        const MAXPATHLEN: usize = 1024;
+        const FSOPT_NOFOLLOW: u64 = 1;
+        // A file that is not open cannot be open only once.
+        const FSIOC_FD_ONLY_OPEN_ONCE: u64 = 0xc004_4115;
+        let (path, cmd, data, options) = (a[0], a[1], a[2], a[3]);
+        if cmd == FSIOC_FD_ONLY_OPEN_ONCE {
+            return Err(Errno::EINVAL);
+        }
+        let raw = m.read_cstr(path, MAXPATHLEN)?;
+        let given = std::str::from_utf8(&raw).map_err(|_| Errno::EINVAL)?;
+        let abs = self.path_io().at_path_str(dirfd(super::bsd::AT_FDCWD as u64) as i32, given)?;
+        let md = if options & FSOPT_NOFOLLOW == 0 { self.vfs.metadata(&abs) } else { self.vfs.metadata_nofollow(&abs) }?;
+        self.darwin_fsctl_checked(m, md.file_type, cmd, data)
+    }
+
+    /// `ffsctl(fd, cmd, data, options)`.
+    pub(crate) fn darwin_ffsctl(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
+        let file = self.fds.get(a[0] as i32)?;
+        // `file_vnode`'s refusal of what is not one.
+        if self.darwin_vnode_of(&file).is_none() {
+            return Err(Errno::EINVAL);
+        }
+        let md = file.handle.metadata()?;
+        self.darwin_fsctl_checked(m, md.file_type, a[1], a[2])
+    }
+
+    /// `mac_mount_check_fsctl`, then `fsctl_internal`.
+    fn darwin_fsctl_checked(&mut self, m: &mut GuestMem<'_>, kind: crate::vfs::FileType, cmd: u64, data: u64) -> Result<u64, Errno> {
+        const IOCPARM_MASK: u64 = 0x1fff;
+        const IOCPARM_MAX: u64 = IOCPARM_MASK + 1;
+        const IOC_OUT: u64 = 0x4000_0000;
+        const IOC_IN: u64 = 0x8000_0000;
+        // What APFS answers itself: whether the volume's device reaches the
+        // kernel through a "Virtual Interface", as a disk image's does. The
+        // root's is the machine's own storage.
+        const APFSIOC_VIRTUAL_INTERFACE: u64 = 0x4008_4a6a;
+        let e = self.darwin_mac_check_fsctl(cmd);
+        if e != 0 {
+            return Err(super::errno::errno_of(e as i32));
+        }
+        if kind == crate::vfs::FileType::CharDevice {
+            return Err(Errno::ENOTTY);
+        }
+        let size = (cmd >> 16) & IOCPARM_MASK;
+        if size > IOCPARM_MAX {
+            return Err(Errno::EINVAL);
+        }
+        // Copied in before anything looks at the command.
+        if cmd & IOC_IN != 0 && size != 0 {
+            m.read(data, size as usize)?;
+        }
+        if cmd != APFSIOC_VIRTUAL_INTERFACE {
+            self.darwin_unimplemented(format!("fsctl command {cmd:#x}"));
+            return Err(Errno::ENOTTY);
+        }
+        if cmd & IOC_OUT != 0 {
+            m.write(data, &0u64.to_le_bytes())?;
+        }
+        Ok(0)
+    }
+
+    /// `fsync_common`: a vnode's writes pushed to its file (ENOTSUP for what
+    /// is not one, as `fp_getfvp` says it). VNOP_FSYNC pushes the file's
+    /// dirty pages, mapped ones among them, so this process's shared
+    /// mappings of it are written back; what it has written goes through
+    /// to the file already.
+    pub(crate) fn darwin_fsync(&mut self, m: &mut GuestMem<'_>, fd: i32) -> Result<u64, Errno> {
+        let file = self.fds.get(fd)?;
+        if self.darwin_vnode_of(&file).is_none() {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        let mapped: Vec<(u64, u64)> = self.mem.lock().log.shared_maps.iter().filter(|s| s.file.same_file(&file)).map(|s| (s.start, s.len)).collect();
+        for (start, len) in mapped {
+            self.map_io().flush_shared(m, start, len)?;
+        }
+        Ok(0)
+    }
+
     /// The filesystem calls this file serves; `None` for any other.
     pub(crate) fn darwin_fs_call(&mut self, m: &mut GuestMem<'_>, raw: u64, a: &[u64; 6]) -> Option<Result<u64, Errno>> {
         let cwd = dirfd(super::bsd::AT_FDCWD as u64);

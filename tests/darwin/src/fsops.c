@@ -10,12 +10,17 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/attr.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
+
+// Declared in a header the SDK leaves out.
+extern int fsctl(const char *, unsigned long, void *, unsigned int);
+extern int ffsctl(int, unsigned long, void *, unsigned int);
 
 #define D "/tmp/gex-fsops"
 
@@ -101,6 +106,31 @@ int main(void) {
     unlink("s");
     unlink("h");
     chdir("/");
+    // fsctl: APFS answers for the root; not for a device, or a name of
+    // nothing.
+    uint64_t virt = 7;
+    if (fsctl("/", 0x40084a6aUL, &virt, 0) != 0 || virt != 0) return bad("fsctl of the root", errno);
+    errno = 0;
+    if (fsctl("/dev/null", 0x40084a6aUL, &virt, 0) != -1 || errno != ENOTTY) return bad("fsctl of a device", errno);
+    errno = 0;
+    if (fsctl(D "/nothing", 0x40084a6aUL, &virt, 0) != -1 || errno != ENOENT) return bad("fsctl of nothing", errno);
+    int dirfd_ = open("/", O_RDONLY);
+    if (dirfd_ < 0 || ffsctl(dirfd_, 0x40084a6aUL, &virt, 0) != 0 || virt != 0) return bad("ffsctl of the root", errno);
+    close(dirfd_);
+
+    // fsync: a file's, not a pipe's, and not a descriptor that is not one.
+    int sf = open(D "/fsynced", O_CREAT | O_RDWR, 0644);
+    if (sf < 0 || write(sf, "x", 1) != 1 || fsync(sf) != 0) return bad("fsync of a file", errno);
+    int ends[2];
+    if (pipe(ends) != 0) return bad("pipe", errno);
+    errno = 0;
+    if (fsync(ends[0]) != -1 || errno != ENOTSUP) return bad("fsync of a pipe", errno);
+    close(ends[0]);
+    close(ends[1]);
+    errno = 0;
+    if (fsync(sf + 100) != -1 || errno != EBADF) return bad("fsync of nothing", errno);
+    close(sf);
+    unlink(D "/fsynced");
     if (rmdir(D)) return bad("rmdir of the emptied directory", errno);
     printf("fsops ok\n");
     return 0;

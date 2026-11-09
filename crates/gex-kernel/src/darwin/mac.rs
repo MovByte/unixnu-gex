@@ -47,6 +47,7 @@ pub mod op {
     pub const SIGNAL: usize = 146;
     pub const SYSCTL_READ: usize = 156;
     pub const SYSCTL_WRITE: usize = 157;
+    pub const SYSTEM_FSCTL: usize = 164;
     pub const SYSTEM_KAS_INFO: usize = 166;
     pub const SYSTEM_MAC_SYSCALL: usize = 173;
     pub const SYSTEM_SCHED: usize = 180;
@@ -262,6 +263,9 @@ impl Facts for KernelFacts<'_> {
     fn syscall_number(&self) -> u32 {
         self.a.number
     }
+    fn object_number(&mut self) -> Result<Option<u32>, Stop> {
+        Ok((self.a.kind == sandbox::kind::FSCTL).then_some(self.a.number))
+    }
     fn mac_call(&self) -> u32 {
         self.a.number2
     }
@@ -397,6 +401,16 @@ impl Kernel {
     }
 
     /// `mac_proc_check_fork` (Sandbox's process-fork).
+    /// Sandbox's `mpo_mount_check_fsctl`: `system-fsctl` for the command,
+    /// but for two commands of APFS's that it lets through.
+    pub(crate) fn darwin_mac_check_fsctl(&mut self, cmd: u64) -> u32 {
+        if cmd == 0x4008_4a4a || cmd == 0xc008_4a44 {
+            return 0;
+        }
+        let a = SbArgs { kind: sandbox::kind::FSCTL, number: cmd as u32, ..Default::default() };
+        self.darwin_sb_evaluate(op::SYSTEM_FSCTL, &a)
+    }
+
     pub(crate) fn darwin_mac_check_fork(&mut self) -> u32 {
         self.darwin_sb_evaluate(op::PROCESS_FORK, &SbArgs::default())
     }

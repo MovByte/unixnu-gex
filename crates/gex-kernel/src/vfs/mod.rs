@@ -806,6 +806,11 @@ impl Moved {
 
 /// A mounted filesystem.
 pub trait FileSystem: Send + Sync {
+    /// A filesystem of `rel`'s subtree, the same files, or `None` when this
+    /// one cannot give one.
+    fn bound_subtree(&self, _rel: &str) -> Option<Arc<dyn FileSystem>> {
+        None
+    }
     /// Its type as `/proc/self/mountinfo` names it. tmpfs unless it says
     /// otherwise, as `statfs` answers for every one.
     fn fs_type(&self) -> &'static str {
@@ -1396,6 +1401,12 @@ impl Namespace {
             }
         }
         Err(Errno::ELOOP)
+    }
+
+    /// The filesystem of the tree at `abs`, for a bind mount of it.
+    pub fn bound_subtree(&self, abs: &str) -> Result<Option<Arc<dyn FileSystem>>, Errno> {
+        let (fs, rel) = self.resolve(abs)?;
+        Ok(fs.bound_subtree(rel.trim_start_matches('/')))
     }
 
     pub fn metadata(&self, path: &str) -> Result<Metadata, Errno> {

@@ -232,6 +232,7 @@ pub mod kind {
     pub const VNODE: u32 = 1;
     pub const SOCKET: u32 = 2;
     pub const PROCESS: u32 = 4;
+    pub const FSCTL: u32 = 5;
     pub const SYSCTL: u32 = 0xf;
     pub const POSIX_IPC: u32 = 6;
     pub const HOST_SPECIAL_PORT: u32 = 7;

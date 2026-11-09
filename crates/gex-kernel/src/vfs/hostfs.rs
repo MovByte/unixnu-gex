@@ -436,6 +436,9 @@ impl FileHandle for HostDir {
 }
 
 impl FileSystem for HostFs {
+    fn bound_subtree(&self, rel: &str) -> Option<Arc<dyn FileSystem>> {
+        Some(Arc::new(HostFs::new(self.host_path(rel).ok()?)))
+    }
     /// [`super::walk_links`], which asks the host about each directory on
     /// the path (a call per component), but with the host's word on a
     /// whole stretch of the path at once ([`host_walk`]). No link on the
