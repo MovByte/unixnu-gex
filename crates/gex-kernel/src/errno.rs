@@ -77,9 +77,23 @@ impl Errno {
         (-(self.0 as i64)) as u64
     }
 
-    /// Map a host I/O error onto the closest guest errno.
+    /// A host errno in the numbering guests are answered in, Linux's. The
+    /// two systems share only part of theirs.
+    pub fn from_host(code: i32) -> Errno {
+        if cfg!(target_os = "macos") {
+            crate::darwin::errno::errno_of(code)
+        } else {
+            Errno(code)
+        }
+    }
+
+    /// Map a host I/O error onto the guest errno. The host's own number
+    /// comes first: `ErrorKind` folds `EPERM` into `EACCES`.
     pub fn from_io(e: &std::io::Error) -> Errno {
         use std::io::ErrorKind::*;
+        if let Some(code) = e.raw_os_error().filter(|&c| c > 0) {
+            return Errno::from_host(code);
+        }
         match e.kind() {
             NotFound => Errno::ENOENT,
             PermissionDenied => Errno::EACCES,
@@ -88,12 +102,7 @@ impl Errno {
             BrokenPipe => Errno::EPIPE,
             WouldBlock => Errno::EAGAIN,
             Interrupted => Errno::EINTR,
-            _ => match e.raw_os_error() {
-                // The host is Linux in every supported native configuration,
-                // so a raw errno passes straight through.
-                Some(code) if code > 0 => Errno(code),
-                _ => Errno::EIO,
-            },
+            _ => Errno::EIO,
         }
     }
 }
@@ -111,6 +120,18 @@ pub fn encode(r: SysResult) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_host_error_keeps_its_own_meaning() {
+        use super::Errno;
+        use std::io::Error;
+        assert_eq!(Errno::from_io(&Error::from_raw_os_error(1)), Errno::EPERM);
+        assert_eq!(Errno::from_io(&Error::from_raw_os_error(13)), Errno::EACCES);
+        let not_empty = if cfg!(target_os = "macos") { 66 } else { 39 };
+        assert_eq!(Errno::from_io(&Error::from_raw_os_error(not_empty)), Errno(39));
+        let again = if cfg!(target_os = "macos") { 35 } else { 11 };
+        assert_eq!(Errno::from_io(&Error::from_raw_os_error(again)), Errno::EAGAIN);
+    }
+
     use super::*;
 
     #[test]

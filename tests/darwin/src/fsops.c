@@ -35,8 +35,22 @@ static void put(const char *p, const char *s) {
     close(fd);
 }
 
+// What a run stopped partway left in the root.
+static void clean(void) {
+    static const char *names[] = {"a", "b", "c", "s", "h", "dl", "dd/f", "dd/g", "fsynced", 0};
+    char path[64];
+    for (int i = 0; names[i]; i++) {
+        snprintf(path, sizeof path, D "/%s", names[i]);
+        unlink(path);
+    }
+    rmdir(D "/sub");
+    rmdir(D "/dd");
+    rmdir(D);
+}
+
 int main(void) {
     struct stat st;
+    clean();
     umask(022);
     if (umask(022) != 022) return bad("umask", 0);
     if (mkdir(D, 07777) || stat(D, &st) || (st.st_mode & 07777) != 0755) return bad("mkdir's mode", st.st_mode & 07777);

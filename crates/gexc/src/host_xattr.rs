@@ -9,6 +9,21 @@ use std::os::unix::ffi::OsStrExt;
 
 pub fn install() {
     set_host_xattr(call);
+    gex_kernel::vfs::hostfs::host_identity::set_host_identity(identity);
+}
+
+/// The effective user and group this process checks access as, and its
+/// groups.
+fn identity() -> (u32, u32, Vec<u32>) {
+    // SAFETY: a count of zero only asks for the size, and the second call
+    // writes at most `n` entries into a vector of that length.
+    unsafe {
+        let n = libc::getgroups(0, std::ptr::null_mut()).max(0);
+        let mut groups = vec![0; n as usize];
+        let got = libc::getgroups(n, groups.as_mut_ptr()).max(0);
+        groups.truncate(got as usize);
+        (libc::geteuid(), libc::getegid(), groups)
+    }
 }
 
 fn call(on: &On<'_>, op: XattrOp<'_>) -> Result<usize, Errno> {
@@ -100,15 +115,12 @@ fn call(on: &On<'_>, op: XattrOp<'_>) -> Result<usize, Errno> {
     };
     if r < 0 {
         let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
-        // The guest wants Linux's numbers; the ones that differ on macOS.
+        // Linux has one name for a missing attribute.
         #[cfg(target_os = "macos")]
-        let e = match e {
-            libc::ENOATTR => 61,  // ENODATA
-            libc::ENOTSUP => 95,  // EOPNOTSUPP
-            libc::ENAMETOOLONG => 36,
-            e => e,
-        };
-        return Err(Errno(e as _));
+        if e == libc::ENOATTR {
+            return Err(Errno(61));
+        }
+        return Err(Errno::from_host(e));
     }
     Ok(r as usize)
 }

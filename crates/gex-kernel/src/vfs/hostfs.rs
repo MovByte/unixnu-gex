@@ -659,7 +659,12 @@ impl FileSystem for HostFs {
         }
         let host = self.host_path(path)?;
         let own = host_ino(&host);
-        let links = std::fs::symlink_metadata(&host).map_or(1, |m| m.nlink());
+        let md = std::fs::symlink_metadata(&host);
+        // What Linux answers; macOS's unlink says EPERM.
+        if md.as_ref().is_ok_and(|m| m.is_dir()) {
+            return Err(Errno::EISDIR);
+        }
+        let links = md.map_or(1, |m| m.nlink());
         std::fs::remove_file(&host).map_err(|e| Errno::from_io(&e))?;
         if let Some(own) = own {
             hnote_removed(self.watch_fs(), &host, own, links.saturating_sub(1));
@@ -905,6 +910,22 @@ pub mod host_walk {
     }
 }
 
+pub mod host_identity {
+    /// The host's effective user, effective group and groups.
+    pub type Call = fn() -> (u32, u32, Vec<u32>);
+
+    static CALL: std::sync::OnceLock<Call> = std::sync::OnceLock::new();
+
+    /// Install it (the native host's). The first call wins.
+    pub fn set_host_identity(call: Call) {
+        let _ = CALL.set(call);
+    }
+
+    pub fn get() -> Option<(u32, u32, Vec<u32>)> {
+        CALL.get().map(|c| c())
+    }
+}
+
 pub mod host_xattr {
     use super::super::{xattr_name, XattrOp};
     use crate::errno::Errno;
@@ -1064,8 +1085,8 @@ mod tests {
 }
 
 /// `access(2)` against the host's permission bits, for this process's
-/// effective ids and groups (from `/proc/self/status`; no unsafe here, so
-/// not the host call itself). Root may read and write anything and execute
+/// effective ids and groups ([`host_identity`], or `/proc/self/status`; no
+/// unsafe here, so not the host call itself). Root may read and write anything and execute
 /// what has an execute bit. ACLs and read-only mounts are not seen.
 #[cfg(unix)]
 fn host_access(host: &std::path::Path, mode: u32) -> Result<(), Errno> {
@@ -1107,6 +1128,9 @@ struct HostIds {
 fn host_ids() -> &'static HostIds {
     static IDS: std::sync::OnceLock<HostIds> = std::sync::OnceLock::new();
     IDS.get_or_init(|| {
+        if let Some((uid, gid, groups)) = host_identity::get() {
+            return HostIds { uid, gid, groups };
+        }
         let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
         // "Uid:\treal\teffective\tsaved\tfs"; the effective one decides.
         let field = |name: &str| -> Vec<u32> {
