@@ -47,7 +47,9 @@ pub mod off {
 pub const PAGE_LEN: usize = 0x4000;
 pub const THIS_VERSION: u16 = 3;
 
-/// `kHas*` capability bits gex's translator implements.
+/// The `kHas*` capability bits of the A10X, as `commpage_init_cpu_capabilities`
+/// reads them from the CPU: an ARMv8.0 core with the crypto and CRC32
+/// extensions and without ARMv8.1's atomics.
 pub mod cap {
     pub const CACHE64: u64 = 0x20;
     pub const FAST_TLS: u64 = 0x80;
@@ -57,7 +59,8 @@ pub mod cap {
     pub const FMA: u64 = 0x2000;
     pub const UP: u64 = 0x8000;
     pub const NUM_CPUS_SHIFT: u32 = 16;
-    pub const LSE: u64 = 0x0200_0000;
+    pub const ADV_SIMD_HPFP: u64 = 0x200;
+    pub const CRYPTO: u64 = 0x0100_0000;
     pub const CRC32: u64 = 0x0400_0000;
 }
 
@@ -94,7 +97,7 @@ pub fn pages(ncpus: u8, memory: u64) -> [Vec<u8>; 2] {
     let mut p = vec![0u8; PAGE_LEN];
     let mut put = |o: usize, b: &[u8]| p[o..o + b.len()].copy_from_slice(b);
     put(off::SIGNATURE, b"commpage 64-bit\0");
-    let mut caps = cap::CACHE64 | cap::FAST_TLS | cap::ADV_SIMD | cap::VFP | cap::EVENT | cap::FMA | cap::LSE | cap::CRC32;
+    let mut caps = cap::CACHE64 | cap::FAST_TLS | cap::ADV_SIMD | cap::VFP | cap::EVENT | cap::FMA | cap::ADV_SIMD_HPFP | cap::CRYPTO | cap::CRC32;
     caps |= u64::from(ncpus) << cap::NUM_CPUS_SHIFT;
     if ncpus == 1 {
         caps |= cap::UP;
@@ -230,7 +233,8 @@ mod tests {
         assert_eq!(u32::from_le_bytes(p[off::KDEBUG_ENABLE..off::KDEBUG_ENABLE + 4].try_into().unwrap()), 0);
         let caps = u64::from_le_bytes(p[off::CPU_CAPABILITIES64..off::CPU_CAPABILITIES64 + 8].try_into().unwrap());
         assert_eq!((caps >> cap::NUM_CPUS_SHIFT) & 0xff, 2);
-        assert_eq!(caps & 0x0100_0000, 0, "no crypto extensions claimed");
+        assert_ne!(caps & cap::CRYPTO, 0, "the crypto extensions");
+        assert_eq!(caps & 0x0200_0000, 0, "no ARMv8.1 atomics");
     }
 
     #[test]

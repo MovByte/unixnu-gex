@@ -112,7 +112,9 @@ pub fn value(path: &str) -> Option<Value> {
         "hw.l2cachesize" | "hw.l2cachesize_compat" => I32(8 << 20),
         "hw.tbfrequency" => I64(24_000_000),
         "hw.cpu64bit_capable" => I32(1),
-        "hw.optional.neon" | "hw.optional.floatingpoint" | "hw.optional.armv8_crc32" | "hw.optional.armv8_1_atomics" | "hw.optional.arm.FEAT_LSE" => I32(1),
+        "hw.optional.neon" | "hw.optional.AdvSIMD" | "hw.optional.neon_hpfp" | "hw.optional.AdvSIMD_HPFPCvt" | "hw.optional.floatingpoint" | "hw.optional.armv8_crc32" | "hw.optional.arm64" | "hw.optional.arm.FEAT_AES" | "hw.optional.arm.FEAT_PMULL" | "hw.optional.arm.FEAT_SHA1" | "hw.optional.arm.FEAT_SHA256" => I32(1),
+        // ARMv8.1 and later features an A10X does not have.
+        "hw.optional.armv8_1_atomics" | "hw.optional.neon_fp16" | "hw.optional.armv8_2_fhm" | "hw.optional.armv8_2_sha3" | "hw.optional.armv8_2_sha512" | "hw.optional.armv8_3_compnum" | "hw.optional.arm.FEAT_LSE" | "hw.optional.arm.FEAT_LSE2" | "hw.optional.arm.FEAT_RDM" | "hw.optional.arm.FEAT_FP16" | "hw.optional.arm.FEAT_FHM" | "hw.optional.arm.FEAT_DotProd" | "hw.optional.arm.FEAT_FCMA" | "hw.optional.arm.FEAT_JSCVT" | "hw.optional.arm.FEAT_LRCPC" | "hw.optional.arm.FEAT_LRCPC2" | "hw.optional.arm.FEAT_FRINTTS" | "hw.optional.arm.FEAT_FlagM" | "hw.optional.arm.FEAT_FlagM2" | "hw.optional.arm.FEAT_I8MM" | "hw.optional.arm.FEAT_BF16" | "hw.optional.arm.FEAT_SHA3" | "hw.optional.arm.FEAT_SHA512" | "hw.optional.arm.FEAT_PAuth" | "hw.optional.arm.FEAT_PAuth2" | "hw.optional.arm.FEAT_FPAC" | "hw.optional.arm.FEAT_BTI" | "hw.optional.arm.FEAT_DPB" | "hw.optional.arm.FEAT_DPB2" | "hw.optional.arm.FEAT_SB" | "hw.optional.arm.FEAT_SPECRES" | "hw.optional.arm.FEAT_RPRES" | "hw.optional.arm.FEAT_SME" | "hw.optional.arm.FEAT_SME2" => I32(0),
         "hw.targettype" => Str("J120"),
         // /chosen/ephemeral-storage.
         "hw.ephemeral_storage" => I32(0),
