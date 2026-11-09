@@ -9878,7 +9878,7 @@ impl Kernel {
         } else {
             ctx::SYSCALL_NR
         };
-        let raw = m
+        let mut raw = m
             .read_u64(self.ctx_addr + nr_slot as u64)
             .unwrap_or(!0);
         let mut a: [u64; 6] = if self.compat {
@@ -9910,7 +9910,7 @@ impl Kernel {
                 }
                 return out;
             }
-            let raw = if raw as u32 as u64 == crate::darwin::PLATFORM {
+            raw = if raw as u32 as u64 == crate::darwin::PLATFORM {
                 raw
             } else {
                 match crate::darwin::bsd_call(m, self.ctx_addr, raw) {
