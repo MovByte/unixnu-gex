@@ -4901,7 +4901,7 @@ impl<'a> Lifter<'a> {
             SysReg::TpidrEl0 => self.b.read(GuestReg::Tpidr),
             SysReg::TpidrroEl0 => self.b.read(GuestReg::TpidrRo),
             SysReg::Ctr => self.b.const_i64(gex_abi::CTR_EL0),
-            SysReg::Cntfrq => self.b.const_i64(gex_abi::CNTFRQ),
+            SysReg::Cntfrq => self.b.const_i64(gex_abi::cntfrq()),
             SysReg::Dczid => {
                 // log2 of the block size in words. The "zeroing prohibited"
                 // bit stays clear because DC ZVA is implemented.

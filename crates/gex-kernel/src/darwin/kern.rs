@@ -199,13 +199,18 @@ pub fn statfs64(mnt: &Mount) -> Vec<u8> {
 /// with it.
 fn darwin_gettimeofday(m: &mut GuestMem<'_>, tp: u64, tzp: u64, abs: u64) -> Result<u64, Errno> {
     if tp != 0 {
+        // clock_gettimeofday_and_absolute_time: the moment it read, which
+        // the commpage's fast path extrapolates from for the next second.
+        let tbr = super::mach::absolute_time();
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        let frac = (u128::from(now.subsec_nanos()) << 64) / 1_000_000_000;
+        super::commpage::set_timestamp(m.bytes, tbr, now.as_secs(), frac as u64);
         let mut tv = [0u8; 16];
         tv[..8].copy_from_slice(&(now.as_secs() as i64).to_le_bytes());
         tv[8..12].copy_from_slice(&(now.subsec_micros() as i32).to_le_bytes());
         m.write(tp, &tv)?;
         if abs != 0 {
-            m.write_u64(abs, super::mach::absolute_time())?;
+            m.write_u64(abs, tbr)?;
         }
     }
     if tzp != 0 {

@@ -2663,6 +2663,18 @@ fn start_darwin_thread_calls(kernel: std::sync::Weak<Mutex<Kernel>>, memory: gex
             }
         });
     }
+    // What the scheduler keeps current as it runs (`thread_quantum_expire`,
+    // every quantum of a running thread): no thread reads this time from the
+    // kernel, so nothing else would move it.
+    {
+        let (kernel, memory) = (kernel.clone(), memory.clone());
+        let _ = std::thread::Builder::new().name("gex-darwin-tick".into()).spawn(move || {
+            while kernel.strong_count() != 0 {
+                gex_kernel::darwin::commpage::tick(memory.bytes(), gex_kernel::darwin::mach::absolute_time());
+                std::thread::sleep(gex_kernel::darwin::commpage::QUANTUM);
+            }
+        });
+    }
     let _ = std::thread::Builder::new().name("gex-darwin-thread-call".into()).spawn(move || loop {
         let seen = bell.generation();
         let next = {
@@ -4533,10 +4545,10 @@ fn place_image(
     // And its commpage, at the alias its constant addresses are folded to.
     if opts.darwin {
         use gex_kernel::darwin::commpage;
-        let page = commpage::page(gex_kernel::darwin::mig::machine::NCPUS as u8, 4 << 30);
+        let pages = commpage::pages(gex_kernel::darwin::mig::machine::NCPUS as u8, 4 << 30);
         let data = memory.bytes();
-        for at in commpage::placements() {
-            data[at as usize..at as usize + page.len()].copy_from_slice(&page);
+        for (at, page) in commpage::placements().into_iter().zip(&pages) {
+            data[at as usize..at as usize + page.len()].copy_from_slice(page);
         }
         let (lo, hi) = (gex_abi::DARWIN_COMMPAGE_ALIAS, gex_abi::DARWIN_COMMPAGE_ALIAS + (gex_abi::DARWIN_COMMPAGE_END - gex_abi::DARWIN_COMMPAGE_RO));
         store.data_mut().with_kernel(|k| k.mem.lock().insert(lo, hi, prot::READ, "[commpage]"));
@@ -5545,6 +5557,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 -3 => {
                     if let Some(c) = lockstep::counter() {
                         return c;
+                    }
+                    if gex_abi::commpage_fold() {
+                        return gex_kernel::darwin::mach::absolute_time() as i64;
                     }
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)

@@ -1308,6 +1308,19 @@ pub const CTR_EL0: u64 = 0x8444_c004;
 /// arithmetic exact against a nanosecond host clock.
 pub const CNTFRQ: u64 = 1_000_000_000;
 
+/// `CNTFRQ_EL0` of a Darwin process: the device's 24 MHz counter
+/// (`mach_timebase_info` gives 125/3).
+pub const DARWIN_CNTFRQ: u64 = 24_000_000;
+
+/// `CNTFRQ_EL0` for what is being translated now.
+pub fn cntfrq() -> u64 {
+    if commpage_fold() {
+        DARWIN_CNTFRQ
+    } else {
+        CNTFRQ
+    }
+}
+
 /// Table slot for a guest address, given its page's directory entry. Masks off
 /// the table index, so a caller holding only the base (table 0) can pass it.
 #[inline]

@@ -120,8 +120,8 @@ pub(crate) fn uptime() -> Duration {
     time_origin().elapsed()
 }
 
-/// `mach_absolute_time`: counter ticks.
-pub(crate) fn absolute_time() -> u64 {
+/// `mach_absolute_time`: counter ticks, what `CNTVCT_EL0` reads.
+pub fn absolute_time() -> u64 {
     (uptime().as_nanos() * u128::from(TIMEBASE.1) / u128::from(TIMEBASE.0)) as u64
 }
 
