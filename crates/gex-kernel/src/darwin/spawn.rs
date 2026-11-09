@@ -799,8 +799,14 @@ impl Kernel {
         let mut copy = self.fork_kernel();
         copy.pid = self.pid;
         copy.tid = self.tid;
-        // An exec's fdt_fork keeps the FP_CLOFORK descriptors a fork's drops.
+        // An exec's fdt_fork: the FP_CLOEXEC descriptors are not copied,
+        // so no file action sees them, and the FP_CLOFORK ones a fork's
+        // drops are.
         for (fd, f, cloexec) in self.fds.entries() {
+            if cloexec {
+                let _ = copy.fds.close(fd);
+                continue;
+            }
             if self.fds.clofork(fd) && copy.fds.get(fd).is_err() {
                 let _ = copy.fds.install(fd, f, cloexec);
                 let _ = copy.fds.set_clofork(fd, true);
