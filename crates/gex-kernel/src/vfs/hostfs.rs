@@ -435,6 +435,25 @@ impl FileHandle for HostDir {
     }
 }
 
+/// `open`'s flags on the host, for what [`std::fs::OpenOptions`] does not
+/// express.
+#[cfg(target_os = "macos")]
+mod hostflag {
+    pub const O_NONBLOCK: i32 = 0x4;
+    pub const O_SYMLINK: i32 = 0x20_0000;
+    pub const O_CREAT: i32 = 0x200;
+    pub const O_TRUNC: i32 = 0x400;
+    pub const O_EXCL: i32 = 0x800;
+}
+
+#[cfg(not(target_os = "macos"))]
+mod hostflag {
+    pub const O_CREAT: i32 = 0o100;
+    pub const O_EXCL: i32 = 0o200;
+    pub const O_TRUNC: i32 = 0o1000;
+    pub const O_NONBLOCK: i32 = 0o4000;
+}
+
 impl FileSystem for HostFs {
     fn bound_subtree(&self, rel: &str) -> Option<Arc<dyn FileSystem>> {
         Some(Arc::new(HostFs::new(self.host_path(rel).ok()?)))
@@ -529,7 +548,7 @@ impl FileSystem for HostFs {
         let mut opts = std::fs::OpenOptions::new();
         opts.read(acc == oflags::O_RDONLY || acc == oflags::O_RDWR)
             .write(want_write);
-        // Linux's O_CREAT, O_EXCL, O_TRUNC and O_NONBLOCK on the host.
+        // O_CREAT, O_EXCL, O_TRUNC and O_NONBLOCK as the host numbers them.
         let mut custom = 0;
         if flags & oflags::O_CREAT != 0 {
             // The guest's mode but never without owner rw: gex does not enforce
@@ -541,21 +560,22 @@ impl FileSystem for HostFs {
             } else {
                 // std refuses to create without write access; Linux creates
                 // with O_RDONLY (gnulib's open tests, `touch`-like opens)
-                custom |= 0o100;
+                custom |= hostflag::O_CREAT;
             }
         }
         if flags & oflags::O_EXCL != 0 {
             if want_write {
                 opts.create_new(true);
             } else if flags & oflags::O_CREAT != 0 {
-                custom |= 0o200;
+                custom |= hostflag::O_EXCL;
             }
         }
         if flags & oflags::O_TRUNC != 0 {
-            if want_write {
+            // std refuses to truncate without write access or with append
+            if want_write && flags & oflags::O_APPEND == 0 {
                 opts.truncate(true);
             } else {
-                custom |= 0o1000;
+                custom |= hostflag::O_TRUNC;
             }
         }
         if flags & oflags::O_APPEND != 0 {
@@ -563,9 +583,8 @@ impl FileSystem for HostFs {
         }
         // O_NONBLOCK reaches the host: opening a host FIFO without a writer
         // must not block (grep -D skip opens one so, to fstat and skip it).
-        // Linux's O_NONBLOCK on the host.
         if flags & oflags::O_NONBLOCK != 0 {
-            custom |= 0o4000;
+            custom |= hostflag::O_NONBLOCK;
         }
         opts.custom_flags(custom);
         let file = opts.open(&host).map_err(|e| Errno::from_io(&e))?;
@@ -614,6 +633,11 @@ impl FileSystem for HostFs {
             return Err(Errno::EROFS);
         }
         host_access(&host, mode)
+    }
+
+    fn metadata_nofollow(&self, path: &str) -> Result<Metadata, Errno> {
+        let host = self.host_path(path)?;
+        std::fs::symlink_metadata(&host).map(|md| convert(&md)).map_err(|e| Errno::from_io(&e))
     }
 
     fn read_link(&self, path: &str) -> Result<String, Errno> {
@@ -776,9 +800,15 @@ impl FileSystem for HostFs {
         }
         let host = self.host_path(path)?;
         // A symlink's own times (`utimensat` with AT_SYMLINK_NOFOLLOW: dpkg
-        // stamps every link it unpacks, before its target exists): std opens
-        // only what a link names, so this leaves the link's times as they are.
+        // stamps every link it unpacks, before its target exists). macOS opens
+        // the link itself with O_SYMLINK; Linux has no such open that std can
+        // set times through, so there this leaves the link's times as they are.
         if std::fs::symlink_metadata(&host).is_ok_and(|m| m.file_type().is_symlink()) {
+            #[cfg(target_os = "macos")]
+            {
+                let f = std::fs::OpenOptions::new().read(true).custom_flags(hostflag::O_SYMLINK).open(&host).map_err(|e| Errno::from_io(&e))?;
+                f.set_times(file_times(atime, mtime)).map_err(|e| Errno::from_io(&e))?;
+            }
             return Ok(());
         }
         let f = std::fs::File::open(&host).map_err(|e| Errno::from_io(&e))?;

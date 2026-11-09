@@ -24,7 +24,9 @@ fn call(on: &On<'_>, op: XattrOp<'_>) -> Result<usize, Errno> {
         match op {
             XattrOp::Get { name, buf } => {
                 let n = name_c(name)?;
-                let (b, l) = (buf.as_mut_ptr() as *mut libc::c_void, buf.len());
+                // No buffer asks for the size; macOS takes one of length
+                // zero as too small.
+                let (b, l) = (if buf.is_empty() { std::ptr::null_mut() } else { buf.as_mut_ptr() as *mut libc::c_void }, buf.len());
                 match &path {
                     Some(p) => libc::lgetxattr(p.as_ptr(), n.as_ptr(), b, l),
                     None => libc::fgetxattr(fd, n.as_ptr(), b, l),
@@ -39,7 +41,7 @@ fn call(on: &On<'_>, op: XattrOp<'_>) -> Result<usize, Errno> {
                 }) as isize
             }
             XattrOp::List { buf } => {
-                let (b, l) = (buf.as_mut_ptr() as *mut libc::c_char, buf.len());
+                let (b, l) = (if buf.is_empty() { std::ptr::null_mut() } else { buf.as_mut_ptr() as *mut libc::c_char }, buf.len());
                 match &path {
                     Some(p) => libc::llistxattr(p.as_ptr(), b, l),
                     None => libc::flistxattr(fd, b, l),
@@ -62,7 +64,9 @@ fn call(on: &On<'_>, op: XattrOp<'_>) -> Result<usize, Errno> {
         match op {
             XattrOp::Get { name, buf } => {
                 let n = name_c(name)?;
-                let (b, l) = (buf.as_mut_ptr() as *mut libc::c_void, buf.len());
+                // No buffer asks for the size; macOS takes one of length
+                // zero as too small.
+                let (b, l) = (if buf.is_empty() { std::ptr::null_mut() } else { buf.as_mut_ptr() as *mut libc::c_void }, buf.len());
                 match &path {
                     Some(p) => libc::getxattr(p.as_ptr(), n.as_ptr(), b, l, 0, nofollow),
                     None => libc::fgetxattr(fd, n.as_ptr(), b, l, 0, 0),
@@ -79,7 +83,7 @@ fn call(on: &On<'_>, op: XattrOp<'_>) -> Result<usize, Errno> {
                 }) as isize
             }
             XattrOp::List { buf } => {
-                let (b, l) = (buf.as_mut_ptr() as *mut libc::c_char, buf.len());
+                let (b, l) = (if buf.is_empty() { std::ptr::null_mut() } else { buf.as_mut_ptr() as *mut libc::c_char }, buf.len());
                 match &path {
                     Some(p) => libc::listxattr(p.as_ptr(), b, l, nofollow),
                     None => libc::flistxattr(fd, b, l, 0),
