@@ -61,6 +61,7 @@ pub mod signal;
 pub mod sockaddr;
 pub mod spawn;
 pub mod sysctl;
+mod sysctl_nodes;
 pub mod sysno;
 pub mod taskpolicy;
 pub mod threadpolicy;

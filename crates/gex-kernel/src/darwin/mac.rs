@@ -41,9 +41,12 @@ pub mod op {
     pub const MACH_TASK_READ: usize = 104;
     pub const PROCESS_CODESIGNING: usize = 119;
     pub const PROCESS_FORK: usize = 122;
+    pub const PROCESS_INFO_PIDINFO: usize = 128;
     pub const PROCESS_INFO_CODESIGNATURE: usize = 124;
     pub const PROCESS_LEGACY_CODESIGNING_STATUS_SET: usize = 142;
     pub const SIGNAL: usize = 146;
+    pub const SYSCTL_READ: usize = 156;
+    pub const SYSCTL_WRITE: usize = 157;
     pub const SYSTEM_KAS_INFO: usize = 166;
     pub const SYSTEM_MAC_SYSCALL: usize = 173;
     pub const SYSTEM_SCHED: usize = 180;
@@ -357,6 +360,40 @@ impl Kernel {
             eprintln!("[gex:{}] Sandbox: {}({}) {}({errno}) operation {op}", self.pid, self.exe_path, self.pid, if errno != 0 { "deny" } else { "allow" });
         }
         errno
+    }
+
+    /// `mac_system_check_sysctlbyname` (Sandbox's hook; AMFI has none): a
+    /// name-to-number walk is free; a read that names a process (its
+    /// `kern.proc.pid` node, its arguments) passes on the Sandbox's
+    /// process-info-pidinfo of that process; otherwise sysctl-read, then
+    /// sysctl-write when a value is given.
+    pub(crate) fn darwin_mac_check_sysctl(&mut self, name: &[u8], oid: &[i32], new: u64, newlen: u64) -> u32 {
+        if oid == [0, 3] {
+            return 0;
+        }
+        if new == 0 {
+            let pid = if oid.len() >= 3 && oid[0] == 1 {
+                if oid.len() >= 4 && oid[1] == 14 {
+                    (oid[2] == 1).then(|| oid[3])
+                } else {
+                    (oid[1] == 0x31 || oid[1] == 0x26).then(|| oid[2])
+                }
+            } else {
+                None
+            };
+            if let Some(pid) = pid.filter(|p| self.procs.exists(*p)) {
+                let a = SbArgs { kind: sandbox::kind::PROCESS, target: Some(pid), ..Default::default() };
+                if self.darwin_sb_evaluate(op::PROCESS_INFO_PIDINFO, &a) == 0 {
+                    return 0;
+                }
+            }
+        }
+        let a = SbArgs { kind: sandbox::kind::SYSCTL, string: Some(name.to_vec()), ..Default::default() };
+        let e = self.darwin_sb_evaluate(op::SYSCTL_READ, &a);
+        if e != 0 || (new == 0 && newlen == 0) {
+            return e;
+        }
+        self.darwin_sb_evaluate(op::SYSCTL_WRITE, &a)
     }
 
     /// `mac_proc_check_fork` (Sandbox's process-fork).

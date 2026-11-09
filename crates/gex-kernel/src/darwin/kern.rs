@@ -1,6 +1,7 @@
 //! Darwin calls that have no Linux counterpart to renumber onto, or whose
 //! results or structures need the kernel's state to translate.
 
+use super::sysctl;
 use super::bsd::sys;
 use crate::errno::Errno;
 use super::ipc::{KQueue, Kq, WorkQueue, Wq};
@@ -78,9 +79,6 @@ mod f {
     pub const NODIRECT: u64 = 62;
     pub const SINGLE_WRITER: u64 = 76;
 }
-
-/// `MAXPATHLEN`.
-const MAXPATHLEN: usize = 1024;
 
 /// AMFI's `__mac_syscall` calls: dyld's policy for the caller, and for
 /// another process; whether a cdhash is in a trust cache; the local
@@ -217,6 +215,84 @@ fn darwin_gettimeofday(m: &mut GuestMem<'_>, tp: u64, tzp: u64, abs: u64) -> Res
         m.write(tzp, &[0u8; 8])?;
     }
     Ok(0)
+}
+
+/// `MAXPATHLEN`.
+const MAXPATHLEN: usize = 1024;
+
+/// `securelevel`: the system never raises it.
+const DARWIN_SECURELEVEL: i32 = 0;
+
+/// A sysctl's numbers, as `int`s.
+fn oid_bytes(oid: &[i32]) -> Vec<u8> {
+    oid.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+/// A sysctl request (`struct sysctl_req`): the caller's buffers and how far
+/// each has been used.
+struct SysctlReq {
+    old: u64,
+    oldlen: u64,
+    oldidx: u64,
+    new: u64,
+    newlen: u64,
+    newidx: u64,
+}
+
+impl SysctlReq {
+    /// `SYSCTL_OUT` (`sysctl_old_user`): short of room, nothing is copied
+    /// and nothing counted; without a buffer it only counts.
+    fn out(&mut self, m: &mut GuestMem<'_>, bytes: &[u8]) -> Result<(), Errno> {
+        if self.old != 0 {
+            if self.oldlen - self.oldidx < bytes.len() as u64 {
+                return Err(Errno::ENOMEM);
+            }
+            m.write(self.old + self.oldidx, bytes)?;
+        }
+        self.oldidx += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// `SYSCTL_IN` (`sysctl_new_user`): the next `n` bytes of the new value.
+    fn input(&mut self, m: &mut GuestMem<'_>, n: usize) -> Result<Vec<u8>, Errno> {
+        if self.new == 0 {
+            return Ok(Vec::new());
+        }
+        if self.newlen - self.newidx < n as u64 {
+            return Err(Errno::EINVAL);
+        }
+        let v = m.read(self.new + self.newidx, n)?.to_vec();
+        self.newidx += n as u64;
+        Ok(v)
+    }
+
+    /// `sysctl_io_string`: the value out (cut to the room there is when
+    /// `trunc`), and any new one in, of less than `size` bytes.
+    fn io_string(&mut self, m: &mut GuestMem<'_>, cur: &[u8], size: usize, trunc: bool) -> Result<Option<Vec<u8>>, Errno> {
+        let mut bytes = cur.to_vec();
+        bytes.push(0);
+        if trunc && self.old != 0 && self.oldlen != 0 && self.oldlen < bytes.len() as u64 {
+            self.out(m, &bytes[..self.oldlen as usize - 1])?;
+            self.out(m, b"\0")?;
+        } else {
+            self.out(m, &bytes)?;
+        }
+        if self.new == 0 {
+            return Ok(None);
+        }
+        if size == 0 {
+            return Err(Errno::EPERM);
+        }
+        if self.newlen as usize >= size {
+            return Err(Errno::EINVAL);
+        }
+        let mut v = self.input(m, self.newlen as usize)?;
+        // What strlen sees after the terminator the kernel places.
+        if let Some(i) = v.iter().position(|&b| b == 0) {
+            v.truncate(i);
+        }
+        Ok(Some(v))
+    }
 }
 
 impl Kernel {
@@ -800,74 +876,152 @@ impl Kernel {
     /// `sysctl(name, namelen, old, oldlenp, new, newlen)`. Nodes are
     /// read-only, except that a write is accepted and ignored where the
     /// node exists.
+    /// `sysctl(name, namelen, old, oldlenp, new, newlen)`.
     fn darwin_sysctl(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
-        use super::sysctl;
         let n = a[1] as usize;
-        if !(1..=24).contains(&n) {
+        if !(2..=sysctl::CTL_MAXNAME).contains(&n) {
             return Err(Errno::EINVAL);
         }
         let mut oid = Vec::with_capacity(n);
         for i in 0..n {
             oid.push(m.read_u32(a[0] + 4 * i as u64)? as i32);
         }
-        // {0, 3}: the OID of the name in `new`.
-        let value = if oid == [0, 3] {
-            let mut buf = [0u8; 256];
-            let len = (a[5] as usize).min(buf.len() - 1);
-            let name = m.read(a[4], len)?;
-            buf[..len].copy_from_slice(name);
-            let name = std::str::from_utf8(&buf[..len]).map_err(|_| Errno::EINVAL)?.trim_end_matches('\0');
-            let Some(o) = sysctl::oid(name) else {
-                if self.trace {
-                    eprintln!("[gex:{}] sysctl: no node {name}", self.pid);
-                }
-                return Err(Errno::ENOENT);
-            };
-            o.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()
-        } else {
-            match sysctl::get(&oid) {
-                Some(v) => v.bytes(self.darwin_user_stack),
-                None => {
-                    if self.trace {
-                        eprintln!("[gex:{}] sysctl: no node {oid:?}", self.pid);
-                    }
-                    return Err(Errno::ENOENT);
-                }
-            }
-        };
-        self.sysctl_out(m, a[2], a[3], &value)
+        self.darwin_sysctl_req(m, None, oid, a)
     }
 
     /// `sysctlbyname(name, namelen, old, oldlenp, new, newlen)`.
     fn darwin_sysctlbyname(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
-        use super::sysctl;
-        let len = (a[1] as usize).min(255);
+        let len = a[1] as usize;
+        if len >= MAXPATHLEN {
+            return Err(Errno::ENAMETOOLONG);
+        }
         let name = String::from_utf8_lossy(m.read(a[0], len)?).trim_end_matches('\0').to_string();
-        let Some(v) = sysctl::oid(&name).and_then(|o| sysctl::get(&o)) else {
-            if self.trace {
-                eprintln!("[gex:{}] sysctlbyname: no node {name}", self.pid);
-            }
-            return Err(Errno::ENOENT);
-        };
-        self.sysctl_out(m, a[2], a[3], &v.bytes(self.darwin_user_stack))
+        self.darwin_sysctl_req(m, Some(name), Vec::new(), a)
     }
 
-    /// Copy a node's value out: the size alone when `old` is null, ENOMEM
-    /// (with the size) when the buffer is short.
-    fn sysctl_out(&mut self, m: &mut GuestMem<'_>, old: u64, oldlenp: u64, value: &[u8]) -> Result<u64, Errno> {
-        if oldlenp == 0 {
-            return Ok(0);
+    /// What `sysctl` and `sysctlbyname` share (`userland_sysctl`): the
+    /// request, its error (ENOMEM still reports the size), the size out.
+    fn darwin_sysctl_req(&mut self, m: &mut GuestMem<'_>, name: Option<String>, oid: Vec<i32>, a: &[u64; 6]) -> Result<u64, Errno> {
+        // fuulong: an address that faults reads as all ones, and the write
+        // at the end fails it.
+        let oldlen = if a[3] != 0 { m.read_u64(a[3]).unwrap_or(u64::MAX) } else { 0 };
+        let mut req = SysctlReq { old: a[2], oldlen, oldidx: 0, new: if a[5] != 0 { a[4] } else { 0 }, newlen: a[5], newidx: 0 };
+        let r = self.darwin_sysctl_root(m, name, oid, &mut req);
+        if let Err(e) = r {
+            if e != Errno::ENOMEM {
+                return Err(e);
+            }
         }
-        let room = m.read_u64(oldlenp)? as usize;
-        m.write_u64(oldlenp, value.len() as u64)?;
-        if old == 0 {
-            return Ok(0);
+        if a[3] != 0 {
+            let n = if req.old != 0 && req.oldidx > req.oldlen { req.oldlen } else { req.oldidx };
+            m.write_u64(a[3], n).map_err(|_| Errno::EFAULT)?;
         }
-        if room < value.len() {
-            return Err(Errno::ENOMEM);
+        r.map(|()| 0)
+    }
+
+    /// `sysctl_root`: the walk, the node's write permissions, the MAC
+    /// check, and its handler.
+    fn darwin_sysctl_root(&mut self, m: &mut GuestMem<'_>, name: Option<String>, oid: Vec<i32>, req: &mut SysctlReq) -> Result<(), Errno> {
+        use sysctl::ctl;
+        let oid = match &name {
+            Some(n) => sysctl::name2oid(n)?,
+            None => oid,
+        };
+        let (node, tail) = sysctl::find(&oid)?;
+        // The name it is checked under, as the walk builds it.
+        let namestring = name.unwrap_or_else(|| sysctl::name_of(&oid));
+        if req.new != 0 && (node.kind & ctl::WR == 0 || (node.kind & ctl::SECURE != 0 && DARWIN_SECURELEVEL > 0)) {
+            return Err(Errno::EPERM);
         }
-        m.write(old, value)?;
-        Ok(0)
+        if req.new != 0 {
+            if node.kind & ctl::EXPERIMENT != 0 {
+                if !self.darwin_task_entitled("com.apple.private.write-kr-experiment-factors") {
+                    return Err(Errno::EPERM);
+                }
+            } else if node.kind & ctl::ANYBODY == 0 {
+                self.darwin_suser()?;
+            }
+        }
+        let e = self.darwin_mac_check_sysctl(namestring.as_bytes(), &oid, req.new, req.newlen);
+        if e != 0 {
+            return Err(super::errno::errno_of(e as i32));
+        }
+        self.darwin_sysctl_handle(m, node, tail, req)
+    }
+
+    /// A node's handler.
+    fn darwin_sysctl_handle(&mut self, m: &mut GuestMem<'_>, node: &sysctl::Node, tail: &[i32], req: &mut SysctlReq) -> Result<(), Errno> {
+        match node.path {
+            "sysctl.name" => req.out(m, sysctl::name_of(tail).as_bytes()).and_then(|()| req.out(m, b"\0")),
+            "sysctl.next" => match sysctl::next(tail) {
+                Some(o) => req.out(m, &oid_bytes(&o)),
+                None => Err(Errno::ENOENT),
+            },
+            "sysctl.name2oid" => {
+                if req.newlen == 0 {
+                    return Err(Errno::ENOENT);
+                }
+                if req.newlen as usize >= MAXPATHLEN {
+                    return Err(Errno::ENAMETOOLONG);
+                }
+                let bytes = req.input(m, req.newlen as usize)?;
+                let n = String::from_utf8_lossy(&bytes).trim_end_matches('\0').to_string();
+                let o = sysctl::name2oid(&n)?;
+                req.out(m, &oid_bytes(&o))
+            }
+            "sysctl.oidfmt" => {
+                let (kind, fmt) = sysctl::oid_fmt(tail)?;
+                req.out(m, &kind.to_le_bytes())?;
+                let mut f = fmt.as_bytes().to_vec();
+                f.push(0);
+                req.out(m, &f)
+            }
+            "kern.hostname" => self.darwin_sysctl_hostname(m, req),
+            "kern.osreleasetype" => self.darwin_sysctl_osreleasetype(m, req),
+            _ => match sysctl::value(node.path) {
+                Some(_) if req.new != 0 => {
+                    self.darwin_unimplemented(format!("sysctl write of {}", node.path));
+                    Err(Errno::EOPNOTSUPP)
+                }
+                Some(v) => {
+                    let b = sysctl::sized(node.path, node.kind, v.bytes(self.darwin_user_stack), req.old, req.oldlen)?;
+                    req.out(m, &b)
+                }
+                None => {
+                    self.darwin_unimplemented(format!("sysctl node {}", node.path));
+                    Err(Errno::EOPNOTSUPP)
+                }
+            },
+        }
+    }
+
+    /// `sysctl_hostname`: a platform binary (or an entitled one) sees and
+    /// sets the name; anyone else reads "localhost" and may not write.
+    fn darwin_sysctl_hostname(&mut self, m: &mut GuestMem<'_>, req: &mut SysctlReq) -> Result<(), Errno> {
+        const ENTITLEMENT: &str = "com.apple.developer.device-information.user-assigned-device-name";
+        let allowed = self.darwin_task_platform_binary() || self.darwin_task_entitled(ENTITLEMENT);
+        if !allowed && req.new != 0 {
+            return Err(Errno::EPERM);
+        }
+        let name = if allowed { sysctl::hostname() } else { b"localhost".to_vec() };
+        let new = req.io_string(m, &name, sysctl::MAXHOSTNAMELEN, true)?;
+        if let Some(v) = new {
+            sysctl::set_hostname(v);
+        }
+        Ok(())
+    }
+
+    /// `sysctl_osreleasetype`: launchd sets it, once.
+    fn darwin_sysctl_osreleasetype(&mut self, m: &mut GuestMem<'_>, req: &mut SysctlReq) -> Result<(), Errno> {
+        let cur = sysctl::os_release_type();
+        if req.new != 0 && (self.pid != 1 || !cur.is_empty()) {
+            return Err(Errno::EPERM);
+        }
+        const SIZE: usize = 48;
+        if let Some(v) = req.io_string(m, &cur, SIZE, false)? {
+            sysctl::set_os_release_type(v);
+        }
+        Ok(())
     }
 
     fn darwin_sigprocmask(&mut self, m: &mut GuestMem<'_>, how: u64, set: u64, old: u64) -> Result<u64, Errno> {
