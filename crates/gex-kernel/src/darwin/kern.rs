@@ -1576,7 +1576,10 @@ impl Kernel {
                 self.darwin_unimplemented(format!("sandbox_check with filter type {ftype} (vnodes, IOKit entries, signal targets)"));
                 return Err(EINVAL);
             }
-            _ => return Err(EINVAL),
+            _ => {
+                self.darwin_unimplemented(format!("sandbox_check with filter type {ftype}"));
+                return Err(EINVAL);
+            }
         }
         let Some(op) = super::mac::OPERATION_NAMES.iter().position(|n| n.as_bytes() == name.as_slice()) else { return Err(EINVAL) };
         if pid != i64::from(self.pid) {
