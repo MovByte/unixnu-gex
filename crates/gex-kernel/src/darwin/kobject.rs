@@ -301,6 +301,7 @@ impl Kernel {
         // and its bank context (task_bank_reset).
         self.darwin_threads_vouchers_release();
         let me = self.ipc().task;
+        self.ipc().imp_remove_watchports(me);
         self.ipc().imp_disconnect_task(me);
         self.darwin_bank_task_destroy();
         let semas: Vec<ObjId> = self.dtask.semas.map.iter().filter(|(_, s)| s.active).map(|(&p, _)| p).collect();

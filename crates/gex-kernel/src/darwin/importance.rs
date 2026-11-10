@@ -117,6 +117,9 @@ pub struct ImpState {
     kmsgs: HashMap<u64, KmsgImp>,
     next_kmsg: u64,
     next_handle: u64,
+    /// `task->watchports`: the ports each task's turnstile watch port
+    /// elements are on.
+    watchports: HashMap<TaskKey, Vec<ObjId>>,
 }
 
 impl ImpState {
@@ -741,8 +744,14 @@ impl Ipc {
     /// a reference.
     fn port_base_imp_task(&mut self, base: ObjId) -> Option<u64> {
         let p = self.port(base);
-        if !p.active || p.tempowner {
+        if !p.active {
             return None;
+        }
+        if p.tempowner {
+            // The task it names, if any.
+            let t = p.imp_task?;
+            self.imp_reference(t);
+            return Some(t);
         }
         let Receiver::Space(_) = p.receiver else { return None };
         let owner = p.owner;
@@ -808,7 +817,10 @@ impl Ipc {
     /// transit to `dest`: its assertions go along the chain, and from the
     /// task that had them to the task at the chain's end.
     pub(crate) fn imp_port_enqueued(&mut self, port: ObjId, dest: ObjId) {
-        // A temporary owner's task (none here) is what the port had.
+        // In a message, it watches for no task (its turnstile watch port
+        // element goes), and the task it named is what had its boosts.
+        self.watchport_clear(port);
+        let release = self.port_mut(port).imp_task.take();
         let assertcnt = self.port(port).impcount;
         self.port_mut(port).tempowner = false;
         let mut cur = dest;
@@ -819,11 +831,23 @@ impl Ipc {
             }
             cur = self.port(cur).destination.expect("in transit");
         }
-        if assertcnt > 0 {
-            if let Some(t) = self.port_base_imp_task(cur) {
+        let task = if assertcnt > 0 { self.port_base_imp_task(cur) } else { None };
+        let transfer = task != release;
+        if let Some(t) = task {
+            if transfer {
                 self.imp_hold_internal_locked(t, assertcnt);
-                self.imp_release(t);
             }
+        }
+        if let Some(r) = release {
+            if transfer {
+                self.imp_drop_internal_locked(r, assertcnt);
+            }
+        }
+        if let Some(t) = task {
+            self.imp_release(t);
+        }
+        if let Some(r) = release {
+            self.imp_release(r);
         }
     }
 
@@ -884,11 +908,15 @@ impl Ipc {
     /// its own, `ith_assertions`); one sent home in a port-destroyed
     /// notification goes as a temporary owner. The count and whether this
     /// destruction is the outermost.
-    pub(crate) fn imp_port_destroy_begin(&mut self, port: ObjId, pdrequest: bool) -> (u32, bool) {
+    pub(crate) fn imp_port_destroy_begin(&mut self, port: ObjId, pdrequest: bool) -> (u32, bool, Option<u64>) {
+        self.watchport_clear(port);
         let top = self.ith_assertions == 0;
         let p = self.port_mut(port);
+        let mut release = None;
         let assertcnt = if p.tempowner {
-            0
+            // A temporary owner's named task had its boosts.
+            release = p.imp_task.take();
+            if release.is_some() { p.impcount } else { 0 }
         } else {
             if pdrequest {
                 p.tempowner = true;
@@ -898,12 +926,19 @@ impl Ipc {
         if top {
             self.ith_assertions = assertcnt;
         }
-        (assertcnt, top)
+        (assertcnt, top, release)
     }
 
     /// `ipc_port_destroy`'s importance, after.
-    pub(crate) fn imp_port_destroy_end(&mut self, assertcnt: u32, top: bool) {
-        if assertcnt > 0 && top {
+    pub(crate) fn imp_port_destroy_end(&mut self, assertcnt: u32, top: bool, release: Option<u64>) {
+        if let Some(r) = release {
+            if assertcnt > 0 {
+                self.ith_assertions = 0;
+                debug_assert!(self.imp_is_any_receiver_type(Some(r)));
+                self.imp_drop_internal(r, assertcnt);
+            }
+            self.imp_release(r);
+        } else if assertcnt > 0 && top {
             self.ith_assertions = 0;
             self.imp_drop_current(assertcnt);
         }
@@ -913,10 +948,102 @@ impl Ipc {
     /// leave the task that had them.
     pub(crate) fn imp_port_tempowner(&mut self, port: ObjId) {
         let p = self.port_mut(port);
-        let assertcnt = if p.tempowner { 0 } else { p.impcount };
+        let mut release = None;
+        let assertcnt = if p.tempowner {
+            release = p.imp_task.take();
+            if release.is_some() { p.impcount } else { 0 }
+        } else {
+            p.impcount
+        };
         p.impdonation = true;
         p.tempowner = true;
-        self.imp_drop_current(assertcnt);
+        match release {
+            Some(r) => {
+                if assertcnt > 0 {
+                    self.imp_drop_internal(r, assertcnt);
+                }
+                self.imp_release(r);
+            }
+            None => self.imp_drop_current(assertcnt),
+        }
+    }
+
+    // -- watch ports --------------------------------------------------------------------
+
+    /// A spawned task's watch ports (`proc_set_task_spawnpolicy`): for an
+    /// adaptive daemon, each temporary owner sends its boosts to the task
+    /// (`task_add_importance_watchport`), which holds those the ports had;
+    /// for any task, each port in a space watches for it
+    /// (`task_add_turnstile_watchports`), the task it watched for before
+    /// losing it.
+    pub(crate) fn imp_add_watchports(&mut self, key: TaskKey, ports: &[Option<ObjId>], adaptive: bool) {
+        if adaptive {
+            let mut boosts = 0;
+            for &p in ports.iter().flatten() {
+                let new = self.imp_for_task(key, false);
+                let port = self.port_mut(p);
+                let (mut boost, mut release, mut kept) = (0, None, false);
+                if port.tempowner {
+                    boost = port.impcount;
+                    release = port.imp_task.take();
+                    if self.imp_is_marked_receiver(new) {
+                        self.port_mut(p).imp_task = new;
+                        kept = true;
+                    }
+                }
+                if let (Some(n), false) = (new, kept) {
+                    self.imp_release(n);
+                }
+                if let Some(r) = release {
+                    if boost > 0 {
+                        self.imp_drop_internal(r, boost);
+                    }
+                    self.imp_release(r);
+                }
+                boosts += boost;
+            }
+            // task_importance_hold_internal_assertion.
+            if boosts > 0 {
+                if let Some(t) = self.imp_for_task(key, false) {
+                    self.imp_hold_internal(t, boosts);
+                    self.imp_release(t);
+                }
+            }
+        }
+        for &p in ports.iter().flatten() {
+            let port = self.port(p);
+            // ipc_port_add_watchport_elem_locked: a live port in a space,
+            // not a special reply port.
+            if !port.active || port.specialreply || !matches!(port.receiver, Receiver::Space(_)) {
+                continue;
+            }
+            self.watchport_clear(p);
+            self.port_mut(p).watchport = Some(key);
+            self.vouchers.imp.watchports.entry(key).or_default().push(p);
+        }
+    }
+
+    /// `ipc_port_clear_watchport_elem_internal`: the port watches for its
+    /// task no more.
+    fn watchport_clear(&mut self, port: ObjId) {
+        if let Some(t) = self.port_mut(port).watchport.take() {
+            if let Some(list) = self.vouchers.imp.watchports.get_mut(&t) {
+                list.retain(|&x| x != port);
+                if list.is_empty() {
+                    self.vouchers.imp.watchports.remove(&t);
+                }
+            }
+        }
+    }
+
+    /// `task_remove_turnstile_watchports`: a task that ends is watched for
+    /// by no port.
+    pub(crate) fn imp_remove_watchports(&mut self, key: TaskKey) {
+        for p in self.vouchers.imp.watchports.remove(&key).unwrap_or_default() {
+            if self.port(p).watchport == Some(key) {
+                self.port_mut(p).watchport = None;
+            }
+        }
     }
 
     // -- messages -----------------------------------------------------------------------

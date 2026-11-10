@@ -179,6 +179,9 @@ pub struct Task {
     pub kevents: kevent::Kevents,
     /// The process's vouchers and their attribute managers' state.
     pub vouchers: voucher::Vouchers,
+    /// A spawned task's watch ports, with their send rights, and whether it
+    /// is an adaptive daemon: bound once the task is in the IPC table.
+    pub pending_watchports: Option<(Vec<Option<ipc::ObjId>>, bool)>,
     /// The program's code signature, when it has one, with the entitlements
     /// its credential carries.
     pub codesign: Option<codesign::CodeSign>,
@@ -343,6 +346,16 @@ impl crate::syscalls::Kernel {
                     link.bell.ring();
                 }
                 ipc.link = Some(link);
+            }
+            // proc_set_task_spawnpolicy's watch ports, the spawn's rights
+            // to them let go after.
+            if let Some((ports, adaptive)) = self.dtask.pending_watchports.take() {
+                let ipc = &mut self.dtask.ipc_raw;
+                let key = ipc.task;
+                ipc.imp_add_watchports(key, &ports, adaptive);
+                for p in ports.into_iter().flatten() {
+                    ipc.release_send(p);
+                }
             }
         }
         &mut self.dtask.ipc_raw

@@ -337,6 +337,11 @@ pub struct Port {
     /// `ip_spimportant`: a boosting send-possible request is armed.
     pub impcount: u32,
     pub spimportant: bool,
+    /// `ip_imp_task`: the task a temporary owner's boosts go to, an
+    /// importance watch port's (an element reference).
+    pub imp_task: Option<u64>,
+    /// `ip_twe`'s task: the task whose turnstile watch port this is.
+    pub watchport: Option<TaskKey>,
     /// `ip_destination`: the port whose queue holds the message this
     /// receive right is in transit in (none in limbo); it holds a
     /// reference on that port.
@@ -410,6 +415,8 @@ impl Port {
             impdonation: false,
             impcount: 0,
             spimportant: false,
+            imp_task: None,
+            watchport: None,
             destination: None,
             no_grant: false,
             service_port: false,
@@ -1194,11 +1201,11 @@ impl Ipc {
             p.connection_port = false;
         }
         let should_destroy = pdrequest.is_none();
-        let (assertcnt, top) = self.imp_port_destroy_begin(port, pdrequest.is_some());
+        let (assertcnt, top, release) = self.imp_port_destroy_begin(port, pdrequest.is_some());
         self.clear_receiver_pub(port, should_destroy);
         if let Some(to) = pdrequest {
             self.outbox.push(Notify::PortDestroyed { to, port });
-            self.imp_port_destroy_end(assertcnt, top);
+            self.imp_port_destroy_end(assertcnt, top, release);
             return;
         }
         if let Some(n) = self.no_senders_prepare_pub(port) {
@@ -1223,7 +1230,7 @@ impl Ipc {
             self.outbox.push(Notify::KobjectDestroyed { port });
         }
         self.release(port);
-        self.imp_port_destroy_end(assertcnt, top);
+        self.imp_port_destroy_end(assertcnt, top, release);
     }
 
     /// `ipc_port_clear_receiver`: out of its sets and its receiver's

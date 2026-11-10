@@ -237,12 +237,14 @@ impl Scratch {
 struct Held {
     registered: Vec<Option<super::ipc::ObjId>>,
     exc: Vec<(Option<super::ipc::right::Carried>, u32, i32, i32)>,
+    /// The watch ports' send rights (`portwatch_array`).
+    watch: Vec<Option<super::ipc::ObjId>>,
 }
 
 impl Held {
     /// `exec_port_actions_destroy`.
     fn release(self, k: &mut Kernel) {
-        for p in self.registered.into_iter().flatten() {
+        for p in self.registered.into_iter().chain(self.watch).flatten() {
             k.ipc().release_send(p);
         }
         for (c, ..) in self.exc {
@@ -599,6 +601,11 @@ impl Kernel {
                 for p in k.special.into_values().chain(k.registered.into_iter().flatten()) {
                     self.ipc().release_send(p);
                 }
+                if let Some((ports, _)) = child.dtask.pending_watchports.take() {
+                    for p in ports.into_iter().flatten() {
+                        self.ipc().release_send(p);
+                    }
+                }
                 super::exception::release_all(self.ipc(), &k.exc);
                 child.close_all_fds();
                 let told = super::coalition::task_terminated(pid);
@@ -686,6 +693,12 @@ impl Kernel {
                 p.lock().unwrap_or_else(|e| e.into_inner()).spawnpolicy(apptype, clamp, role);
             }
         }
+        // Its watch ports, bound to its task (an adaptive daemon's for
+        // importance) once the task is the IPC table's.
+        if !held.watch.is_empty() {
+            let adaptive = apptype == super::taskpolicy::apptype::DAEMON_ADAPTIVE;
+            child.dtask.pending_watchports = Some((std::mem::take(&mut held.watch), adaptive));
+        }
         if let Some(at) = attr {
             self.darwin_spawn_jetsam(child.pid, at);
         }
@@ -772,14 +785,9 @@ impl Kernel {
                 return Err(Errno::EINVAL);
             }
         }
-        // Audit sessions and importance watch ports are not here.
-        for i in 0..count {
-            let what = match action(i).0 {
-                PSPA_AU_SESSION => "a posix_spawn audit session port action (audit sessions)",
-                PSPA_IMP_WATCHPORTS => "a posix_spawn watch port action (importance watch ports)",
-                _ => continue,
-            };
-            self.darwin_unimplemented(what.into());
+        // Audit sessions are not here.
+        if (0..count).any(|i| action(i).0 == PSPA_AU_SESSION) {
+            self.darwin_unimplemented("a posix_spawn audit session port action (audit sessions)".into());
             return Err(Errno::EINVAL);
         }
         let mut held = Held::default();
@@ -815,6 +823,8 @@ impl Kernel {
                     }
                 }
                 PSPA_REGISTERED_PORTS => held.registered.push(port),
+                // Held until the spawn's policy binds them.
+                PSPA_IMP_WATCHPORTS => held.watch.push(port),
                 PSPA_EXCEPTION => {
                     let a = raw(i);
                     held.exc.push((carried, le32(a, 4), le32(a, 12) as i32, le32(a, 16) as i32));
