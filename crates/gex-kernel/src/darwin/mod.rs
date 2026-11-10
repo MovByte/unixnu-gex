@@ -85,6 +85,7 @@ pub mod timer;
 pub mod triage;
 pub mod trustcache;
 pub mod vm;
+pub mod coalition;
 pub mod importance;
 pub mod voucher;
 pub mod wait;

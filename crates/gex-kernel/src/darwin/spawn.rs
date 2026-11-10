@@ -345,6 +345,9 @@ impl Kernel {
         let mapped: Vec<(u64, u64)> = self.mem.lock().vmas().iter().map(|v| (v.start, v.end)).collect();
         self.dtask.vm.fork(&mapped);
         let pid = self.procs.spawn(self.pid);
+        // task_create_internal: the child's task is in its parent's
+        // coalitions.
+        super::coalition::fork(self.pid, pid);
         // forkproc's ids and start time for the child, which its task takes.
         let ids = (super::next_uniqueid(), super::next_pidversion(), super::procinfo::microtime());
         *self.dtask.fork_ids.lock().unwrap_or_else(|e| e.into_inner()) = Some(ids);
@@ -449,7 +452,7 @@ impl Kernel {
         let mut attr = None;
         let mut file_actions = None;
         let mut port_actions: Option<Vec<u8>> = None;
-        let mut coal_info = 0;
+        let (mut coal_info, mut coal_size) = (0, 0);
         let mut creds = SpawnCreds::default();
         if adesc != 0 {
             let d = m.read(adesc, ARGS_DESC_SIZE)?.to_vec();
@@ -458,11 +461,12 @@ impl Kernel {
             let (fa_size, fa) = pair(1);
             let (pa_size, pa) = pair(2);
             let (mx_size, mx) = pair(3);
-            let (_, coal) = pair(4);
+            let (csize, coal) = pair(4);
             let (persona_size, persona) = pair(5);
             let (cred_size, cred) = pair(6);
             let (root_size, _) = pair(7);
             coal_info = coal;
+            coal_size = csize;
             if attr_size != 0 {
                 attr = Some(Attr::parse(m.read(attrp, ATTR_SIZE)?));
             }
@@ -523,10 +527,6 @@ impl Kernel {
             if at.apptype & PROC_TYPE_MASK == PROC_TYPE_DRIVER && !self.dtask.codesign.as_ref().is_some_and(|c| c.entitled("com.apple.private.spawn-driver")) {
                 return Err(Errno::EPERM);
             }
-            if coal_info != 0 && at.flags & flag::SETEXEC == 0 {
-                self.darwin_unimplemented("posix_spawn into coalitions".into());
-                return Err(Errno::EINVAL);
-            }
             self.darwin_spawn_unported(at)?;
             if at.flags & flag::SETEXEC != 0 {
                 if port_actions.is_some() {
@@ -536,6 +536,29 @@ impl Kernel {
                 return self.darwin_spawn_setexec(m, at, file_actions.as_deref(), &creds, path, argv, envv).map(Spawned::Exec);
             }
         }
+        // The coalitions it names (a spawn with attributes), activated
+        // against their end until the child is in them.
+        let mut coals = None;
+        if attr.is_some() && coal_info != 0 {
+            let n = (coal_size as usize).min(48);
+            let mut info = [0u8; 48];
+            info[..n].copy_from_slice(m.read(coal_info, n)?);
+            let me = self.pid;
+            let entitled = self.darwin_task_entitled("com.apple.private.coalition-spawn");
+            coals = Some(super::coalition::Spawn::activate(&info, |k| super::coalition::privileged(me, k) || entitled)?);
+        }
+        let r = self.darwin_spawn_process(m, attr.as_ref(), file_actions.as_deref(), port_actions.as_deref(), &creds, path, argv, envv, coals.as_ref());
+        // spawn_coalitions_release_all: the child holds them now.
+        if let Some(mut c) = coals {
+            let told = c.release_all();
+            self.darwin_coalitions_notify(told);
+        }
+        r
+    }
+
+    /// `posix_spawn`'s new process: fork1, then the child's half.
+    #[allow(clippy::too_many_arguments)]
+    fn darwin_spawn_process(&mut self, m: &mut GuestMem<'_>, attr: Option<&Attr>, file_actions: Option<&[u8]>, port_actions: Option<&[u8]>, creds: &SpawnCreds, path: u64, argv: u64, envv: u64, coals: Option<&super::coalition::Spawn>) -> Result<Spawned, Errno> {
         // fork1(PROC_CREATE_SPAWN): a new process of this one's, no memory,
         // in this one's persona.
         self.darwin_fork1_checks()?;
@@ -547,6 +570,11 @@ impl Kernel {
         child.dtask.csflags.fetch_and(!super::amfi::cs::GET_TASK_ALLOW, std::sync::atomic::Ordering::AcqRel);
         child.signals.thread().set_tsd(0);
         let pid = self.procs.spawn(self.pid);
+        // Its task in the coalitions named, with its roles, or its parent's.
+        match coals {
+            Some(c) => c.place(self.pid, pid),
+            None => super::coalition::fork(self.pid, pid),
+        }
         // The spawner's NOTE_FORK, whatever becomes of the child.
         crate::procnote::post(self.pid, crate::procnote::note::FORK | pid as u32);
         child.pid = pid;
@@ -555,7 +583,7 @@ impl Kernel {
         child.thread_sig(pid);
         child.forget_own_pidfds();
         child.darwin_publish();
-        let spawned = self.darwin_spawn_child(m, &mut child, attr.as_ref(), file_actions.as_deref(), port_actions.as_deref(), &creds, path, argv, envv);
+        let spawned = self.darwin_spawn_child(m, &mut child, attr, file_actions, port_actions, creds, path, argv, envv);
         // A guard the file actions tripped is the spawning thread's.
         if child.dtask.fd_guard.is_some() {
             self.dtask.fd_guard = child.dtask.fd_guard.take();
@@ -571,6 +599,8 @@ impl Kernel {
                 }
                 super::exception::release_all(self.ipc(), &k.exc);
                 child.close_all_fds();
+                let told = super::coalition::task_terminated(pid);
+                self.darwin_coalitions_notify(told);
                 self.procs.reap(pid);
                 Err(e)
             }

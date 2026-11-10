@@ -105,11 +105,6 @@ pub(crate) mod bank {
     pub const FLAG_ADOPTION_ALLOWED: u32 = 0x1;
 }
 
-/// `THREAD_GROUP_SYSTEM`: the thread group of the init jetsam coalition
-/// (`COALITION_ROLE_SYSTEM`), which every task here is in, no coalition
-/// being made (`task_coalition_get_thread_group`).
-const THREAD_GROUP_SYSTEM: u64 = 0;
-
 /// `MACH_VOUCHER_IMPORTANCE_ATTR_DROP_EXTERNAL`.
 const IMPORTANCE_ATTR_DROP_EXTERNAL: u32 = 2;
 
@@ -1128,7 +1123,7 @@ impl Kernel {
             macho_uuid: self.dtask.uuid,
         };
         let persona_uid = persona.as_ref().map_or(super::cred::UID_NONE, |p| p.get_uid());
-        BankTask { refs: 1, made: 0, voucher_ref: 0, info, persona_uid, hasentitlement: self.bank_task_is_propagate_entitled(), thread_group: THREAD_GROUP_SYSTEM, to_pay: Vec::new(), to_charge: Vec::new() }
+        BankTask { refs: 1, made: 0, voucher_ref: 0, info, persona_uid, hasentitlement: self.bank_task_is_propagate_entitled(), thread_group: super::coalition::thread_group(self.pid), to_pay: Vec::new(), to_charge: Vec::new() }
     }
 
     /// `bank_task_is_propagate_entitled`: a platform binary propagates
@@ -1331,9 +1326,12 @@ impl Kernel {
                         persona = a.so_persona;
                     }
                     let merchant = self.get_bank_task_context();
-                    // An app's voucher takes its own thread group, which is
-                    // every task's here.
                     let cur_tg = self.bank_task(merchant).thread_group;
+                    // An app's voucher takes the app's own thread group.
+                    let mut tg = tg;
+                    if self.darwin_policy().is_app() {
+                        tg = cur_tg;
+                    }
                     if !self.bank_task_can_adopt_persona(merchant, persona) {
                         persona = self.bank_task_get_persona(merchant);
                     }

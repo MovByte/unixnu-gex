@@ -345,9 +345,13 @@ impl Kernel {
                 Ok(0)
             }
             call::PIDORIGINATORINFO => self.darwin_pidoriginatorinfo(m, pid, fl, buf, size),
-            // KERNMSGBUF, PIDFILEPORTINFO, PIDRUSAGE, LISTCOALITIONS,
-            // CANUSEFGHW, PIDDYNKQUEUEINFO, TERMINATE_RSR.
-            4 | 6 | 9 | 11..=13 | 16 => {
+            // proc_listcoalitions: the pid argument is its flavor, the
+            // flavor its coalition type.
+            11 => self.darwin_listcoalitions(m, pid, fl as i32, buf, size),
+            12 => self.darwin_can_use_foreground_hw(m, pid, buf, size),
+            // KERNMSGBUF, PIDFILEPORTINFO, PIDRUSAGE, PIDDYNKQUEUEINFO,
+            // TERMINATE_RSR.
+            4 | 6 | 9 | 13 | 16 => {
                 self.darwin_unimplemented(format!("proc_info call {callnum} (flavor {fl})"));
                 Err(e::EINVAL)
             }
@@ -428,20 +432,8 @@ impl Kernel {
         if pid != 0 && pid != self.pid {
             return Err(e::EINVAL);
         }
-        // proc_get_originatorbgstate: background if the thread is, not if
-        // the process is an application; else as the originator's task is.
         if fl == BGSTATE {
-            const PROC_FLAG_APPLICATION: u32 = 0x100_0000;
-            let mut bg = u32::from(self.darwin_thread_darwinbg(self.tid));
-            if bg == 0 && self.darwin_bgstate(self.pid)? & PROC_FLAG_APPLICATION == 0 {
-                let origin = self.darwin_voucher_origin_pid()?;
-                // proc_pidbackgrounded: a live process's task's DARWIN_BG.
-                if self.darwin_public(origin).is_none_or(|(_, zombie)| zombie) {
-                    return Err(e::ESRCH);
-                }
-                let tp = if origin == self.pid { Some(self.darwin_policy()) } else { self.procs.task_policy(origin).map(|c| *c.lock().unwrap_or_else(|e| e.into_inner())) };
-                bg = u32::from(tp.is_some_and(|p| p.effective.darwinbg));
-            }
+            let bg = self.darwin_originator_bgstate()?;
             m.write(buf, &bg.to_le_bytes()).map_err(|_| 14)?;
             return Ok(4);
         }
@@ -455,6 +447,143 @@ impl Kernel {
         }
         m.write(buf, &b).map_err(|_| 14)?;
         Ok(u64::from(size))
+    }
+
+    /// `proc_listcoalitions(flavor, type, buffer, buffersize)`: each
+    /// coalition (of one type) as `struct procinfo_coalinfo`, as many as
+    /// fit; with no buffer, the room they take.
+    fn darwin_listcoalitions(&mut self, m: &mut GuestMem<'_>, flavor: i32, k: i32, buf: u64, size: u32) -> Result<u64, i32> {
+        const ALL_COALS: i32 = 1;
+        const SINGLE_TYPE: i32 = 2;
+        const ELEM: u64 = 16;
+        let k = match flavor {
+            ALL_COALS => -1,
+            SINGLE_TYPE => k,
+            _ => return Err(e::EINVAL),
+        };
+        let list = super::coalition::list(k);
+        if list.is_empty() || buf == 0 || size == 0 {
+            return Ok(list.len() as u64 * ELEM);
+        }
+        let mut b = Vec::with_capacity(list.len() * ELEM as usize);
+        for (id, ty, tasks) in list {
+            b.extend_from_slice(&id.to_le_bytes());
+            b.extend_from_slice(&ty.to_le_bytes());
+            b.extend_from_slice(&tasks.to_le_bytes());
+        }
+        b.truncate((size as usize).min(b.len()));
+        m.write(buf, &b).map_err(|_| 14)?;
+        Ok(b.len() as u64)
+    }
+
+    /// `proc_get_originatorbgstate`: background if the thread is, not if
+    /// the process is an application; else as the originator's task is.
+    fn darwin_originator_bgstate(&mut self) -> Result<u32, i32> {
+        const PROC_FLAG_APPLICATION: u32 = 0x100_0000;
+        let mut bg = u32::from(self.darwin_thread_darwinbg(self.tid));
+        if bg == 0 && self.darwin_bgstate(self.pid)? & PROC_FLAG_APPLICATION == 0 {
+            let origin = self.darwin_voucher_origin_pid()?;
+            // proc_pidbackgrounded: a live process's task's DARWIN_BG.
+            if self.darwin_public(origin).is_none_or(|(_, zombie)| zombie) {
+                return Err(e::ESRCH);
+            }
+            let tp = if origin == self.pid { Some(self.darwin_policy()) } else { self.procs.task_policy(origin).map(|c| *c.lock().unwrap_or_else(|e| e.into_inner())) };
+            bg = u32::from(tp.is_some_and(|p| p.effective.darwinbg));
+        }
+        Ok(bg)
+    }
+
+    /// `proc_can_use_foreground_hw(pid, reason, reasonsize)`: whether the
+    /// process may use foreground hardware, and why. The leader of its
+    /// jetsam coalition, an application, may while it is a UI one and not
+    /// in the background. (Another member finds no leader: the kernel's
+    /// look-up of its coalition's leader starts from no coalition.) Else a
+    /// process asking for itself may by the originator of the voucher it
+    /// adopted.
+    fn darwin_can_use_foreground_hw(&mut self, m: &mut GuestMem<'_>, pid: i32, u_reason: u64, reasonsize: u32) -> Result<u64, i32> {
+        const OK: u32 = 0;
+        const DAEMON_OK: u32 = 1;
+        const DAEMON_LEADER: u32 = 10;
+        const LEADER_NONUI: u32 = 11;
+        const LEADER_BACKGROUND: u32 = 12;
+        const DAEMON_NO_VOUCHER: u32 = 13;
+        const NO_VOUCHER_ATTR: u32 = 14;
+        const NO_ORIGINATOR: u32 = 15;
+        const ORIGINATOR_BACKGROUND: u32 = 16;
+        const VOUCHER_ERROR: u32 = 98;
+        const ERROR: u32 = 99;
+        const PROC_FLAG_APPLICATION: u32 = 0x100_0000;
+        const ENOATTR: i32 = 93;
+        let mut reason = ERROR;
+        let mut ret = 0;
+        let r: Result<(), i32> = 'out: {
+            if pid <= 0 {
+                break 'out Err(e::EINVAL);
+            }
+            if self.darwin_public(pid).is_none_or(|(_, zombie)| zombie) {
+                break 'out Err(e::ESRCH);
+            }
+            if pid != self.pid && self.creds.uid() != 0 {
+                break 'out Err(e::EPERM);
+            }
+            if super::coalition::leader(pid).1 {
+                let flags = match self.darwin_bgstate(pid) {
+                    Ok(f) => f,
+                    Err(x) => break 'out Err(x),
+                };
+                if flags & PROC_FLAG_APPLICATION == PROC_FLAG_APPLICATION {
+                    let tp = if pid == self.pid { Some(self.darwin_policy()) } else { self.procs.task_policy(pid).map(|c| *c.lock().unwrap_or_else(|e| e.into_inner())) };
+                    let ef = tp.map(|p| p.effective).unwrap_or_default();
+                    if ef.darwinbg {
+                        reason = LEADER_BACKGROUND;
+                        break 'out Ok(());
+                    }
+                    use super::taskpolicy::role;
+                    if matches!(ef.role, role::FOREGROUND_APPLICATION | role::BACKGROUND_APPLICATION) {
+                        ret = 1;
+                        reason = OK;
+                    } else {
+                        reason = LEADER_NONUI;
+                    }
+                    break 'out Ok(());
+                }
+                reason = DAEMON_LEADER;
+            }
+            if pid != self.pid {
+                break 'out Err(e::EINVAL);
+            }
+            match self.darwin_originator_bgstate() {
+                Ok(0) => {
+                    reason = DAEMON_OK;
+                    ret = 1;
+                    Ok(())
+                }
+                Ok(_) => {
+                    reason = ORIGINATOR_BACKGROUND;
+                    Ok(())
+                }
+                Err(x) if x == e::ESRCH => {
+                    reason = NO_ORIGINATOR;
+                    Ok(())
+                }
+                Err(ENOATTR) => {
+                    reason = NO_VOUCHER_ATTR;
+                    Ok(())
+                }
+                Err(x) if x == e::EINVAL => {
+                    reason = DAEMON_NO_VOUCHER;
+                    Ok(())
+                }
+                Err(x) => {
+                    reason = VOUCHER_ERROR;
+                    Err(x)
+                }
+            }
+        };
+        if reasonsize >= 4 && u_reason != 0 {
+            let _ = m.write(u_reason, &reason.to_le_bytes());
+        }
+        r.map(|()| ret)
     }
 
     /// `thread_get_current_voucher_origin_pid`: the bank's
@@ -800,6 +929,17 @@ impl Kernel {
                 Ok(4)
             }
             EXITREASONINFO | EXITREASONBASICINFO => self.darwin_pidexitreasoninfo(m, pid, buf, fl == EXITREASONBASICINFO),
+            // proc_pidcoalitioninfo: its coalitions' ids, by type (none, 0).
+            COALITIONINFO => {
+                let (ids, _) = super::coalition::membership(pid);
+                let mut b = Vec::with_capacity(40);
+                for id in ids {
+                    b.extend_from_slice(&id.to_le_bytes());
+                }
+                b.resize(40, 0);
+                m.write(buf, &b).map_err(fault)?;
+                Ok(40)
+            }
             _ => {
                 self.darwin_unimplemented(format!("proc_pidinfo flavor {fl}"));
                 Err(e::EINVAL)

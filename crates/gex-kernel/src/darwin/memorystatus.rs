@@ -1391,9 +1391,8 @@ impl crate::syscalls::Kernel {
                 if self.procs.jetsam().get(pid).is_none() {
                     return Err(Errno::ESRCH);
                 }
-                if pid != self.pid && !root && !entitled {
-                    // A coalition leader may change its members'.
-                    self.darwin_unimplemented("memorystatus_set_process_is_freezable on another process by its coalition leader (coalitions)".into());
+                // Another process's, for the leader of its jetsam coalition.
+                if pid != self.pid && !root && !entitled && super::coalition::leader(pid).0 != Some(self.pid) {
                     return Err(Errno::EPERM);
                 }
                 self.procs.jetsam().set_freezable(pid, freezable).map(|_| 0)
@@ -1417,8 +1416,11 @@ impl crate::syscalls::Kernel {
                 }
                 Ok(u64::from(self.procs.jetsam().freeze_state(pid).is_some_and(|(_, f)| f)))
             }
-            cmd::GET_JETSAM_SNAPSHOT | cmd::GET_PRESSURE_STATUS | cmd::GET_MEMLIMIT_EXCESS | cmd::FREEZER_CONTROL | cmd::MARK_PROCESS_COALITION_SWAPPABLE | cmd::GET_PROCESS_COALITION_IS_SWAPPABLE => {
-                self.darwin_unimplemented(format!("memorystatus_control command {command} (the memory model: footprints, pressure, the freezer, coalitions)"));
+            // memorystatus_swap_all_apps: this device's tree sets no
+            // kern.swap_all_apps, so app swap is not supported.
+            cmd::MARK_PROCESS_COALITION_SWAPPABLE | cmd::GET_PROCESS_COALITION_IS_SWAPPABLE => Err(Errno::EOPNOTSUPP),
+            cmd::GET_JETSAM_SNAPSHOT | cmd::GET_PRESSURE_STATUS | cmd::GET_MEMLIMIT_EXCESS | cmd::FREEZER_CONTROL => {
+                self.darwin_unimplemented(format!("memorystatus_control command {command} (the memory model: footprints, pressure, the freezer)"));
                 Err(Errno::EINVAL)
             }
             _ => Err(Errno::EINVAL),

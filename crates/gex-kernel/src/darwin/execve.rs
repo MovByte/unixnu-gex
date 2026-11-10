@@ -558,6 +558,11 @@ impl Kernel {
         };
         // task_bank_init, the image in place.
         self.darwin_task_bank_init();
+        // The new task takes the old one's coalitions and roles (a spawn's
+        // child was put in its own when it was made).
+        if spawn.is_none_or(|s| s.flags & super::spawn::flag::SETEXEC != 0) {
+            super::coalition::exec(self.pid);
+        }
         // A spawn's own exec with attributes: its process control.
         if let Some(pc) = spawn.filter(|s| s.flags & super::spawn::flag::SETEXEC != 0).and_then(|s| s.pcontrol) {
             self.dtask.pcaction.store(super::spawn::pcaction_of(pc), std::sync::atomic::Ordering::Release);

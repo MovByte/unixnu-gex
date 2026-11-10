@@ -289,7 +289,12 @@ impl Kernel {
     /// ended (`ipc_space_terminate`), every right in it with the
     /// notifications that owes; then its space leaves the system's table.
     pub fn darwin_task_terminate(&mut self) {
-        if !self.darwin || self.dtask.ipc_raw.task == 0 {
+        if !self.darwin {
+            return;
+        }
+        // coalitions_remove_task, launchd told of those it emptied.
+        self.darwin_coalitions_task_end();
+        if self.dtask.ipc_raw.task == 0 {
             return;
         }
         // Its threads' vouchers, its importance (ipc_importance_disconnect_task)
