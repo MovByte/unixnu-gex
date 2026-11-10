@@ -398,7 +398,7 @@ impl Kernel {
             // session's uuid_string_t (with its NUL) and the cdhash.
             use sha2::Digest;
             let mut uuid = [0u8; 37];
-            let u = super::sysctl::BOOTSESSIONUUID.as_bytes();
+            let u = super::sysctl::bootsessionuuid().as_bytes();
             uuid[..u.len()].copy_from_slice(u);
             let mut h = sha2::Sha256::new();
             h.update(boothash_salt(self)?.to_le_bytes());

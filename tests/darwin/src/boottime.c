@@ -5,6 +5,9 @@
 #include <mach/mach_time.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <string.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
 
@@ -31,6 +34,30 @@ int main(void) {
     uint64_t now_us = (uint64_t)now.tv_sec * 1000000u + (uint64_t)now.tv_usec;
     long skew = (long)(now_us - (bt_us + up_us));
     if (skew < -100000 || skew > 100000) return bad("now less boot time less uptime (us)", skew, 0);
+    // This boot's session: a version 4 UUID, the same to every process.
+    char uuid[37] = {0}, child[37] = {0};
+    size_t ulen = sizeof uuid;
+    if (sysctlbyname("kern.bootsessionuuid", uuid, &ulen, NULL, 0) != 0 || ulen != 37) return bad("kern.bootsessionuuid's length", (long)ulen, 37);
+    if (uuid[8] != '-' || uuid[14] != '4' || !strchr("89AB", uuid[19]) || !strncmp(uuid, "00000000", 8) || strpbrk(uuid, "abcdef")) {
+        printf("boottime: kern.bootsessionuuid: %s\n", uuid);
+        return 1;
+    }
+    int up[2];
+    pipe(up);
+    pid_t kid = fork();
+    if (kid == 0) {
+        ulen = sizeof child;
+        sysctlbyname("kern.bootsessionuuid", child, &ulen, NULL, 0);
+        write(up[1], child, sizeof child);
+        _exit(0);
+    }
+    read(up[0], child, sizeof child);
+    waitpid(kid, NULL, 0);
+    if (memcmp(uuid, child, sizeof uuid)) {
+        printf("boottime: a child's session: %s, not %s\n", child, uuid);
+        return 1;
+    }
+
     printf("boottime ok\n");
     return 0;
 }

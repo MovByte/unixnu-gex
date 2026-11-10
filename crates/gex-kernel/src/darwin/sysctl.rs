@@ -65,7 +65,22 @@ pub const CTL_HW: i32 = 6;
 pub const PRIVATE: i32 = 0x7f00;
 
 /// `bootsessionuuid_string`.
-pub const BOOTSESSIONUUID: &str = "00000000-0000-0000-0000-000000000000";
+/// `kern.bootsessionuuid`: this boot's, a version 4 UUID in capitals as
+/// the real system's is. What sets it is outside the kernel; here it comes
+/// from the one thing unique to the boot, the time it began.
+pub fn bootsessionuuid() -> &'static str {
+    use sha2::Digest;
+    static UUID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    UUID.get_or_init(|| {
+        let d = sha2::Sha256::digest(super::mach::boottime_usec().to_le_bytes());
+        let mut b = [0u8; 16];
+        b.copy_from_slice(&d[..16]);
+        b[6] = (b[6] & 0x0f) | 0x40;
+        b[8] = (b[8] & 0x3f) | 0x80;
+        let hex = |r: std::ops::Range<usize>| r.map(|i| format!("{:02X}", b[i])).collect::<String>();
+        format!("{}-{}-{}-{}-{}", hex(0..4), hex(4..6), hex(6..8), hex(8..10), hex(10..16))
+    })
+}
 
 /// `(name, oid, value)`.
 /// The values this kernel has, by node.
@@ -95,7 +110,7 @@ pub fn value(path: &str) -> Option<Value> {
         "kern.osvariant_status" => I64(0),
         "kern.secure_kernel" => I32(0),
         "kern.hv_vmm_present" => I32(0),
-        "kern.bootsessionuuid" => Str(BOOTSESSIONUUID),
+        "kern.bootsessionuuid" => Str(bootsessionuuid()),
         "kern.uuid" => Str("D6F6E0D2-FE60-38A0-9214-556B7FAF8951"),
         "kern.osbuildconfig" => Str("release"),
         "kern.willshutdown" => I32(0),
