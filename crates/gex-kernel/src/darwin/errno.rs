@@ -27,6 +27,10 @@ pub fn errno_of(darwin: i32) -> crate::errno::Errno {
     }
 }
 
+/// `EOPNOTSUPP`, which Linux has as one number with `ENOTSUP`, carried on
+/// that number for Darwin's `ENOTSUP`.
+pub const EOPNOTSUPP: crate::errno::Errno = native(102);
+
 /// `EBADEXEC`.
 pub const EBADEXEC: crate::errno::Errno = native(85);
 

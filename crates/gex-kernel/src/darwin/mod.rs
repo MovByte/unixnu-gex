@@ -66,6 +66,7 @@ pub mod sema;
 pub mod shm;
 pub mod signal;
 pub mod sockaddr;
+pub mod sockerr;
 pub mod spawn;
 pub mod kinfo;
 pub mod sysctl;

@@ -309,6 +309,9 @@ impl Kernel {
         if let Some(r) = self.darwin_fixed_call(m, raw, a) {
             return Some(res(r));
         }
+        if let Some(e) = self.darwin_sock_refused(raw, a) {
+            return Some(neg(e));
+        }
         if let Some(write) = super::fsops::vectored(raw) {
             if let Err(e) = self.darwin_uio_check(m, write, a) {
                 return Some(neg(e));

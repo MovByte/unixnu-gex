@@ -10,10 +10,8 @@ use crate::errno::Errno;
 use crate::syscalls::Kernel;
 use crate::GuestMem;
 
-/// `CROSSARCH_MAX_VALID_NAMESPACE`, Darwin's `EOPNOTSUPP` (Linux's one
-/// number is Darwin's `ENOTSUP`).
+/// `CROSSARCH_MAX_VALID_NAMESPACE`.
 const CROSSARCH_MAX_VALID_NAMESPACE: u64 = 0;
-const DARWIN_EOPNOTSUPP: Errno = super::errno::native(102);
 
 impl Kernel {
     fn darwin_entitled(&self, name: &str) -> bool {
@@ -34,7 +32,7 @@ impl Kernel {
         Some(match raw {
             sys::CROSSARCH_TRAP => Err(if a[0] as u32 as u64 > CROSSARCH_MAX_VALID_NAMESPACE { Errno::EINVAL } else { Errno::EOPNOTSUPP }),
             sys::SWAPON | sys::UNDELETE | sys::SEARCHFS | sys::KAS_INFO | sys::DEBUG_SYSCALL_REJECT | sys::DEBUG_SYSCALL_REJECT_CONFIG => Err(Errno::EOPNOTSUPP),
-            sys::QUOTACTL => Err(DARWIN_EOPNOTSUPP),
+            sys::QUOTACTL => Err(super::errno::EOPNOTSUPP),
             sys::REVOKE => self.darwin_revoke(m, a[0]),
             sys::SETPRIVEXEC => {
                 let was = self.dtask.p_debugger;
