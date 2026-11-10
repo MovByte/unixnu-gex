@@ -430,3 +430,31 @@ mod tests {
         assert_eq!((c.uid, c.ruid, c.svuid), (501, 501, 501));
     }
 }
+
+/// `posix_cred_access`: whether `cred` may have `mode_req` (in owner bits,
+/// `S_IRUSR` and the like) of an object with this owner, group and mode.
+/// The owner falls through to the group and world bits; root is the
+/// caller's to let past first.
+pub fn posix_cred_access(cred: &Cred, uid: u32, gid: u32, mode: u32, mode_req: u32) -> Result<(), crate::errno::Errno> {
+    let owner = mode & 0o700;
+    let group = (mode & 0o070) << 3;
+    let world = (mode & 0o007) << 6;
+    if cred.uid == uid && mode_req & owner == mode_req {
+        return Ok(());
+    }
+    if mode_req & group & world == mode_req {
+        return Ok(());
+    }
+    let member = cred.groups.contains(&gid);
+    let allowed = if mode_req & group != mode_req {
+        // A member is refused by the group bits, and world's cannot help.
+        !member && mode_req & world == mode_req
+    } else {
+        member || mode_req & world == mode_req
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(crate::errno::Errno::EACCES)
+    }
+}

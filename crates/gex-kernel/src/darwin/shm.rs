@@ -7,6 +7,7 @@
 //! `msync` and `munmap`, so two processes that map one see each other's
 //! writes only then.
 
+use super::cred::Cred;
 use crate::errno::{Errno, SysResult};
 use crate::file::OpenFile;
 use crate::syscalls::Kernel;
@@ -83,25 +84,15 @@ impl Pshm {
     }
 }
 
-/// `pshm_access`/`posix_cred_access`: whether the caller may open the
-/// object for `fmode` (`FREAD`, `FWRITE`). Root always may.
-fn access(p: &Pshm, fmode: u32, uid: u32, gid: u32) -> Result<(), Errno> {
-    if uid == 0 {
+/// `pshm_access`: whether the caller may open the object for `fmode`
+/// (`FREAD`, `FWRITE`). Root always may; anyone else as `posix_cred_access`
+/// says.
+fn access(p: &Pshm, fmode: u32, cred: &Cred) -> Result<(), Errno> {
+    if cred.uid == 0 {
         return Ok(());
     }
-    let req = (if fmode & FREAD != 0 { 0o4 } else { 0 }) | (if fmode & FWRITE != 0 { 0o2 } else { 0 });
-    let bits = if uid == p.uid {
-        (p.mode >> 6) & 7
-    } else if gid == p.gid {
-        (p.mode >> 3) & 7
-    } else {
-        p.mode & 7
-    };
-    if bits & req == req {
-        Ok(())
-    } else {
-        Err(Errno::EACCES)
-    }
+    let req = (if fmode & FREAD != 0 { 0o400 } else { 0 }) | (if fmode & FWRITE != 0 { 0o200 } else { 0 });
+    super::cred::posix_cred_access(cred, p.uid, p.gid, p.mode, req)
 }
 
 /// The names (`pshm_head`).
@@ -117,7 +108,7 @@ impl Names {
 
     /// The object `shm_open(name, oflag, mode)` opens, and whether it was
     /// made by the call. `fmode` is `FFLAGS(oflag)`.
-    fn open(&self, name: &str, fmode: u32, mode: u32, uid: u32, gid: u32, pid: i32) -> Result<(Arc<Pshm>, bool), Errno> {
+    fn open(&self, name: &str, fmode: u32, mode: u32, cred: &Cred, pid: i32) -> Result<(Arc<Pshm>, bool), Errno> {
         let mut names = self.by_name.lock().unwrap();
         match names.get(name) {
             Some(p) => {
@@ -128,14 +119,14 @@ impl Names {
                 if fmode & O_TRUNC != 0 && p.allocated() {
                     return Err(Errno::EINVAL);
                 }
-                access(p, fmode, uid, gid)?;
+                access(p, fmode, cred)?;
                 Ok((Arc::clone(p), false))
             }
             None => {
                 if fmode & O_CREAT == 0 {
                     return Err(Errno::ENOENT);
                 }
-                let p = Arc::new(Pshm::new(name, mode & ALLPERMS, uid, gid, pid));
+                let p = Arc::new(Pshm::new(name, mode & ALLPERMS, cred.uid, cred.groups.first().copied().unwrap_or(0), pid));
                 names.insert(name.to_string(), Arc::clone(&p));
                 Ok((p, true))
             }
@@ -143,11 +134,11 @@ impl Names {
     }
 
     /// `shm_unlink`: the name goes; the object lives while it is open.
-    fn unlink(&self, name: &str, uid: u32, gid: u32) -> Result<(), Errno> {
+    fn unlink(&self, name: &str, cred: &Cred) -> Result<(), Errno> {
         let mut names = self.by_name.lock().unwrap();
         let p = names.get(name).ok_or(Errno::ENOENT)?;
-        if let Err(e) = access(p, FWRITE, uid, gid) {
-            if p.uid != uid {
+        if let Err(e) = access(p, FWRITE, cred) {
+            if p.uid != cred.uid {
                 return Err(e);
             }
         }
@@ -230,8 +221,7 @@ impl Kernel {
         if fmode & (FREAD | FWRITE) == 0 {
             return Err(Errno::EINVAL);
         }
-        let (uid, gid) = (self.creds.uid(), self.creds.gid());
-        let (p, made) = NAMES.open(&name, fmode, a[2] as u32 & ALLPERMS, uid, gid, self.pid)?;
+        let (p, made) = NAMES.open(&name, fmode, a[2] as u32 & ALLPERMS, &self.dtask.cred, self.pid)?;
         if !made && p.creator != self.pid {
             self.darwin_unimplemented(format!(
                 "shm_open {name:?}: the object is also held by process {}; their mappings of it agree only at msync and munmap",
@@ -247,7 +237,7 @@ impl Kernel {
     /// `shm_unlink(name)`: any failure of the name is `EINVAL`.
     pub(crate) fn darwin_shm_unlink(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
         let name = get_name(m, a[0]).map_err(|_| Errno::EINVAL)?;
-        NAMES.unlink(&name, self.creds.uid(), self.creds.gid()).map(|_| 0)
+        NAMES.unlink(&name, &self.dtask.cred).map(|_| 0)
     }
 
     /// `ftruncate(fd, length)` on an object (`pshm_truncate`).
@@ -300,7 +290,7 @@ mod tests {
     const RW: u32 = FREAD | FWRITE;
 
     fn open(n: &Names, name: &str, fmode: u32, mode: u32) -> Result<(Arc<Pshm>, bool), Errno> {
-        n.open(name, fmode, mode, 501, 20, 7)
+        n.open(name, fmode, mode, &Cred::of(501, 20), 7)
     }
 
     #[test]
@@ -340,8 +330,8 @@ mod tests {
     fn unlink_removes_the_name_and_leaves_the_object() {
         let n = Names::new();
         let (a, _) = open(&n, "x", RW | O_CREAT, 0o600).unwrap();
-        n.unlink("x", 501, 20).unwrap();
-        assert_eq!(n.unlink("x", 501, 20).unwrap_err(), Errno::ENOENT);
+        n.unlink("x", &Cred::of(501, 20)).unwrap();
+        assert_eq!(n.unlink("x", &Cred::of(501, 20)).unwrap_err(), Errno::ENOENT);
         assert_eq!(open(&n, "x", RW, 0).unwrap_err(), Errno::ENOENT);
         // the object is still there for whoever holds it
         a.allocate(1).unwrap();
@@ -356,15 +346,33 @@ mod tests {
         open(&n, "x", RW | O_CREAT, 0o640).unwrap();
         // the group may read, not write; others nothing
         assert!(n.by_name.lock().unwrap().get("x").is_some());
-        assert_eq!(n.open("x", FREAD, 0, 600, 20, 8).map(|_| ()), Ok(()));
-        assert_eq!(n.open("x", FWRITE, 0, 600, 20, 8).unwrap_err(), Errno::EACCES);
-        assert_eq!(n.open("x", FREAD, 0, 600, 30, 8).unwrap_err(), Errno::EACCES);
+        assert_eq!(n.open("x", FREAD, 0, &Cred::of(600, 20), 8).map(|_| ()), Ok(()));
+        assert_eq!(n.open("x", FWRITE, 0, &Cred::of(600, 20), 8).unwrap_err(), Errno::EACCES);
+        assert_eq!(n.open("x", FREAD, 0, &Cred::of(600, 30), 8).unwrap_err(), Errno::EACCES);
         // root may do anything
-        assert!(n.open("x", RW, 0, 0, 0, 8).is_ok());
+        assert!(n.open("x", RW, 0, &Cred::of(0, 0), 8).is_ok());
         // a non-owner may not unlink what he cannot write; the owner may whatever the mode
-        assert_eq!(n.unlink("x", 600, 20).unwrap_err(), Errno::EACCES);
+        assert_eq!(n.unlink("x", &Cred::of(600, 20)).unwrap_err(), Errno::EACCES);
         let (p, _) = open(&n, "ro", RW | O_CREAT, 0o400).unwrap();
         assert_eq!(p.uid, 501);
-        n.unlink("ro", 501, 20).unwrap();
+        n.unlink("ro", &Cred::of(501, 20)).unwrap();
+    }
+
+    #[test]
+    fn the_owner_falls_through_to_the_group_and_others() {
+        let n = Names::new();
+        open(&n, "g", RW | O_CREAT, 0o044).unwrap();
+        // no owner bits: the group's and others' let the owner read
+        assert!(n.open("g", FREAD, 0, &Cred::of(501, 20), 8).is_ok());
+        assert_eq!(n.open("g", FWRITE, 0, &Cred::of(501, 20), 8).unwrap_err(), Errno::EACCES);
+        // a member of a group the bits refuse is refused, whatever others may
+        open(&n, "w", RW | O_CREAT, 0o604).unwrap();
+        assert_eq!(n.open("w", FREAD, 0, &Cred::of(600, 20), 8).unwrap_err(), Errno::EACCES);
+        assert!(n.open("w", FREAD, 0, &Cred::of(600, 30), 8).is_ok());
+        // supplementary groups count
+        let mut c = Cred::of(600, 30);
+        c.groups.push(20);
+        open(&n, "s", RW | O_CREAT, 0o640).unwrap();
+        assert!(n.open("s", FREAD, 0, &c, 8).is_ok());
     }
 }
