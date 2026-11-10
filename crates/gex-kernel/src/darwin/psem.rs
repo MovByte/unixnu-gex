@@ -29,6 +29,7 @@ const FREAD: u32 = 1;
 const FWRITE: u32 = 2;
 const O_CREAT: u32 = 0x200;
 const O_EXCL: u32 = 0x800;
+const O_EXEC: u32 = 0x4000_0000;
 const ALLPERMS: u32 = 0o7777;
 
 /// A waiter's state: still waiting, handed the wakeup, or gone (a signal
@@ -70,6 +71,12 @@ impl std::fmt::Debug for Psem {
 }
 
 impl Psem {
+    /// `psem_usecount`.
+    pub fn usecount(&self) -> u32 {
+        let _names = names();
+        self.inner().usecount
+    }
+
     fn inner(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -177,7 +184,14 @@ impl Kernel {
         if self.fds.list().len() >= self.fds.limit() {
             return Err(Errno::EMFILE);
         }
-        let mut fmode = (a[1] as u32).wrapping_add(1);
+        let oflag = a[1] as u32;
+        if oflag & O_EXEC != 0 {
+            // FFLAGS keeps no access mode, and the file FEXEC, which a
+            // descriptor here does not carry.
+            self.darwin_unimplemented(format!("sem_open {name:?} with O_EXEC (an execute-only descriptor)"));
+            return Err(Errno::EINVAL);
+        }
+        let mut fmode = super::shm::fflags(oflag);
         let (cmode, value) = (a[2] as u32 & ALLPERMS, a[3] as u32 as u64);
         if fmode & O_CREAT != 0 && value > SEM_VALUE_MAX {
             return Err(Errno::EINVAL);
@@ -222,7 +236,7 @@ impl Kernel {
             p.inner().usecount += 1;
         }
         let handle: Arc<dyn FileHandle> = Arc::new(PsemHandle(p));
-        let file = OpenFile::new(handle, format!("/psem:{name}"), 0, fmode & FREAD != 0, fmode & FWRITE != 0);
+        let file = OpenFile::new(handle, format!("/psem:{name}"), super::shm::file_flags(fmode), fmode & FREAD != 0, fmode & FWRITE != 0);
         self.fds.insert(file, false).map(|fd| fd as u64)
     }
 

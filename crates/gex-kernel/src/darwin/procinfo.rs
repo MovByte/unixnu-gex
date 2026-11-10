@@ -750,13 +750,18 @@ impl Kernel {
     fn darwin_proc_pidfdinfo(&mut self, m: &mut GuestMem<'_>, pid: i32, fl: u32, fd: i32, buf: u64, bufsize: u32) -> Result<u64, i32> {
         const PIDFDVNODEINFO: u32 = 1;
         const PIDFDVNODEPATHINFO: u32 = 2;
-        const VNODE: u32 = 1;
+        const PIDFDPSEMINFO: u32 = 4;
+        const PIDFDPSHMINFO: u32 = 5;
         const MAXPATHLEN: usize = 1024;
         let size: u32 = match fl {
             PIDFDVNODEINFO => 176,
             PIDFDVNODEPATHINFO => 1200,
-            3..=10 => {
-                self.darwin_unimplemented(format!("proc_pidfdinfo flavor {fl} (a socket, semaphore, shared memory object, pipe, kqueue or channel)"));
+            // proc_fileinfo, vinfo_stat and the name; shared memory's with
+            // the mapping's address.
+            PIDFDPSEMINFO => 24 + 136 + MAXPATHLEN as u32,
+            PIDFDPSHMINFO => 24 + 136 + 8 + MAXPATHLEN as u32,
+            3 | 6..=10 => {
+                self.darwin_unimplemented(format!("proc_pidfdinfo flavor {fl} (a socket, pipe, kqueue or channel)"));
                 return Err(e::EINVAL);
             }
             _ => return Err(e::EINVAL),
@@ -771,51 +776,61 @@ impl Kernel {
             return Err(e::EINVAL);
         };
         let Ok(file) = fds.get(fd) else { return Err(e::EBADF) };
-        if fdtype(&file) != VNODE {
+        let want = match fl {
+            PIDFDPSEMINFO => dtype::PSXSEM,
+            PIDFDPSHMINFO => dtype::PSXSHM,
+            _ => dtype::VNODE,
+        };
+        // fp_get_ftype: a descriptor of another type is EBADF.
+        if fdtype(&file) != want {
             return Err(e::EBADF);
         }
-        let Ok(md) = file.metadata() else { return Err(e::EBADF) };
         let mut out = Vec::with_capacity(size as usize);
-        // fill_fileinfo: the file's flags as fg_flag has them (FFLAGS), one
-        // descriptor's own state, and its guard's.
-        let lflags = file.darwin_lflags.load(std::sync::atomic::Ordering::Acquire) & (super::lockf::FWASLOCKED | super::ioctl::fflag::FNOCACHE | super::ioctl::fflag::FNORDAHEAD | super::ioctl::fflag::FNODIRECT | super::ioctl::fflag::FSINGLE_WRITER);
-        let openflags = (super::bsd::open_flags_back(file.flags()) + 1) as u32 | lflags;
-        let mut status: u32 = 0;
-        // This lookup holds one reference, and the table another.
-        if Arc::strong_count(&file) > 2 {
-            status |= 1;
-        }
-        if fds.cloexec(fd).unwrap_or(false) {
-            status |= 2;
-        }
-        if fds.clofork(fd) {
-            status |= 8;
-        }
-        let mut guardflags: u32 = 0;
-        if let Some(g) = fds.guard(fd) {
-            use super::guarded::attr;
-            status |= 4;
-            for (a, bit) in [(attr::CLOSE, 1), (attr::DUP, 2), (attr::SOCKET_IPC, 4), (attr::FILEPORT, 8)] {
-                if g.has(a) {
-                    guardflags |= bit;
+        match fl {
+            PIDFDPSEMINFO => {
+                let Some(p) = Arc::clone(&file.handle).as_posix_sem() else { return Err(e::EBADF) };
+                out.extend_from_slice(&fileinfo(fds, fd, &file, want));
+                // fill_pseminfo: mode, owner and group, the use count as
+                // the size, and the name.
+                let mut st = [0u8; 136];
+                st[4..6].copy_from_slice(&(p.mode as u16).to_le_bytes());
+                st[16..20].copy_from_slice(&p.uid.to_le_bytes());
+                st[20..24].copy_from_slice(&p.gid.to_le_bytes());
+                st[88..96].copy_from_slice(&u64::from(p.usecount()).to_le_bytes());
+                out.extend_from_slice(&st);
+                out.extend_from_slice(&ipc_name(&p.name, MAXPATHLEN));
+            }
+            PIDFDPSHMINFO => {
+                let Some(h) = Arc::clone(&file.handle).as_posix_shm() else { return Err(e::EBADF) };
+                out.extend_from_slice(&fileinfo(fds, fd, &file, want));
+                // fill_pshminfo: mode, owner and group, the length as the
+                // size, this open's mapping, and the name.
+                let p = &h.0;
+                let mut st = [0u8; 136];
+                st[4..6].copy_from_slice(&(p.mode as u16).to_le_bytes());
+                st[16..20].copy_from_slice(&p.uid.to_le_bytes());
+                st[20..24].copy_from_slice(&p.gid.to_le_bytes());
+                st[88..96].copy_from_slice(&p.length().to_le_bytes());
+                out.extend_from_slice(&st);
+                out.extend_from_slice(&h.mapp_addr().to_le_bytes());
+                out.extend_from_slice(&ipc_name(&p.name, MAXPATHLEN));
+            }
+            _ => {
+                let Ok(md) = file.metadata() else { return Err(e::EBADF) };
+                out.extend_from_slice(&fileinfo(fds, fd, &file, want));
+                let path = self.vfs.canonical(&file.path);
+                let mnt = super::kern::mount_of(&path);
+                let st = crate::fs::Stat { uid: self.creds.uid(), gid: self.creds.gid(), dev: u64::from(mnt.fsid as u32), ..Kernel::stat_from(&md) }.encode_darwin();
+                out.extend_from_slice(&vnode_info(&st, md.file_type, mnt.fsid as u32, super::kern::vfsstat::APFS_TYPENUM));
+                if fl == PIDFDVNODEPATHINFO {
+                    let mut p = [0u8; MAXPATHLEN];
+                    let n = path.len().min(MAXPATHLEN - 1);
+                    p[..n].copy_from_slice(&path.as_bytes()[..n]);
+                    out.extend_from_slice(&p);
                 }
             }
         }
-        out.extend_from_slice(&openflags.to_le_bytes());
-        out.extend_from_slice(&status.to_le_bytes());
-        out.extend_from_slice(&file.offset().to_le_bytes());
-        out.extend_from_slice(&VNODE.to_le_bytes());
-        out.extend_from_slice(&guardflags.to_le_bytes());
-        let path = self.vfs.canonical(&file.path);
-        let mnt = super::kern::mount_of(&path);
-        let st = crate::fs::Stat { uid: self.creds.uid(), gid: self.creds.gid(), dev: u64::from(mnt.fsid as u32), ..Kernel::stat_from(&md) }.encode_darwin();
-        out.extend_from_slice(&vnode_info(&st, md.file_type, mnt.fsid as u32, super::kern::vfsstat::APFS_TYPENUM));
-        if fl == PIDFDVNODEPATHINFO {
-            let mut p = [0u8; MAXPATHLEN];
-            let n = path.len().min(MAXPATHLEN - 1);
-            p[..n].copy_from_slice(&path.as_bytes()[..n]);
-            out.extend_from_slice(&p);
-        }
+        debug_assert_eq!(out.len(), size as usize);
         m.write(buf, &out).map_err(|_| 14)?;
         Ok(u64::from(size))
     }
@@ -1148,23 +1163,77 @@ fn vnode_info(st: &[u8], ty: crate::vfs::FileType, fsid: u32, fsid2: u32) -> [u8
     v
 }
 
+/// `DTYPE_*`: a file's kind.
+mod dtype {
+    pub const VNODE: u32 = 1;
+    pub const SOCKET: u32 = 2;
+    pub const PSXSHM: u32 = 3;
+    pub const PSXSEM: u32 = 4;
+    pub const KQUEUE: u32 = 5;
+    pub const PIPE: u32 = 6;
+}
+
 fn fdtype(f: &Arc<crate::file::OpenFile>) -> u32 {
-    const VNODE: u32 = 1;
-    const SOCKET: u32 = 2;
-    const PSHM: u32 = 3;
-    const KQUEUE: u32 = 5;
-    const PIPE: u32 = 6;
     if f.handle.pipe_end().is_some() {
-        PIPE
+        dtype::PIPE
     } else if Arc::clone(&f.handle).as_kqueue().is_some() {
-        KQUEUE
+        dtype::KQUEUE
     } else if Arc::clone(&f.handle).as_posix_shm().is_some() {
-        PSHM
+        dtype::PSXSHM
+    } else if Arc::clone(&f.handle).as_posix_sem().is_some() {
+        dtype::PSXSEM
     } else if f.handle.metadata().is_ok_and(|md| md.file_type == crate::vfs::FileType::Socket) {
-        SOCKET
+        dtype::SOCKET
     } else {
-        VNODE
+        dtype::VNODE
     }
+}
+
+/// `fill_fileinfo` (`struct proc_fileinfo`, 24 bytes): the file's flags as
+/// fg_flag has them (FFLAGS), its offset and type, one descriptor's own
+/// state, and its guard's.
+fn fileinfo(fds: &crate::file::FdTable, fd: i32, file: &Arc<crate::file::OpenFile>, ty: u32) -> [u8; 24] {
+    let lflags = file.darwin_lflags.load(std::sync::atomic::Ordering::Acquire) & (super::lockf::FWASLOCKED | super::ioctl::fflag::FNOCACHE | super::ioctl::fflag::FNORDAHEAD | super::ioctl::fflag::FNODIRECT | super::ioctl::fflag::FSINGLE_WRITER);
+    let openflags = (super::bsd::open_flags_back(file.flags()) + 1) as u32 | lflags;
+    let mut status: u32 = 0;
+    // The caller's lookup holds one reference, and the table another.
+    if Arc::strong_count(file) > 2 {
+        status |= 1;
+    }
+    if fds.cloexec(fd).unwrap_or(false) {
+        status |= 2;
+    }
+    if fds.clofork(fd) {
+        status |= 8;
+    }
+    let mut guardflags: u32 = 0;
+    if let Some(g) = fds.guard(fd) {
+        use super::guarded::attr;
+        status |= 4;
+        for (a, bit) in [(attr::CLOSE, 1), (attr::DUP, 2), (attr::SOCKET_IPC, 4), (attr::FILEPORT, 8)] {
+            if g.has(a) {
+                guardflags |= bit;
+            }
+        }
+    }
+    let mut b = [0u8; 24];
+    b[0..4].copy_from_slice(&openflags.to_le_bytes());
+    b[4..8].copy_from_slice(&status.to_le_bytes());
+    b[8..16].copy_from_slice(&file.offset().to_le_bytes());
+    b[16..20].copy_from_slice(&ty.to_le_bytes());
+    b[20..24].copy_from_slice(&guardflags.to_le_bytes());
+    b
+}
+
+/// A semaphore's or shared memory object's name in a `MAXPATHLEN` field:
+/// its `PSEMNAMLEN + 1` (or `PSHMNAMLEN + 1`) bytes copied, the rest zero.
+fn ipc_name(name: &str, len: usize) -> Vec<u8> {
+    const NAMLEN: usize = 31;
+    let mut b = vec![0u8; len];
+    for (i, c) in name.chars().take(NAMLEN).enumerate() {
+        b[i] = c as u32 as u8;
+    }
+    b
 }
 
 /// `proc_piduniqidentifierinfo` (56 bytes).

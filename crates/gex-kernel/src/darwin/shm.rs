@@ -15,6 +15,7 @@ use crate::unix::MemFd;
 use crate::vfs::{FileHandle, FileType, Metadata};
 use crate::GuestMem;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// `PSHMNAMLEN`: a name is at most this many bytes, and the string with its
@@ -24,6 +25,10 @@ pub const PSHMNAMLEN: usize = 31;
 /// `FREAD` and `FWRITE`, the kernel's spelling of the access mode.
 const FREAD: u32 = 1;
 const FWRITE: u32 = 2;
+/// `O_EXEC`, which is `FEXEC` as well.
+const O_EXEC: u32 = 0x4000_0000;
+/// `FMASK`: what of the open's flags the file keeps.
+const FMASK: u32 = FREAD | FWRITE | super::ioctl::FCNTLFLAGS as u32 | O_EXEC;
 
 /// Darwin's `O_CREAT`, `O_TRUNC` and `O_EXCL`.
 const O_TRUNC: u32 = 0x400;
@@ -150,14 +155,25 @@ impl Names {
 /// The host process's names.
 static NAMES: Names = Names::new();
 
-/// The descriptor of an object: `DTYPE_PSXSHM`, which has no `read` or
-/// `write` ([`Kernel::darwin_shm_fd`]).
+/// The descriptor of an object (`pshmnode_t`): `DTYPE_PSXSHM`, which has
+/// no `read` or `write` ([`Kernel::darwin_shm_fd`]).
 #[derive(Debug)]
-pub struct PshmHandle(pub Arc<Pshm>);
+pub struct PshmHandle(pub Arc<Pshm>, AtomicU64);
+
+impl PshmHandle {
+    /// `mapp_addr`: where this open's last mapping of the object starts.
+    pub fn mapp_addr(&self) -> u64 {
+        self.1.load(Ordering::Acquire)
+    }
+
+    pub fn set_mapp_addr(&self, at: u64) {
+        self.1.store(at, Ordering::Release);
+    }
+}
 
 impl FileHandle for PshmHandle {
-    fn as_posix_shm(self: Arc<Self>) -> Option<Arc<Pshm>> {
-        Some(Arc::clone(&self.0))
+    fn as_posix_shm(self: Arc<Self>) -> Option<Arc<PshmHandle>> {
+        Some(self)
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult {
@@ -184,6 +200,22 @@ impl FileHandle for PshmHandle {
     fn truncate(&self, len: u64) -> Result<(), Errno> {
         self.0.allocate(len)
     }
+}
+
+/// `FFLAGS(oflags)`: the access mode one more than it was, or taken away
+/// for an execute-only open.
+pub(crate) fn fflags(oflags: u32) -> u32 {
+    if oflags & O_EXEC != 0 {
+        oflags & !3
+    } else {
+        oflags.wrapping_add(1)
+    }
+}
+
+/// The file's `fg_flag` (`fmode & FMASK`) as the open's flags it keeps,
+/// in the canonical terms; without `FEXEC`, which neither open has kept.
+pub(crate) fn file_flags(fmode: u32) -> u64 {
+    super::bsd::open_flags(u64::from((fmode & FMASK).wrapping_sub(1)))
 }
 
 /// `shm_open`'s name: `copyinstr` into `PSHMNAMLEN + 1` bytes, and not empty.
@@ -215,9 +247,7 @@ impl Kernel {
     /// `shm_open(name, oflag, mode)`.
     pub(crate) fn darwin_shm_open(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
         let name = get_name(m, a[0])?;
-        let oflag = a[1] as u32;
-        // `FFLAGS`: the access mode is one more than it was.
-        let fmode = oflag.wrapping_add(1);
+        let fmode = fflags(a[1] as u32);
         if fmode & (FREAD | FWRITE) == 0 {
             return Err(Errno::EINVAL);
         }
@@ -228,8 +258,8 @@ impl Kernel {
                 p.creator
             ));
         }
-        let handle: Arc<dyn FileHandle> = Arc::new(PshmHandle(p));
-        let file = OpenFile::new(handle, format!("/shm:{name}"), 0, fmode & FREAD != 0, fmode & FWRITE != 0);
+        let handle: Arc<dyn FileHandle> = Arc::new(PshmHandle(p, AtomicU64::new(0)));
+        let file = OpenFile::new(handle, format!("/shm:{name}"), file_flags(fmode), fmode & FREAD != 0, fmode & FWRITE != 0);
         // Close-on-exec, as `FP_CLOEXEC`.
         self.fd_io().fds.insert(file, true).map(|fd| fd as u64)
     }
@@ -255,7 +285,7 @@ impl Kernel {
         const MAP_SHARED: u64 = 1;
         const PROT_WRITE: u64 = 2;
         let f = self.fd_io().fds.get(a[4] as i32)?;
-        let Some(shm) = Arc::clone(&f.handle).as_posix_shm() else { return Ok(()) };
+        let Some(shm) = Arc::clone(&f.handle).as_posix_shm().map(|h| Arc::clone(&h.0)) else { return Ok(()) };
         let (len, prot, flags, pos) = (a[1], a[2], a[3], a[5]);
         // `mmap` has split a position off the page it is in and added it to
         // the length before `pshm_mmap` sees either.

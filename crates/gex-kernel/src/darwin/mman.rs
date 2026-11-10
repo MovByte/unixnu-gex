@@ -335,10 +335,15 @@ impl Kernel {
         }
         let n = super::bsd::translate(super::bsd::sys::MMAP, &mut b);
         let at = self.canonical(m, n, b)?;
-        let writable = self.fds.get(a[4] as i32).map(|f| f.writable).unwrap_or(false);
+        let file = self.fds.get(a[4] as i32).ok();
+        let writable = file.as_ref().is_some_and(|f| f.writable);
         let max = if writable { prot::READ | prot::WRITE } else { prot::READ } as u8;
         let end = round(at.saturating_add(a[1]));
         self.dtask.vm.enter(at & !PAGE_MASK, end, Attrs { kind: kind::SHM, max, inherit: inherit::SHARE, ..Attrs::default() }, a[5] & !PAGE_MASK);
+        // The open's mapp_addr: where the mapping starts.
+        if let Some(h) = file.and_then(|f| Arc::clone(&f.handle).as_posix_shm()) {
+            h.set_mapp_addr(at & !PAGE_MASK);
+        }
         Ok(at)
     }
 
