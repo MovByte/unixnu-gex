@@ -67,6 +67,28 @@ impl Kernel {
         files().lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned().ok_or(Errno::EINVAL)
     }
 
+    /// The open file of the file port a send right names in process `pid`'s
+    /// space (`fileport_invoke`): EINVAL for anything else, and for a
+    /// process without a space (kernproc's holds no file port).
+    pub(crate) fn darwin_fileport_file_in(&mut self, pid: i32, name: u32) -> Result<Arc<OpenFile>, Errno> {
+        if pid == self.pid {
+            return self.darwin_fileport_file(name);
+        }
+        let ipc = &mut self.ipc();
+        let Some(key) = ipc.links.iter().find(|(_, l)| l.pid == pid).map(|(&k, _)| k) else { return Err(Errno::EINVAL) };
+        let id = ipc
+            .with_space(key, |ipc| {
+                let port = ipc.translate_send(name).ok()?;
+                match ipc.port(port).kobject {
+                    Some(Kobject::FilePort(id)) => Some(id),
+                    _ => None,
+                }
+            })
+            .flatten()
+            .ok_or(Errno::EINVAL)?;
+        files().lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned().ok_or(Errno::EINVAL)
+    }
+
     /// `fileport_makefd(port)`: a new close-on-exec descriptor of the port's
     /// file.
     pub(crate) fn darwin_fileport_makefd(&mut self, name: u32) -> Result<u64, Errno> {
