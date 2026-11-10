@@ -408,7 +408,7 @@ pub struct Kevents {
     /// there are, for a host thread that says when descriptors may have
     /// changed.
     pub pipe_klist: Vec<KnId>,
-    pub pipe_watch: Arc<std::sync::atomic::AtomicUsize>,
+    pub pipe_watch: Arc<std::sync::atomic::AtomicU64>,
     /// The knotes on [`pipe_klist`](Self::pipe_klist) whose descriptor no
     /// event announces (a socket the host carries): counted in `pipe_watch`
     /// above bit 32, for it to be looked at on a timer.

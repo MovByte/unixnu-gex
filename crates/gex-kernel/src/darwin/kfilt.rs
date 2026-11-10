@@ -120,7 +120,7 @@ enum WlOp {
 }
 
 /// The weight in `pipe_watch` of a knote no event announces.
-const POLLED_KNOTE: usize = 1 << 32;
+const POLLED_KNOTE: u64 = 1 << 32;
 
 /// A filter's id, by its `EVFILT_*`.
 fn id(f: i16) -> u8 {
@@ -1594,7 +1594,7 @@ impl Kernel {
 
     /// The count of pipe knotes, for a host thread that says when pipes
     /// may have changed.
-    pub fn darwin_pipe_watch(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+    pub fn darwin_pipe_watch(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
         std::sync::Arc::clone(&self.dtask.kevents.pipe_watch)
     }
 
