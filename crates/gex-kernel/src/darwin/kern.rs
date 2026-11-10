@@ -192,6 +192,41 @@ pub fn statfs64(mnt: &Mount) -> Vec<u8> {
     b
 }
 
+/// `sizeof(struct user64_statfs)`, the struct of 32-bit inodes, and what
+/// `statfs` and `fstatfs` copy of it (`munge_statfs`'s partial copy: not
+/// `f_reserved3` and `f_reserved4`); its MFSNAMELEN and MNAMELEN.
+pub const STATFS_SIZE: usize = 336;
+const STATFS_PARTIAL: usize = STATFS_SIZE - 33;
+const MFSNAMELEN: usize = 15;
+const MNAMELEN_INO32: usize = 90;
+
+/// One `struct user64_statfs` for `mnt` (`munge_statfs`): the counts as
+/// longs, the type beside the subtype, and the names cut to fit, as
+/// `strlcpy` cuts them.
+pub fn statfs_ino32(mnt: &Mount) -> [u8; STATFS_SIZE] {
+    let mut b = [0u8; STATFS_SIZE];
+    let mut put = |o: usize, v: &[u8]| b[o..o + v.len()].copy_from_slice(v);
+    put(8, &u64::from(vfsstat::BSIZE).to_le_bytes());
+    put(16, &u64::from(vfsstat::IOSIZE).to_le_bytes());
+    put(24, &vfsstat::BLOCKS.to_le_bytes());
+    put(32, &vfsstat::BFREE.to_le_bytes());
+    put(40, &vfsstat::BAVAIL.to_le_bytes());
+    put(48, &vfsstat::FILES.to_le_bytes());
+    put(56, &vfsstat::FFREE.to_le_bytes());
+    put(64, &(mnt.fsid as u32).to_le_bytes());
+    put(68, &vfsstat::APFS_TYPENUM.to_le_bytes());
+    put(78, &(vfsstat::APFS_TYPENUM as u16).to_le_bytes());
+    put(80, &u64::from(mnt.flags).to_le_bytes());
+    let mut name = |o: usize, size: usize, v: &[u8]| {
+        let n = v.len().min(size - 1);
+        b[o..o + n].copy_from_slice(&v[..n]);
+    };
+    name(104, MFSNAMELEN, b"apfs");
+    name(119, MNAMELEN_INO32, mnt.on.as_bytes());
+    name(209, MNAMELEN_INO32, mnt.from.as_bytes());
+    b
+}
+
 /// `gettimeofday(tp, tzp, mach_absolute_time)`: a 64-bit `timeval` (seconds,
 /// then 32-bit microseconds), a zero timezone, and the absolute time taken
 /// with it.
@@ -597,6 +632,10 @@ impl Kernel {
             sys::GETATTRLISTBULK => res(self.darwin_getattrlistbulk(m, a)),
             sys::STATFS64 => res(self.darwin_statfs(m, Some(a[0]), 0, a[1])),
             sys::FSTATFS64 => res(self.darwin_statfs(m, None, a[0], a[1])),
+            sys::STATFS => res(self.darwin_statfs_ino32(m, Some(a[0]), 0, a[1])),
+            sys::FSTATFS => res(self.darwin_statfs_ino32(m, None, a[0], a[1])),
+            sys::GETFSSTAT => res(self.darwin_getfsstat_ino32(m, a[0], a[1], 0, 0)),
+            sys::MAC_GETFSSTAT => res(self.darwin_getfsstat_ino32(m, a[0], a[1], a[2], a[3])),
             sys::SYSCTL => res(self.darwin_sysctl(m, a)),
             sys::SYSCTLBYNAME => res(self.darwin_sysctlbyname(m, a)),
             // dup3 refuses to copy a descriptor onto itself; dup2 checks it
@@ -1006,9 +1045,9 @@ impl Kernel {
         Ok(n as u64)
     }
 
-    /// The mount `statfs64` finds: that of the vnode the path names
-    /// (`namei`, FOLLOW), or of the descriptor's for `fstatfs64`
-    /// (`file_vnode`: EINVAL for what is no vnode). devfs's has no
+    /// The mount `statfs64` and `statfs` find: that of the vnode the path
+    /// names (`namei`, FOLLOW), or of the descriptor's for `fstatfs64` and
+    /// `fstatfs` (`file_vnode`: EINVAL for what is no vnode). devfs's has no
     /// record here: reported.
     fn darwin_statfs_mount(&mut self, m: &GuestMem<'_>, path: Option<u64>, fd: u64) -> Result<&'static Mount, Errno> {
         let canon = match path {
@@ -1040,6 +1079,44 @@ impl Kernel {
         let mnt = self.darwin_statfs_mount(m, path, fd)?;
         m.write(buf, &statfs64(mnt))?;
         Ok(0)
+    }
+
+    /// `statfs(path, buf)` or `fstatfs(fd, buf)` (`statfs_internal`): the
+    /// struct of 32-bit inodes, but for its last reserved fields.
+    fn darwin_statfs_ino32(&mut self, m: &mut GuestMem<'_>, path: Option<u64>, fd: u64, buf: u64) -> Result<u64, Errno> {
+        let mnt = self.darwin_statfs_mount(m, path, fd)?;
+        m.write(buf, &statfs_ino32(mnt)[..STATFS_PARTIAL])?;
+        Ok(0)
+    }
+
+    /// `__mac_getfsstat(buf, bufsize, mac, macsize, flags)`, and `getfsstat`
+    /// with no labels: a whole struct of 32-bit inodes for each mount there
+    /// is room for, and the count of them all with no buffer. A mount's MAC
+    /// label is reported.
+    fn darwin_getfsstat_ino32(&mut self, m: &mut GuestMem<'_>, buf: u64, bufsize: u64, mac: u64, macsize: u64) -> Result<u64, Errno> {
+        let (bufsize, macsize) = (bufsize as u32, macsize as u32);
+        if bufsize > i32::MAX as u32 || macsize > i32::MAX as u32 {
+            return Err(Errno::EINVAL);
+        }
+        let maxcount = bufsize as usize / STATFS_SIZE;
+        if mac != 0 {
+            if macsize as usize / 8 != maxcount {
+                return Err(Errno::EINVAL);
+            }
+            m.read(mac, macsize as usize)?;
+            if buf != 0 && maxcount > 0 {
+                self.darwin_unimplemented("__mac_getfsstat with labels (mac_mount_label_get)".into());
+                return Err(Errno::EINVAL);
+            }
+        }
+        if buf == 0 {
+            return Ok(MOUNTS.len() as u64);
+        }
+        let n = maxcount.min(MOUNTS.len());
+        for (i, mnt) in MOUNTS.iter().take(n).enumerate() {
+            m.write(buf + (i * STATFS_SIZE) as u64, &statfs_ino32(mnt))?;
+        }
+        Ok(n as u64)
     }
 
     /// `sysctl(name, namelen, old, oldlenp, new, newlen)`. Nodes are
