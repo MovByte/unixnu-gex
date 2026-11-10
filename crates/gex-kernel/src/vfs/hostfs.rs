@@ -773,6 +773,10 @@ impl FileSystem for HostFs {
         Ok((Some(crate::inotify::Key { fs: self.watch_fs(), ino: md.ino() }), md.is_dir()))
     }
 
+    fn watch_key_of(&self, ino: u64) -> Option<crate::inotify::Key> {
+        Some(crate::inotify::Key { fs: self.watch_fs(), ino })
+    }
+
     /// `chmod`, same floor as creation: the host must keep owner rw on what it
     /// owns for the guest.
     fn chmod(&self, path: &str, mode: u32) -> Result<(), Errno> {

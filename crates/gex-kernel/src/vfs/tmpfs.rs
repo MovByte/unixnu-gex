@@ -1693,6 +1693,10 @@ impl FileSystem for TmpFs {
         Ok((Some(crate::inotify::Key { fs: fs_key(&self.inner), ino }), isdir))
     }
 
+    fn watch_key_of(&self, ino: u64) -> Option<crate::inotify::Key> {
+        Some(crate::inotify::Key { fs: fs_key(&self.inner), ino })
+    }
+
     /// From the tree, under one lock: no handle made (with its own copy of
     /// the path) for one question.
     fn metadata(&self, path: &str) -> Result<Metadata, Errno> {

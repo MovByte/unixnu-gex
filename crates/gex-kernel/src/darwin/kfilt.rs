@@ -1583,8 +1583,12 @@ impl Kernel {
         if let Some(k) = fp.darwin_vnote_key.get() {
             return Some(*k);
         }
-        let (fs, rel) = self.vfs.watch_target(&fp.path, true).ok()?;
-        let key = fs.watch_key(&rel).ok()?.0?;
+        let key = match self.vfs.watch_target(&fp.path, true).and_then(|(fs, rel)| fs.watch_key(&rel)) {
+            Ok((key, _)) => key?,
+            // Unlinked since it was opened: the vnode is still there, by
+            // the number the open file has.
+            Err(_) => self.vfs.watch_target(&fp.path, false).ok()?.0.watch_key_of(fp.handle.metadata().ok()?.ino)?,
+        };
         Some(*fp.darwin_vnote_key.get_or_init(|| key))
     }
 

@@ -980,6 +980,11 @@ pub trait FileSystem: Send + Sync {
     fn watch_key(&self, path: &str) -> Result<(Option<crate::inotify::Key>, bool), Errno> {
         self.metadata(path).map(|m| (None, m.file_type == FileType::Directory))
     }
+    /// The key of a file with this number and possibly no name left.
+    fn watch_key_of(&self, ino: u64) -> Option<crate::inotify::Key> {
+        let _ = ino;
+        None
+    }
 
     /// Whether its watches are kept in another module, by path
     /// ([`crate::inotify::Remote`]): the global kernel's tree.
