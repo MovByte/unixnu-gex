@@ -38,6 +38,15 @@ struct Stream {
     closed: bool,
 }
 
+impl Drop for Stream {
+    /// Descriptors never read go with it.
+    fn drop(&mut self) {
+        for (_, _, f) in &self.fds {
+            f.fg_release();
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct Pipe {
     state: Mutex<Stream>,
@@ -102,6 +111,8 @@ impl Pipe {
         // Attach at the first byte of this write, as Linux does.
         let at = s.written;
         for fd in fds {
+            // In flight, it holds the file (unp_internalize).
+            fd.fg_retain();
             s.fds.push_back((at, at + n as u64, fd));
         }
         s.bytes.extend(&buf[..n]);
@@ -149,6 +160,7 @@ impl Pipe {
         if let Some((at, _)) = group {
             while s.fds.front().is_some_and(|f| f.0 == at) {
                 let (_, _, file) = s.fds.pop_front().unwrap();
+                file.fg_release();
                 if out.len() < max_fds {
                     out.push(file);
                 } else {

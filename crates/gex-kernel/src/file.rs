@@ -42,6 +42,10 @@ pub struct OpenFile {
     pub darwin_lock_key: OnceLock<(u64, u64)>,
     /// Its vnode as the filesystems name it for vnode notes.
     pub darwin_vnote_key: OnceLock<crate::inotify::Key>,
+    /// XNU's `fg_count`: the descriptors, file ports and messages in flight
+    /// that hold it, which its other references (a lookup's, a mapping's)
+    /// are not.
+    fg_count: std::sync::atomic::AtomicU32,
     /// A path to unlink when the last descriptor to this file closes. Set for
     /// `O_TMPFILE`: Linux makes such a file nameless at once, but gex keeps it
     /// named (`.gex-tmpfile-*`) so the `linkat("/proc/self/fd/N", target,
@@ -98,6 +102,21 @@ impl Drop for OpenFile {
 }
 
 impl OpenFile {
+    /// `fg_ref`: another descriptor, file port or message in flight holds it.
+    pub fn fg_retain(&self) {
+        self.fg_count.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// `fg_drop`: one of those lets go.
+    pub fn fg_release(&self) {
+        let _ = self.fg_count.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+    }
+
+    /// `fg_count`.
+    pub fn fg_count(&self) -> u32 {
+        self.fg_count.load(Ordering::Acquire)
+    }
+
     /// The absolute path this description's directory has now, for the
     /// calls that resolve through it (`openat(dirfd, ...)`, `fchdir`): the
     /// path it was opened at, unless the directory (or one above it) has
@@ -144,6 +163,7 @@ impl OpenFile {
             darwin_lflags: std::sync::atomic::AtomicU32::new(0),
             darwin_lock_key: OnceLock::new(),
             darwin_vnote_key: OnceLock::new(),
+            fg_count: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -173,6 +193,7 @@ impl OpenFile {
             darwin_lflags: std::sync::atomic::AtomicU32::new(0),
             darwin_lock_key: OnceLock::new(),
             darwin_vnote_key: OnceLock::new(),
+            fg_count: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -487,9 +508,24 @@ impl std::fmt::Debug for FdTable {
 /// A copy of the table that shares every open-file description: what `fork`
 /// needs, so the child sees the same offsets. The copy is a table of its own.
 impl Clone for FdTable {
+    /// Each descriptor of the copy holds its file too (`fdt_fork`'s `fg_ref`).
     fn clone(&self) -> FdTable {
         let t = self.read(|t| t.clone());
+        for f in t.entries.iter().flatten() {
+            f.fg_retain();
+        }
         FdTable::from_parts(t, self.generation(), self.limit())
+    }
+}
+
+impl Drop for FdTable {
+    /// The table's descriptors let their files go.
+    fn drop(&mut self) {
+        self.read(|t| {
+            for f in t.entries.iter().flatten() {
+                f.fg_release();
+            }
+        });
     }
 }
 
@@ -527,7 +563,26 @@ impl FdTable {
         self.cur.write(|old| {
             let mut t = old.clone();
             match f(&mut t) {
-                Ok(r) => (Some(t), Ok(r)),
+                Ok(r) => {
+                    // A descriptor that now names another file (or none)
+                    // lets the old one go and holds the new.
+                    let n = old.entries.len().max(t.entries.len());
+                    for i in 0..n {
+                        let (a, b) = (old.entries.get(i).and_then(Option::as_ref), t.entries.get(i).and_then(Option::as_ref));
+                        match (a, b) {
+                            (Some(a), Some(b)) if Arc::ptr_eq(a, b) => {}
+                            _ => {
+                                if let Some(b) = b {
+                                    b.fg_retain();
+                                }
+                                if let Some(a) = a {
+                                    a.fg_release();
+                                }
+                            }
+                        }
+                    }
+                    (Some(t), Ok(r))
+                }
                 Err(e) => (None, Err(e)),
             }
         })
@@ -931,6 +986,31 @@ mod tests {
         let r = OpenFile::new(Arc::new(PipeEnd { pipe: Arc::clone(&p), write: false }), "r".into(), 0, true, false);
         let w = OpenFile::new(Arc::new(PipeEnd { pipe: p, write: true }), "w".into(), 1, false, true);
         (r, w)
+    }
+
+    /// `fg_count`: each descriptor holding the file counts, in this table
+    /// and a fork's copy; one moved over another lets that one go.
+    #[test]
+    fn fg_count_follows_descriptors() {
+        let (r, w) = pipe_pair();
+        let t = FdTable::new();
+        let a = t.insert(Arc::clone(&r), false).unwrap() as i32;
+        assert_eq!(r.fg_count(), 1);
+        let b = t.insert(Arc::clone(&r), false).unwrap() as i32;
+        assert_eq!(r.fg_count(), 2);
+        let c = t.clone_table();
+        assert_eq!(r.fg_count(), 4);
+        t.install(b, Arc::clone(&w), false).unwrap();
+        assert_eq!((r.fg_count(), w.fg_count()), (3, 1));
+        // The same file installed where it already is: no change.
+        t.install(b, Arc::clone(&w), false).unwrap();
+        assert_eq!(w.fg_count(), 1);
+        drop(c);
+        assert_eq!(r.fg_count(), 1);
+        t.close(a).unwrap();
+        assert_eq!(r.fg_count(), 0);
+        drop(t);
+        assert_eq!(w.fg_count(), 0);
     }
 
     /// A close drops the description when it returns, with readers about:

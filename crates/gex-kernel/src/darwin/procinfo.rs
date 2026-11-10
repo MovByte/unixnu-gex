@@ -1190,14 +1190,14 @@ fn fdtype(f: &Arc<crate::file::OpenFile>) -> u32 {
 }
 
 /// `fill_fileinfo` (`struct proc_fileinfo`, 24 bytes): the file's flags as
-/// fg_flag has them (FFLAGS), its offset and type, one descriptor's own
-/// state, and its guard's.
+/// fg_flag has them (FFLAGS), its offset and type, whether more than one
+/// descriptor, file port or message holds it, one descriptor's own state,
+/// and its guard's.
 fn fileinfo(fds: &crate::file::FdTable, fd: i32, file: &Arc<crate::file::OpenFile>, ty: u32) -> [u8; 24] {
     let lflags = file.darwin_lflags.load(std::sync::atomic::Ordering::Acquire) & (super::lockf::FWASLOCKED | super::ioctl::fflag::FNOCACHE | super::ioctl::fflag::FNORDAHEAD | super::ioctl::fflag::FNODIRECT | super::ioctl::fflag::FSINGLE_WRITER);
     let openflags = (super::bsd::open_flags_back(file.flags()) + 1) as u32 | lflags;
     let mut status: u32 = 0;
-    // The caller's lookup holds one reference, and the table another.
-    if Arc::strong_count(file) > 2 {
+    if file.fg_count() > 1 {
         status |= 1;
     }
     if fds.cloexec(fd).unwrap_or(false) {

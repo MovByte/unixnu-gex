@@ -23,7 +23,9 @@ static NEXT: AtomicU32 = AtomicU32::new(1);
 /// The last send right to file port `id` went: its open file with it
 /// (`fileport_notify`).
 pub fn fileport_no_senders(id: u32) {
-    files().lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    if let Some(f) = files().lock().unwrap_or_else(|e| e.into_inner()).remove(&id) {
+        f.fg_release();
+    }
 }
 
 impl Kernel {
@@ -38,6 +40,8 @@ impl Kernel {
             return Err(self.darwin_fp_guard_exception(fd, g, super::guarded::flavor::FILEPORT));
         }
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        // The port holds the file (fg_ref).
+        file.fg_retain();
         files().lock().unwrap_or_else(|e| e.into_inner()).insert(id, file);
         // fileport_alloc: IPC_KOBJECT_ALLOC_MAKE_SEND | IPC_KOBJECT_ALLOC_NSREQUEST,
         // so the file goes with the last send right.
