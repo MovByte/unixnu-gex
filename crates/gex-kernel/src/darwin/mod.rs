@@ -25,6 +25,7 @@ pub mod cpumon;
 pub mod cred;
 pub mod errno;
 pub mod exec;
+pub mod eventlink;
 pub mod fileport;
 pub mod footprint;
 pub mod xattr;
@@ -269,6 +270,8 @@ pub struct Task {
     pub ca_client_wi: bool,
     /// Each thread waiting on a POSIX semaphore, and on which.
     pub psem_waits: std::collections::HashMap<i32, psem::Waiting>,
+    /// Each thread waiting on an eventlink, and on which.
+    pub eventlink_waits: std::collections::HashMap<i32, eventlink::Waiting>,
     /// The files named to the image in `executable_file` and `dyld_file`
     /// (their file system, number and path), which `fsgetpath` is asked for.
     pub image_files: Vec<(u64, u64, String)>,

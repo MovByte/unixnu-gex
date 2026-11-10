@@ -691,6 +691,55 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             Some(_) => Reply::err(KERN_INVALID_ARGUMENT),
             None => bad(),
         },
+        // mach_eventlink_create(task, option) -> eventlink_pair: the kernel's
+        // send right to each end moved out.
+        (Kobject::Task, 716200) => match arg(req, 0) {
+            Some(option) => match k.darwin_eventlink_create(option as u32) {
+                Ok(ports) => {
+                    let mut r = Reply::ok(Vec::new());
+                    for p in ports {
+                        r.ports.push(PortOut::Right(Carried::Port(p), super::ipc::right::msgt::PORT_SEND));
+                    }
+                    r
+                }
+                Err(e) => Reply::err(e as i32),
+            },
+            None => bad(),
+        },
+        // mach_eventlink_destroy, _associate and _disassociate go to the
+        // eventlink's port; any other kernel object converts to none. The
+        // thread port's right is released once converted.
+        (o, 716201) => Reply::err(k.darwin_eventlink_destroy(o) as i32),
+        // mach_eventlink_associate(eventlink, thread, copyin_addr_wait,
+        // copyin_mask_wait, copyin_addr_signal, copyin_mask_signal, option).
+        (o, 716202) => match (desc_port(req, 0), arg_after(req, 1, 0), arg_after(req, 1, 1), arg_after(req, 1, 2), arg_after(req, 1, 3), arg_after(req, 1, 4), arg_after(req, 1, 5), arg_after(req, 1, 6), arg_after(req, 1, 7), arg_after(req, 1, 8)) {
+            (Some((right, disp)), Some(w0), Some(w1), Some(w2), Some(w3), Some(w4), Some(w5), Some(w6), Some(w7), Some(option)) => {
+                let u = |lo: i32, hi: i32| u64::from(lo as u32) | u64::from(hi as u32) << 32;
+                let thread = match right {
+                    Some(Carried::Port(p)) => {
+                        let port = k.ipc().port(p);
+                        match port.kobject {
+                            Some(Kobject::Thread(t)) if port.active => Some(t),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                let r = k.darwin_eventlink_associate(o, thread, [u(w0, w1), u(w2, w3), u(w4, w5), u(w6, w7)], option as u32);
+                // A failure's right is the server's to destroy.
+                if r == 0 {
+                    if let Some(c) = right {
+                        k.ipc().object_destroy(c, disp);
+                    }
+                }
+                Reply::err(r as i32)
+            }
+            _ => bad(),
+        },
+        (o, 716203) => match arg(req, 0) {
+            Some(option) => Reply::err(k.darwin_eventlink_disassociate(o, option as u32) as i32),
+            None => bad(),
+        },
         // task_restartable_ranges_register(task, ranges, count) and
         // task_restartable_ranges_synchronize(task).
         (Kobject::Task, 8000) => restartable_register(k, req),

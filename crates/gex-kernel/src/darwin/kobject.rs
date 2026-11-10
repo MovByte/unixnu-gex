@@ -431,6 +431,7 @@ impl Kernel {
             Some(Kobject::Voucher(v)) => self.ipc_voucher_no_senders(v),
             Some(Kobject::FilePort(id)) => super::fileport::fileport_no_senders(id),
             Some(Kobject::WorkInterval(id)) => super::workinterval::work_interval_no_senders(id),
+            Some(Kobject::Eventlink(..)) => self.darwin_eventlink_no_senders(port),
             Some(Kobject::TaskRead | Kobject::TaskInspect | Kobject::ThreadRead(_) | Kobject::ThreadInspect(_)) => self.darwin_flavor_port_no_senders(port),
             other => self.darwin_unimplemented(format!("no-senders for kernel object {other:?}")),
         }

@@ -320,6 +320,8 @@ pub enum Finish {
     Psem(super::psem::Cont),
     /// `aio_suspend`.
     AioSuspend(super::aio::Cont),
+    /// `mach_eventlink_wait_until`, `mach_eventlink_signal_wait_until`.
+    Eventlink(super::eventlink::Cont),
     /// An exception's handler's reply (`exception_deliver`).
     Exception(super::triage::Pending),
     /// `__sigwait`: the signals waited for, where the one taken goes.
@@ -419,6 +421,13 @@ impl Kernel {
             sys::OPEN_EXTENDED => Some(self.darwin_open_extended(m, a)),
             sys::SEM_WAIT | sys::SEM_WAIT_NOCANCEL => Some(self.darwin_sem_wait(m, a)),
             sys::AIO_SUSPEND | sys::AIO_SUSPEND_NOCANCEL => Some(self.darwin_aio_suspend(m, a)),
+            sys::MACH_EVENTLINK_WAIT_UNTIL | sys::MACH_EVENTLINK_SIGNAL_WAIT_UNTIL => Some(self.darwin_eventlink_wait(m, raw, a)),
+            // The count and kern_return_t in one word, never an errno.
+            sys::MACH_EVENTLINK_SIGNAL => {
+                let r = self.darwin_eventlink_call(raw, a).expect("mach_eventlink_signal");
+                bsd_result(m, self.ctx_addr, Ok(r), false);
+                Some(SyscallOutcome::Continue)
+            }
             sys::SELECT | sys::SELECT_NOCANCEL => Some(self.darwin_select(m, a, false)),
             sys::PSELECT | sys::PSELECT_NOCANCEL => Some(self.darwin_select(m, a, true)),
             sys::KEVENT64 => Some(<Kq as KQueue>::kevent_legacy(self, m, a, true)),
@@ -830,6 +839,7 @@ impl Kernel {
             Finish::Lockf(c) => return self.darwin_lockf_wait_done(m, c, res),
             Finish::Psem(c) => return self.darwin_psem_wait_done(m, c, res),
             Finish::AioSuspend(_) => return self.darwin_aio_suspend_done(m, res),
+            Finish::Eventlink(_) => return self.darwin_eventlink_wait_done(m, res),
             Finish::Exception(p) => return self.darwin_exc_wait_done(m, p, res),
             Finish::Psynch(c) => self.darwin_psynch_wait_done(m, c, res),
             Finish::Sigwait { siglist, sig } => return self.darwin_sigwait_done(m, siglist, sig, res),

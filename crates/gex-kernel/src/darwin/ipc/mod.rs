@@ -255,6 +255,8 @@ pub enum Kobject {
     RpcReply(i32),
     /// IKOT_WORK_INTERVAL: a joinable work interval, by its id.
     WorkInterval(u64),
+    /// IKOT_EVENTLINK: an end of an eventlink, by the eventlink's number.
+    Eventlink(u64, u8),
 }
 
 /// A port's reply semantics (`ip_reply_port_semantics`).
