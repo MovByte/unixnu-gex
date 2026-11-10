@@ -5,8 +5,16 @@
 // send and receive right that still works.
 
 #include <mach/mach.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
+
+static void *sleeper(void *arg) {
+    (void)arg;
+    pause();
+    return NULL;
+}
 
 static int bad(const char *what, long got, long want) {
     printf("portrefs: %s: %#lx, want %#lx\n", what, got, want);
@@ -93,6 +101,21 @@ int main(void) {
         printf("portrefs: both kinds at once: %d\n", kr);
         return 1;
     }
+    // A kernel routine that fails leaves the rights its request carried to
+    // the server to destroy: thread_set_mach_voucher of another, running
+    // thread takes nothing from the port it is given, whose sender still
+    // holds it (no no-senders notification yet).
+    mach_port_t v;
+    mach_port_allocate(task, MACH_PORT_RIGHT_RECEIVE, &v);
+    mach_port_insert_right(task, v, v, MACH_MSG_TYPE_MAKE_SEND);
+    if ((kr = mach_port_request_notification(task, v, MACH_NOTIFY_NO_SENDERS, 0, v, MACH_MSG_TYPE_MAKE_SEND_ONCE, &prev))) return bad("arming no-senders", kr, 0);
+    pthread_t other;
+    pthread_create(&other, NULL, sleeper, NULL);
+    usleep(20000);
+    if ((kr = thread_set_mach_voucher(pthread_mach_thread_np(other), v)) != KERN_INVALID_ARGUMENT) return bad("another thread's voucher", kr, KERN_INVALID_ARGUMENT);
+    if ((kr = mach_msg(&r.m.h, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof r, v, 0, MACH_PORT_NULL)) != MACH_RCV_TIMED_OUT) return bad("no-senders while a right is held", kr ? kr : r.m.h.msgh_id, MACH_RCV_TIMED_OUT);
+    mach_port_deallocate(task, v);
+    if ((kr = mach_msg(&r.m.h, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof r, v, 1000, MACH_PORT_NULL)) || r.m.h.msgh_id != MACH_NOTIFY_NO_SENDERS) return bad("no-senders once it went", kr ? kr : r.m.h.msgh_id, MACH_NOTIFY_NO_SENDERS);
     printf("portrefs ok\n");
     return 0;
 }

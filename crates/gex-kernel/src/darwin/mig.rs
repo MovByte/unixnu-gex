@@ -797,7 +797,8 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         }
         // thread_set_mach_voucher(thread, voucher): the calling thread, or
         // one not yet started, takes a reference on the voucher (none
-        // clears it); the request's right and its reference are released.
+        // clears it); the request's right and its reference are released
+        // when it does.
         (Kobject::Thread(t), 3626) => match desc_port(req, 0) {
             Some((right, disp)) => {
                 let own = k.dtask.kcaller == 0 || k.dtask.kcaller == k.ipc().task;
@@ -824,8 +825,11 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
                     }
                     0
                 };
-                if let Some(c) = right {
-                    k.ipc().object_destroy(c, disp);
+                // A failure's right is the server's to destroy.
+                if r == 0 {
+                    if let Some(c) = right {
+                        k.ipc().object_destroy(c, disp);
+                    }
                 }
                 Reply::err(r)
             }
