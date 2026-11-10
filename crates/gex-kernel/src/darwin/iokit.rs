@@ -245,6 +245,41 @@ pub fn iterator_next(id: u32) -> Option<u32> {
     ITERATORS.lock().unwrap_or_else(|e| e.into_inner()).get_mut(id as usize)?.pop()
 }
 
+/// An `IOServiceUserNotification`: the services its matching notification
+/// has handed it and not yet given out (`newSet`, taken from its end), and
+/// the send right to the port it would ping (`remotePort`). No service
+/// comes or goes once the registry is built, so after the services already
+/// there none is added and no ping is owed.
+struct Notification {
+    new_set: Vec<u32>,
+    wake: Option<u64>,
+}
+
+static NOTIFICATIONS: std::sync::Mutex<Vec<Option<Notification>>> = std::sync::Mutex::new(Vec::new());
+
+/// `kMaxOutstanding`: a notification holds at most this many services.
+const MAX_OUTSTANDING: usize = 1024;
+
+/// A notification of the services `existing` hands it, in that order, and
+/// the right `wake` it keeps; its number.
+pub fn notification_new(existing: Vec<u32>, wake: Option<u64>) -> u32 {
+    let new_set = existing.into_iter().take(MAX_OUTSTANDING).collect();
+    let mut t = NOTIFICATIONS.lock().unwrap_or_else(|e| e.into_inner());
+    t.push(Some(Notification { new_set, wake }));
+    (t.len() - 1) as u32
+}
+
+/// `copyNextObject`: the last service handed it, or none (and it is armed
+/// again).
+pub fn notification_next(id: u32) -> Option<u32> {
+    NOTIFICATIONS.lock().unwrap_or_else(|e| e.into_inner()).get_mut(id as usize)?.as_mut()?.new_set.pop()
+}
+
+/// The notification freed: the right it kept, to release.
+pub fn notification_free(id: u32) -> Option<u64> {
+    NOTIFICATIONS.lock().unwrap_or_else(|e| e.into_inner()).get_mut(id as usize)?.take()?.wake
+}
+
 /// `serialize_str` and `serialize_bool`'s common frame.
 pub fn serialize_prop(p: &Prop) -> Vec<u8> {
     const K_OS_SERIALIZE_BINARY_SIGNATURE: &[u8; 4] = b"\xd3\0\0\0";

@@ -446,6 +446,80 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             r.unimplemented = Some(format!("IOConnectCallMethod on {class}: selector {selector}, {scalars} scalars, {inband} bytes in: {:x?}", &bytes[..bytes.len().min(64)]));
             r
         }
+        // io_service_add_notification_bin(main_port, notification_type,
+        // matching, wake_port, reference) -> notification: an
+        // IOServiceUserNotification over what the dictionary matches now
+        // (internal_io_service_add_notification). It keeps the wake port's
+        // send right until it is freed.
+        (Kobject::IoMain, 2884) => {
+            const K_IO_RETURN_NO_RESOURCES: i32 = 0xe00002be_u32 as i32;
+            const K_IO_RETURN_UNSUPPORTED: i32 = 0xe00002c7_u32 as i32;
+            const K_IO_RETURN_NOT_READY: i32 = 0xe00002d8_u32 as i32;
+            // sizeof(OSAsyncReference64).
+            const ASYNC_REF64: usize = 8 * 8;
+            let Some((wake, _)) = desc_port(req, 0) else { return bad() };
+            let Some((ty, at)) = inline_cstr_at(req, 4 + 12 + NDR, 128) else { return bad() };
+            let Some(n) = i32_at(&req.body, at) else { return bad() };
+            let n = n as u32 as usize;
+            let Some(bytes) = req.body.get(at + 4..at + 4 + n) else { return bad() };
+            let ref_at = at + 4 + ((n + 3) & !3);
+            let Some(refs) = i32_at(&req.body, ref_at) else { return bad() };
+            // A dictionary not read here, whether malformed (xnu's
+            // kIOReturnBadArgument) or of kinds this reader lacks, is said.
+            let Some(dict) = super::iokit::unserialize_dict(bytes) else {
+                let mut r = Reply::err(K_IO_RETURN_NOT_READY);
+                r.unimplemented = Some(format!("a matching dictionary of nested or other kinds: {:x?}", &bytes[..bytes.len().min(300)]));
+                return r;
+            };
+            // IOServiceUserNotification::init: no bigger a reference than
+            // an OSAsyncReference64.
+            if refs as u32 as usize * 8 > ASYNC_REF64 {
+                return Reply::err(K_IO_RETURN_NO_RESOURCES);
+            }
+            // doInstallNotification: which services already there it is
+            // handed (those published, or matched; terminated ones none),
+            // and no other kind of notification.
+            let existing = match ty {
+                b"IOServicePublish" | b"IOServiceFirstPublish" | b"IOServiceMatched" | b"IOServiceFirstMatch" => true,
+                b"IOServiceTerminate" | b"IOServiceWillTerminate" => false,
+                _ => return Reply::err(K_IO_RETURN_UNSUPPORTED),
+            };
+            let items = if existing {
+                match super::iokit::matching(super::iokit::tree(), &dict) {
+                    Ok(items) => items,
+                    Err(what) => {
+                        let mut r = Reply::err(K_IO_RETURN_NOT_READY);
+                        r.unimplemented = Some(format!("IOService matching: {what}"));
+                        return r;
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            let wake = match wake {
+                Some(Carried::Port(p)) => Some(p),
+                _ => None,
+            };
+            let id = super::iokit::notification_new(items, wake);
+            let port = k.ipc().kobject_port(Kobject::IoNotification(id));
+            k.ipc().port_mut(port).owner = 0;
+            k.ipc().make_send(port);
+            k.ipc().port_mut(port).nsrequest_kobject = true;
+            Reply::port(Carried::Port(port))
+        }
+        // io_iterator_next, io_iterator_reset and io_iterator_is_valid on
+        // a notification: its services from the last handed; a reset does
+        // nothing, and it is always valid.
+        (Kobject::IoNotification(id), 2802) => match super::iokit::notification_next(*id) {
+            Some(i) => {
+                let port = k.ipc().global_port(Kobject::IoEntry(i));
+                k.ipc().copy_send(port);
+                Reply::port(Carried::Port(port))
+            }
+            None => Reply { ret: KERN_SUCCESS, defer: None, out: Vec::new(), ports: Vec::new(), unimplemented: None }.with_null_port(0),
+        },
+        (Kobject::IoNotification(_), 2803) => Reply::ok(Vec::new()),
+        (Kobject::IoNotification(_), 2834) => Reply::ok(1u32.to_le_bytes().to_vec()),
         // io_iterator_next(iterator) -> object, or none left.
         (Kobject::IoIterator(id), 2802) => match super::iokit::iterator_next(*id) {
             Some(i) => {

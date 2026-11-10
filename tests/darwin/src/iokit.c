@@ -1,6 +1,8 @@
 // IOKit from a task: the main port, the device tree's entries and their
-// properties, a path that does not exist, and the APFS volumes as services
-// with their roles and the container above them.
+// properties, a path that does not exist, the APFS volumes as services
+// with their roles and the container above them, and a matching
+// notification: the volumes already there, the last first, then none; a
+// termination notification has none, and an unknown kind is refused.
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
@@ -10,6 +12,20 @@
 static int bad(const char *what, long got, long want) {
     printf("iokit: %s: %ld, want %ld\n", what, got, want);
     return 1;
+}
+
+static void notified(void *ref, io_iterator_t it) {
+}
+
+// The registry ids an iterator gives, up to 64.
+static int ids(io_iterator_t it, uint64_t *out) {
+    int n = 0;
+    io_object_t o;
+    while ((o = IOIteratorNext(it)) != IO_OBJECT_NULL) {
+        if (n < 64) IORegistryEntryGetRegistryEntryID(o, &out[n++]);
+        IOObjectRelease(o);
+    }
+    return n;
 }
 
 int main(void) {
@@ -51,6 +67,33 @@ int main(void) {
     IOObjectRelease(it);
     if (volumes != 6) return bad("volumes", volumes, 6);
     if (system != 1) return bad("system volumes", system, 1);
+
+    uint64_t a[64], b[64];
+    IOServiceGetMatchingServices(main_port, IOServiceMatching("AppleAPFSVolume"), &it);
+    int na = ids(it, a);
+    IOObjectRelease(it);
+    IONotificationPortRef np = IONotificationPortCreate(main_port);
+    if (np == NULL) return bad("a notification port", 0, 1);
+    io_iterator_t ni = IO_OBJECT_NULL;
+    kr = IOServiceAddMatchingNotification(np, kIOFirstMatchNotification, IOServiceMatching("AppleAPFSVolume"), notified, NULL, &ni);
+    if (kr != KERN_SUCCESS || ni == IO_OBJECT_NULL) return bad("a matching notification", kr, 0);
+    int nb = ids(ni, b);
+    if (nb != na) return bad("services notified", nb, na);
+    for (int i = 0; i < na; i++) {
+        if (b[i] != a[na - 1 - i]) return bad("notified the last first", i, 0);
+    }
+    if (!IOIteratorIsValid(ni)) return bad("the notification valid", 0, 1);
+    IOIteratorReset(ni);
+    if (IOIteratorNext(ni) != IO_OBJECT_NULL) return bad("nothing after a reset", 1, 0);
+    io_iterator_t ti = IO_OBJECT_NULL;
+    kr = IOServiceAddMatchingNotification(np, kIOTerminatedNotification, IOServiceMatching("AppleAPFSVolume"), notified, NULL, &ti);
+    if (kr != KERN_SUCCESS || IOIteratorNext(ti) != IO_OBJECT_NULL) return bad("a termination notification", kr, 0);
+    io_iterator_t bi = IO_OBJECT_NULL;
+    kr = IOServiceAddMatchingNotification(np, "IOServiceNoSuchKind", IOServiceMatching("AppleAPFSVolume"), notified, NULL, &bi);
+    if (kr != (kern_return_t)0xe00002c7) return bad("an unknown kind", kr, 0xe00002c7);
+    IOObjectRelease(ti);
+    IOObjectRelease(ni);
+    IONotificationPortDestroy(np);
 
     printf("iokit ok\n");
     return 0;

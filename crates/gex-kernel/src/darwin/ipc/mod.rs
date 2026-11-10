@@ -248,6 +248,9 @@ pub enum Kobject {
     FilePort(u32),
     /// An `io_iterator_t`.
     IoIterator(u32),
+    /// An `io_iterator_t` that is a matching notification
+    /// (`IOServiceUserNotification`), by its number.
+    IoNotification(u32),
     /// IKOT_IOKIT_CONNECT: a user client of service `0`.
     IoConnect(u32),
     /// A thread's kernel reply port (`ith_rpc_reply`): the reply to an RPC
