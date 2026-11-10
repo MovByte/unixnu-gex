@@ -39,9 +39,12 @@ impl Kernel {
         }
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
         files().lock().unwrap_or_else(|e| e.into_inner()).insert(id, file);
+        // fileport_alloc: IPC_KOBJECT_ALLOC_MAKE_SEND | IPC_KOBJECT_ALLOC_NSREQUEST,
+        // so the file goes with the last send right.
         let ipc = &mut self.ipc();
         let port = ipc.kobject_port(Kobject::FilePort(id));
         ipc.make_send(port);
+        ipc.port_mut(port).nsrequest_kobject = true;
         let name = self.darwin_copyout_send(port);
         if name == 0 {
             return Err(Errno::EINVAL);

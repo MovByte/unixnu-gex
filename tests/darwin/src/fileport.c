@@ -35,6 +35,22 @@ int main(void) {
     if (read(fd, buf, 2) != 2 || memcmp(buf, "hi", 2) != 0) return bad("reading through it", errno, 0);
     close(fd);
 
+    // The port holds the file open: with the write end's descriptor closed
+    // the reader sees no end of file until the port's last send right goes.
+    fileport_t wport = MACH_PORT_NULL;
+    if (fileport_makeport(ends[1], &wport) != 0) return bad("fileport_makeport of the write end", errno, 0);
+    int w2 = dup(ends[1]);
+    close(ends[1]);
+    if (fcntl(ends[0], F_SETFL, O_NONBLOCK) != 0) return bad("O_NONBLOCK", errno, 0);
+    errno = 0;
+    if (read(ends[0], buf, 1) != -1 || errno != EAGAIN) return bad("reading while the port holds it", errno, EAGAIN);
+    close(w2);
+    errno = 0;
+    if (read(ends[0], buf, 1) != -1 || errno != EAGAIN) return bad("reading while only the port holds it", errno, EAGAIN);
+    if (mach_port_deallocate(mach_task_self(), wport) != KERN_SUCCESS) return bad("mach_port_deallocate", 1, 0);
+    if (read(ends[0], buf, 1) != 0) return bad("end of file after the port went", errno, 0);
+    ends[1] = -1;
+
     // What is not a file port; a descriptor that cannot go in one.
     errno = 0;
     if (fileport_makefd(mach_task_self()) != -1 || errno != EINVAL) return bad("the task's port", errno, EINVAL);
@@ -57,7 +73,6 @@ int main(void) {
     if (syscall(177, NULL, NULL) != -1 || errno != EINVAL) return bad("kdebug_typefilter of nothing", errno, EINVAL);
 
     close(ends[0]);
-    close(ends[1]);
     printf("fileport ok\n");
     return 0;
 }
