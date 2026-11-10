@@ -595,8 +595,8 @@ impl Kernel {
             sys::FGETATTRLIST => res(self.darwin_fgetattrlist(m, a)),
             sys::GETATTRLISTAT => res(self.darwin_getattrlistat(m, a)),
             sys::GETATTRLISTBULK => res(self.darwin_getattrlistbulk(m, a)),
-            sys::STATFS64 => res(self.darwin_statfs(m, Some(a[0]), a[1])),
-            sys::FSTATFS64 => res(self.darwin_statfs(m, None, a[1])),
+            sys::STATFS64 => res(self.darwin_statfs(m, Some(a[0]), 0, a[1])),
+            sys::FSTATFS64 => res(self.darwin_statfs(m, None, a[0], a[1])),
             sys::SYSCTL => res(self.darwin_sysctl(m, a)),
             sys::SYSCTLBYNAME => res(self.darwin_sysctlbyname(m, a)),
             // dup3 refuses to copy a descriptor onto itself; dup2 checks it
@@ -1006,19 +1006,38 @@ impl Kernel {
         Ok(n as u64)
     }
 
-    /// `statfs64(path, buf)` or `fstatfs64(fd, buf)`: the mount with the
-    /// longest prefix of the file's path.
-    fn darwin_statfs(&mut self, m: &mut GuestMem<'_>, path: Option<u64>, buf: u64) -> Result<u64, Errno> {
-        let _ = path;
-        let p = match path {
+    /// The mount `statfs64` finds: that of the vnode the path names
+    /// (`namei`, FOLLOW), or of the descriptor's for `fstatfs64`
+    /// (`file_vnode`: EINVAL for what is no vnode). devfs's has no
+    /// record here: reported.
+    fn darwin_statfs_mount(&mut self, m: &GuestMem<'_>, path: Option<u64>, fd: u64) -> Result<&'static Mount, Errno> {
+        let canon = match path {
             Some(at) => {
                 let mut b = [0u8; MAXPATHLEN];
                 let n = m.read_cstr_into(at, &mut b)?.ok_or(Errno::ENAMETOOLONG)?;
-                String::from_utf8_lossy(&b[..n]).into_owned()
+                let given = std::str::from_utf8(&b[..n]).map_err(|_| Errno::EINVAL)?;
+                let abs = self.path_io().at_path_str(super::bsd::dirfd(super::bsd::AT_FDCWD as u64) as i32, given)?;
+                self.vfs.metadata(&abs)?;
+                self.vfs.canonical(&abs)
             }
-            None => String::from("/"),
+            None => {
+                let file = self.fds.get(fd as i32)?;
+                if self.darwin_vnode_of(&file).is_none() || std::sync::Arc::clone(&file.handle).as_posix_sem().is_some() {
+                    return Err(Errno::EINVAL);
+                }
+                file.path.clone()
+            }
         };
-        let mnt = mount_of(&p);
+        if canon == "/dev" || canon.starts_with("/dev/") {
+            self.darwin_unimplemented(format!("statfs of {canon} (devfs_statfs: the devfs mount has no record here)"));
+            return Err(Errno::EINVAL);
+        }
+        Ok(mount_of(&canon))
+    }
+
+    /// `statfs64(path, buf)` or `fstatfs64(fd, buf)`.
+    fn darwin_statfs(&mut self, m: &mut GuestMem<'_>, path: Option<u64>, fd: u64, buf: u64) -> Result<u64, Errno> {
+        let mnt = self.darwin_statfs_mount(m, path, fd)?;
         m.write(buf, &statfs64(mnt))?;
         Ok(0)
     }
