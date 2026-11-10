@@ -582,6 +582,8 @@ impl Kernel {
         self.darwin_finish = None;
         self.darwin_pipe_sigpipe = None;
         self.darwin_execsigs();
+        // _aio_exec: the old image's requests are let go.
+        self.dtask.aio = Default::default();
         // An exec's NOTE_EXEC (a new process's came in its spawner's call).
         if spawn.is_none_or(|s| s.flags & super::spawn::flag::SETEXEC != 0) {
             crate::procnote::post(self.pid, crate::procnote::note::EXEC);

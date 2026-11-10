@@ -13,6 +13,7 @@ use crate::errno::Errno;
 use crate::GuestMem;
 use gex_abi::ctx;
 
+pub mod aio;
 pub mod amfi;
 pub mod applematch;
 pub mod attrcall;
@@ -260,6 +261,8 @@ pub struct Task {
     /// `thread_guard_violation`'s pending exception of a guarded descriptor,
     /// its code and subcode, for the call's way out (`fd_guard_ast`).
     pub fd_guard: Option<(u64, u64)>,
+    /// Its asynchronous I/O requests.
+    pub aio: aio::Aio,
     /// Each thread waiting on a POSIX semaphore, and on which.
     pub psem_waits: std::collections::HashMap<i32, psem::Waiting>,
     /// The files named to the image in `executable_file` and `dyld_file`
