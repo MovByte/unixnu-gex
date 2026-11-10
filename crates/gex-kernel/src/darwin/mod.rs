@@ -355,6 +355,12 @@ impl crate::syscalls::Kernel {
         if importance::LIVE_DONOR_CHANGED.load(std::sync::atomic::Ordering::Relaxed) {
             self.ipc().importance_settle();
         }
+        // The file lock assertions the locks took and gave back.
+        if lockf::IMP_PENDING.load(std::sync::atomic::Ordering::Relaxed) {
+            for (hold, pid) in lockf::take_importance() {
+                self.ipc().imp_file_lock(pid, hold);
+            }
+        }
         self.dtask.ipc_raw.check_in();
     }
 

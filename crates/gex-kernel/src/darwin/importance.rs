@@ -69,6 +69,7 @@ pub struct ImpTask {
     assertcnt: u32,
     legacy_externcnt: u32,
     legacy_externdrop: u32,
+    filelocks: u32,
     /// `iit_updatepolicy`: a transition is to be applied to the task.
     updatepolicy: bool,
     /// `iit_updateq` is the list of updates being made.
@@ -262,7 +263,7 @@ impl Ipc {
         let (pid, policy) = (link.pid, link.policy.clone()?);
         let imp = self.imp();
         let h = imp.alloc();
-        imp.elems.insert(h, Elem::Task(ImpTask { refs: 1, made: 0, externcnt: 0, externdrop: 0, kmsgs: Vec::new(), task: Some((key, pid)), policy, inherits: Vec::new(), assertcnt: 0, legacy_externcnt: 0, legacy_externdrop: 0, updatepolicy: false, queued: false }));
+        imp.elems.insert(h, Elem::Task(ImpTask { refs: 1, made: 0, externcnt: 0, externdrop: 0, kmsgs: Vec::new(), task: Some((key, pid)), policy, inherits: Vec::new(), assertcnt: 0, legacy_externcnt: 0, legacy_externdrop: 0, filelocks: 0, updatepolicy: false, queued: false }));
         imp.by_task.insert(key, h);
         Some(h)
     }
@@ -568,6 +569,42 @@ impl Ipc {
         if self.imp_is_any_receiver_type(Some(h)) {
             self.imp_drop_internal_locked(h, count);
         }
+    }
+
+    /// `task_importance_hold_file_lock_assertion` (an element made if need
+    /// be) or `task_importance_drop_file_lock_assertion` (only with one) on
+    /// process `pid`'s task; a task that has ended has none.
+    pub(crate) fn imp_file_lock(&mut self, pid: i32, hold: bool) {
+        let Some(key) = self.links.iter().find(|(_, l)| l.pid == pid).map(|(&k, _)| k) else { return };
+        if hold {
+            if let Some(t) = self.imp_base(key) {
+                self.imp_hold_file_lock(t, 1);
+            }
+        } else if let Some(t) = self.vouchers.imp.by_task.get(&key).copied() {
+            self.imp_drop_file_lock(t, 1);
+        }
+    }
+
+    /// `ipc_importance_task_hold_file_lock_assertion`.
+    pub(crate) fn imp_hold_file_lock(&mut self, h: u64, count: u32) {
+        if self.imp_is_any_receiver_type(Some(h)) {
+            self.imp_hold_internal_locked(h, count);
+            self.itask(h).filelocks += count;
+        }
+    }
+
+    /// `ipc_importance_task_drop_file_lock_assertion`.
+    pub(crate) fn imp_drop_file_lock(&mut self, h: u64, count: u32) -> u32 {
+        if !self.imp_is_any_receiver_type(Some(h)) {
+            return kr::SUCCESS;
+        }
+        let t = self.itask(h);
+        if count > t.filelocks {
+            return kr::INVALID_ARGUMENT;
+        }
+        t.filelocks -= count;
+        self.imp_drop_internal_locked(h, count);
+        kr::SUCCESS
     }
 
     /// `ipc_importance_task_hold_legacy_external_assertion`: only a task

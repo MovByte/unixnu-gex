@@ -100,6 +100,9 @@ struct Lockf {
     /// `lf_blkhd`.
     blkhd: VecDeque<u64>,
     waker: Option<Waker>,
+    /// `lf_boosted`: the lock's owner holds a file lock importance
+    /// assertion for a donor blocked on it.
+    boosted: bool,
 }
 
 /// `LF_END`.
@@ -127,11 +130,43 @@ struct Table {
     /// Each vnode's `v_lockf` list, in order.
     lists: HashMap<Vnode, Vec<u64>>,
     next: u64,
+    /// The file lock importance assertions to hold (true) or drop on
+    /// their processes' tasks, in order, once the table is let go
+    /// ([`take_importance`]).
+    imp_ops: Vec<(bool, i32)>,
 }
 
 fn table() -> &'static Mutex<Table> {
     static T: OnceLock<Mutex<Table>> = OnceLock::new();
     T.get_or_init(Default::default)
+}
+
+/// A process's importance as the locks see it: `task_is_importance_donor`
+/// and `task_is_importance_receiver_type`, from its task policy.
+type ImpQuery = Box<dyn Fn(i32) -> (bool, bool) + Send + Sync>;
+
+static IMP_QUERY: OnceLock<ImpQuery> = OnceLock::new();
+
+/// Assertions are waiting in the table.
+pub static IMP_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How the locks learn a process's importance (set once, by the first
+/// Darwin lock call).
+pub fn set_importance_query(q: ImpQuery) {
+    let _ = IMP_QUERY.set(q);
+}
+
+fn imp_of(pid: Option<i32>) -> (bool, bool) {
+    match (pid, IMP_QUERY.get()) {
+        (Some(p), Some(q)) => q(p),
+        _ => (false, false),
+    }
+}
+
+/// The file lock importance assertions to hold and drop, taken.
+pub fn take_importance() -> Vec<(bool, i32)> {
+    IMP_PENDING.store(false, std::sync::atomic::Ordering::Relaxed);
+    std::mem::take(&mut table().lock().unwrap_or_else(|e| e.into_inner()).imp_ops)
 }
 
 /// `struct flock` (`l_start`, `l_len`, `l_pid`, `l_type`, `l_whence`).
@@ -297,7 +332,7 @@ impl Table {
             return;
         }
         let l1 = &self.locks[&lock1];
-        let split = Lockf { start: e2 + 1, end: l1.end, id: l1.id, ty: l1.ty, flags: l1.flags, owner: l1.owner, vnode: v, next: None, blkhd: VecDeque::new(), waker: None };
+        let split = Lockf { start: e2 + 1, end: l1.end, id: l1.id, ty: l1.ty, flags: l1.flags, owner: l1.owner, vnode: v, next: None, blkhd: VecDeque::new(), waker: None, boosted: l1.boosted };
         let sid = self.alloc(split);
         self.l(lock1).end = s2 - 1;
         let list = self.list(v);
@@ -372,19 +407,79 @@ impl Table {
             if self.l(lock).flags & lf::F_FLOCK == 0 {
                 self.l(block).flags &= !lf::F_WAKE1_SAFE;
             }
+            // Importance is donated where the blocker's owner is known: a
+            // POSIX lock's process, or an OFD lock's other owner.
+            if self.same_owned_kind(lock, block) {
+                self.boost_blocking_proc(lock, block);
+            }
             return Step::Blocked(lock);
         }
         self.grant(lock);
         Step::Done(Ok(()))
     }
 
+    /// Both POSIX locks, or OFD locks of two known owners: the kinds whose
+    /// blocker's owner is unambiguous.
+    fn same_owned_kind(&self, a: u64, b: u64) -> bool {
+        let (x, y) = (&self.locks[&a], &self.locks[&b]);
+        x.flags & y.flags & lf::F_POSIX != 0 || (x.flags & y.flags & lf::F_OFD_LOCK != 0 && x.owner != y.owner && x.owner.is_some() && y.owner.is_some())
+    }
+
+    /// `lf_boost_blocking_proc`: a donor blocked on a receiver's lock
+    /// boosts it with a file lock assertion (`lf_hold_assertion`), and
+    /// goes to the head of the lock's queue (`lf_jump_to_queue_head`).
+    fn boost_blocking_proc(&mut self, lock: u64, block: u64) {
+        if !imp_of(self.l(lock).owner).0 {
+            return;
+        }
+        let bowner = self.l(block).owner;
+        if !self.l(block).boosted && imp_of(bowner).1 {
+            self.hold_assertion(block);
+        }
+        let q = &mut self.l(block).blkhd;
+        q.retain(|&x| x != lock);
+        q.push_front(lock);
+    }
+
+    /// `lf_hold_assertion`.
+    fn hold_assertion(&mut self, block: u64) {
+        let owner = self.l(block).owner.expect("a known owner");
+        self.imp_ops.push((true, owner));
+        IMP_PENDING.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.l(block).boosted = true;
+    }
+
+    /// `lf_drop_assertion`.
+    fn drop_assertion(&mut self, block: u64) {
+        let owner = self.l(block).owner.expect("a known owner");
+        self.imp_ops.push((false, owner));
+        IMP_PENDING.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.l(block).boosted = false;
+    }
+
+    /// `lf_adjust_assertion`: a boosted lock keeps its boost while a donor
+    /// of its kind still waits on it.
+    fn adjust_assertion(&mut self, block: u64) {
+        if !self.l(block).boosted {
+            return;
+        }
+        let receiver = imp_of(self.l(block).owner).1;
+        let waiting: Vec<u64> = self.l(block).blkhd.iter().copied().collect();
+        let keep = waiting.into_iter().any(|n| self.same_owned_kind(block, n) && imp_of(self.l(n).owner).0 && receiver);
+        if !keep {
+            self.drop_assertion(block);
+        }
+    }
+
     /// `lf_setlock` after the sleep: `err` is how it ended.
     fn setlock_resume(&mut self, lock: u64, err: Option<Errno>) -> Step {
         if let Some(n) = self.l(lock).next.take() {
-            // Woken early (a signal, a timeout): off the blocker's list;
-            // with no error, it was spurious and the scan goes on.
+            // Woken early (a signal, a timeout): off the blocker's list,
+            // whose boost is adjusted; with no error, it was spurious and
+            // the scan goes on.
             if let Some(b) = self.locks.get_mut(&n) {
                 b.blkhd.retain(|&x| x != lock);
+                self.adjust_assertion(n);
             }
             if err.is_none() {
                 return self.setlock_scan(lock);
@@ -507,6 +602,9 @@ impl Table {
             let ov = self.lists[&v][i];
             let unlkend = lf_end(self.l(unlock));
             self.wakelock(ov, false);
+            if self.l(ov).boosted {
+                self.drop_assertion(ov);
+            }
             match case {
                 Ovl::None => break,
                 Ovl::EqualsLock => {
@@ -625,7 +723,7 @@ pub fn advlock(v: Vnode, id: Id, op: Op, fl: &mut Flock, flags: u32, owner: Opti
     if flags & lf::F_FLOCK != 0 {
         flags |= lf::F_WAKE1_SAFE;
     }
-    let lock = t.alloc(Lockf { start, end, id, ty: fl.ty, flags, owner, vnode: v, next: None, blkhd: VecDeque::new(), waker });
+    let lock = t.alloc(Lockf { start, end, id, ty: fl.ty, flags, owner, vnode: v, next: None, blkhd: VecDeque::new(), waker, boosted: false });
     match op {
         Op::SetLk => t.setlock_scan(lock),
         Op::Unlck => {
@@ -772,7 +870,26 @@ impl Kernel {
     }
 
     /// The `fcntl` lock commands; a blocking one may sleep.
+    /// The locks' view of a process's importance: a marked donor or a
+    /// boosted receiver donates (`ipc_importance_task_is_donor`, a boost
+    /// being an assertion held), and a receiver or de-nap receiver takes
+    /// boosts.
+    fn darwin_lock_importance_query(&self) {
+        if IMP_QUERY.get().is_some() {
+            return;
+        }
+        let procs = Arc::clone(&self.procs);
+        set_importance_query(Box::new(move |pid| {
+            procs.task_policy(pid).map_or((false, false), |p| {
+                let p = p.lock().unwrap_or_else(|e| e.into_inner());
+                let i = p.imp;
+                (i.donor || (i.receiver && p.requested.boosted), i.receiver || i.denap_receiver)
+            })
+        }));
+    }
+
     pub(crate) fn darwin_fcntl_lock(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> SyscallOutcome {
+        self.darwin_lock_importance_query();
         let r = self.darwin_fcntl_lock_inner(m, a);
         self.darwin_lock_outcome(m, r)
     }
@@ -881,6 +998,7 @@ impl Kernel {
 
     /// `flock(fd, how)`.
     pub(crate) fn darwin_flock(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> SyscallOutcome {
+        self.darwin_lock_importance_query();
         let r = self.darwin_flock_inner(a[0] as i32, a[1]);
         self.darwin_lock_outcome(m, r)
     }
@@ -931,6 +1049,7 @@ impl Kernel {
     /// what the call answers (the descriptor, or the lock's error with the
     /// descriptor closed), or a sleep for the lock.
     pub(crate) fn darwin_open_lock(&mut self, m: &mut GuestMem<'_>, fd: i32, dflags: u64) -> SyscallOutcome {
+        self.darwin_lock_importance_query();
         const O_SHLOCK: u64 = 0x10;
         const O_EXLOCK: u64 = 0x20;
         const O_NONBLOCK: u64 = 0x4;
