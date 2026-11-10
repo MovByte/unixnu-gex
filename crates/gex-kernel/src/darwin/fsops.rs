@@ -395,6 +395,7 @@ impl Kernel {
             sys::UTIMES => self.darwin_utimes(m, cwd as i32, a[0], a[1]),
             sys::FUTIMES => self.darwin_utimes(m, a[0] as i32, 0, a[1]),
             sys::GETDIRENTRIES64 => self.darwin_getdirentries64(m, a[0] as i32, a[1], a[2], a[3]),
+            sys::GETDIRENTRIES => self.darwin_getdirentries(m, a[0] as i32, a[1], a[2], a[3]),
             // A directory's offset is where its next entry is read from;
             // a vnode's lseek is its knotes' NOTE_NONE (what it may read
             // changed).
@@ -465,36 +466,65 @@ impl Kernel {
         self.path_io().set_times_at(m, dirfd, path, atime, mtime, true)
     }
 
-    /// `getdirentries64(fd, buf, bufsize, position)`, as `vnode_readdir64`
-    /// does for a filesystem without extended readdir: the 32-bit dirents
-    /// that fit in 3/8 of the buffer, each made a `struct direntry`.
-    fn darwin_getdirentries64(&mut self, m: &mut GuestMem<'_>, fd: i32, buf: u64, ubufsize: u64, position: u64) -> Result<u64, Errno> {
-        let mut bufsize = if ubufsize >= GETDIRENTRIES64_EXTENDED_BUFSIZE { ubufsize - 4 } else { ubufsize };
+    /// `getdirentries_common`'s checks: a readable descriptor of a
+    /// directory, and the buffer's size at most GETDIRENTRIES_MAXBUFSIZE.
+    fn darwin_readdir_file(&mut self, fd: i32, bufsize: u64) -> Result<(std::sync::Arc<crate::file::OpenFile>, u64), Errno> {
         let file = self.fds.get(fd)?;
         if !file.readable {
             return Err(Errno::EBADF);
         }
-        bufsize = bufsize.min(GETDIRENTRIES_MAXBUFSIZE);
+        let bufsize = bufsize.min(GETDIRENTRIES_MAXBUFSIZE);
         if file.handle.metadata()?.file_type != crate::vfs::FileType::Directory {
             return Err(Errno::EINVAL);
         }
+        Ok((file, bufsize))
+    }
+
+    /// `VNOP_READDIR` without extended entries, as the filesystems here
+    /// answer it: from the directory's offset, each entry whose 32-bit
+    /// `struct dirent` still fits in `room` bytes, handed to `put`; EINVAL
+    /// when not even the first fits. The offset it started at, the one past
+    /// them (which [`Self::darwin_readdir_done`] moves to once they are
+    /// copied out), and whether the end was reached, come back.
+    fn darwin_readdir(file: &crate::file::OpenFile, room: usize, mut put: impl FnMut(&crate::vfs::DirEntry)) -> Result<(usize, usize, bool), Errno> {
         let loff = file.dir_cursor();
-        let room = 3 * (bufsize.min(87371) as usize) / 8;
         let mut used = 0;
-        let mut out = Vec::new();
         let mut at = loff;
-        let mut eof = false;
-        loop {
+        let eof = loop {
             let Some(e) = file.dir_entry(at)? else {
-                eof = true;
-                break;
+                break true;
             };
-            let name = e.name.as_bytes();
-            let dl = dirent_len(name.len());
+            let dl = dirent_len(e.name.len());
             if used + dl > room {
-                break;
+                break false;
             }
             used += dl;
+            put(&e);
+            at += 1;
+        };
+        // A buffer too small for the next entry (VNOP_READDIR's EINVAL).
+        if at == loff && !eof {
+            return Err(Errno::EINVAL);
+        }
+        Ok((loff, at, eof))
+    }
+
+    /// The directory's offset past what was read.
+    fn darwin_readdir_done(file: &crate::file::OpenFile, at: usize) {
+        file.set_dir_cursor(at);
+        let _ = file.seek(at as i64, 0);
+    }
+
+    /// `getdirentries64(fd, buf, bufsize, position)`, as `vnode_readdir64`
+    /// does for a filesystem without extended readdir: the 32-bit dirents
+    /// that fit in 3/8 of the buffer, each made a `struct direntry`.
+    fn darwin_getdirentries64(&mut self, m: &mut GuestMem<'_>, fd: i32, buf: u64, ubufsize: u64, position: u64) -> Result<u64, Errno> {
+        let bufsize = if ubufsize >= GETDIRENTRIES64_EXTENDED_BUFSIZE { ubufsize - 4 } else { ubufsize };
+        let (file, bufsize) = self.darwin_readdir_file(fd, bufsize)?;
+        let room = 3 * (bufsize.min(87371) as usize) / 8;
+        let mut out = Vec::new();
+        let (loff, at, eof) = Self::darwin_readdir(&file, room, |e| {
+            let name = e.name.as_bytes();
             let rec = dirent64_len(name.len());
             let mut r = vec![0u8; rec];
             r[0..8].copy_from_slice(&e.ino.to_le_bytes());
@@ -503,19 +533,36 @@ impl Kernel {
             r[20] = e.file_type.dirent_type();
             r[21..21 + name.len()].copy_from_slice(name);
             out.extend_from_slice(&r);
-            at += 1;
-        }
-        // A buffer too small for the next entry (VNOP_READDIR's EINVAL).
-        if out.is_empty() && !eof {
-            return Err(Errno::EINVAL);
-        }
+        })?;
         m.write(buf, &out)?;
-        file.set_dir_cursor(at);
-        let _ = file.seek(at as i64, 0);
+        Self::darwin_readdir_done(&file, at);
         m.write_u64(position, loff as u64)?;
         if ubufsize >= GETDIRENTRIES64_EXTENDED_BUFSIZE {
             m.write_u32(buf + bufsize, if eof { GETDIRENTRIES64_EOF } else { 0 })?;
         }
+        Ok(out.len() as u64)
+    }
+
+    /// `getdirentries(fd, buf, count, basep)`: `VNOP_READDIR`'s 32-bit
+    /// dirents themselves, in the whole buffer, and the offset they were
+    /// read from as a long.
+    fn darwin_getdirentries(&mut self, m: &mut GuestMem<'_>, fd: i32, buf: u64, count: u64, basep: u64) -> Result<u64, Errno> {
+        let (file, bufsize) = self.darwin_readdir_file(fd, count as u32 as u64)?;
+        let mut out = Vec::new();
+        let (loff, at, _) = Self::darwin_readdir(&file, bufsize as usize, |e| {
+            let name = e.name.as_bytes();
+            let rec = dirent_len(name.len());
+            let mut r = vec![0u8; rec];
+            r[0..4].copy_from_slice(&(e.ino as u32).to_le_bytes());
+            r[4..6].copy_from_slice(&(rec as u16).to_le_bytes());
+            r[6] = e.file_type.dirent_type();
+            r[7] = name.len() as u8;
+            r[8..8 + name.len()].copy_from_slice(name);
+            out.extend_from_slice(&r);
+        })?;
+        m.write(buf, &out)?;
+        Self::darwin_readdir_done(&file, at);
+        m.write_u64(basep, loff as u64)?;
         Ok(out.len() as u64)
     }
 }
