@@ -2231,9 +2231,11 @@ impl Kernel {
                 if pflags & CPU_PERCENT != 0 && (cpu_percent <= 0 || cpu_percent > 100 || cpu_refillms <= 0 || cpu_refillms > 0x00ff_ffff) {
                     return Err(Errno::EINVAL);
                 }
-                if pflags & WORK_INTERVAL != 0 {
-                    // kern_work_interval_get_policy_from_port.
-                    self.darwin_unimplemented("workloops with work intervals".into());
+                // kern_work_interval_get_policy_from_port: an interval's
+                // class, WI_CLASS_NONE with no workload configuration loaded,
+                // brings no policy, so what the loop asks for stays; the
+                // thread group it preadopts has no effect here.
+                if pflags & WORK_INTERVAL != 0 && self.darwin_port_work_interval(i32_(32) as u32).is_err() {
                     return Err(Errno::EINVAL);
                 }
                 let (mut tf, mut pri, mut pol, mut cpu, mut refill) = (0u16, 0u8, 0u8, 0u8, 0u32);

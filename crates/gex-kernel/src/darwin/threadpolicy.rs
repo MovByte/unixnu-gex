@@ -85,6 +85,12 @@ impl Kernel {
         if flavor == flavor::TIME_CONSTRAINT_WITH_PRIORITY && (info.len() < 5 || info[4] != BASEPRI_RTQUEUES) {
             return KERN_INVALID_ARGUMENT;
         }
+        // A thread in a work interval whose workload ID does not allow
+        // real-time may not become realtime.
+        use super::workinterval::thflag;
+        if matches!(flavor, flavor::TIME_CONSTRAINT | flavor::TIME_CONSTRAINT_WITH_PRIORITY) && th.wi_flags & (thflag::HAS_WORKLOAD_ID | thflag::RT_ALLOWED) == thflag::HAS_WORKLOAD_ID {
+            return KERN_INVALID_POLICY;
+        }
         let saved = (th.policy.qos != qos::UNSPECIFIED).then_some((th.policy.qos, th.policy.relpri));
         if saved.is_some() {
             th.policy.qos = qos::UNSPECIFIED;

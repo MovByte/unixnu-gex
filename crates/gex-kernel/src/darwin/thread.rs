@@ -213,6 +213,10 @@ pub struct DThread {
     pub cpu_credited: u64,
     /// TH_MODE_REALTIME's time constraints, while it is in that mode.
     pub realtime: Option<super::threadpolicy::Realtime>,
+    /// The work interval it is in (`th_work_interval`), and what it keeps
+    /// of that interval's workload ID (`th_work_interval_flags`).
+    pub work_interval: Option<std::sync::Arc<super::workinterval::WorkInterval>>,
+    pub wi_flags: u32,
     /// `thread_abort` of it while its task is held: it takes its signals.
     pub job_abort: bool,
     /// Off its CPU: parked by a hold, or waiting in a call (what

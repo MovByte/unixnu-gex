@@ -347,6 +347,9 @@ impl Kernel {
         if let Some(r) = self.darwin_aio_call(m, raw, a) {
             return Some(res(r));
         }
+        if let Some(r) = self.darwin_work_interval_call(m, raw, a) {
+            return Some(res(r));
+        }
         if let Some(r) = self.darwin_psem_call(m, raw, a) {
             return Some(res(r));
         }

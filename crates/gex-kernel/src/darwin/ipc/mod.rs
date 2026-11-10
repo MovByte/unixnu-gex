@@ -253,6 +253,8 @@ pub enum Kobject {
     /// A thread's kernel reply port (`ith_rpc_reply`): the reply to an RPC
     /// the kernel made for it.
     RpcReply(i32),
+    /// IKOT_WORK_INTERVAL: a joinable work interval, by its id.
+    WorkInterval(u64),
 }
 
 /// A port's reply semantics (`ip_reply_port_semantics`).

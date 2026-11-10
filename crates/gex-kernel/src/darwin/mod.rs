@@ -86,6 +86,7 @@ pub mod trustcache;
 pub mod vm;
 pub mod voucher;
 pub mod wait;
+pub mod workinterval;
 pub mod workq;
 
 
@@ -263,6 +264,9 @@ pub struct Task {
     pub fd_guard: Option<(u64, u64)>,
     /// Its asynchronous I/O requests.
     pub aio: aio::Aio,
+    /// TF_CA_CLIENT_WI: a Core Animation client work interval was made
+    /// (`task_set_ca_client_wi`).
+    pub ca_client_wi: bool,
     /// Each thread waiting on a POSIX semaphore, and on which.
     pub psem_waits: std::collections::HashMap<i32, psem::Waiting>,
     /// The files named to the image in `executable_file` and `dyld_file`
