@@ -1,5 +1,6 @@
 // The calls with a file security argument, with no access control list, the
-// answer for every file here; fsgetpath_ext and proc_info_extended_id.
+// answer for every file here (an APFS file's security says so);
+// fsgetpath_ext and proc_info_extended_id.
 
 #include <errno.h>
 #include <fcntl.h>
@@ -49,20 +50,44 @@ int main(void) {
     if (fd < 0) return bad("open_extended", errno, 0);
     if (write(fd, "abc", 3) != 3) return bad("the file it opened", errno, 0);
 
-    // With no list, its size comes back zero.
+    // An APFS file's security: no list, null owner and group GUIDs.
+    static const unsigned char noacl[44] = {0x6d, 0xc1, 0x2c, 0x01, [36] = 0xff, 0xff, 0xff, 0xff};
     struct stat plain, st;
     if (stat(f, &plain) != 0) return bad("stat", errno, 0);
     size_t size = 1234;
-    char sec[64];
+    unsigned char sec[64];
+    memset(sec, 0x5a, sizeof sec);
     if (sys8(STAT, (long)f, (long)&st, (long)sec, (long)&size, 0, 0, 0, 0) != 0) return bad("stat64_extended", errno, 0);
     if (st.st_ino != plain.st_ino || st.st_size != 3 || (st.st_mode & 07777) != 0640) return bad("what it saw", st.st_mode, 0640);
-    if (size != 0) return bad("the list's size", (long)size, 0);
+    if (size != 44) return bad("the security's size", (long)size, 44);
+    if (memcmp(sec, noacl, 44) || sec[44] != 0x5a) return bad("the security", sec[0], noacl[0]);
     size = 77;
-    if (sys8(STAT, (long)f, (long)&st, 0, (long)&size, 0, 0, 0, 0) != 0 || size != 77) return bad("no list wanted", (long)size, 77);
-    size = 1;
-    if (sys8(LSTAT, (long)f, (long)&st, (long)sec, (long)&size, 0, 0, 0, 0) != 0 || size != 0) return bad("lstat64_extended", errno, 0);
-    size = 1;
-    if (sys8(FSTAT, fd, (long)&st, (long)sec, (long)&size, 0, 0, 0, 0) != 0 || size != 0 || st.st_size != 3) return bad("fstat64_extended", errno, 0);
+    if (sys8(STAT, (long)f, (long)&st, 0, (long)&size, 0, 0, 0, 0) != 0 || size != 77) return bad("no security wanted", (long)size, 77);
+    // Too small a buffer: only the size.
+    size = 43;
+    memset(sec, 0x5a, sizeof sec);
+    if (sys8(STAT, (long)f, (long)&st, (long)sec, (long)&size, 0, 0, 0, 0) != 0 || size != 44 || sec[0] != 0x5a) return bad("a small buffer", (long)size, 44);
+    size = 1000;
+    if (sys8(LSTAT, (long)f, (long)&st, (long)sec, (long)&size, 0, 0, 0, 0) != 0 || size != 44 || memcmp(sec, noacl, 44)) return bad("lstat64_extended", errno, 0);
+    size = 1000;
+    if (sys8(FSTAT, fd, (long)&st, (long)sec, (long)&size, 0, 0, 0, 0) != 0 || size != 44 || st.st_size != 3 || memcmp(sec, noacl, 44)) return bad("fstat64_extended", errno, 0);
+    // devfs keeps none, and neither has a pipe.
+    size = 1000;
+    if (sys8(STAT, (long)"/dev/null", (long)&st, (long)sec, (long)&size, 0, 0, 0, 0) != 0 || size != 0) return bad("devfs", (long)size, 0);
+    int p[2];
+    if (pipe(p) != 0) return bad("pipe", errno, 0);
+    size = 1000;
+    if (sys8(FSTAT, p[0], (long)&st, (long)sec, (long)&size, 0, 0, 0, 0) != 0 || size != 0) return bad("a pipe", (long)size, 0);
+    // fstat goes on past a struct it could not copy out, and the security's
+    // copyout is the answer; the stat forms stop.
+    size = 1000;
+    if (sys8(FSTAT, fd, 8, (long)sec, (long)&size, 0, 0, 0, 0) != 0 || size != 44) return bad("fstat64_extended at a bad address", errno, 0);
+    size = 1000;
+    if (expect("fstat64_extended of a pipe at a bad address", sys8(FSTAT, p[0], 8, (long)sec, (long)&size, 0, 0, 0, 0), EFAULT) || size != 0) return 1;
+    size = 1000;
+    if (expect("stat64_extended at a bad address", sys8(STAT, (long)f, 8, (long)sec, (long)&size, 0, 0, 0, 0), EFAULT) || size != 1000) return 1;
+    close(p[0]);
+    close(p[1]);
     size = 1;
     if (expect("no such file", sys8(STAT, (long)"/nonexistent", (long)&st, (long)sec, (long)&size, 0, 0, 0, 0), ENOENT)) return 1;
     if (size != 1) return bad("the size after a failure", (long)size, 1);
