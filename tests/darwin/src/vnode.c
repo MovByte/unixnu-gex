@@ -2,7 +2,8 @@
 // NOTE_ATTRIB, a link NOTE_LINK, a flock unlock NOTE_FUNLOCK, a rename
 // NOTE_RENAME, an unlink NOTE_DELETE|NOTE_LINK; a directory hears
 // NOTE_WRITE for a name made and NOTE_WRITE|NOTE_LINK for a directory made;
-// and an EVFILT_READ at the end of a file wakes when it grows.
+// an EVFILT_READ at the end of a file wakes when it grows; and devfs's
+// directory takes a knote, which hears nothing while no node comes or goes.
 
 #include <errno.h>
 #include <fcntl.h>
@@ -82,6 +83,14 @@ int main(void) {
     if (kevent(kq, NULL, 0, &out, 1, &zero) != 1 || out.ident != (uintptr_t)r || out.data != 4) return bad("EVFILT_READ after the file grew", (unsigned)out.data);
     close(w);
     close(r);
+
+    int dev = open("/dev", O_RDONLY | O_EVTONLY);
+    if (dev < 0) return bad("open /dev", (unsigned)errno);
+    struct kevent res;
+    EV_SET(&ev, dev, EVFILT_VNODE, EV_ADD | EV_CLEAR | EV_RECEIPT, NOTE_WRITE | NOTE_LINK | NOTE_ATTRIB, 0, NULL);
+    if (kevent(kq, &ev, 1, &res, 1, NULL) != 1 || !(res.flags & EV_ERROR) || res.data != 0) return bad("a knote on /dev", (unsigned)res.data);
+    if ((v = got(dev)) != 0) return bad("/dev unchanged", v);
+    close(dev);
     close(f);
     close(d);
     unlink(D "/g");

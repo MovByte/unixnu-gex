@@ -12,6 +12,12 @@ use super::{DirEntry, FileHandle, FileSystem, FileType, Metadata};
 use crate::errno::{Errno, SysResult};
 use std::sync::Arc;
 
+/// A node's watch key within this filesystem: its name's FNV-1a hash
+/// (every node reports inode 1, so the number cannot tell them apart).
+fn node_key(path: &str) -> u64 {
+    path.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
+}
+
 /// Which device a handle refers to.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Device {
@@ -265,12 +271,18 @@ impl FileSystem for DevFs {
     }
 
     /// No inotify on `/dev/input`: a program without udev then watches
-    /// its mtime instead (see `evdev`).
+    /// its mtime instead (see `evdev`). What never changes once mounted --
+    /// the top directory's listing and its devices -- has a key no note is
+    /// ever posted on; `/dev/pts` gains and loses nodes with no note, so it
+    /// has none.
     fn watch_key(&self, path: &str) -> Result<(Option<crate::inotify::Key>, bool), Errno> {
         if super::evdev::is_input_dir(path) {
             return Err(Errno::EACCES);
         }
-        self.metadata(path).map(|m| (None, m.file_type == FileType::Directory))
+        let md = self.metadata(path)?;
+        let changing = path == "pts" || path.starts_with("pts/") || path == "input" || path.starts_with("input/");
+        let key = (!changing).then(|| crate::inotify::Key { fs: self as *const DevFs as usize, ino: node_key(path) });
+        Ok((key, md.file_type == FileType::Directory))
     }
 
     fn read_link(&self, path: &str) -> Result<String, Errno> {
