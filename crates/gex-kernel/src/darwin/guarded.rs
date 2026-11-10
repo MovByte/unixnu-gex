@@ -53,9 +53,18 @@ const O_NOFOLLOW: u64 = 0x100;
 const O_SYMLINK: u64 = 0x0020_0000;
 const O_NOFOLLOW_ANY: u64 = 0x2000_0000;
 const O_LOCKS: u64 = 0x30;
+/// `O_EXEC` (`FEXEC`), and with O_DIRECTORY `O_SEARCH`.
+const O_EXEC: u64 = 0x4000_0000;
+const O_DIRECTORY: u64 = 0x10_0000;
 /// The open flags a plain renumbering does not carry: an open with one
 /// goes through [`Kernel::darwin_open_finish`].
-pub(crate) const OPEN_FINISHED: u64 = O_LOCKS | O_CLOFORK | O_SYMLINK | O_NOFOLLOW_ANY;
+pub(crate) const OPEN_FINISHED: u64 = O_LOCKS | O_CLOFORK | O_SYMLINK | O_NOFOLLOW_ANY | O_EXEC;
+
+/// Whether an open's flags need [`Kernel::darwin_open_finish`]: one a plain
+/// renumbering does not carry, or both access mode bits (open1's EINVAL).
+pub(crate) fn open_needs_finish(flags: u64) -> bool {
+    flags & OPEN_FINISHED != 0 || flags & 3 == 3
+}
 const O_DP_GETRAWENCRYPTED: u64 = 0x1;
 const O_DP_GETRAWUNENCRYPTED: u64 = 0x2;
 const O_DP_AUTHENTICATE: u64 = 0x4;
@@ -236,39 +245,12 @@ impl Kernel {
     }
 
     /// `open1` for an `open` or `openat` a plain renumbering cannot do:
-    /// `vn_open_auth`'s O_NOFOLLOW_ANY and O_SYMLINK, O_CLOFORK, the guard
-    /// set before the descriptor is seen, and O_EXLOCK or O_SHLOCK taken
-    /// after.
+    /// [`Kernel::darwin_open1`], then O_EXLOCK or O_SHLOCK taken after.
     pub(crate) fn darwin_open_finish(&mut self, m: &mut GuestMem<'_>, raw: u64, a: [u64; 6], guard: Option<FdGuard>) -> SyscallOutcome {
         let at = if raw == sys::OPEN || raw == sys::OPEN_NOCANCEL { 1 } else { 2 };
         let dflags = a[at];
-        let symlink = match self.darwin_open_links(m, at, &a) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = super::set_result(m, self.ctx_addr, e.as_return());
-                return SyscallOutcome::Continue;
-            }
-        };
-        let mut la = a;
-        la[at] &= !OPEN_FINISHED;
-        let n = super::bsd::translate(raw, &mut la);
-        if symlink {
-            // The translated call is openat's. The name is opened, not
-            // what it names.
-            la[2] = (la[2] & !3) | crate::fs::oflags::O_PATH | 0x8000;
-        }
-        match self.canonical(m, n, la) {
+        match self.darwin_open1(m, raw, a, guard) {
             Ok(fd) => {
-                let fd = fd as i32;
-                if dflags & O_CLOFORK != 0 {
-                    let _ = self.fds.set_clofork(fd, true);
-                }
-                if let Some(g) = guard {
-                    let _ = self.fds.change_guard(fd, |slot, _, _| {
-                        *slot = Some(g);
-                        Ok(())
-                    });
-                }
                 if dflags & O_LOCKS != 0 {
                     return self.darwin_open_lock(m, fd, dflags);
                 }
@@ -279,6 +261,54 @@ impl Kernel {
             }
         }
         SyscallOutcome::Continue
+    }
+
+    /// `open1` up to the lock (`open`, `openat`, or a spawn's PSFA_OPEN, as
+    /// `raw` and its arguments `a`): the access mode's checks,
+    /// `vn_open_auth`'s O_NOFOLLOW_ANY and O_SYMLINK, the open, then
+    /// O_CLOFORK and the guard set before the descriptor is seen.
+    pub(crate) fn darwin_open1(&mut self, m: &mut GuestMem<'_>, raw: u64, a: [u64; 6], guard: Option<FdGuard>) -> Result<i32, Errno> {
+        let at = if raw == sys::OPEN || raw == sys::OPEN_NOCANCEL { 1 } else { 2 };
+        let dflags = a[at];
+        self.darwin_open_mode(dflags)?;
+        let symlink = self.darwin_open_links(m, at, &a)?;
+        let mut la = a;
+        la[at] &= !OPEN_FINISHED;
+        let n = super::bsd::translate(raw, &mut la);
+        if symlink {
+            // The translated call is openat's. The name is opened, not
+            // what it names.
+            la[2] = (la[2] & !3) | crate::fs::oflags::O_PATH | 0x8000;
+        }
+        let fd = self.canonical(m, n, la)? as i32;
+        if dflags & O_CLOFORK != 0 {
+            let _ = self.fds.set_clofork(fd, true);
+        }
+        if let Some(g) = guard {
+            let _ = self.fds.change_guard(fd, |slot, _, _| {
+                *slot = Some(g);
+                Ok(())
+            });
+        }
+        Ok(fd)
+    }
+
+    /// `open1`'s access mode: both bits (O_ACCMODE), or O_EXEC with a read
+    /// or write mode (FEXEC cannot be told from FREAD), are EINVAL. An
+    /// execute-only open's descriptor (FEXEC, or O_SEARCH's FSEARCH)
+    /// neither reads nor writes yet keeps the vnode's other operations,
+    /// which no descriptor here does; it is reported.
+    fn darwin_open_mode(&mut self, flags: u64) -> Result<(), Errno> {
+        let amode = flags & 3;
+        if amode == 3 || (amode != 0 && flags & O_EXEC != 0) {
+            return Err(Errno::EINVAL);
+        }
+        if flags & O_EXEC != 0 {
+            let what = if flags & O_DIRECTORY != 0 { "O_SEARCH (a search-only descriptor)" } else { "O_EXEC (an execute-only descriptor)" };
+            self.darwin_unimplemented(format!("an open with {what}"));
+            return Err(Errno::EINVAL);
+        }
+        Ok(())
     }
 
     /// `vn_open_auth`'s walk of an open's path for O_NOFOLLOW_ANY (ELOOP at

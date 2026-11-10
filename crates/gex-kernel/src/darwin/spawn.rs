@@ -999,9 +999,9 @@ impl Kernel {
                     let mode = u32::from(mode) & !self.proc_fs.umask() & 0o777;
                     let mut s = Scratch::path(path);
                     let mut gm = GuestMem::new(&mut s.0);
-                    let mut la = [Scratch::AT, u64::from(oflag), u64::from(mode), 0, 0, 0];
-                    let n = super::bsd::translate(super::bsd::sys::OPEN, &mut la);
-                    let got = self.canonical(&mut gm, n, la)? as i32;
+                    // open1, as an open syscall's.
+                    let la = [Scratch::AT, u64::from(oflag), u64::from(mode), 0, 0, 0];
+                    let got = self.darwin_open1(&mut gm, super::bsd::sys::OPEN, la, None)?;
                     // open1's O_EXLOCK or O_SHLOCK: the new open file's flock.
                     if oflag & 0x30 != 0 {
                         if let Err(e) = self.darwin_open_lock_now(got, u64::from(oflag)) {
