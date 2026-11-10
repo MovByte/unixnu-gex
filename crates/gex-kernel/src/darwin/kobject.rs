@@ -292,6 +292,11 @@ impl Kernel {
         if !self.darwin || self.dtask.ipc_raw.task == 0 {
             return;
         }
+        // Its threads' vouchers, its importance (ipc_importance_disconnect_task)
+        // and its bank context (task_bank_reset).
+        self.darwin_threads_vouchers_release();
+        self.darwin_importance_disconnect_task();
+        self.darwin_bank_task_destroy();
         let semas: Vec<ObjId> = self.dtask.semas.map.iter().filter(|(_, s)| s.active).map(|(&p, _)| p).collect();
         for p in semas {
             self.semaphore_destroy_internal(None, p);

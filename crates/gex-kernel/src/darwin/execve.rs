@@ -485,6 +485,11 @@ impl Kernel {
         for a in std::mem::take(&mut self.dtask.kports.thread_exc).into_values() {
             super::exception::release_all(self.ipc(), &a);
         }
+        // The old task's threads' vouchers and its bank context go with it;
+        // its importance goes on with the new task
+        // (ipc_importance_exec_switch_task).
+        self.darwin_threads_vouchers_release();
+        self.darwin_bank_task_destroy();
         let old = std::mem::take(&mut self.dtask);
         let (realtimer, vtimers) = (old.realtimer, old.vtimers);
         // task_copy_fields_for_exec.
@@ -508,6 +513,7 @@ impl Kernel {
             dispatchqueue_serialno_offset: old.dispatchqueue_serialno_offset,
             dispatchqueue_label_offset: old.dispatchqueue_label_offset,
             policy: old.policy,
+            vouchers: old.vouchers.for_exec(),
             said: old.said,
             // p_csflags: the exec's own, made at its start from these.
             csflags: old.csflags,
@@ -546,6 +552,8 @@ impl Kernel {
             },
             ..Default::default()
         };
+        // task_bank_init, the image in place.
+        self.darwin_task_bank_init();
         // A spawn's own exec with attributes: its process control.
         if let Some(pc) = spawn.filter(|s| s.flags & super::spawn::flag::SETEXEC != 0).and_then(|s| s.pcontrol) {
             self.dtask.pcaction.store(super::spawn::pcaction_of(pc), std::sync::atomic::Ordering::Release);

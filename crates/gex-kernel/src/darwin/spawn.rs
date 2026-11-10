@@ -293,6 +293,8 @@ impl Kernel {
             csflags: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(t.csflags.load(std::sync::atomic::Ordering::Acquire) & !super::amfi::cs::KILLED)),
             // forkproc: the parent's persona.
             persona: t.persona.clone(),
+            // task_bank_init for the child, with the parent's credential.
+            vouchers: super::voucher::Vouchers::forked(t.cred.uid, t.cred.gid()),
             puniqueid: t.uniqueid,
             // The ids and start time a fork chose for its child; a spawn's
             // child takes new ones.
@@ -624,6 +626,9 @@ impl Kernel {
         }
         // The image's signature, as its load added it.
         child.dtask.codesign = img.load.sig.as_deref().cloned();
+        // task_bank_init, the child's credentials, persona and image in
+        // place.
+        child.darwin_task_bank_reinit();
         // exec_handle_exception_port_actions: now that the child's
         // signature is known, its exception ports as task_set_exception_ports
         // sets them (each held right consumed when set).

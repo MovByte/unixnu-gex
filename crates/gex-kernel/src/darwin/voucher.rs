@@ -87,12 +87,11 @@ pub mod vkr {
     pub const INVALID_TASK: u32 = 16;
 }
 
-/// The bank's handles: `BANK_DEFAULT_VALUE` (NULL) and
-/// `BANK_DEFAULT_TASK_VALUE` (-1); the task's own bank context.
+/// The bank's handles, `BANK_DEFAULT_VALUE` (NULL) and
+/// `BANK_DEFAULT_TASK_VALUE` (1), and its commands.
 pub(crate) mod bank {
     pub const DEFAULT_VALUE: u64 = 0;
-    pub const DEFAULT_TASK_VALUE: u64 = u64::MAX;
-    pub const TASK_HANDLE: u64 = 0x1000;
+    pub const DEFAULT_TASK_VALUE: u64 = 1;
     /// `PERSONA_ID_NONE`.
     pub const PERSONA_ID_NONE: u32 = !0;
     /// `BANK_ORIGINATOR_PID`, `BANK_PERSONA_TOKEN`, `BANK_PERSONA_ID`,
@@ -102,11 +101,15 @@ pub(crate) mod bank {
     pub const PERSONA_ID: u32 = 0x3;
     pub const PERSONA_ADOPT_ANY: u32 = 0x4;
     pub const ORIGINATOR_PROXIMATE_PID: u32 = 0x5;
+    /// `PROC_PERSONA_INFO_FLAG_ADOPTION_ALLOWED`.
+    pub const FLAG_ADOPTION_ALLOWED: u32 = 0x1;
 }
 
-/// The importance manager's handle for the task's own element
-/// (`task_imp_base`).
-const IMP_TASK_HANDLE: u64 = 0x2000;
+/// `THREAD_GROUP_SYSTEM`: the thread group of the init jetsam coalition
+/// (`COALITION_ROLE_SYSTEM`), which every task here is in, no coalition
+/// being made (`task_coalition_get_thread_group`).
+const THREAD_GROUP_SYSTEM: u64 = 0;
+
 /// `MACH_VOUCHER_IMPORTANCE_ATTR_DROP_EXTERNAL`.
 const IMPORTANCE_ATTR_DROP_EXTERNAL: u32 = 2;
 
@@ -273,34 +276,130 @@ struct Voucher {
     port: Option<ObjId>,
 }
 
-/// The task's bank context (`struct bank_task`).
-#[derive(Debug, Default)]
+/// `struct proc_persona_info`: the process a bank context stands for.
+#[derive(Clone, Copy, Debug, Default)]
+struct ProcPersonaInfo {
+    unique_pid: u64,
+    pid: i32,
+    flags: u32,
+    pidversion: u32,
+    persona_id: u32,
+    uid: u32,
+    gid: u32,
+    macho_uuid: [u8; 16],
+}
+
+impl ProcPersonaInfo {
+    fn bytes(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(PROC_PERSONA_INFO_SIZE as usize);
+        b.extend_from_slice(&self.unique_pid.to_le_bytes());
+        b.extend_from_slice(&self.pid.to_le_bytes());
+        for w in [self.flags, self.pidversion, self.persona_id, self.uid, self.gid] {
+            b.extend_from_slice(&w.to_le_bytes());
+        }
+        b.extend_from_slice(&self.macho_uuid);
+        b
+    }
+}
+
+/// `struct bank_persona`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BankPersona {
+    id: u32,
+    uid: u32,
+}
+
+/// A task's bank context (`struct bank_task`).
+#[derive(Debug)]
 struct BankTask {
     refs: u32,
     made: u32,
     voucher_ref: u32,
-    pid: i32,
-    persona_id: u32,
-    flags: u32,
+    info: ProcPersonaInfo,
+    persona_uid: u32,
     hasentitlement: bool,
+    thread_group: u64,
+    /// `bt_accounts_to_pay`, `bt_accounts_to_charge`.
+    to_pay: Vec<u64>,
+    to_charge: Vec<u64>,
 }
 
-/// The task's importance element (`struct ipc_importance_task`).
-#[derive(Debug, Default)]
+/// `struct bank_account`: what a merchant task's work for a holder is
+/// billed to. The bill (`ba_bill`) and the ledgers it is rolled up into
+/// are not kept: nothing here reads them (proc_pid_rusage's billed and
+/// serviced times, ledger(2)), those calls being unimplemented.
+#[derive(Debug)]
+struct BankAccount {
+    refs: u32,
+    made: u32,
+    merchant: u64,
+    holder: u64,
+    secureoriginator: u64,
+    proximateprocess: u64,
+    thread_group: u64,
+    so_persona: BankPersona,
+}
+
+#[derive(Debug)]
+enum BankElem {
+    Task(BankTask),
+    Account(BankAccount),
+}
+
+/// A task's importance element (`struct ipc_importance_task`).
+#[derive(Debug)]
 struct ImpTask {
     refs: u32,
     made: u32,
+    /// `task_pid(iit_task)`: none once the task is disconnected.
+    pid: Option<i32>,
 }
 
-/// The process's vouchers and their managers' state.
+/// A task's own voucher state: its bank context (`task->bank_context`)
+/// and importance element (`task->task_imp_base`), and the credential's
+/// ids when its bank context was to be made (`task_bank_init`, at a fork
+/// or once an exec's image is in place).
 #[derive(Debug, Default)]
 pub struct Vouchers {
+    bank_context: Option<u64>,
+    bank_ids: Option<(u32, u32)>,
+    imp_base: Option<u64>,
+}
+
+/// The system's vouchers (`ivht`), each key's value table (`ivac`) and the
+/// managers' elements, which every task shares with the IPC table.
+#[derive(Debug, Default)]
+pub struct VoucherTables {
     ivac: Vec<Option<Ivac>>,
     vouchers: HashMap<VoucherId, Voucher>,
     by_table: HashMap<[u32; KEY_NUM], VoucherId>,
     next: VoucherId,
-    bank_task: Option<BankTask>,
-    imp_task: Option<ImpTask>,
+    bank: HashMap<u64, BankElem>,
+    imp: HashMap<u64, ImpTask>,
+    next_handle: u64,
+}
+
+impl Vouchers {
+    /// A forked task's: its bank context to be made with these ids.
+    pub fn forked(uid: u32, gid: u32) -> Vouchers {
+        Vouchers { bank_ids: Some((uid, gid)), ..Vouchers::default() }
+    }
+
+    /// An exec's new task's: the old task's importance element, which
+    /// now stands for it.
+    pub fn for_exec(&self) -> Vouchers {
+        assert!(self.bank_context.is_none());
+        Vouchers { imp_base: self.imp_base, ..Vouchers::default() }
+    }
+}
+
+impl VoucherTables {
+    /// A handle for a new element: distinct from the managers' defaults,
+    /// aligned as an element's address is.
+    fn alloc_handle(&mut self) -> u64 {
+        self.next_handle = self.next_handle.max(0x1000) + 0x40;
+        self.next_handle
+    }
 }
 
 /// A recipe from user space or the kernel (`mach_voucher_attr_recipe_t`,
@@ -343,21 +442,16 @@ fn index_to_key(i: u32) -> u32 {
 }
 
 impl Kernel {
-    fn vs(&mut self) -> &mut Vouchers {
-        let v = &mut self.dtask.vouchers;
+    fn vt(&mut self) -> &mut VoucherTables {
+        let v = &mut self.ipc().vouchers;
         if v.ivac.is_empty() {
             // bank_init and ipc_importance_init: the managers registered,
-            // each with a default value of 0; the task's bank context made
-            // with the task (bank_task_initialize).
+            // each with a default value of 0.
             v.ivac = (0..key::NUM_WELL_KNOWN).map(|_| None).collect();
             v.ivac[key_to_index(key::IMPORTANCE) as usize] = Some(Ivac::new(0));
             v.ivac[key_to_index(key::BANK) as usize] = Some(Ivac::new(bank::DEFAULT_VALUE));
         }
-        if self.dtask.vouchers.bank_task.is_none() {
-            let bt = self.bank_task_alloc_init();
-            self.dtask.vouchers.bank_task = Some(bt);
-        }
-        &mut self.dtask.vouchers
+        v
     }
 
     /// `ivgt_lookup`: the key's manager, if one is registered.
@@ -365,7 +459,6 @@ impl Kernel {
         if key_index as usize >= key::NUM_WELL_KNOWN {
             return None;
         }
-        self.vs();
         match index_to_key(key_index) {
             key::IMPORTANCE => Some(Ivam::Importance),
             key::BANK => Some(Ivam::Bank),
@@ -374,11 +467,11 @@ impl Kernel {
     }
 
     fn ivac(&mut self, key_index: u32) -> &mut Ivac {
-        self.vs().ivac[key_index as usize].as_mut().expect("a registered key")
+        self.vt().ivac[key_index as usize].as_mut().expect("a registered key")
     }
 
     fn voucher(&mut self, v: VoucherId) -> &mut Voucher {
-        self.dtask.vouchers.vouchers.get_mut(&v).expect("a voucher")
+        self.vt().vouchers.get_mut(&v).expect("a voucher")
     }
 
     /// `iv_lookup`.
@@ -394,7 +487,7 @@ impl Kernel {
 
     /// `iv_alloc`.
     fn iv_alloc(&mut self) -> VoucherId {
-        let vs = self.vs();
+        let vs = self.vt();
         vs.next += 1;
         let id = vs.next;
         vs.vouchers.insert(id, Voucher { table: [IV_UNUSED_VALINDEX; KEY_NUM], refs: 1, port: None });
@@ -419,7 +512,7 @@ impl Kernel {
     fn iv_dealloc(&mut self, v: VoucherId, unhash: bool) {
         if unhash {
             let t = self.voucher(v).table;
-            self.dtask.vouchers.by_table.remove(&t);
+            self.vt().by_table.remove(&t);
         }
         if let Some(port) = self.voucher(v).port.take() {
             // ipc_kobject_dealloc_port: no send right is left.
@@ -434,19 +527,19 @@ impl Kernel {
             self.ivace_release(i, vi);
             self.voucher(v).table[i as usize] = IV_UNUSED_VALINDEX;
         }
-        self.dtask.vouchers.vouchers.remove(&v);
+        self.vt().vouchers.remove(&v);
     }
 
     /// `iv_dedup`: the voucher already made with the same values, or this
     /// one, now known.
     fn iv_dedup(&mut self, v: VoucherId) -> VoucherId {
         let t = self.voucher(v).table;
-        if let Some(&dupe) = self.dtask.vouchers.by_table.get(&t) {
+        if let Some(&dupe) = self.vt().by_table.get(&t) {
             self.ipc_voucher_reference(dupe);
             self.iv_dealloc(v, false);
             return dupe;
         }
-        self.dtask.vouchers.by_table.insert(t, v);
+        self.vt().by_table.insert(t, v);
         v
     }
 
@@ -915,6 +1008,15 @@ impl Kernel {
         vkr::SUCCESS
     }
 
+    /// The task's threads let go of the vouchers they adopted, as they end
+    /// with it (`thread_deallocate_complete`).
+    pub(crate) fn darwin_threads_vouchers_release(&mut self) {
+        let held: Vec<VoucherId> = self.dtask.threads.map.values_mut().filter_map(|t| t.voucher.take()).collect();
+        for v in held {
+            self.ipc_voucher_release(v);
+        }
+    }
+
     // -- the traps -----------------------------------------------------------------------
 
     /// `host_create_mach_voucher_trap(host, recipes, recipes_size,
@@ -985,41 +1087,195 @@ impl Kernel {
 
     // -- the bank ------------------------------------------------------------------------
 
-    /// `bank_task_alloc_init`: the task's bank context, with its process's
-    /// persona and whether that persona may be adopted
-    /// (`bank_task_is_persona_adoption_allowed`: a system or system proxy
-    /// persona's, on iOS).
-    fn bank_task_alloc_init(&mut self) -> BankTask {
-        const PROC_PERSONA_INFO_FLAG_ADOPTION_ALLOWED: u32 = 0x1;
-        let persona = self.dtask.persona.clone();
-        let flags = if persona.as_ref().is_some_and(|p| p.adoption_allowed()) { PROC_PERSONA_INFO_FLAG_ADOPTION_ALLOWED } else { 0 };
-        let persona_id = persona.map_or(bank::PERSONA_ID_NONE, |p| p.id);
-        BankTask { refs: 1, made: 0, voucher_ref: 0, pid: self.pid, persona_id, flags, hasentitlement: self.bank_task_is_propagate_entitled() }
+    /// The credential's ids are what the task's bank context will record
+    /// (`task_bank_init`, at a fork and once an exec's image is in
+    /// place); the rest of what it records does not change in a task.
+    pub(crate) fn darwin_task_bank_init(&mut self) {
+        assert!(self.dtask.vouchers.bank_context.is_none(), "Task bank init called with non null bank context");
+        self.dtask.vouchers.bank_ids = Some((self.dtask.cred.uid, self.dtask.cred.gid()));
     }
 
-    /// `bank_get_bank_ledger_thread_group_and_persona`'s persona for a
-    /// voucher whose bank value is no account: the current task's bank
-    /// context's.
-    pub(crate) fn darwin_bank_persona_id(&mut self) -> u32 {
-        self.bank_task().persona_id
+    /// A spawn's child's `task_bank_init`, once its credentials and
+    /// persona are its own: the ids its fork recorded give way.
+    pub(crate) fn darwin_task_bank_reinit(&mut self) {
+        self.dtask.vouchers.bank_ids = None;
+        self.darwin_task_bank_init();
+    }
+
+    /// `get_bank_task_context(current_task(), FALSE)`: the task's bank
+    /// context, made from what `task_bank_init` recorded.
+    fn get_bank_task_context(&mut self) -> u64 {
+        if let Some(h) = self.dtask.vouchers.bank_context {
+            return h;
+        }
+        let bt = self.bank_task_alloc_init();
+        let vt = self.vt();
+        let h = vt.alloc_handle();
+        vt.bank.insert(h, BankElem::Task(bt));
+        self.dtask.vouchers.bank_context = Some(h);
+        h
+    }
+
+    /// `bank_task_alloc_init`: the task's bank context, with one reference
+    /// (the task's), its process's persona and whether that persona may be
+    /// adopted (`bank_task_is_persona_adoption_allowed`: a system or
+    /// system proxy persona's, on iOS).
+    fn bank_task_alloc_init(&mut self) -> BankTask {
+        let persona = self.dtask.persona.clone();
+        let flags = if persona.as_ref().is_some_and(|p| p.adoption_allowed()) { bank::FLAG_ADOPTION_ALLOWED } else { 0 };
+        let (uid, gid) = self.dtask.vouchers.bank_ids.unwrap_or((self.dtask.cred.uid, self.dtask.cred.gid()));
+        let info = ProcPersonaInfo {
+            unique_pid: self.dtask.uniqueid,
+            pid: self.pid,
+            flags,
+            pidversion: self.dtask.pidversion as u32,
+            persona_id: persona.as_ref().map_or(bank::PERSONA_ID_NONE, |p| p.id),
+            uid,
+            gid,
+            macho_uuid: self.dtask.uuid,
+        };
+        let persona_uid = persona.as_ref().map_or(super::cred::UID_NONE, |p| p.get_uid());
+        BankTask { refs: 1, made: 0, voucher_ref: 0, info, persona_uid, hasentitlement: self.bank_task_is_propagate_entitled(), thread_group: THREAD_GROUP_SYSTEM, to_pay: Vec::new(), to_charge: Vec::new() }
     }
 
     /// `bank_task_is_propagate_entitled`: a platform binary propagates
     /// its persona unless entitled not to.
     fn bank_task_is_propagate_entitled(&mut self) -> bool {
-        if self.darwin_task_entitled("com.apple.private.persona.no-propagate") {
+        if self.darwin_task_entitled("com.apple.private.personas.no.propagate") {
             return false;
         }
         self.darwin_task_platform_binary()
     }
 
-    fn bank_task(&mut self) -> &mut BankTask {
-        self.vs().bank_task.as_mut().expect("the task's bank context")
+    fn bank_task(&mut self, h: u64) -> &mut BankTask {
+        match self.vt().bank.get_mut(&h) {
+            Some(BankElem::Task(t)) => t,
+            _ => panic!("a bank task"),
+        }
+    }
+
+    fn bank_account(&mut self, h: u64) -> &mut BankAccount {
+        match self.vt().bank.get_mut(&h) {
+            Some(BankElem::Account(a)) => a,
+            _ => panic!("a bank account"),
+        }
+    }
+
+    fn bank_is_task(&mut self, h: u64) -> bool {
+        match self.vt().bank.get(&h) {
+            Some(BankElem::Task(_)) => true,
+            Some(BankElem::Account(_)) => false,
+            None => panic!("Bogus bank type passed in get_value"),
+        }
+    }
+
+    /// `bank_task_get_persona`.
+    fn bank_task_get_persona(&mut self, h: u64) -> BankPersona {
+        let t = self.bank_task(h);
+        BankPersona { id: t.info.persona_id, uid: t.persona_uid }
+    }
+
+    /// `bank_task_can_adopt_persona`.
+    fn bank_task_can_adopt_persona(&mut self, merchant: u64, p: BankPersona) -> bool {
+        let t = self.bank_task(merchant);
+        if t.info.persona_id == p.id {
+            return true;
+        }
+        if t.info.flags & bank::FLAG_ADOPTION_ALLOWED == 0 {
+            return false;
+        }
+        // A persona uid set, other than a system session persona's that
+        // belongs to no user (UINT_MAX), must be the new one's.
+        let own = t.persona_uid;
+        own == super::cred::UID_NONE || own == u32::MAX || own == p.uid
+    }
+
+    /// `bank_task_made_reference`, and the voucher system's reference the
+    /// first time (`bt_voucher_ref`).
+    fn bank_task_made_reference_for_voucher(&mut self, h: u64) {
+        let t = self.bank_task(h);
+        t.made += 1;
+        if t.voucher_ref == 0 {
+            t.refs += 1;
+            t.voucher_ref = 1;
+        }
+    }
+
+    /// `bank_task_dealloc`: a reference goes; the last frees the context.
+    fn bank_task_dealloc(&mut self, h: u64) {
+        let t = self.bank_task(h);
+        t.refs -= 1;
+        if t.refs > 0 {
+            return;
+        }
+        assert!(t.to_pay.is_empty() && t.to_charge.is_empty());
+        self.vt().bank.remove(&h);
+    }
+
+    /// `bank_account_alloc_init`: the holder's account with the merchant,
+    /// for this originator, proximate process, thread group and persona,
+    /// with a made reference: the one it has, or a new one linking them.
+    fn bank_account_alloc_init(&mut self, holder: u64, merchant: u64, so: u64, pp: u64, tg: u64, persona: BankPersona) -> u64 {
+        let to_pay = self.bank_task(holder).to_pay.clone();
+        for a in to_pay {
+            let acc = self.bank_account(a);
+            if acc.merchant != merchant || acc.secureoriginator != so || acc.proximateprocess != pp || acc.thread_group != tg || acc.so_persona.id != persona.id {
+                continue;
+            }
+            acc.made += 1;
+            return a;
+        }
+        let vt = self.vt();
+        let h = vt.alloc_handle();
+        vt.bank.insert(h, BankElem::Account(BankAccount { refs: 1, made: 1, merchant, holder, secureoriginator: so, proximateprocess: pp, thread_group: tg, so_persona: persona }));
+        self.bank_task(holder).to_pay.push(h);
+        self.bank_task(merchant).to_charge.push(h);
+        for t in [holder, merchant, so, pp] {
+            self.bank_task(t).refs += 1;
+        }
+        h
+    }
+
+    /// `bank_account_dealloc_with_sync`: the account goes if the voucher
+    /// system's made references are all there are.
+    fn bank_account_dealloc_with_sync(&mut self, h: u64, sync: u32) -> u32 {
+        let acc = self.bank_account(h);
+        if acc.made != sync {
+            return vkr::FAILURE;
+        }
+        acc.made -= sync;
+        acc.refs -= 1;
+        assert!(acc.refs == 0, "Releasing a non zero ref bank account");
+        let (holder, merchant, so, pp) = (acc.holder, acc.merchant, acc.secureoriginator, acc.proximateprocess);
+        // bank_rollup_chit_to_tasks: the bill is not kept (BankAccount).
+        self.bank_task(holder).to_pay.retain(|&a| a != h);
+        self.bank_task(merchant).to_charge.retain(|&a| a != h);
+        self.vt().bank.remove(&h);
+        for t in [holder, merchant, so, pp] {
+            self.bank_task_dealloc(t);
+        }
+        vkr::SUCCESS
+    }
+
+    /// `bank_task_destroy`: the task lets go of its bank context (its
+    /// accounts keep it while they last).
+    pub(crate) fn darwin_bank_task_destroy(&mut self) {
+        if let Some(h) = self.dtask.vouchers.bank_context.take() {
+            self.bank_task_dealloc(h);
+        }
+    }
+
+    /// The bank element a value names, the default task value naming the
+    /// current task's context.
+    fn bank_element(&mut self, h: u64) -> u64 {
+        if h == bank::DEFAULT_TASK_VALUE { self.get_bank_task_context() } else { h }
     }
 
     /// `bank_get_value`.
     fn bank_get_value(&mut self, command: u32, prev: &[u64], content: &[u8]) -> Result<(u64, u32), u32> {
         match command {
+            // The default task value, which SEND_PREPROCESS makes a bank
+            // context's.
             cmd::BANK_CREATE => Ok((bank::DEFAULT_TASK_VALUE, VALUE_FLAGS_PERSIST)),
             cmd::BANK_MODIFY_PERSONA => {
                 for &h in prev {
@@ -1029,22 +1285,69 @@ impl Kernel {
                     if !self.darwin_task_entitled("com.apple.private.persona.modify") {
                         return Err(vkr::NO_ACCESS);
                     }
-                    let _ = content;
-                    self.darwin_unimplemented("bank persona changes (personas)".into());
-                    return Err(vkr::INVALID_ARGUMENT);
+                    // struct persona_modify_info: persona_id, then (8-byte
+                    // aligned) unique_pid.
+                    if content.len() != 16 {
+                        return Err(vkr::INVALID_ARGUMENT);
+                    }
+                    let id = u32::from_le_bytes(content[0..4].try_into().unwrap());
+                    let unique_pid = u64::from_le_bytes(content[8..16].try_into().unwrap());
+                    // bank_verify_persona_id.
+                    let Some(p) = super::persona::lookup(id) else { return Err(vkr::INVALID_ARGUMENT) };
+                    let persona = BankPersona { id, uid: p.get_uid() };
+                    // Only a bank context's persona changes: its holder is
+                    // to be trusted.
+                    if !self.bank_is_task(h) {
+                        return Err(vkr::INVALID_ARGUMENT);
+                    }
+                    let holder = h;
+                    if unique_pid != self.bank_task(holder).info.unique_pid {
+                        return Err(vkr::INVALID_CAPABILITY);
+                    }
+                    let tg = self.bank_task(holder).thread_group;
+                    if !self.bank_task_can_adopt_persona(holder, persona) {
+                        return Err(vkr::INVALID_ARGUMENT);
+                    }
+                    if self.bank_task(holder).info.persona_id == persona.id {
+                        self.bank_task_made_reference_for_voucher(holder);
+                        return Ok((holder, 0));
+                    }
+                    return Ok((self.bank_account_alloc_init(holder, holder, holder, holder, tg, persona), 0));
                 }
                 Ok((bank::DEFAULT_VALUE, 0))
             }
             cmd::AUTO_REDEEM => {
                 for &h in prev {
+                    // A default task value is not received from IPC.
                     if h == bank::DEFAULT_VALUE || h == bank::DEFAULT_TASK_VALUE {
                         continue;
                     }
-                    // Within one task, holder, merchant, originator and
-                    // proximate process are the task itself, in no
-                    // persona and one thread group.
-                    assert_eq!(h, bank::TASK_HANDLE);
-                    return Ok((bank::DEFAULT_TASK_VALUE, VALUE_FLAGS_PERSIST));
+                    let (holder, so, pp, tg, mut persona);
+                    if self.bank_is_task(h) {
+                        holder = h;
+                        so = h;
+                        pp = h;
+                        tg = self.bank_task(h).thread_group;
+                        persona = self.bank_task_get_persona(h);
+                    } else {
+                        let a = self.bank_account(h);
+                        holder = a.holder;
+                        so = a.secureoriginator;
+                        pp = a.proximateprocess;
+                        tg = a.thread_group;
+                        persona = a.so_persona;
+                    }
+                    let merchant = self.get_bank_task_context();
+                    // An app's voucher takes its own thread group, which is
+                    // every task's here.
+                    let cur_tg = self.bank_task(merchant).thread_group;
+                    if !self.bank_task_can_adopt_persona(merchant, persona) {
+                        persona = self.bank_task_get_persona(merchant);
+                    }
+                    if holder == merchant && holder == so && holder == pp && tg == cur_tg && persona.id == self.bank_task(holder).info.persona_id {
+                        return Ok((bank::DEFAULT_TASK_VALUE, VALUE_FLAGS_PERSIST));
+                    }
+                    return Ok((self.bank_account_alloc_init(holder, merchant, so, pp, tg, persona), 0));
                 }
                 Ok((bank::DEFAULT_VALUE, 0))
             }
@@ -1053,29 +1356,40 @@ impl Kernel {
                     if h == bank::DEFAULT_VALUE {
                         continue;
                     }
-                    // The value is the task's own context (the default task
-                    // value names it): the holder and the secure originator.
-                    // The merchant is the sending task, which is the same
-                    // one; without the propagate entitlement the merchant
-                    // becomes the originator. All one task, in no persona and
-                    // one thread group, is the holder's own value, with a
-                    // voucher reference the first time.
-                    assert!(h == bank::DEFAULT_TASK_VALUE || h == bank::TASK_HANDLE);
-                    let (holder, merchant) = (bank::TASK_HANDLE, bank::TASK_HANDLE);
-                    let originator = if self.bank_task().hasentitlement { holder } else { merchant };
-                    let proximate = merchant;
-                    assert!(holder == merchant && holder == originator && holder == proximate, "a bank account between two tasks");
-                    let bt = self.bank_task();
-                    bt.made += 1;
-                    if bt.voucher_ref == 0 {
-                        bt.refs += 1;
-                        bt.voucher_ref = 1;
+                    let e = self.bank_element(h);
+                    let (holder, mut so, tg, mut persona);
+                    if self.bank_is_task(e) {
+                        holder = e;
+                        so = e;
+                        tg = self.bank_task(e).thread_group;
+                        persona = self.bank_task_get_persona(e);
+                    } else {
+                        let a = self.bank_account(e);
+                        holder = a.holder;
+                        so = a.secureoriginator;
+                        tg = a.thread_group;
+                        persona = a.so_persona;
                     }
-                    return Ok((holder, 0));
+                    let merchant = self.get_bank_task_context();
+                    let cur_tg = self.bank_task(merchant).thread_group;
+                    // Without the entitlement to propagate it, the
+                    // originator is the sender, with its persona.
+                    if !self.bank_task(merchant).hasentitlement {
+                        so = merchant;
+                        persona = self.bank_task_get_persona(merchant);
+                    }
+                    let pp = merchant;
+                    if holder == merchant && holder == so && holder == pp && tg == cur_tg && persona.id == self.bank_task(holder).info.persona_id {
+                        self.bank_task_made_reference_for_voucher(holder);
+                        return Ok((holder, 0));
+                    }
+                    return Ok((self.bank_account_alloc_init(holder, merchant, so, pp, tg, persona), 0));
                 }
                 Ok((bank::DEFAULT_VALUE, 0))
             }
             cmd::REDEEM => {
+                // The value is to have been auto-redeemed: a reference on
+                // that account, for its merchant only.
                 for &h in prev {
                     if h == bank::DEFAULT_VALUE {
                         continue;
@@ -1083,8 +1397,16 @@ impl Kernel {
                     if h == bank::DEFAULT_TASK_VALUE {
                         return Ok((bank::DEFAULT_TASK_VALUE, VALUE_FLAGS_PERSIST));
                     }
-                    assert_eq!(h, bank::TASK_HANDLE);
-                    return Ok((bank::DEFAULT_TASK_VALUE, VALUE_FLAGS_PERSIST));
+                    let mine = self.get_bank_task_context();
+                    if self.bank_is_task(h) {
+                        return if h == mine { Ok((bank::DEFAULT_TASK_VALUE, VALUE_FLAGS_PERSIST)) } else { Err(vkr::INVALID_CAPABILITY) };
+                    }
+                    let a = self.bank_account(h);
+                    if a.merchant != mine {
+                        return Err(vkr::INVALID_CAPABILITY);
+                    }
+                    a.made += 1;
+                    return Ok((h, 0));
                 }
                 Ok((bank::DEFAULT_VALUE, 0))
             }
@@ -1095,119 +1417,177 @@ impl Kernel {
     /// `bank_release_value`.
     fn bank_release_value(&mut self, value: u64, sync: u32) -> u32 {
         assert!(value != bank::DEFAULT_VALUE && value != bank::DEFAULT_TASK_VALUE);
-        assert_eq!(value, bank::TASK_HANDLE);
-        let bt = self.bank_task();
-        if bt.made != sync {
+        if !self.bank_is_task(value) {
+            return self.bank_account_dealloc_with_sync(value, sync);
+        }
+        let t = self.bank_task(value);
+        if t.made != sync {
             return vkr::FAILURE;
         }
-        bt.made -= sync;
-        assert_eq!(bt.voucher_ref, 1);
-        bt.voucher_ref = 0;
-        // bank_task_dealloc: the task's own reference keeps it.
-        bt.refs -= 1;
-        assert!(bt.refs > 0);
+        t.made -= sync;
+        assert_eq!(t.voucher_ref, 1);
+        t.voucher_ref = 0;
+        self.bank_task_dealloc(value);
         vkr::SUCCESS
     }
 
     /// `bank_extract_content`.
     fn bank_extract_content(&mut self, vals: &[u64], size: u32) -> Result<(u32, Vec<u8>), u32> {
         for &h in vals {
+            if size == 0 {
+                break;
+            }
             if h == bank::DEFAULT_VALUE {
                 continue;
             }
+            let e = self.bank_element(h);
             if BANK_CONTENT_SIZE > size {
                 return Err(vkr::NO_SPACE);
             }
-            let pid = self.bank_task().pid;
-            let mut s = format!(" Bank Context for a pid {pid}\n").into_bytes();
-            s.push(0);
-            return Ok((cmd::BANK_NULL, s));
+            let s = if self.bank_is_task(e) {
+                format!(" Bank Context for a pid {}\n", self.bank_task(e).info.pid)
+            } else {
+                let a = self.bank_account(e);
+                let (holder, merchant, so, pp, sop) = (a.holder, a.merchant, a.secureoriginator, a.proximateprocess, a.so_persona.id);
+                let pid = |k: &mut Kernel, t: u64| k.bank_task(t).info.pid;
+                let (hp, mp, sp, ppp) = (pid(self, holder), pid(self, merchant), pid(self, so), pid(self, pp));
+                let pp_persona = self.bank_task(pp).info.persona_id;
+                format!(" Bank Account linking holder pid {hp} with merchant pid {mp}, originator PID/persona: {sp}, {sop} and proximate PID/persona: {ppp}, {pp_persona}\n")
+            };
+            // snprintf into MACH_VOUCHER_BANK_CONTENT_SIZE bytes.
+            let mut b = s.into_bytes();
+            b.truncate(BANK_CONTENT_SIZE as usize - 1);
+            b.push(0);
+            return Ok((cmd::BANK_NULL, b));
         }
         Ok((cmd::NOOP, Vec::new()))
     }
 
     /// `bank_command`.
     fn bank_command(&mut self, vals: &[u64], command: u32, out_size: u32) -> Result<Vec<u8>, u32> {
-        let task_value = |h: u64| h == bank::DEFAULT_TASK_VALUE || h == bank::TASK_HANDLE;
+        let first = vals.iter().copied().find(|&h| h != bank::DEFAULT_VALUE);
         match command {
             bank::ORIGINATOR_PID => {
                 if out_size < 4 {
                     return Err(vkr::NO_SPACE);
                 }
-                match vals.iter().copied().find(|&h| h != bank::DEFAULT_VALUE) {
-                    Some(h) if task_value(h) => Ok(self.bank_task().pid.to_le_bytes().to_vec()),
-                    Some(_) => unreachable!("only the task's bank values are made here"),
-                    None => Err(vkr::INVALID_VALUE),
-                }
+                let Some(h) = first else { return Err(vkr::INVALID_VALUE) };
+                let e = self.bank_element(h);
+                let t = if self.bank_is_task(e) { e } else { self.bank_account(e).holder };
+                Ok(self.bank_task(t).info.pid.to_le_bytes().to_vec())
             }
             bank::PERSONA_TOKEN => {
                 if out_size < 2 * PROC_PERSONA_INFO_SIZE {
                     return Err(vkr::NO_SPACE);
                 }
-                match vals.iter().copied().find(|&h| h != bank::DEFAULT_VALUE) {
-                    Some(h) if task_value(h) => Err(vkr::INVALID_OBJECT),
-                    Some(_) => unreachable!("only the task's bank values are made here"),
-                    None => Err(vkr::INVALID_VALUE),
+                let Some(h) = first else { return Err(vkr::INVALID_VALUE) };
+                let e = self.bank_element(h);
+                if self.bank_is_task(e) {
+                    return Err(vkr::INVALID_OBJECT);
                 }
+                let (so, pp) = (self.bank_account(e).secureoriginator, self.bank_account(e).proximateprocess);
+                let mut o = self.bank_task(so).info.bytes();
+                o.extend_from_slice(&self.bank_task(pp).info.bytes());
+                Ok(o)
             }
             bank::PERSONA_ID => {
                 if out_size < 4 {
                     return Err(vkr::NO_SPACE);
                 }
-                match vals.iter().copied().find(|&h| h != bank::DEFAULT_VALUE) {
-                    Some(h) if task_value(h) => Ok(self.bank_task().persona_id.to_le_bytes().to_vec()),
-                    Some(_) => unreachable!("only the task's bank values are made here"),
-                    None => Err(vkr::INVALID_VALUE),
-                }
+                let Some(h) = first else { return Err(vkr::INVALID_VALUE) };
+                let e = self.bank_element(h);
+                let id = if self.bank_is_task(e) { self.bank_task(e).info.persona_id } else { self.bank_account(e).so_persona.id };
+                Ok(id.to_le_bytes().to_vec())
             }
             bank::PERSONA_ADOPT_ANY => {
                 if out_size < 4 {
                     return Err(vkr::NO_SPACE);
                 }
-                // PROC_PERSONA_INFO_FLAG_ADOPTION_ALLOWED.
-                let any = u32::from(self.bank_task().flags & 0x1 != 0);
+                let merchant = self.get_bank_task_context();
+                let any = u32::from(self.bank_task(merchant).info.flags & bank::FLAG_ADOPTION_ALLOWED != 0);
                 Ok(any.to_le_bytes().to_vec())
             }
             bank::ORIGINATOR_PROXIMATE_PID => {
                 if out_size < 8 {
                     return Err(vkr::NO_SPACE);
                 }
-                match vals.iter().copied().find(|&h| h != bank::DEFAULT_VALUE) {
-                    Some(h) if task_value(h) => {
-                        let mut o = self.bank_task().pid.to_le_bytes().to_vec();
-                        o.extend_from_slice(&(-1i32).to_le_bytes());
-                        Ok(o)
-                    }
-                    Some(_) => unreachable!("only the task's bank values are made here"),
-                    None => Err(vkr::INVALID_VALUE),
-                }
+                let Some(h) = first else { return Err(vkr::INVALID_VALUE) };
+                let e = self.bank_element(h);
+                let (origin, proximate) = if self.bank_is_task(e) { (e, None) } else { (self.bank_account(e).holder, Some(self.bank_account(e).proximateprocess)) };
+                let mut o = self.bank_task(origin).info.pid.to_le_bytes().to_vec();
+                let ppid = match proximate {
+                    Some(p) => self.bank_task(p).info.pid,
+                    None => -1,
+                };
+                o.extend_from_slice(&ppid.to_le_bytes());
+                Ok(o)
             }
             _ => Err(vkr::INVALID_ARGUMENT),
         }
     }
 
-    // -- importance --------------------------------------------------------------------
-
-    /// `ipc_importance_for_task(task, made)`.
-    fn ipc_importance_for_task(&mut self, made: bool) -> u64 {
-        let it = &mut self.vs().imp_task;
-        match it {
-            Some(t) => {
-                if made {
-                    if t.made == 0 {
-                        t.refs += 1;
-                    }
-                    t.made += 1;
-                } else {
-                    t.refs += 1;
+    /// `bank_get_bank_ledger_thread_group_and_persona`'s persona for a
+    /// voucher: its bank account's originator persona, or else the current
+    /// task's (`bank_get_voucher_bank_account`).
+    pub(crate) fn darwin_bank_persona_id(&mut self, v: VoucherId) -> u32 {
+        let ki = key_to_index(key::BANK);
+        let vi = self.iv_lookup(v, ki);
+        if let Some(&h) = self.ivac(ki).values(vi).first() {
+            if h != bank::DEFAULT_VALUE {
+                let e = self.bank_element(h);
+                if !self.bank_is_task(e) {
+                    return self.bank_account(e).so_persona.id;
                 }
             }
-            None => {
-                // One reference for the task, one for the caller.
-                *it = Some(ImpTask { refs: 2, made: u32::from(made) });
-            }
         }
-        IMP_TASK_HANDLE
+        let mine = self.get_bank_task_context();
+        self.bank_task(mine).info.persona_id
+    }
+
+    // -- importance --------------------------------------------------------------------
+
+    /// `ipc_importance_for_task(current_task(), made)`: the task's
+    /// element, made the first time with a reference for the task and one
+    /// for the caller (or a made reference).
+    fn ipc_importance_for_task(&mut self, made: bool) -> u64 {
+        if let Some(h) = self.dtask.vouchers.imp_base {
+            let t = self.vt().imp.get_mut(&h).expect("the task's importance");
+            if made {
+                if t.made == 0 {
+                    t.refs += 1;
+                }
+                t.made += 1;
+            } else {
+                t.refs += 1;
+            }
+            return h;
+        }
+        let pid = self.pid;
+        let vt = self.vt();
+        let h = vt.alloc_handle();
+        vt.imp.insert(h, ImpTask { refs: 2, made: u32::from(made), pid: Some(pid) });
+        self.dtask.vouchers.imp_base = Some(h);
+        h
+    }
+
+    /// `ipc_importance_release_locked` of a task element: the last
+    /// reference, once its task is disconnected, frees it.
+    fn ipc_importance_task_release(&mut self, h: u64) {
+        let t = self.vt().imp.get_mut(&h).expect("an importance element");
+        t.refs -= 1;
+        if t.refs == 0 {
+            assert!(t.pid.is_none());
+            self.vt().imp.remove(&h);
+        }
+    }
+
+    /// `ipc_importance_disconnect_task`: the task leaves its element,
+    /// which vouchers may keep.
+    pub(crate) fn darwin_importance_disconnect_task(&mut self) {
+        if let Some(h) = self.dtask.vouchers.imp_base.take() {
+            self.vt().imp.get_mut(&h).expect("the task's importance").pid = None;
+            self.ipc_importance_task_release(h);
+        }
     }
 
     /// `ipc_importance_get_value`.
@@ -1218,8 +1598,7 @@ impl Kernel {
         match command {
             cmd::REDEEM => match prev.first() {
                 Some(&h) => {
-                    assert_eq!(h, IMP_TASK_HANDLE);
-                    let t = self.vs().imp_task.as_mut().expect("a task element");
+                    let t = self.vt().imp.get_mut(&h).expect("an importance element");
                     assert!(t.made > 0);
                     t.made += 1;
                     Ok((h, 0))
@@ -1233,21 +1612,20 @@ impl Kernel {
 
     /// `ipc_importance_release_value`.
     fn ipc_importance_release_value(&mut self, value: u64, sync: u32) -> u32 {
-        assert_eq!(value, IMP_TASK_HANDLE);
         assert!(sync > 0);
-        let t = self.vs().imp_task.as_mut().expect("a task element");
+        let t = self.vt().imp.get_mut(&value).expect("an importance element");
         if sync != t.made {
             assert!(sync < t.made);
             return vkr::FAILURE;
         }
         t.made = 0;
-        // ipc_importance_release_locked: the task's reference keeps it.
-        t.refs -= 1;
-        assert!(t.refs > 0);
+        self.ipc_importance_task_release(value);
         vkr::SUCCESS
     }
 
-    /// `ipc_importance_extract_content`.
+    /// `ipc_importance_extract_content`: "Importance for pid N" (a
+    /// release kernel's), truncated to the room given as scnprintf does,
+    /// with its NUL.
     fn ipc_importance_extract_content(&mut self, vals: &[u64], size: u32) -> Result<(u32, Vec<u8>), u32> {
         if size < 1 {
             return Err(vkr::NO_SPACE);
@@ -1257,9 +1635,9 @@ impl Kernel {
             if h == 0 {
                 continue;
             }
-            // A task element: "Importance for pid N", truncated to the
-            // room given as scnprintf does, with its NUL.
-            let s = format!("Importance for pid {}", self.pid);
+            // task_importance_task_get_pid: task_pid of no task is -1.
+            let pid = self.vt().imp.get(&h).expect("an importance element").pid.unwrap_or(-1);
+            let s = format!("Importance for pid {pid}");
             let room = (size as usize).saturating_sub(1);
             out.extend_from_slice(&s.as_bytes()[..s.len().min(room)]);
             out.push(0);

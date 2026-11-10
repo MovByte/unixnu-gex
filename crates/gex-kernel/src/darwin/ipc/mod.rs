@@ -549,6 +549,9 @@ pub struct Ipc {
     timestamp: u32,
     /// `TASK_CONTROL_PORT_PINNED_HARD`: a pinned right's misuse is fatal.
     pub pinned_hard: bool,
+    /// The system's vouchers and their attribute managers' elements,
+    /// while this task holds the table.
+    pub vouchers: super::voucher::VoucherTables,
 }
 
 impl Drop for Ipc {
@@ -638,6 +641,7 @@ pub struct IpcShared {
     globals: Vec<(Kobject, ObjId)>,
     host_exc: super::exception::ExcActions,
     host_special: Vec<(i32, ObjId)>,
+    vouchers: super::voucher::VoucherTables,
 }
 
 /// The system's IPC table, taken by one task at a time for the length of a
@@ -718,6 +722,7 @@ impl Ipc {
         self.globals = std::mem::take(&mut s.globals);
         self.host_exc = s.host_exc;
         self.host_special = std::mem::take(&mut s.host_special);
+        self.vouchers = std::mem::take(&mut s.vouchers);
         self.held = true;
         if !self.globals.iter().any(|(g, _)| *g == Kobject::UxHandler) {
             self.ux_handler_setup();
@@ -734,7 +739,7 @@ impl Ipc {
         let cell = Arc::clone(self.cell.as_ref().expect("a held table has its cell"));
         let mut spaces = std::mem::take(&mut self.others);
         spaces.insert(self.task, std::mem::take(&mut self.space));
-        let s = IpcShared { objects: std::mem::take(&mut self.objects), next_id: self.next_id, timestamp: self.timestamp, spaces, next_task: self.next_task_hint, queues: std::mem::take(&mut self.queues), links: std::mem::take(&mut self.links), globals: std::mem::take(&mut self.globals), host_special: std::mem::take(&mut self.host_special), host_exc: std::mem::take(&mut self.host_exc) };
+        let s = IpcShared { objects: std::mem::take(&mut self.objects), next_id: self.next_id, timestamp: self.timestamp, spaces, next_task: self.next_task_hint, queues: std::mem::take(&mut self.queues), links: std::mem::take(&mut self.links), globals: std::mem::take(&mut self.globals), host_special: std::mem::take(&mut self.host_special), host_exc: std::mem::take(&mut self.host_exc), vouchers: std::mem::take(&mut self.vouchers) };
         self.held = false;
         cell.put(s);
     }
@@ -751,7 +756,7 @@ impl Ipc {
         self.held = false;
         if let Some(cell) = cell {
             let spaces = std::mem::take(&mut self.others);
-            let s = IpcShared { objects: std::mem::take(&mut self.objects), next_id: self.next_id, timestamp: self.timestamp, spaces, next_task: self.next_task_hint, queues: std::mem::take(&mut self.queues), links: std::mem::take(&mut self.links), globals: std::mem::take(&mut self.globals), host_special: std::mem::take(&mut self.host_special), host_exc: std::mem::take(&mut self.host_exc) };
+            let s = IpcShared { objects: std::mem::take(&mut self.objects), next_id: self.next_id, timestamp: self.timestamp, spaces, next_task: self.next_task_hint, queues: std::mem::take(&mut self.queues), links: std::mem::take(&mut self.links), globals: std::mem::take(&mut self.globals), host_special: std::mem::take(&mut self.host_special), host_exc: std::mem::take(&mut self.host_exc), vouchers: std::mem::take(&mut self.vouchers) };
             cell.put(s);
         }
     }

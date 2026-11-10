@@ -404,8 +404,8 @@ impl Kernel {
     /// `current_persona_get_id`: the persona of the current thread's
     /// voucher's bank, or else of the process; none without one.
     pub(crate) fn darwin_current_persona_id(&mut self) -> u32 {
-        if self.dtask.threads.map.get(&self.tid).is_some_and(|t| t.voucher.is_some()) {
-            return self.darwin_bank_persona_id();
+        if let Some(v) = self.dtask.threads.map.get(&self.tid).and_then(|t| t.voucher) {
+            return self.darwin_bank_persona_id(v);
         }
         self.dtask.persona.as_ref().map_or(ID_NONE, |p| p.id)
     }
