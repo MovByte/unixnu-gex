@@ -706,6 +706,7 @@ impl Kernel {
         if addr == 0 || addr & (size - 1) != 0 {
             return done(self, m, Err(Errno::EINVAL));
         }
+        self.darwin_ulock_xproc(opcode, addr, size);
         let ull = self.dtask.ulocks.map.entry(addr).or_default();
         ull.nwaiters += 1;
         if ull.opcode == 0 {
@@ -752,6 +753,23 @@ impl Kernel {
         self.darwin_block(m, Wait { deadline, cont: Finish::Ulock { addr, no_errno } })
     }
 
+    /// Whether the word at `addr` is in memory another task may map too: a
+    /// shared file, a POSIX shared memory object, or an entry a fork shared
+    /// (`is_shared`). xnu meets waiters from other tasks there by the VM
+    /// object and offset; memory here is each task's own.
+    pub(crate) fn darwin_cross_task_word(&self, addr: u64, size: u64) -> bool {
+        use super::vm::kind;
+        self.dtask.vm.pieces(addr, addr.saturating_add(size)).iter().any(|(_, _, a)| a.kind == kind::FILE_SHARED || a.kind == kind::SHM || a.shared)
+    }
+
+    /// A `*_SHARED` ulock operation on a word other tasks may wait on too
+    /// (`ULK_XPROC`), which is reported.
+    fn darwin_ulock_xproc(&mut self, opcode: u8, addr: u64, size: u64) {
+        if matches!(opcode, ul::COMPARE_AND_WAIT_SHARED | ul::COMPARE_AND_WAIT64_SHARED) && self.darwin_cross_task_word(addr, size) {
+            self.darwin_unimplemented("a shared ulock in memory another process maps (waiters across processes)".into());
+        }
+    }
+
     /// `ulock_wait_cleanup`: this waiter leaves, the lock forgotten with
     /// its last. The waiters left.
     fn darwin_ulock_wait_cleanup(&mut self, addr: u64) -> u32 {
@@ -787,6 +805,8 @@ impl Kernel {
         if addr == 0 {
             return Err(Errno::EINVAL);
         }
+        let size = if matches!(opcode, ul::COMPARE_AND_WAIT64 | ul::COMPARE_AND_WAIT64_SHARED) { 8 } else { 4 };
+        self.darwin_ulock_xproc(opcode, addr, size);
         let wake_thread = if flags & ul::WAKE_THREAD != 0 {
             match self.darwin_name_to_thread(wake_value as u32) {
                 Some(t) if t != self.tid => Some(t),

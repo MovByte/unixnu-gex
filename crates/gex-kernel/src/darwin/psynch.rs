@@ -936,13 +936,14 @@ impl Kernel {
         super::mig::machine::TASK_THREADMAX
     }
 
-    /// A psynch object's address and its sharing: process-shared objects
-    /// are keyed by their address too, every Darwin process being a tenant
-    /// of its own memory here; one shared with another process cannot be
-    /// waited for across them yet.
+    /// A psynch object's key (`ksyn_findobj`'s): its address, which for a
+    /// process-shared object in this task's own memory names its VM object
+    /// and offset as well. One in memory another task may map too is waited
+    /// for across tasks by that object, which memory here, each task's own,
+    /// does not give; it is reported.
     fn psynch_key(&mut self, addr: u64, flags: u32) -> u64 {
-        if flags & PTHREAD_PSHARED_FLAGS_MASK == PTHREAD_PROCESS_SHARED {
-            self.darwin_unimplemented("a process-shared psynch object across processes".into());
+        if flags & PTHREAD_PSHARED_FLAGS_MASK == PTHREAD_PROCESS_SHARED && self.darwin_cross_task_word(addr, 4) {
+            self.darwin_unimplemented("a process-shared psynch object in memory another process maps".into());
         }
         addr
     }
