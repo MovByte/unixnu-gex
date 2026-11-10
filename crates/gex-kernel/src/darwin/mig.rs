@@ -156,6 +156,10 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
     match (obj, req.id) {
         // host_info(host, flavor, out, &count)
         (Kobject::Host | Kobject::HostPriv, 200) => match (arg(req, 0), arg(req, 1)) {
+            (Some(HOST_VM_PURGABLE), Some(_)) => {
+                k.darwin_unimplemented("host_info HOST_VM_PURGABLE (purgeable memory has no page model here)".into());
+                Reply::err(KERN_FAILURE)
+            }
             (Some(flavor), Some(count)) => host_info(flavor, count as u32),
             _ => bad(),
         },
@@ -1021,8 +1025,13 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
 }
 
 /// `host_info`, with the caller's count checked as XNU checks it.
+const HOST_VM_PURGABLE: i32 = 9;
+
 fn host_info(flavor: i32, count: u32) -> Reply {
     use machine::*;
+    // PE_i_can_has_debugger: /chosen's debug-enabled, zero on a production
+    // device.
+    const HOST_CAN_HAS_DEBUGGER: i32 = 11;
     const HOST_BASIC_INFO: i32 = 1;
     const HOST_SCHED_INFO: i32 = 3;
     const HOST_RESOURCE_SIZES: i32 = 4;
@@ -1062,6 +1071,12 @@ fn host_info(flavor: i32, count: u32) -> Reply {
             Reply::ok(words(&[80, 80, 64, 31, 0, 0, 0, 79]))
         }
         HOST_SEMAPHORE_TRAPS | HOST_MACH_MSG_TRAP => Reply::ok(words(&[])),
+        HOST_CAN_HAS_DEBUGGER => {
+            if count < 1 {
+                return Reply::err(KERN_FAILURE);
+            }
+            Reply::ok(words(&[0]))
+        }
         HOST_PREFERRED_USER_ARCH => {
             if count < 2 {
                 return Reply::err(KERN_FAILURE);

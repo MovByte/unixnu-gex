@@ -690,7 +690,39 @@ impl Kernel {
                     }
                 }
             },
-            _ => neg(Errno::EINVAL),
+            c => res(self.darwin_fcntl_other(fd as i32, c as u32)),
+        }
+    }
+
+    /// A command `darwin_fcntl` does not serve: one XNU's switch does is
+    /// reported; any other goes down as an ioctl of the vnode, where the
+    /// answers were measured on APFS and of a device.
+    fn darwin_fcntl_other(&mut self, fd: i32, c: u32) -> Result<u64, Errno> {
+        const IOC_VOID: u32 = 0x2000_0000;
+        const IOC_INOUT: u32 = 0xc000_0000;
+        const SERVED: &[u32] = &[40, 41, 43, 49, 52, 53, 54, 55, 56, 57, 58, 60, 65, 66, 68, 69, 70, 71, 72, 75, 77, 78, 79, 80, 81, 82, 84, 90, 91, 92, 93, 94, 95, 96, 99, 100, 102, 104, 105, 106, 107, 108, 109, 110, 111];
+        if SERVED.contains(&c) {
+            self.darwin_unimplemented(format!("fcntl {c} (bsd/sys/fcntl.h)"));
+            return Err(Errno::EINVAL);
+        }
+        if c & IOC_VOID != 0 && c & IOC_INOUT != 0 {
+            return Err(Errno::EINVAL);
+        }
+        if c & (IOC_VOID | IOC_INOUT) != 0 {
+            self.darwin_unimplemented(format!("fcntl {c:#x} (an ioctl of the vnode)"));
+            return Err(Errno::EINVAL);
+        }
+        let file = self.fds.get(fd)?;
+        if self.darwin_vnode_of(&file).is_none() || file.handle.metadata().is_ok_and(|md| md.file_type == crate::vfs::FileType::Socket) {
+            return Err(Errno::EBADF);
+        }
+        if file.is_tty() {
+            self.darwin_unimplemented(format!("fcntl {c} of a terminal (ttioctl)"));
+            return Err(Errno::EINVAL);
+        }
+        match file.metadata()?.file_type {
+            crate::vfs::FileType::CharDevice => Err(Errno::ENODEV),
+            _ => Err(Errno::ENOTTY),
         }
     }
 

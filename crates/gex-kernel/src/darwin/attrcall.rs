@@ -298,7 +298,6 @@ const VOL_INFO: u32 = 0x8000_0000;
 const FILE_SETMASK: u32 = 0x0000_0020;
 const FILE_DEVTYPE: u32 = 0x0000_0020;
 const MAX_BUFFER: u64 = 8192;
-const FSOPT_UTIMES_NULL: u64 = 0x2;
 const S_IWUSR: u32 = 0o200;
 const ALLPERMS: u32 = 0o7777;
 
@@ -473,7 +472,8 @@ impl Kernel {
             self.darwin_unimplemented(format!("setattrlist of {what} (the filesystems here do not keep it)"));
             return Err(Errno::EINVAL);
         }
-        let _ = options & FSOPT_UTIMES_NULL;
+        // FSOPT_UTIMES_NULL only widens who may set the times, and every
+        // file here is the caller's.
         // Finder Info goes first when the owner is losing write access, so
         // that the mode change does not stop it.
         let finder_first = attrs.mode.is_some_and(|mode| mode & S_IWUSR == 0);

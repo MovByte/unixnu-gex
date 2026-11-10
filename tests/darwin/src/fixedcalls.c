@@ -3,6 +3,7 @@
 // task.
 
 #include <errno.h>
+#include <mach/mach.h>
 #include <stdio.h>
 #include <unistd.h>
 
@@ -55,6 +56,11 @@ int main(void) {
     if (syscall(152, 1) != 0) return 1;
     if (syscall(152, 0) != 1) return 1;
     if (syscall(152, 0) != 0) return 1;
+
+    // PE_i_can_has_debugger, on a production device.
+    int can = -1;
+    mach_msg_type_number_t count = 1;
+    if (host_info(mach_host_self(), 11, &can, &count) != KERN_SUCCESS || can != 0 || count != 1) { printf("fixedcalls: HOST_CAN_HAS_DEBUGGER: %d\n", can); return 1; }
 
     puts("fixedcalls ok");
     return 0;

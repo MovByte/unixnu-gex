@@ -427,8 +427,8 @@ impl Kernel {
                 let len = len.checked_add(off - foff).ok_or(Errno::EOVERFLOW)?;
                 foff.checked_add(len).ok_or(Errno::EOVERFLOW)?;
             }
-            // fstore_t checked, then VNOP_ALLOCATE: the filesystems here
-            // allocate no storage ahead (ENOTSUP), and none is allocated.
+            // fstore_t checked, then VNOP_ALLOCATE, which APFS serves and
+            // the filesystems here cannot: they allocate no storage ahead.
             F_PREALLOCATE => {
                 if !file.writable {
                     return Err(Errno::EBADF);
@@ -442,12 +442,15 @@ impl Kernel {
                     F_PEOFPOSMODE | F_VOLPOSMODE => {}
                     _ => return Err(Errno::EINVAL),
                 }
+                self.darwin_unimplemented("F_PREALLOCATE (VNOP_ALLOCATE: the filesystems here allocate no storage ahead)".into());
                 return Err(Errno::EOPNOTSUPP);
             }
-            // The filesystems here keep no data protection class: the
-            // attribute is unsupported to get and ignored when set.
-            F_GETPROTECTIONCLASS => return Err(Errno::EOPNOTSUPP),
-            F_SETPROTECTIONCLASS => {}
+            // A data protection class is the key store's, and the
+            // filesystems here have no such attribute to keep it in.
+            F_GETPROTECTIONCLASS | F_SETPROTECTIONCLASS => {
+                self.darwin_unimplemented(format!("fcntl {c} (a file's data protection class)"));
+                return Err(Errno::EOPNOTSUPP);
+            }
             _ => unreachable!("darwin_fcntl_vnode: {c}"),
         }
         Ok(0)

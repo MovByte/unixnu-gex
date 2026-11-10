@@ -49,8 +49,14 @@ int main(void) {
     ra.ra_offset = 0;
     if (fcntl(f, F_RDADVISE, &ra)) return bad("F_RDADVISE", errno);
     fstore_t fst = {.fst_flags = F_ALLOCATEALL, .fst_posmode = F_PEOFPOSMODE, .fst_offset = 0, .fst_length = 4096, .fst_bytesalloc = 77};
-    if (fcntl(f, F_PREALLOCATE, &fst) != -1 || errno != ENOTSUP || fst.fst_bytesalloc != 0) return bad("F_PREALLOCATE", errno);
-    if (fcntl(f, F_GETPROTECTIONCLASS) != -1 || errno != ENOTSUP) return bad("F_GETPROTECTIONCLASS", errno);
+    fst.fst_posmode = 0;
+    if (fcntl(f, F_PREALLOCATE, &fst) != -1 || errno != EINVAL || fst.fst_bytesalloc != 0) return bad("F_PREALLOCATE of no position mode", errno);
+    // A command with no case of its own is an ioctl of the vnode.
+    if (fcntl(f, 9999) != -1 || errno != ENOTTY) return bad("an unknown fcntl of a file", errno);
+    if (fcntl(p[0], 9999) != -1 || errno != EBADF) return bad("an unknown fcntl of a pipe", errno);
+    int dn = open("/dev/null", O_RDWR);
+    if (fcntl(dn, 9999) != -1 || errno != ENODEV) return bad("an unknown fcntl of a device", errno);
+    close(dn);
     if (fcntl(p[1], F_NOCACHE, 1) != -1 || errno != EBADF) return bad("F_NOCACHE on a pipe", errno);
     close(f);
     unlink("/tmp/gex-ioctl");
