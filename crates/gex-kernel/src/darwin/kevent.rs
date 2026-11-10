@@ -421,7 +421,9 @@ pub struct Kevents {
     /// Threads to wake when the call settles.
     wake: Vec<(i32, WaitResult)>,
     /// Each thread in poll: its pollfd array, and where it is.
-    poll: HashMap<i32, (u64, Vec<PollFd>)>,
+    pub(super) poll: HashMap<i32, (u64, Vec<PollFd>)>,
+    /// Each thread in select: which set and descriptor each entry there is.
+    pub(super) select: HashMap<i32, super::select::Select>,
 }
 
 /// `struct pollfd`.
@@ -433,7 +435,7 @@ pub struct PollFd {
 }
 
 /// `POLL*` (`bsd/sys/poll.h`).
-mod pollev {
+pub(super) mod pollev {
     pub const IN: i16 = 0x0001;
     pub const PRI: i16 = 0x0002;
     pub const OUT: i16 = 0x0004;
@@ -451,7 +453,7 @@ mod pollev {
 }
 
 /// `EV_POLL` and `EV_OOBAND` (EV_FLAG0, EV_FLAG1).
-const EV_POLL: u16 = 0x1000;
+pub(super) const EV_POLL: u16 = 0x1000;
 const EV_OOBAND: u16 = 0x2000;
 
 /// `kevent_ctx_s`: a call's data buffer and scan.
@@ -512,7 +514,7 @@ enum OverrideDrop {
 }
 
 impl Kernel {
-    fn kev(&mut self) -> &mut Kevents {
+    pub(super) fn kev(&mut self) -> &mut Kevents {
         &mut self.dtask.kevents
     }
 
@@ -599,7 +601,7 @@ impl Kernel {
 
     // -- allocation -----------------------------------------------------------------------
 
-    fn kq_new(&mut self, state: u16, nqueues: usize, nsuppressed: usize) -> KqId {
+    pub(super) fn kq_new(&mut self, state: u16, nqueues: usize, nsuppressed: usize) -> KqId {
         let ev = self.kev();
         ev.next_kq += 1;
         let id = ev.next_kq;
@@ -1105,7 +1107,7 @@ impl Kernel {
 
     /// `kevent_register`: change `kev` on `kqid`. The filter's result, and
     /// the knote that waits when it asks to.
-    fn kevent_register(&mut self, m: &mut GuestMem<'_>, kqid: KqId, kev: &mut Kev) -> (u32, Option<KnId>) {
+    pub(super) fn kevent_register(&mut self, m: &mut GuestMem<'_>, kqid: KqId, kev: &mut Kev) -> (u32, Option<KnId>) {
         let kev_flags = kev.flags;
         let mut result = 0u32;
         let mut wait_kn = None;
@@ -2642,14 +2644,20 @@ impl Kernel {
             self.poll_finish(m, kqid, Ok(()), rfds);
             return SyscallOutcome::Continue;
         }
+        // clock_interval_to_deadline of the timeout as an unsigned count
+        // of milliseconds.
+        let wait = (timeout != -1).then(|| std::time::Duration::from_nanos((timeout as i64 as u64).wrapping_mul(1_000_000)));
+        self.poll_scan(m, kqid, rfds, wait)
+    }
+
+    /// `kqueue_scan` for what `poll` and `select` registered, `wait` long
+    /// (`None`, for ever): `rfds` already found ready means it does not wait.
+    pub(super) fn poll_scan(&mut self, m: &mut GuestMem<'_>, kqid: KqId, rfds: i32, wait: Option<std::time::Duration>) -> SyscallOutcome {
         let mut ctx = Ctx { process_noutputs: rfds, process_flags: kf::POLL, ..Ctx::default() };
         if rfds != 0 {
             ctx.process_flags |= kf::IMMEDIATE;
-        } else if timeout != -1 {
-            // clock_interval_to_deadline of the timeout as an unsigned count
-            // of milliseconds.
-            let ns = (timeout as i64 as u64).wrapping_mul(1_000_000);
-            ctx.deadline = Instant::now().checked_add(std::time::Duration::from_nanos(ns));
+        } else if let Some(d) = wait {
+            ctx.deadline = Instant::now().checked_add(d);
         }
         let flags = ctx.process_flags;
         match self.kqueue_scan(m, kqid, flags, &mut ctx, Out::Poll) {
@@ -2670,6 +2678,13 @@ impl Kernel {
     fn poll_finish(&mut self, m: &mut GuestMem<'_>, kqid: KqId, r: Result<(), Errno>, noutputs: i32) {
         let tid = self.tid;
         let (ufds, fds) = self.kev().poll.remove(&tid).unwrap_or_default();
+        if let Some(sel) = self.kev().select.remove(&tid) {
+            let r = super::select::finish(self, m, sel, &fds, r);
+            self.kqueue_free(kqid);
+            self.darwin_kevent_settle(m);
+            super::thread::bsd_result(m, self.ctx_addr, r, false);
+            return;
+        }
         let r = r.and_then(|()| {
             let mut b = Vec::with_capacity(fds.len() * 8);
             for f in &fds {

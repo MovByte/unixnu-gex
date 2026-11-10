@@ -408,6 +408,8 @@ impl Kernel {
             sys::WRITE | sys::WRITE_NOCANCEL | sys::WRITEV | sys::WRITEV_NOCANCEL if self.darwin_pipe_of(a[0]).is_some() => Some(self.darwin_pipe_write(m, raw, a)),
             sys::KEVENT => Some(<Kq as KQueue>::kevent_legacy(self, m, a, false)),
             sys::POLL | sys::POLL_NOCANCEL => Some(self.darwin_poll(m, a)),
+            sys::SELECT | sys::SELECT_NOCANCEL => Some(self.darwin_select(m, a, false)),
+            sys::PSELECT | sys::PSELECT_NOCANCEL => Some(self.darwin_select(m, a, true)),
             sys::KEVENT64 => Some(<Kq as KQueue>::kevent_legacy(self, m, a, true)),
             sys::KEVENT_QOS => Some(<Kq as KQueue>::kevent_qos(self, m, a)),
             sys::KEVENT_ID => Some(<Kq as KQueue>::kevent_id(self, m, a)),

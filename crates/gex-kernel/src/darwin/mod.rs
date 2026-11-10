@@ -63,6 +63,7 @@ pub mod reason;
 pub mod rlimit;
 pub mod sandbox;
 pub mod sema;
+pub mod select;
 pub mod shm;
 pub mod signal;
 pub mod sockaddr;
