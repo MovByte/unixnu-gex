@@ -309,6 +309,9 @@ impl Kernel {
         if let Some(r) = self.darwin_fixed_call(m, raw, a) {
             return Some(res(r));
         }
+        if let Some(r) = self.darwin_filesec_call(m, raw, a) {
+            return Some(res(r));
+        }
         if let Some(e) = self.darwin_sock_refused(raw, a) {
             return Some(neg(e));
         }
@@ -340,6 +343,8 @@ impl Kernel {
             sys::FCNTL | sys::FCNTL_NOCANCEL => self.darwin_fcntl(m, a),
             sys::FSGETPATH => res(self.darwin_fsgetpath(m, a)),
             sys::PROC_INFO => res(self.darwin_proc_info(m, a)),
+            sys::PROC_INFO_EXTENDED_ID => res(self.darwin_proc_info_extended_id(m, a)),
+            sys::FSGETPATH_EXT => res(self.darwin_fsgetpath_ext(m, a)),
             sys::PROCESS_POLICY => res(self.darwin_process_policy(m, a)),
             sys::MEMORYSTATUS_CONTROL => res(self.darwin_memorystatus_control(m, a)),
             sys::GETTIMEOFDAY => res(darwin_gettimeofday(m, a[0], a[1], a[2])),
@@ -872,17 +877,64 @@ impl Kernel {
     /// `fsgetpath(buf, size, fsid, objid)`: the path of a file named by its
     /// filesystem and object ids. Only the shared cache is named so.
     fn darwin_fsgetpath(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
-        let fs = u64::from(m.read_u32(a[2])?) | u64::from(m.read_u32(a[2] + 4)?) << 32;
-        if (fs, a[3]) != (super::CACHE_FS_ID, super::CACHE_OBJ_ID) || self.darwin_region.0 == 0 {
-            return Err(Errno::ENOENT);
+        const FSGETPATH_MAXBUFLEN: u64 = 8192;
+        const ROOT_OBJID: u64 = 2;
+        if a[1] > FSGETPATH_MAXBUFLEN || a[1] == 0 {
+            return Err(Errno::EINVAL);
         }
-        let mut b = super::CACHE_PATH.as_bytes().to_vec();
+        let fs = u64::from(m.read_u32(a[2])?) | u64::from(m.read_u32(a[2] + 4)?) << 32;
+        // mount_lookupby_volfsid, by the first half.
+        let Some(mnt) = MOUNTS.iter().find(|mnt| mnt.fsid as u32 == fs as u32) else {
+            return Err(Errno::EOPNOTSUPP);
+        };
+        let image = self.dtask.image_files.iter().find(|f| (f.0, f.1) == (fs, a[3])).map(|f| f.2.clone());
+        let path = if a[3] == ROOT_OBJID {
+            mnt.on.to_string()
+        } else if (fs, a[3]) == (super::CACHE_FS_ID, super::CACHE_OBJ_ID) && self.darwin_region.0 != 0 {
+            super::CACHE_PATH.to_string()
+        } else if let Some(path) = image {
+            path
+        } else {
+            self.darwin_unimplemented(format!("fsgetpath of object {:#x} (VFS_VGET: the filesystems here look files up by name only)", a[3]));
+            return Err(Errno::ENOENT);
+        };
+        let mut b = path.as_bytes().to_vec();
         b.push(0);
         if (a[1] as usize) < b.len() {
             return Err(Errno::ENOSPC);
         }
         m.write(a[0], &b)?;
         Ok(b.len() as u64)
+    }
+
+    /// `fsgetpath_ext(buf, bufsize, fsid, objid, options)`: there are no
+    /// firmlinks to leave out of a path, and the file system's own ID is the
+    /// one its path is found by.
+    fn darwin_fsgetpath_ext(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
+        const FSOPT_NOFIRMLINKPATH: u64 = 0x80;
+        const FSOPT_ISREALFSID: u64 = 0x200;
+        if a[4] as u32 as u64 & !(FSOPT_NOFIRMLINKPATH | FSOPT_ISREALFSID) != 0 {
+            return Err(Errno::EINVAL);
+        }
+        self.darwin_fsgetpath(m, a)
+    }
+
+    /// `proc_info_extended_id(callnum, pid, flavor, flags, ext_id, arg,
+    /// buffer, buffersize)`.
+    fn darwin_proc_info_extended_id(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
+        const PIF_COMPARE_IDVERSION: u64 = 1;
+        const PIF_COMPARE_UNIQUEID: u64 = 2;
+        let flags = a[3] as u32 as u64;
+        if flags & (PIF_COMPARE_IDVERSION | PIF_COMPARE_UNIQUEID) == PIF_COMPARE_IDVERSION | PIF_COMPARE_UNIQUEID {
+            return Err(Errno::EINVAL);
+        }
+        if flags != 0 {
+            self.darwin_unimplemented(format!("proc_info_extended_id with flags {flags:#x} (comparing the process's identity)"));
+            return Err(Errno::EINVAL);
+        }
+        let buffer = m.read_u64(self.ctx_addr + gex_abi::ctx::x(6) as u64)?;
+        let size = m.read_u64(self.ctx_addr + gex_abi::ctx::x(7) as u64)?;
+        self.darwin_proc_info(m, &[a[0], a[1], a[2], a[5], buffer, size])
     }
 
     /// `getfsstat64(buf, bufsize, flags)`: the mounts, or how many there

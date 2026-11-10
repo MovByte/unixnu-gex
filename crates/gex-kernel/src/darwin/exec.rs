@@ -384,10 +384,12 @@ impl Kernel {
         s.add_apple(format!("main_stack=0x{:x},0x{:x},0x{:x},0x{:x}", stack[0], stack[1], stack[2], stack[3]).as_bytes())?;
         let (fsid, fileid) = self.darwin_file_id(l.exe_path)?;
         s.add_apple(format!("executable_file=0x{fsid:x},0x{fileid:x}").as_bytes())?;
+        self.dtask.image_files = vec![(fsid, fileid, self.vfs.canonical(l.exe_path))];
         if let Some(dyld) = l.dylinker {
             let (fsid, fileid) = self.darwin_file_id(dyld)?;
             if fsid != 0 || fileid != 0 {
                 s.add_apple(format!("dyld_file=0x{fsid:x},0x{fileid:x}").as_bytes())?;
+                self.dtask.image_files.push((fsid, fileid, self.vfs.canonical(dyld)));
             }
         }
         if let Some(cdhash) = l.code_signature.map(super::codesign::cdhash).transpose()? {

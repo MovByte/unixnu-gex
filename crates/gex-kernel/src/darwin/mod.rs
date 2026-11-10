@@ -34,6 +34,7 @@ pub mod exception;
 pub mod execve;
 pub mod fsops;
 pub mod ioctl;
+pub mod filesec;
 pub mod fixedcalls;
 pub mod clonefile;
 pub mod pathconf;
@@ -258,6 +259,9 @@ pub struct Task {
     /// `thread_guard_violation`'s pending exception of a guarded descriptor,
     /// its code and subcode, for the call's way out (`fd_guard_ast`).
     pub fd_guard: Option<(u64, u64)>,
+    /// The files named to the image in `executable_file` and `dyld_file`
+    /// (their file system, number and path), which `fsgetpath` is asked for.
+    pub image_files: Vec<(u64, u64, String)>,
     /// `P_LNOATTACH` and `P_FORCEQUOTA`.
     pub no_attach: bool,
     /// `p_debugger`.
