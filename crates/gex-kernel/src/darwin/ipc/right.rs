@@ -114,7 +114,11 @@ impl Ipc {
 
     /// `ipc_port_release_receive`: a receive right in flight, gone.
     pub fn release_receive(&mut self, port: ObjId) {
+        let dest = self.port_mut(port).destination.take();
         self.port_destroy(port);
+        if let Some(d) = dest {
+            self.release(d);
+        }
     }
 
     /// `ipc_object_destroy`: a carried right of type `t` destroyed.
@@ -420,8 +424,15 @@ impl Ipc {
             msgt::PORT_RECEIVE => {
                 let task = self.task;
                 let p = self.port_mut(port);
+                // The port leaves its journey for this space; its old
+                // destination's reference goes.
+                let dest = p.destination.take();
                 p.receiver = Receiver::Space(name);
                 p.owner = task;
+                if let Some(d) = dest {
+                    self.release(d);
+                }
+                let p = self.port_mut(port);
                 if p.connection_port {
                     p.immovable_receive = true;
                 }

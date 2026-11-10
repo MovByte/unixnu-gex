@@ -332,6 +332,10 @@ pub struct Port {
     pub reply_semantics: ReplySemantics,
     pub tempowner: bool,
     pub impdonation: bool,
+    /// `ip_destination`: the port whose queue holds the message this
+    /// receive right is in transit in (none in limbo); it holds a
+    /// reference on that port.
+    pub destination: Option<ObjId>,
     pub no_grant: bool,
     pub service_port: bool,
     /// A service port labeled as a bootstrap port
@@ -399,6 +403,7 @@ impl Port {
             reply_semantics: ReplySemantics::None,
             tempowner: false,
             impdonation: false,
+            destination: None,
             no_grant: false,
             service_port: false,
             bootstrap_port: false,
@@ -1215,10 +1220,40 @@ impl Ipc {
                 self.kmsg_destroy(k, false);
             }
         } else {
+            // In limbo: in no space, and in no message's journey yet.
             p.immovable_receive = false;
             p.receiver = Receiver::Transit;
+            p.destination = None;
             self.mqueue_changed(port);
         }
+    }
+
+    /// `ipc_port_check_circularity`: whether queueing the receive right
+    /// `port` (in limbo) in a message to `dest` would close a cycle of
+    /// ports each in transit to the next. If it would not, the port goes
+    /// in transit to `dest`, which it references.
+    pub fn check_circularity(&mut self, port: ObjId, dest: ObjId) -> bool {
+        if port == dest {
+            return true;
+        }
+        // ipc_port_destination_chain_lock: from dest to the first port
+        // not in transit (or dead).
+        let mut base = dest;
+        loop {
+            let p = self.port(base);
+            match (p.active, p.receiver, p.destination) {
+                (true, Receiver::Transit, Some(next)) => base = next,
+                _ => break,
+            }
+        }
+        if base == port {
+            return true;
+        }
+        self.reference(dest);
+        let p = self.port_mut(port);
+        assert!(p.active && p.receiver == Receiver::Transit && p.destination.is_none(), "a port in limbo");
+        p.destination = Some(dest);
+        false
     }
 
     /// `ipc_pset_destroy`.

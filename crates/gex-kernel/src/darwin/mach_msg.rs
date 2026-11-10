@@ -850,6 +850,26 @@ impl Kernel {
                 }
                 _ => unreachable!(),
             };
+            // A receive right sent to a port that is, or is in transit to,
+            // its own port would close a cycle: the message is marked to be
+            // destroyed when it is sent.
+            let mut circular = false;
+            match &d {
+                Desc::Port { right: Some(Carried::Port(p)), disp, .. } | Desc::Guarded { right: Some(Carried::Port(p)), disp, .. } if *disp == msgt::PORT_RECEIVE => {
+                    circular = self.ipc().check_circularity(*p, kmsg.dest);
+                }
+                Desc::OolPorts { rights, disp, .. } if *disp == msgt::PORT_RECEIVE => {
+                    for (r, _) in rights {
+                        if let Some(Carried::Port(p)) = r {
+                            circular |= self.ipc().check_circularity(*p, kmsg.dest);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if circular {
+                kmsg.bits |= bits::CIRCULAR;
+            }
             kmsg.descs.push(d);
         }
         Ok(())
@@ -876,6 +896,12 @@ impl Kernel {
     /// send succeeds; to a kernel object, the object's server answers; else
     /// it is queued or handed to a receiver.
     fn kmsg_send(&mut self, mut kmsg: Box<Kmsg>, options: u64, timeout_zero: bool) -> Result<(), SendWait> {
+        // A message that would make a circular loop of ports is destroyed,
+        // and the send succeeds.
+        if kmsg.bits & bits::CIRCULAR != 0 {
+            self.ipc().kmsg_destroy(kmsg, false);
+            return Ok(());
+        }
         if let Some(vp) = kmsg.voucher {
             kmsg.voucher = Some(self.ipc_voucher_send_preprocessing(vp));
         }
@@ -1583,7 +1609,17 @@ impl Kernel {
             }
         };
         let complex = if descs.is_empty() { 0 } else { bits::COMPLEX };
-        let k = Kmsg { bits: bits::set(msgt::PORT_SEND_ONCE, 0, 0, complex), size: HEADER + body.len() as u32, dest: to, reply: None, voucher: None, voucher_raw: 0, id: msgid, body, descs, sender: Sender::KERNEL, aux: Vec::new(), keep_alive: false, ppriority: 0, qos_override: 0 };
+        // ipc_kmsg_copyin_port_from_kernel: a receive right the kernel
+        // sends is checked for a cycle unless the kernel is its
+        // destination's receiver.
+        let mut circular = false;
+        if let [Desc::Port { right: Some(Carried::Port(p)), disp: msgt::PORT_RECEIVE, .. }] = descs[..] {
+            let ipc = self.ipc();
+            if ipc.port(to).receiver != Receiver::Kernel {
+                circular = ipc.check_circularity(p, to);
+            }
+        }
+        let k = Kmsg { bits: bits::set(msgt::PORT_SEND_ONCE, 0, 0, complex) | if circular { bits::CIRCULAR } else { 0 }, size: HEADER + body.len() as u32, dest: to, reply: None, voucher: None, voucher_raw: 0, id: msgid, body, descs, sender: Sender::KERNEL, aux: Vec::new(), keep_alive: false, ppriority: 0, qos_override: 0 };
         self.darwin_kernel_send(Box::new(k));
     }
 
