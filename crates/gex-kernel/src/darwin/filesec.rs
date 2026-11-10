@@ -38,15 +38,18 @@ fn on_devfs(canon: &str) -> bool {
 }
 
 impl Kernel {
-    /// `stat64_extended`, `lstat64_extended` and `fstat64_extended`
-    /// (`fstatat_internal`, `fstat`): the plain call's `struct stat`,
+    /// `stat_extended`, `lstat_extended`, `fstat_extended` and their `64`
+    /// forms (`fstatat_internal`, `fstat`): the plain call's `struct stat`,
     /// then the size of the file security and, when the buffer holds it,
     /// the file security itself; a size of zero for none.
     fn darwin_stat_extended(&mut self, m: &mut GuestMem<'_>, raw: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         let (plain, follow) = match raw {
             sys::STAT64_EXTENDED => (sys::STAT64, Some(true)),
             sys::LSTAT64_EXTENDED => (sys::LSTAT64, Some(false)),
-            _ => (sys::FSTAT64, None),
+            sys::FSTAT64_EXTENDED => (sys::FSTAT64, None),
+            sys::STAT_EXTENDED => (sys::STAT, Some(true)),
+            sys::LSTAT_EXTENDED => (sys::LSTAT, Some(false)),
+            _ => (sys::FSTAT, None),
         };
         let (xsecurity, xsecurity_size) = (a[2], a[3]);
         let r = self.darwin_plain_call(m, plain, [a[0], a[1], 0, 0, 0, 0]);
@@ -110,7 +113,7 @@ impl Kernel {
     }
 
     /// A call by its plain number, as a guest would make it.
-    fn darwin_plain_call(&mut self, m: &mut GuestMem<'_>, raw: u64, mut la: [u64; 6]) -> Result<u64, Errno> {
+    pub(super) fn darwin_plain_call(&mut self, m: &mut GuestMem<'_>, raw: u64, mut la: [u64; 6]) -> Result<u64, Errno> {
         match self.darwin_call(m, raw, &la) {
             Some(ret) => match ret as i64 {
                 e @ -4095..=-1 => Err(Errno(-e as i32)),
@@ -127,7 +130,7 @@ impl Kernel {
     /// [`Self::darwin_open_extended`]'s.
     pub(crate) fn darwin_filesec_call(&mut self, m: &mut GuestMem<'_>, raw: u64, a: &[u64; 6]) -> Option<Result<u64, Errno>> {
         Some(match raw {
-            sys::STAT64_EXTENDED | sys::LSTAT64_EXTENDED | sys::FSTAT64_EXTENDED => self.darwin_stat_extended(m, raw, a),
+            sys::STAT64_EXTENDED | sys::LSTAT64_EXTENDED | sys::FSTAT64_EXTENDED | sys::STAT_EXTENDED | sys::LSTAT_EXTENDED | sys::FSTAT_EXTENDED => self.darwin_stat_extended(m, raw, a),
             sys::UMASK_EXTENDED => match self.darwin_filesec_refused("umask_extended", u64::from(NO_ID), u64::from(NO_ID), a[1], false) {
                 Some(e) => Err(e),
                 None => self.darwin_plain_call(m, sys::UMASK, [a[0], 0, 0, 0, 0, 0]),

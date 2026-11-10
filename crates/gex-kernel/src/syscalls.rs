@@ -729,6 +729,9 @@ pub struct Kernel {
     /// A parked write to a Darwin pipe: whether its EPIPE sends the process
     /// SIGPIPE (the open file has no `FG_NOSIGPIPE`).
     pub darwin_pipe_sigpipe: Option<bool>,
+    /// A Darwin `stat`, `lstat`, `fstat` or `fstatat` (not their `64`
+    /// forms) in progress: its `struct stat` is the 32-bit-inode one.
+    pub darwin_stat_ino32: bool,
     /// A parked Darwin `wait4`'s status address, for its status in Darwin's
     /// encoding ([`crate::darwin::exit`]).
     pub darwin_wait4: Option<u64>,
@@ -3099,6 +3102,8 @@ pub struct PathIo<'a> {
     pub compat: bool,
     /// A Darwin process: its `struct stat` is Darwin's.
     pub darwin: bool,
+    /// Its `struct stat` the 32-bit-inode one ([`Kernel::darwin_stat_ino32`]).
+    pub stat_ino32: bool,
     pub pid: i32,
     /// The process's ids, read at each call: the owner a stat reports.
     pub creds: &'a Creds,
@@ -3632,7 +3637,11 @@ impl PathIo<'_> {
                 Some(p) if p.starts_with('/') && md.file_type != crate::vfs::FileType::Socket => crate::darwin::kern::mount_of(p).fsid as u32 as u64,
                 _ => 0,
             };
-            st.encode_darwin()
+            if self.stat_ino32 {
+                st.encode_darwin_ino32()
+            } else {
+                st.encode_darwin()
+            }
         } else {
             st.encode_for(self.compat)
         }
@@ -9192,6 +9201,7 @@ impl Kernel {
             darwin_user_stack: 0,
             darwin_finish: None,
             darwin_pipe_sigpipe: None,
+            darwin_stat_ino32: false,
             darwin_wait4: None,
             darwin_exec: None,
             darwin_spawned: None,
@@ -9624,6 +9634,7 @@ impl Kernel {
             darwin_user_stack: 0,
             darwin_finish: None,
             darwin_pipe_sigpipe: None,
+            darwin_stat_ino32: false,
             darwin_wait4: None,
             darwin_exec: None,
             darwin_spawned: None,
@@ -10408,6 +10419,7 @@ impl Kernel {
             map: self.map_io(),
             compat: self.compat,
             darwin: self.darwin,
+            stat_ino32: self.darwin_stat_ino32,
             pid: self.pid,
             creds: &self.creds,
             procs: &self.procs,

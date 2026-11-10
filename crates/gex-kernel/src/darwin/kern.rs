@@ -552,6 +552,7 @@ impl Kernel {
                     }
                 }
             }
+            sys::STAT | sys::LSTAT | sys::FSTAT | sys::FSTATAT => res(self.darwin_stat_ino32(m, raw, a)),
             sys::FSTAT64 if self.darwin_pipe_of(a[0]).is_some() => res(self.darwin_pipe_stat(m, a[0], a[1])),
             sys::FSTATAT64 => res(self.darwin_fstatat64(m, a)),
             sys::FACCESSAT => res(self.darwin_faccessat(m, a)),
@@ -730,6 +731,22 @@ impl Kernel {
             crate::vfs::FileType::CharDevice => Err(Errno::ENODEV),
             _ => Err(Errno::ENOTTY),
         }
+    }
+
+    /// `stat`, `lstat`, `fstat` and `fstatat`: their `64` forms' lookup
+    /// (`fstatat_internal`, `fstat1` with `isstat64` 0), the `struct stat`
+    /// written the one with a 32-bit inode number.
+    fn darwin_stat_ino32(&mut self, m: &mut GuestMem<'_>, raw: u64, a: &[u64; 6]) -> Result<u64, Errno> {
+        let wide = match raw {
+            sys::STAT => sys::STAT64,
+            sys::LSTAT => sys::LSTAT64,
+            sys::FSTAT => sys::FSTAT64,
+            _ => sys::FSTATAT64,
+        };
+        self.darwin_stat_ino32 = true;
+        let r = self.darwin_plain_call(m, wide, *a);
+        self.darwin_stat_ino32 = false;
+        r
     }
 
     /// `proc_info(callnum, pid, flavor, arg, buffer, buffersize)`.

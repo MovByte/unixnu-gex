@@ -178,6 +178,29 @@ impl Stat {
         b
     }
 
+    /// Darwin's `struct stat` with a 32-bit inode number (`user64_stat`,
+    /// 120 bytes), what `stat`, `lstat`, `fstat` and `fstatat` write
+    /// (`vn_stat` with `isstat64` 0, then `munge_user64_stat`): the inode
+    /// number truncated, no birth time, and the spare fields zero.
+    pub fn encode_darwin_ino32(&self) -> StatBytes {
+        let mut b = StatBytes::zeroed(120);
+        b[0..4].copy_from_slice(&(self.dev as u32).to_le_bytes());
+        b[4..8].copy_from_slice(&(self.ino as u32).to_le_bytes());
+        b[8..10].copy_from_slice(&(self.mode as u16).to_le_bytes());
+        b[10..12].copy_from_slice(&(self.nlink.min(u16::MAX as u32) as u16).to_le_bytes());
+        b[12..16].copy_from_slice(&self.uid.to_le_bytes());
+        b[16..20].copy_from_slice(&self.gid.to_le_bytes());
+        b[20..24].copy_from_slice(&(self.rdev as u32).to_le_bytes());
+        for (off, (t, ns)) in [24usize, 40, 56].into_iter().zip(self.times()) {
+            b[off..off + 8].copy_from_slice(&t.to_le_bytes());
+            b[off + 8..off + 16].copy_from_slice(&(ns as i64).to_le_bytes());
+        }
+        b[72..80].copy_from_slice(&self.size.to_le_bytes());
+        b[80..88].copy_from_slice(&self.blocks.to_le_bytes());
+        b[88..92].copy_from_slice(&self.blksize.to_le_bytes());
+        b
+    }
+
     /// As [`Stat::encode`], or the i386 `struct stat64` (96 bytes, packed to
     /// 4-byte alignment) for a 32-bit process.
     pub fn encode_for(&self, compat: bool) -> StatBytes {
@@ -257,5 +280,46 @@ mod oflag_tests {
         assert_eq!(to_generic(from_generic(every | all)), every | all);
         // An i386 or wasm32 program spells them x86's way on every build.
         assert_eq!(from_guest(O_NOFOLLOW, true), O_NOFOLLOW);
+    }
+}
+
+#[cfg(test)]
+mod stat_tests {
+    use super::Stat;
+
+    /// `user64_stat` against `user64_stat64`: the same fields at their own
+    /// offsets, the inode number truncated and no birth time.
+    #[test]
+    fn the_32_bit_inode_struct_is_the_64_bit_one_munged() {
+        let st = Stat {
+            dev: 0x0100_0002,
+            ino: 0x1_2345_6789,
+            mode: 0o100640,
+            nlink: 3,
+            uid: 501,
+            gid: 20,
+            rdev: 7,
+            size: 5,
+            blksize: 4096,
+            blocks: 8,
+            atime: 11,
+            atime_ns: 12,
+            mtime: 13,
+            mtime_ns: 14,
+            ctime: 15,
+            ctime_ns: 16,
+        };
+        let (w, n) = (st.encode_darwin(), st.encode_darwin_ino32());
+        assert_eq!(n.len(), 120);
+        let i32_at = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let i16_at = |b: &[u8], o: usize| u16::from_le_bytes(b[o..o + 2].try_into().unwrap());
+        assert_eq!(i32_at(&n, 0), i32_at(&w, 0));
+        assert_eq!(i32_at(&n, 4), 0x2345_6789);
+        assert_eq!(i16_at(&n, 8), i16_at(&w, 4));
+        assert_eq!(i16_at(&n, 10), i16_at(&w, 6));
+        assert_eq!(n[12..24], w[16..28]);
+        assert_eq!(n[24..72], w[32..80]);
+        assert_eq!(n[72..92], w[96..116]);
+        assert!(n[92..120].iter().all(|&b| b == 0));
     }
 }

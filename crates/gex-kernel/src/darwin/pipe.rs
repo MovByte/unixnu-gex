@@ -174,7 +174,7 @@ impl Kernel {
             blocks: ((pipe_count + pipe_size - 1) / pipe_size) as i64,
             ..Default::default()
         };
-        m.write(buf, &st.encode_darwin())?;
+        m.write(buf, &if self.darwin_stat_ino32 { st.encode_darwin_ino32() } else { st.encode_darwin() })?;
         Ok(0)
     }
 }
