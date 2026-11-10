@@ -11,6 +11,8 @@ use super::execve::Image;
 use crate::errno::Errno;
 use crate::syscalls::{nr, Kernel, SyscallOutcome};
 use crate::GuestMem;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 /// `posix_spawn` flags (`bsd/sys/spawn.h`).
 pub mod flag {
@@ -616,7 +618,8 @@ impl Kernel {
         let policy = attr.map_or((0, 0, 0), |a| super::taskpolicy::spawn_attrs(a.apptype, a.qos_clamp, a.darwin_role));
         let mut after = After { flags, policy, sigmask: attr.map_or(0, |a| a.sigmask), sigdefault: attr.map_or(0, |a| a.sigdefault), inherit: Vec::new(), max_addr: attr.map_or(0, |a| a.max_addr), crash_behavior: if self.dtask.codesign.as_ref().is_some_and(|c| c.entitled("com.apple.private.spawn-panic-crash-behavior")) { attr.map_or(0, |a| a.crash_behavior) } else { 0 }, pcontrol: attr.map(|a| a.pcontrol), cpumonitor: attr.map_or((0, 0), |a| (a.cpumonitor_percent, a.cpumonitor_interval)) };
         if let Some(fa) = file_actions {
-            after.inherit = child.darwin_file_actions(fa, flags)?;
+            let mut fileports = self.darwin_spawn_fileports(fa);
+            after.inherit = child.darwin_file_actions(fa, flags, &mut fileports)?;
         }
         let mut held = match port_actions {
             Some(pa) => self.darwin_spawn_port_actions(child, pa)?,
@@ -859,9 +862,10 @@ impl Kernel {
             }
         }
         let mut after = After { flags: at.flags, policy: super::taskpolicy::spawn_attrs(at.apptype, at.qos_clamp, at.darwin_role), sigmask: at.sigmask, sigdefault: at.sigdefault, inherit: Vec::new(), max_addr: at.max_addr, crash_behavior: if self.dtask.codesign.as_ref().is_some_and(|c| c.entitled("com.apple.private.spawn-panic-crash-behavior")) { at.crash_behavior } else { 0 }, pcontrol: Some(at.pcontrol), cpumonitor: (at.cpumonitor_percent, at.cpumonitor_interval) };
+        let mut fileports = file_actions.map(|fa| self.darwin_spawn_fileports(fa)).unwrap_or_default();
         let activated = (|| {
             if let Some(fa) = file_actions {
-                after.inherit = copy.darwin_file_actions(fa, at.flags)?;
+                after.inherit = copy.darwin_file_actions(fa, at.flags, &mut fileports)?;
             }
             copy.darwin_spawn_creds(at, creds)?;
             let binprefs = Some(at.binprefs).filter(|b| b[0].0 != 0);
@@ -954,7 +958,24 @@ impl Kernel {
     /// each action in turn, stopping at the first that fails; with
     /// `POSIX_SPAWN_CLOEXEC_DEFAULT`, the descriptors they make or name are
     /// the ones the exec keeps.
-    fn darwin_file_actions(&mut self, b: &[u8], flags: u16) -> Result<Vec<i32>, Errno> {
+    /// The open files of the spawn's PSFA_FILEPORT_DUP2 actions, each as
+    /// the spawner's space finds its file port, by action.
+    fn darwin_spawn_fileports(&mut self, b: &[u8]) -> HashMap<usize, Result<Arc<crate::file::OpenFile>, Errno>> {
+        let count = le32(b, 4) as usize;
+        let mut out = HashMap::new();
+        for i in 0..count {
+            let o = PSFA_HDR as usize + PSFA_ACTION_SIZE as usize * i;
+            if le32(b, o) == psfa::FILEPORT_DUP2 {
+                // psfaa_fileport, with psfaa_dup2args' new descriptor after.
+                let name = le32(b, o + 4);
+                let r = if super::ipc::name_valid(name) { self.darwin_fileport_file(name) } else { Err(Errno::EINVAL) };
+                out.insert(i, r);
+            }
+        }
+        out
+    }
+
+    fn darwin_file_actions(&mut self, b: &[u8], flags: u16, fileports: &mut HashMap<usize, Result<Arc<crate::file::OpenFile>, Errno>>) -> Result<Vec<i32>, Errno> {
         let count = le32(b, 4) as usize;
         let at = |i: usize| PSFA_HDR as usize + PSFA_ACTION_SIZE as usize * i;
         for i in 0..count {
@@ -964,10 +985,6 @@ impl Kernel {
                 psfa::OPEN => {
                     let (oflag, mode) = (le32(b, o + 8), le16(b, o + 12));
                     let path = &b[o + 14..o + 14 + PATH_MAX];
-                    if oflag & 0x30 != 0 {
-                        self.darwin_unimplemented("posix_spawn's PSFA_OPEN with O_EXLOCK or O_SHLOCK".into());
-                        return Err(Errno::EINVAL);
-                    }
                     // The mode under the umask, its permission bits only.
                     let mode = u32::from(mode) & !self.proc_fs.umask() & 0o777;
                     let mut s = Scratch::path(path);
@@ -975,6 +992,13 @@ impl Kernel {
                     let mut la = [Scratch::AT, u64::from(oflag), u64::from(mode), 0, 0, 0];
                     let n = super::bsd::translate(super::bsd::sys::OPEN, &mut la);
                     let got = self.canonical(&mut gm, n, la)? as i32;
+                    // open1's O_EXLOCK or O_SHLOCK: the new open file's flock.
+                    if oflag & 0x30 != 0 {
+                        if let Err(e) = self.darwin_open_lock_now(got, u64::from(oflag)) {
+                            let _ = self.darwin_close(got);
+                            return Err(e);
+                        }
+                    }
                     if got != fd {
                         let r = self.darwin_dup2(got, fd);
                         let _ = self.darwin_close(got);
@@ -984,9 +1008,17 @@ impl Kernel {
                 psfa::DUP2 => {
                     self.darwin_dup2(fd, le32(b, o + 8) as i32)?;
                 }
+                // fileport_makefd with no descriptor flags, then dup2 and
+                // close.
                 psfa::FILEPORT_DUP2 => {
-                    self.darwin_unimplemented("posix_spawn's PSFA_FILEPORT_DUP2 (fileports)".into());
-                    return Err(Errno::EINVAL);
+                    let file = fileports.remove(&i).expect("each file port resolved")?;
+                    let got = self.fds.insert(file, false)? as i32;
+                    let new = le32(b, o + 8) as i32;
+                    if got != new {
+                        let r = self.darwin_dup2(got, new);
+                        let _ = self.darwin_close(got);
+                        r?;
+                    }
                 }
                 psfa::CLOSE => self.darwin_close(fd)?,
                 psfa::INHERIT => {

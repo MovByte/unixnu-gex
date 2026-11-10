@@ -1078,6 +1078,32 @@ impl Kernel {
         }
     }
 
+    /// open1's O_EXLOCK or O_SHLOCK on descriptor `fd` for a spawn's
+    /// PSFA_OPEN, taken now; one that would have to wait for the lock is
+    /// reported (the spawn would sleep in the child's open).
+    pub(crate) fn darwin_open_lock_now(&mut self, fd: i32, dflags: u64) -> Result<(), Errno> {
+        self.darwin_lock_importance_query();
+        const O_SHLOCK: u64 = 0x10;
+        const O_EXLOCK: u64 = 0x20;
+        const O_NONBLOCK: u64 = 0x4;
+        let file = self.fds.get(fd)?;
+        let v = match self.darwin_lock_target(&file) {
+            Target::Lockf(v) => v,
+            Target::NoAdvlock => return Err(Errno::EOPNOTSUPP),
+            Target::NotVnode => return Ok(()),
+        };
+        let ty = if dflags & O_EXLOCK != 0 { F_WRLCK } else if dflags & O_SHLOCK != 0 { F_RDLCK } else { return Ok(()) };
+        let wait = if dflags & O_NONBLOCK == 0 { lf::F_WAIT } else { 0 };
+        match self.darwin_flock_set(&file, v, ty, wait, Some(fd))? {
+            None => Ok(()),
+            Some((c, _)) => {
+                let _ = resume(c.req, Some(Errno::EINTR));
+                self.darwin_unimplemented("posix_spawn's PSFA_OPEN waiting for its file's lock (the spawn sleeping in the child's open)".into());
+                Err(Errno::EINTR)
+            }
+        }
+    }
+
     /// A blocked lock call's sleep has ended.
     pub(crate) fn darwin_lockf_wait_done(&mut self, m: &mut GuestMem<'_>, c: Cont, res: WaitResult) -> Option<SyscallOutcome> {
         let err = match res {

@@ -53,13 +53,20 @@ impl Kernel {
         Ok(0)
     }
 
-    /// `fileport_makefd(port)`: a new close-on-exec descriptor of the port's
-    /// file.
-    pub(crate) fn darwin_fileport_makefd(&mut self, name: u32) -> Result<u64, Errno> {
+    /// The open file of the file port a send right names (a right this
+    /// task's space has, as `ipc_object_copyin` takes a copy of it, and
+    /// `fileport_port_to_fileglob`): EINVAL for anything else.
+    pub(crate) fn darwin_fileport_file(&mut self, name: u32) -> Result<Arc<OpenFile>, Errno> {
         let ipc = &mut self.ipc();
         let Ok(port) = ipc.translate_send(name) else { return Err(Errno::EINVAL) };
         let Some(Kobject::FilePort(id)) = ipc.port(port).kobject else { return Err(Errno::EINVAL) };
-        let Some(file) = files().lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned() else { return Err(Errno::EINVAL) };
+        files().lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned().ok_or(Errno::EINVAL)
+    }
+
+    /// `fileport_makefd(port)`: a new close-on-exec descriptor of the port's
+    /// file.
+    pub(crate) fn darwin_fileport_makefd(&mut self, name: u32) -> Result<u64, Errno> {
+        let file = self.darwin_fileport_file(name)?;
         self.fds.insert(file, true)
     }
 }
