@@ -295,7 +295,8 @@ impl Kernel {
         // Its threads' vouchers, its importance (ipc_importance_disconnect_task)
         // and its bank context (task_bank_reset).
         self.darwin_threads_vouchers_release();
-        self.darwin_importance_disconnect_task();
+        let me = self.ipc().task;
+        self.ipc().imp_disconnect_task(me);
         self.darwin_bank_task_destroy();
         let semas: Vec<ObjId> = self.dtask.semas.map.iter().filter(|(_, s)| s.active).map(|(&p, _)| p).collect();
         for p in semas {
@@ -658,6 +659,6 @@ impl Reply {
             }
             (b, Vec::new(), 0)
         };
-        Kmsg { bits: bits::set(reply_type, 0, 0, complex), size: 24 + body.len() as u32, dest, reply: None, voucher: None, voucher_raw: 0, id: id + 100, body, descs, sender: Sender::KERNEL, aux: Vec::new(), keep_alive: false, ppriority: 0, qos_override: 0 }
+        Kmsg { bits: bits::set(reply_type, 0, 0, complex), size: 24 + body.len() as u32, dest, reply: None, voucher: None, voucher_raw: 0, id: id + 100, body, descs, sender: Sender::KERNEL, aux: Vec::new(), keep_alive: false, ppriority: 0, qos_override: 0, imp: None }
     }
 }

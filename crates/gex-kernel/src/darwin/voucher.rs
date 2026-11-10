@@ -346,24 +346,14 @@ enum BankElem {
     Account(BankAccount),
 }
 
-/// A task's importance element (`struct ipc_importance_task`).
-#[derive(Debug)]
-struct ImpTask {
-    refs: u32,
-    made: u32,
-    /// `task_pid(iit_task)`: none once the task is disconnected.
-    pid: Option<i32>,
-}
-
-/// A task's own voucher state: its bank context (`task->bank_context`)
-/// and importance element (`task->task_imp_base`), and the credential's
-/// ids when its bank context was to be made (`task_bank_init`, at a fork
-/// or once an exec's image is in place).
+/// A task's own voucher state: its bank context (`task->bank_context`),
+/// and the credential's ids when it was to be made (`task_bank_init`, at
+/// a fork or once an exec's image is in place). Its importance element is
+/// the IPC table's, by task.
 #[derive(Debug, Default)]
 pub struct Vouchers {
     bank_context: Option<u64>,
     bank_ids: Option<(u32, u32)>,
-    imp_base: Option<u64>,
 }
 
 /// The system's vouchers (`ivht`), each key's value table (`ivac`) and the
@@ -375,7 +365,7 @@ pub struct VoucherTables {
     by_table: HashMap<[u32; KEY_NUM], VoucherId>,
     next: VoucherId,
     bank: HashMap<u64, BankElem>,
-    imp: HashMap<u64, ImpTask>,
+    pub(crate) imp: super::importance::ImpState,
     next_handle: u64,
 }
 
@@ -385,11 +375,10 @@ impl Vouchers {
         Vouchers { bank_ids: Some((uid, gid)), ..Vouchers::default() }
     }
 
-    /// An exec's new task's: the old task's importance element, which
-    /// now stands for it.
+    /// An exec's new task's: its bank context is yet to be made.
     pub fn for_exec(&self) -> Vouchers {
         assert!(self.bank_context.is_none());
-        Vouchers { imp_base: self.imp_base, ..Vouchers::default() }
+        Vouchers::default()
     }
 }
 
@@ -966,20 +955,13 @@ impl Kernel {
         self.convert_voucher_to_port(nv)
     }
 
-    /// `ipc_importance_receive` with MACH_RCV_VOUCHER: the received
-    /// voucher is remade with the importance the message carried (none:
-    /// importance is never donated here, `ipc_importance_send` finding no
-    /// donor), under the importance manager's control.
-    pub(crate) fn ipc_importance_receive_voucher(&mut self, voucher_port: Option<ObjId>) -> Option<ObjId> {
-        let port = voucher_port?;
-        let Some(super::ipc::Kobject::Voucher(sent)) = self.ipc().port(port).kobject else { unreachable!("a voucher port") };
-        let recipes = vec![
-            Recipe { key: key::ALL, command: cmd::COPY, previous: Some(sent), content: Vec::new() },
-            Recipe { key: key::IMPORTANCE, command: cmd::SET_VALUE_HANDLE, previous: None, content: 0u64.to_le_bytes().to_vec() },
-        ];
-        let nv = self.ipc_create_mach_voucher(Some(key::IMPORTANCE), &recipes).expect("the importance voucher").expect("a voucher");
-        self.ipc().release_send(port);
-        Some(self.convert_voucher_to_port(nv))
+    /// The importance value of the voucher a port names
+    /// (`mach_voucher_attr_control_get_values`), if it has one.
+    pub(crate) fn voucher_port_importance(&mut self, port: ObjId) -> Option<u64> {
+        let Some(super::ipc::Kobject::Voucher(v)) = self.ipc().port(port).kobject else { return None };
+        let ki = key_to_index(key::IMPORTANCE);
+        let vi = self.iv_lookup(v, ki);
+        self.ivac(ki).values(vi).first().copied()
     }
 
     /// `thread_set_voucher_name`: the calling thread adopts the voucher a
@@ -1557,51 +1539,8 @@ impl Kernel {
 
     // -- importance --------------------------------------------------------------------
 
-    /// `ipc_importance_for_task(current_task(), made)`: the task's
-    /// element, made the first time with a reference for the task and one
-    /// for the caller (or a made reference).
-    fn ipc_importance_for_task(&mut self, made: bool) -> u64 {
-        if let Some(h) = self.dtask.vouchers.imp_base {
-            let t = self.vt().imp.get_mut(&h).expect("the task's importance");
-            if made {
-                if t.made == 0 {
-                    t.refs += 1;
-                }
-                t.made += 1;
-            } else {
-                t.refs += 1;
-            }
-            return h;
-        }
-        let pid = self.pid;
-        let vt = self.vt();
-        let h = vt.alloc_handle();
-        vt.imp.insert(h, ImpTask { refs: 2, made: u32::from(made), pid: Some(pid) });
-        self.dtask.vouchers.imp_base = Some(h);
-        h
-    }
-
-    /// `ipc_importance_release_locked` of a task element: the last
-    /// reference, once its task is disconnected, frees it.
-    fn ipc_importance_task_release(&mut self, h: u64) {
-        let t = self.vt().imp.get_mut(&h).expect("an importance element");
-        t.refs -= 1;
-        if t.refs == 0 {
-            assert!(t.pid.is_none());
-            self.vt().imp.remove(&h);
-        }
-    }
-
-    /// `ipc_importance_disconnect_task`: the task leaves its element,
-    /// which vouchers may keep.
-    pub(crate) fn darwin_importance_disconnect_task(&mut self) {
-        if let Some(h) = self.dtask.vouchers.imp_base.take() {
-            self.vt().imp.get_mut(&h).expect("the task's importance").pid = None;
-            self.ipc_importance_task_release(h);
-        }
-    }
-
-    /// `ipc_importance_get_value`.
+    /// `ipc_importance_get_value`: a redeem is a made reference on the
+    /// value; IMPORTANCE_SELF the current task's element.
     fn ipc_importance_get_value(&mut self, command: u32, prev: &[u64], content: &[u8]) -> Result<(u64, u32), u32> {
         if !content.is_empty() {
             return Err(vkr::INVALID_ARGUMENT);
@@ -1609,32 +1548,25 @@ impl Kernel {
         match command {
             cmd::REDEEM => match prev.first() {
                 Some(&h) => {
-                    let t = self.vt().imp.get_mut(&h).expect("an importance element");
-                    assert!(t.made > 0);
-                    t.made += 1;
+                    self.ipc().imp_redeem(h);
                     Ok((h, 0))
                 }
                 None => Ok((0, 0)),
             },
-            cmd::IMPORTANCE_SELF => Ok((self.ipc_importance_for_task(true), 0)),
+            cmd::IMPORTANCE_SELF => {
+                let me = self.ipc().task;
+                Ok((self.ipc().imp_for_task(me, true).unwrap_or(0), 0))
+            }
             _ => Err(vkr::INVALID_ARGUMENT),
         }
     }
 
     /// `ipc_importance_release_value`.
     fn ipc_importance_release_value(&mut self, value: u64, sync: u32) -> u32 {
-        assert!(sync > 0);
-        let t = self.vt().imp.get_mut(&value).expect("an importance element");
-        if sync != t.made {
-            assert!(sync < t.made);
-            return vkr::FAILURE;
-        }
-        t.made = 0;
-        self.ipc_importance_task_release(value);
-        vkr::SUCCESS
+        self.ipc().imp_release_value(value, sync)
     }
 
-    /// `ipc_importance_extract_content`: "Importance for pid N" (a
+    /// `ipc_importance_extract_content`: the first value's description (a
     /// release kernel's), truncated to the room given as scnprintf does,
     /// with its NUL.
     fn ipc_importance_extract_content(&mut self, vals: &[u64], size: u32) -> Result<(u32, Vec<u8>), u32> {
@@ -1646,9 +1578,7 @@ impl Kernel {
             if h == 0 {
                 continue;
             }
-            // task_importance_task_get_pid: task_pid of no task is -1.
-            let pid = self.vt().imp.get(&h).expect("an importance element").pid.unwrap_or(-1);
-            let s = format!("Importance for pid {pid}");
+            let s = self.ipc().imp_content(h);
             let room = (size as usize).saturating_sub(1);
             out.extend_from_slice(&s.as_bytes()[..s.len().min(room)]);
             out.push(0);
@@ -1657,17 +1587,47 @@ impl Kernel {
         Ok((cmd::NOOP, out))
     }
 
-    /// `ipc_importance_command`: only an inherited element takes
-    /// DROP_EXTERNAL, and none is made here.
+    /// `ipc_importance_command`: DROP_EXTERNAL on an inherit, given a
+    /// count of 4 bytes and room for one or none.
     fn ipc_importance_command(&mut self, vals: &[u64], command: u32, input: &[u8], out_size: u32) -> Result<Vec<u8>, u32> {
         if input.len() != 4 || (out_size != 0 && out_size != 4) {
             return Err(vkr::INVALID_ARGUMENT);
         }
+        let refs = u32::from_le_bytes(input.try_into().unwrap());
         if command != IMPORTANCE_ATTR_DROP_EXTERNAL {
             return Err(vkr::NOT_SUPPORTED);
         }
-        let _ = vals;
-        Err(vkr::INVALID_ARGUMENT)
+        let n = self.ipc().imp_drop_external(vals, refs)?;
+        Ok(if out_size != 0 { n.to_le_bytes().to_vec() } else { Vec::new() })
+    }
+
+    /// `ipc_importance_receive`: with MACH_RCV_VOUCHER, the importance the
+    /// message carried goes into the voucher received (made for it when
+    /// none was sent), as the receiver's inherit of it; without, it is
+    /// taken as a legacy boost.
+    pub(crate) fn ipc_importance_receive(&mut self, kmsg: &mut super::ipc::msg::Kmsg, options: u64) {
+        if options & super::ipc::msg::opt::RCV_VOUCHER == 0 {
+            self.ipc().importance_receive_legacy(kmsg);
+            return;
+        }
+        let inherit = self.ipc().importance_inherit_from_kmsg(kmsg);
+        let sent = kmsg.voucher;
+        if sent.is_none() && inherit.is_none() {
+            return;
+        }
+        let mut recipes = Vec::new();
+        if let Some(port) = sent {
+            let Some(super::ipc::Kobject::Voucher(v)) = self.ipc().port(port).kobject else { unreachable!("a voucher port") };
+            recipes.push(Recipe { key: key::ALL, command: cmd::COPY, previous: Some(v), content: Vec::new() });
+        }
+        // The inherit's made reference goes to the voucher.
+        recipes.push(Recipe { key: key::IMPORTANCE, command: cmd::SET_VALUE_HANDLE, previous: None, content: inherit.unwrap_or(0).to_le_bytes().to_vec() });
+        let nv = self.ipc_create_mach_voucher(Some(key::IMPORTANCE), &recipes).expect("the importance voucher").expect("a voucher");
+        kmsg.bits |= super::ipc::right::msgt::MOVE_SEND << 16;
+        if let Some(port) = sent {
+            self.ipc().release_send(port);
+        }
+        kmsg.voucher = Some(self.convert_voucher_to_port(nv));
     }
 }
 

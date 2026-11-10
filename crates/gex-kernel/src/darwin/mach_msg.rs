@@ -501,7 +501,7 @@ impl Kernel {
             self.clean_header(dest, out_bits, reply, voucher);
             return Err(0x1000_0016);
         }
-        let mut kmsg = Kmsg { bits: out_bits, size: u.msg_size, dest, reply, voucher, voucher_raw: u.voucher, id: u.id, body, descs: Vec::new(), sender: self.darwin_sender(), aux, keep_alive: false, ppriority: 0, qos_override: 0 };
+        let mut kmsg = Kmsg { bits: out_bits, size: u.msg_size, dest, reply, voucher, voucher_raw: u.voucher, id: u.id, body, descs: Vec::new(), sender: self.darwin_sender(), aux, keep_alive: false, ppriority: 0, qos_override: 0, imp: None };
         self.kmsg_set_qos(&mut kmsg, options, u.priority);
         if u.bits & bits::COMPLEX != 0 {
             // A message to a dead port or to a kernel object may carry
@@ -698,7 +698,11 @@ impl Kernel {
                 if e.request != 0 && ipc.port(dport).active && ipc.port(dport).receiver != Receiver::Kernel {
                     if ipc.port(dport).msgcount >= ipc.port(dport).qlimit {
                         let qos_ovr = if u.priority & 0xff == 0xff { super::thread::pp::qos(u64::from(u.priority)) } else { msg_priority_override_qos(u.priority) };
-                        ipc.request_sparm(dport, e.request, options, qos_ovr);
+                        if ipc.request_sparm(dport, e.request, options, qos_ovr) {
+                            // The first boosting send-possible request
+                            // this cycle pushes its boost down the port.
+                            ipc.port_importance_delta(dport, true, 1);
+                        }
                     } else {
                         // The port has room: the request armed now cannot
                         // be missed, so the send ignores the limit.
@@ -925,7 +929,27 @@ impl Kernel {
             }
             return self.kobject_send(port, kmsg, options, timeout_zero);
         }
-        self.mqueue_send(kmsg, options, timeout_zero)
+        let me = self.ipc().task;
+        self.darwin_importance_send(&mut kmsg, options, me);
+        self.mqueue_send_importance(kmsg, options, timeout_zero)
+    }
+
+    /// `ipc_importance_send` for a message about to be queued, as task
+    /// `sender` sends it, with the importance its voucher holds.
+    fn darwin_importance_send(&mut self, kmsg: &mut Kmsg, options: u64, sender: super::ipc::TaskKey) {
+        let vimp = kmsg.voucher.and_then(|vp| self.voucher_port_importance(vp));
+        self.ipc().importance_send(kmsg, options, sender, vimp);
+    }
+
+    /// `ipc_mqueue_send_locked`, and the importance a failure gives back.
+    fn mqueue_send_importance(&mut self, kmsg: Box<Kmsg>, options: u64, timeout_zero: bool) -> Result<(), SendWait> {
+        match self.mqueue_send(kmsg, options, timeout_zero) {
+            Err(SendWait::Failed(r, Some(mut k))) => {
+                self.ipc().importance_send_failed(&mut k, r);
+                Err(SendWait::Failed(r, Some(k)))
+            }
+            other => other,
+        }
     }
 
     /// `ipc_kobject_server` for a request to this task's (or the kernel's)
@@ -938,7 +962,7 @@ impl Kernel {
         {
             let ipc = &mut self.ipc();
             ipc.port_mut(port).seqno = ipc.port(port).seqno.wrapping_add(1);
-            let Some(reply) = self.kobject_server(port, kmsg) else { return Ok(()) };
+            let Some(mut reply) = self.kobject_server(port, kmsg) else { return Ok(()) };
             let rport = reply.dest;
             let ipc = &mut self.ipc();
             if !ipc.port(rport).active {
@@ -946,8 +970,12 @@ impl Kernel {
                 ipc.kmsg_destroy(reply, true);
                 return Ok(());
             }
+            // The reply goes as the request's sender sends with the same
+            // options (ipc_importance_send).
+            let sender = if self.dtask.kcaller != 0 { self.dtask.kcaller } else { self.ipc().task };
+            self.darwin_importance_send(&mut reply, options, sender);
             // A kernel reply that cannot be queued is destroyed.
-            match self.mqueue_send(reply, options | opt::SEND_ALWAYS, timeout_zero) {
+            match self.mqueue_send_importance(reply, options | opt::SEND_ALWAYS, timeout_zero) {
                 Err(SendWait::Failed(_, Some(k))) => {
                     let ipc = &mut self.ipc();
                     ipc.release(k.dest);
@@ -1024,6 +1052,8 @@ impl Kernel {
                     (WaitResult::TimedOut | WaitResult::Interrupted, _) => {
                         self.ipc().mqueue_cancel_room(port, me);
                         let r = if res == WaitResult::TimedOut { mr::SEND_TIMED_OUT } else { mr::SEND_INTERRUPTED };
+                        let mut kmsg = kmsg;
+                        self.ipc().importance_send_failed(&mut kmsg, r);
                         let (addr, size) = self.dtask.pending_send_buf.remove(&tid).expect("a waiting send keeps its buffer");
                         r | self.pseudo_receive(m, kmsg, addr, size)
                     }
@@ -1094,7 +1124,9 @@ impl Kernel {
                 }
                 return (r, msgr);
             }
-            let kmsg = rcv.kmsg.expect("a too-large message taken off the queue");
+            let mut kmsg = rcv.kmsg.expect("a too-large message taken off the queue");
+            // The importance it carried is discarded.
+            self.ipc().importance_clean(&mut kmsg);
             let r = self.receive_error(m, kmsg, rcv.seqno, bufs, options, r, &mut msgr);
             return (r, msgr);
         }
@@ -1102,23 +1134,37 @@ impl Kernel {
             return (r, msgr);
         }
         let mut kmsg = rcv.kmsg.expect("a received message");
+        // ipc_importance_receive, then ipc_voucher_receive_postprocessing.
+        self.ipc_importance_receive(&mut kmsg, options);
         if options & opt::RCV_VOUCHER != 0 {
-            // ipc_importance_receive, then ipc_voucher_receive_postprocessing.
             if let Some(vp) = kmsg.voucher {
-                let vp = self.ipc_importance_receive_voucher(Some(vp)).expect("a voucher");
-                kmsg.bits |= msgt::MOVE_SEND << 16;
                 kmsg.voucher = Some(self.ipc_voucher_receive_postprocessing(vp));
             }
         }
         let context = self.ipc().port(kmsg.dest).context;
         let (priority, qos_ovrd) = (kmsg.ppriority, kmsg.qos_override);
+        let (raised, voucher) = (kmsg.bits & bits::RAISEIMP != 0, kmsg.voucher.is_some());
         let r = match self.kmsg_copyout(m, *kmsg, options) {
             Ok(out) => {
                 msgr.priority = priority;
                 msgr.qos_ovrd = qos_ovrd;
                 self.put_to_user(m, out, rcv.seqno, context, bufs, options, mr::SUCCESS, &mut msgr)
             }
-            Err((out, e)) => self.put_to_user(m, out, rcv.seqno, context, bufs, options, e, &mut msgr),
+            Err((mut out, e)) => {
+                // ipc_importance_unreceive: the legacy boost taken is given
+                // back.
+                if raised {
+                    out.bits &= !bits::RAISEIMP;
+                    if !voucher {
+                        let ipc = self.ipc();
+                        let me = ipc.task;
+                        if let Some(t) = ipc.imp_base(me) {
+                            ipc.imp_drop_legacy_external(t, 1);
+                        }
+                    }
+                }
+                self.put_to_user(m, out, rcv.seqno, context, bufs, options, e, &mut msgr)
+            }
         };
         (r, msgr)
     }
@@ -1619,7 +1665,7 @@ impl Kernel {
                 circular = ipc.check_circularity(p, to);
             }
         }
-        let k = Kmsg { bits: bits::set(msgt::PORT_SEND_ONCE, 0, 0, complex) | if circular { bits::CIRCULAR } else { 0 }, size: HEADER + body.len() as u32, dest: to, reply: None, voucher: None, voucher_raw: 0, id: msgid, body, descs, sender: Sender::KERNEL, aux: Vec::new(), keep_alive: false, ppriority: 0, qos_override: 0 };
+        let k = Kmsg { bits: bits::set(msgt::PORT_SEND_ONCE, 0, 0, complex) | if circular { bits::CIRCULAR } else { 0 }, size: HEADER + body.len() as u32, dest: to, reply: None, voucher: None, voucher_raw: 0, id: msgid, body, descs, sender: Sender::KERNEL, aux: Vec::new(), keep_alive: false, ppriority: 0, qos_override: 0, imp: None };
         self.darwin_kernel_send(Box::new(k));
     }
 

@@ -103,6 +103,7 @@ pub mod opt {
     pub const SEND_FILTER_NONFATAL: u64 = 0x1_0000;
     pub const SEND_TRAILER: u64 = 0x2_0000;
     pub const SEND_NOIMPORTANCE: u64 = 0x4_0000;
+    pub const SEND_IMPORTANCE: u64 = 0x8_0000;
     pub const SEND_SYNC_OVERRIDE: u64 = 0x10_0000;
     pub const SEND_PROPAGATE_QOS: u64 = 0x20_0000;
     pub const SEND_SYNC_BOOTSTRAP_CHECKIN: u64 = 0x80_0000;
@@ -192,6 +193,9 @@ pub struct Kmsg {
     /// are its port's kernel override, none here.
     pub ppriority: u32,
     pub qos_override: u8,
+    /// The message's importance record, while it has a link to an
+    /// importance element or carries a boost ([`super::super::importance`]).
+    pub imp: Option<u64>,
 }
 
 /// What a receive came to, for the receiving thread
@@ -594,7 +598,10 @@ impl Ipc {
     }
 
     /// `ipc_kmsg_destroy`: every right a message holds, destroyed.
-    pub fn kmsg_destroy(&mut self, kmsg: Box<Kmsg>, skip_remote: bool) {
+    pub fn kmsg_destroy(&mut self, mut kmsg: Box<Kmsg>, skip_remote: bool) {
+        // ipc_kmsg_clean_header: the importance chain first, while the
+        // destination is referenced.
+        self.importance_clean(&mut kmsg);
         if !skip_remote {
             self.object_destroy(Carried::Port(kmsg.dest), bits::remote(kmsg.bits));
         }

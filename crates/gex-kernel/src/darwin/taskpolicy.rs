@@ -127,13 +127,46 @@ pub struct Effective {
     pub adaptive_bg: bool,
 }
 
-/// The importance subsystem's marks on a task (`task_importance_mark_*`).
+/// The importance subsystem's marks on a task (`task_importance_mark_*`,
+/// `iit_donor`, `iit_live_donor`, `iit_receiver`, `iit_denap`), and its
+/// count of transitions (`iit_transitions`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Importance {
     pub donor: bool,
     pub live_donor: bool,
     pub receiver: bool,
     pub denap_receiver: bool,
+    pub transitions: u64,
+    /// The donor mark the task's queued messages and inherits last had
+    /// propagated through them: a live donor whose effective policy
+    /// changed its mark (`ipc_importance_task_update_live_donor`) has its
+    /// importance propagated when the change is settled.
+    pub donor_propagated: bool,
+}
+
+impl Importance {
+    /// `ipc_importance_task_mark_donor`.
+    pub fn mark_donor(&mut self, donating: bool) {
+        if donating && !self.donor {
+            self.transitions += 1;
+        }
+        self.donor = donating;
+        self.donor_propagated = donating;
+    }
+
+    /// `ipc_importance_task_mark_receiver`, `..._mark_denap_receiver`,
+    /// `..._mark_live_donor`.
+    pub fn mark_receiver(&mut self, receiving: bool) {
+        self.receiver = receiving;
+    }
+
+    pub fn mark_denap_receiver(&mut self, denap: bool) {
+        self.denap_receiver = denap;
+    }
+
+    pub fn mark_live_donor(&mut self, live: bool) {
+        self.live_donor = live;
+    }
 }
 
 /// A task's policy, and its priority range (`task->priority`,
@@ -174,6 +207,21 @@ impl TaskPolicy {
     /// copy's, `exec`, keeps an adaptive daemon adaptive).
     pub fn create(parent: &TaskPolicy, exec: bool) -> TaskPolicy {
         let mut t = TaskPolicy::default();
+        // task_importance_init_from_parent, before: the parent's donor,
+        // live donor and de-nap marks, and its receiver mark for an exec
+        // copy only.
+        if parent.imp.donor {
+            t.imp.mark_donor(true);
+        }
+        if parent.imp.live_donor {
+            t.imp.mark_live_donor(true);
+        }
+        if exec && parent.imp.receiver {
+            t.imp.mark_receiver(true);
+        }
+        if parent.imp.denap_receiver {
+            t.imp.mark_denap_receiver(true);
+        }
         let p = parent.requested;
         let r = &mut t.requested;
         r.apptype = p.apptype;
@@ -189,10 +237,10 @@ impl TaskPolicy {
         if r.apptype == apptype::DAEMON_ADAPTIVE && !exec {
             if p.boosted {
                 r.apptype = apptype::DAEMON_INTERACTIVE;
-                t.imp.donor = true;
+                t.imp.mark_donor(true);
             } else {
                 r.apptype = apptype::DAEMON_BACKGROUND;
-                t.imp.receiver = false;
+                t.imp.mark_receiver(false);
             }
         }
         t.update(true);
@@ -200,12 +248,28 @@ impl TaskPolicy {
         t
     }
 
-    /// `task_importance_update_live_donor`: a live donor donates as its
-    /// effective policy says.
+    /// `ipc_importance_task_update_live_donor`: a live donor donates as its
+    /// effective policy says; what it donates through follows when the
+    /// change is settled (`donor_propagated`).
     fn update_live_donor(&mut self) {
-        if self.imp.live_donor {
-            self.imp.donor = self.effective.live_donor;
+        if !self.imp.live_donor {
+            return;
         }
+        let before = self.imp.donor;
+        self.imp.donor = self.effective.live_donor;
+        if !before && self.imp.donor {
+            self.imp.transitions += 1;
+        }
+        if self.imp.donor != self.imp.donor_propagated {
+            super::importance::LIVE_DONOR_CHANGED.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// `task_update_boost_locked`: the task boosted or not, its policy
+    /// updated.
+    pub fn set_boosted(&mut self, boost: bool) {
+        self.requested.boosted = boost;
+        self.update(false);
     }
 
     /// `proc_set_task_spawnpolicy` without port watching: the app type's
@@ -213,33 +277,33 @@ impl TaskPolicy {
     /// none is foreground) and the QoS clamp.
     pub fn spawnpolicy(&mut self, apptype: u8, qos_clamp: u8, role: u8) {
         if apptype != apptype::NONE {
-            self.imp.receiver = false;
-            self.imp.denap_receiver = false;
+            self.imp.mark_receiver(false);
+            self.imp.mark_denap_receiver(false);
         }
         let imp = &mut self.imp;
         match apptype {
             apptype::APP_DEFAULT => {
-                imp.donor = false;
-                imp.live_donor = true;
+                imp.mark_donor(false);
+                imp.mark_live_donor(true);
             }
             // ipc_importance_interactive_receiver: false unless a boot-arg.
             apptype::DAEMON_INTERACTIVE => {
-                imp.donor = true;
-                imp.live_donor = false;
-                imp.receiver = false;
+                imp.mark_donor(true);
+                imp.mark_live_donor(false);
+                imp.mark_receiver(false);
             }
             apptype::DAEMON_STANDARD => {
-                imp.donor = true;
-                imp.live_donor = false;
+                imp.mark_donor(true);
+                imp.mark_live_donor(false);
             }
             apptype::DAEMON_ADAPTIVE => {
-                imp.donor = false;
-                imp.live_donor = false;
-                imp.receiver = true;
+                imp.mark_donor(false);
+                imp.mark_live_donor(false);
+                imp.mark_receiver(true);
             }
             apptype::DAEMON_BACKGROUND | apptype::DRIVER => {
-                imp.donor = false;
-                imp.live_donor = false;
+                imp.mark_donor(false);
+                imp.mark_live_donor(false);
             }
             _ => {}
         }
@@ -456,9 +520,15 @@ impl TaskPolicy {
             next.role = role::UNSPECIFIED;
             next.suppressed_cpu = false;
         }
+        // task_policy_update_complete_unlocked: a change of the live
+        // donor bit updates the task's donor mark.
+        let live_donor_changed = self.effective.live_donor != next.live_donor;
         self.effective = next;
         if in_create {
             return;
+        }
+        if live_donor_changed {
+            self.update_live_donor();
         }
 
         // The task's priority range, from the policy just swapped in.

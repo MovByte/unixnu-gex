@@ -85,6 +85,7 @@ pub mod timer;
 pub mod triage;
 pub mod trustcache;
 pub mod vm;
+pub mod importance;
 pub mod voucher;
 pub mod wait;
 pub mod workinterval;
@@ -325,6 +326,7 @@ impl crate::syscalls::Kernel {
             // Other tasks reach this one through its link: its mailbox, and
             // the bell of its thread calls, which empty it.
             let bell = self.dtask.timers.bell();
+            let policy = self.dtask.policy.clone().or_else(|| self.procs.task_policy(self.pid));
             let ipc = &mut self.dtask.ipc_raw;
             if !ipc.link.as_ref().is_some_and(|l| std::sync::Arc::ptr_eq(&l.bell, &bell)) {
                 // What other tasks left for the link it replaces (an exec's
@@ -334,7 +336,7 @@ impl crate::syscalls::Kernel {
                 let pending = old.as_ref().map(|l| std::mem::take(&mut *l.mailbox.lock().unwrap_or_else(|e| e.into_inner()))).unwrap_or_default();
                 let name_port = old.and_then(|l| l.name_port.lock().unwrap_or_else(|e| e.into_inner()).take());
                 let ring = !pending.is_empty();
-                let link = std::sync::Arc::new(ipc::TaskLink { mailbox: std::sync::Mutex::new(pending), bell, pid: self.pid, name_port: std::sync::Mutex::new(name_port), codesign: self.dtask.codesign.clone(), csflags: std::sync::Arc::clone(&self.dtask.csflags), pidversion: self.dtask.pidversion, textoff: self.dtask.textoff, uniqueid: self.dtask.uniqueid });
+                let link = std::sync::Arc::new(ipc::TaskLink { mailbox: std::sync::Mutex::new(pending), bell, pid: self.pid, name_port: std::sync::Mutex::new(name_port), codesign: self.dtask.codesign.clone(), csflags: std::sync::Arc::clone(&self.dtask.csflags), pidversion: self.dtask.pidversion, textoff: self.dtask.textoff, uniqueid: self.dtask.uniqueid, policy });
                 ipc.links.insert(ipc.task, std::sync::Arc::clone(&link));
                 if ring {
                     link.bell.ring();
@@ -348,6 +350,11 @@ impl crate::syscalls::Kernel {
     /// The kernel call is done with IPC: the system's table goes back for
     /// the other tasks.
     pub fn darwin_ipc_leave(&mut self) {
+        // A live donor whose donor mark changed in this call has its
+        // importance propagated (`task_policy_update_complete_unlocked`).
+        if importance::LIVE_DONOR_CHANGED.load(std::sync::atomic::Ordering::Relaxed) {
+            self.ipc().importance_settle();
+        }
         self.dtask.ipc_raw.check_in();
     }
 

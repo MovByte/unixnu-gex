@@ -234,7 +234,10 @@ impl Ipc {
                 if let Some(gf) = guard {
                     *gf |= guard_flags::UNGUARDED_ON_SEND;
                 }
-                self.port_mut(port).tempowner = true;
+                // In limbo it is a temporary owner, and the boosts it gave
+                // the current task go (ipc_object_copyin).
+                let assertcnt = self.imp_receive_copied_in(port);
+                self.imp_drop_current(assertcnt);
                 Ok((Carried::Port(port), request))
             }
             msgt::COPY_SEND | msgt::MOVE_SEND | msgt::MOVE_SEND_ONCE => {
@@ -430,6 +433,7 @@ impl Ipc {
                 p.receiver = Receiver::Space(name);
                 p.owner = task;
                 if let Some(d) = dest {
+                    self.imp_receive_copied_out(port, d);
                     self.release(d);
                 }
                 let p = self.port_mut(port);
@@ -540,7 +544,9 @@ impl Ipc {
         }
         self.space.lookup_mut_any(name).object = Some(port);
         if t == msgt::PORT_RECEIVE {
-            self.port_mut(port).tempowner = false;
+            // Not enqueued on a port bound here: this space's task takes
+            // the port's assertions.
+            self.imp_receive_slammed(port);
         }
         self.right_copyout(name, t, port, None);
         Ok(())

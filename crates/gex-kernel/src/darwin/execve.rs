@@ -486,10 +486,14 @@ impl Kernel {
             super::exception::release_all(self.ipc(), &a);
         }
         // The old task's threads' vouchers and its bank context go with it;
-        // its importance goes on with the new task
-        // (ipc_importance_exec_switch_task).
+        // its importance goes on with the new task once its legacy
+        // assertions are reset (ipc_importance_exec_switch_task). The
+        // linkage that switch makes between the two tasks is for watch
+        // ports, which spawn refuses, and is gone when the exec ends.
         self.darwin_threads_vouchers_release();
         self.darwin_bank_task_destroy();
+        let me = self.ipc().task;
+        self.ipc().imp_task_reset(me);
         let old = std::mem::take(&mut self.dtask);
         let (realtimer, vtimers) = (old.realtimer, old.vtimers);
         // task_copy_fields_for_exec.

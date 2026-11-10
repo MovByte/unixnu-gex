@@ -332,6 +332,11 @@ pub struct Port {
     pub reply_semantics: ReplySemantics,
     pub tempowner: bool,
     pub impdonation: bool,
+    /// `ip_impcount`: the importance assertions the port carries (its
+    /// messages' boosts and its ports' in transit to it), and
+    /// `ip_spimportant`: a boosting send-possible request is armed.
+    pub impcount: u32,
+    pub spimportant: bool,
     /// `ip_destination`: the port whose queue holds the message this
     /// receive right is in transit in (none in limbo); it holds a
     /// reference on that port.
@@ -403,6 +408,8 @@ impl Port {
             reply_semantics: ReplySemantics::None,
             tempowner: false,
             impdonation: false,
+            impcount: 0,
+            spimportant: false,
             destination: None,
             no_grant: false,
             service_port: false,
@@ -557,6 +564,12 @@ pub struct Ipc {
     /// The system's vouchers and their attribute managers' elements,
     /// while this task holds the table.
     pub vouchers: super::voucher::VoucherTables,
+    /// `ith_assertions`: the importance assertions of the outermost port
+    /// destruction under way.
+    pub ith_assertions: u32,
+    /// The task making the call (`current_task()`) while another's space
+    /// stands in for this one's ([`Ipc::with_space`]).
+    pub caller: Option<TaskKey>,
 }
 
 impl Drop for Ipc {
@@ -630,6 +643,8 @@ pub struct TaskLink {
     pub textoff: i64,
     /// Its process's `p_uniqueid`.
     pub uniqueid: u64,
+    /// Its task policy, with its importance marks.
+    pub policy: Option<super::importance::Policy>,
 }
 
 /// What every task shares: the ports and sets (XNU's are kernel objects,
@@ -806,7 +821,9 @@ impl Ipc {
         let space = self.others.remove(&task)?;
         let own = std::mem::replace(&mut self.space, space);
         let me = std::mem::replace(&mut self.task, task);
+        let caller = self.caller.replace(me);
         let r = f(self);
+        self.caller = caller;
         self.task = me;
         let space = std::mem::replace(&mut self.space, own);
         self.others.insert(task, space);
@@ -1060,7 +1077,10 @@ impl Ipc {
     /// (a sender found the port full).
     /// With `MACH_SEND_OVERRIDE`, the message at the queue's head takes
     /// the sender's QoS (`ipc_mqueue_override_send_locked`).
-    pub fn request_sparm(&mut self, port: ObjId, index: u32, options: u64, qos_ovr: u8) {
+    /// Whether the request, armed, is to boost the port: one that takes
+    /// donations, not yet boosted by such a request, for a send with
+    /// MACH_SEND_IMPORTANCE or from a donor.
+    pub fn request_sparm(&mut self, port: ObjId, index: u32, options: u64, qos_ovr: u8) -> bool {
         let p = self.port_mut(port);
         let r = &mut p.requests.as_mut().expect("a request table")[index as usize];
         if r.spreq {
@@ -1069,12 +1089,25 @@ impl Ipc {
             if options & msg::opt::SEND_OVERRIDE != 0 && qos_ovr != 0 {
                 self.mqueue_override_send(port, qos_ovr);
             }
+            let p = self.port(port);
+            if options & msg::opt::SEND_NOIMPORTANCE == 0 && p.impdonation && !p.spimportant && (options & msg::opt::SEND_IMPORTANCE != 0 || self.imp_current_is_donor()) {
+                return true;
+            }
         }
+        false
     }
 
     /// `ipc_port_spnotify`: the port has room; every armed send-possible
     /// request fires.
     pub fn spnotify(&mut self, port: ObjId) {
+        if !self.port(port).sprequests {
+            return;
+        }
+        // The boost a send-possible request pushed goes.
+        if self.port(port).spimportant {
+            self.port_mut(port).spimportant = false;
+            self.port_importance_delta(port, false, -1);
+        }
         if !self.port(port).sprequests {
             return;
         }
@@ -1148,7 +1181,6 @@ impl Ipc {
         p.reply_context = 0;
         let pdrequest = if !p.specialreply { p.pdrequest.take() } else { None };
         if pdrequest.is_some() {
-            p.tempowner = true;
             // The notification carries a service port home to launchd.
             if p.service_port {
                 if let Some(l) = p.splabel.as_mut().filter(|l| l.flags & ispl::SPECIAL_PDREQUEST != 0) {
@@ -1162,9 +1194,11 @@ impl Ipc {
             p.connection_port = false;
         }
         let should_destroy = pdrequest.is_none();
+        let (assertcnt, top) = self.imp_port_destroy_begin(port, pdrequest.is_some());
         self.clear_receiver_pub(port, should_destroy);
         if let Some(to) = pdrequest {
             self.outbox.push(Notify::PortDestroyed { to, port });
+            self.imp_port_destroy_end(assertcnt, top);
             return;
         }
         if let Some(n) = self.no_senders_prepare_pub(port) {
@@ -1189,6 +1223,7 @@ impl Ipc {
             self.outbox.push(Notify::KobjectDestroyed { port });
         }
         self.release(port);
+        self.imp_port_destroy_end(assertcnt, top);
     }
 
     /// `ipc_port_clear_receiver`: out of its sets and its receiver's
@@ -1253,6 +1288,7 @@ impl Ipc {
         let p = self.port_mut(port);
         assert!(p.active && p.receiver == Receiver::Transit && p.destination.is_none(), "a port in limbo");
         p.destination = Some(dest);
+        self.imp_port_enqueued(port, dest);
         false
     }
 
@@ -1779,6 +1815,11 @@ impl Ipc {
                 }
                 let index = self.port_request_alloc(port, name, n, spreq, sparm);
                 self.space.lookup_mut(name).expect("in use").request = index;
+                // An armed request from a donor boosts the full port.
+                let p = self.port(port);
+                if spreq && sparm && p.impdonation && !p.spimportant && self.imp_current_is_donor() {
+                    self.port_importance_delta(port, true, 1);
+                }
                 return Ok(previous);
             }
         }

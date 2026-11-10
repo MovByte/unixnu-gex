@@ -471,9 +471,11 @@ impl Ipc {
                 if !name_valid(name) {
                     return Err(kr::INVALID_RIGHT);
                 }
-                let mut v = status(self.port(self.translate_receive(name)?));
-                // mpie_boost_cnt (no importance donation here), reserved[6]
-                v.extend([0u32; 7]);
+                let p = self.port(self.translate_receive(name)?);
+                let mut v = status(p);
+                // mpie_boost_cnt, reserved[6].
+                v.push(p.impcount);
+                v.extend([0u32; 6]);
                 Ok(v)
             }
             attr::SERVICE_THROTTLED => {
@@ -524,7 +526,7 @@ impl Ipc {
                 }
                 self.translate_receive(name).err().unwrap_or(kr::SUCCESS)
             }
-            attr::TEMPOWNER | attr::DENAP_RECEIVER => {
+            attr::TEMPOWNER | attr::IMPORTANCE_RECEIVER | attr::DENAP_RECEIVER => {
                 if !name_valid(name) {
                     return kr::INVALID_RIGHT;
                 }
@@ -532,13 +534,17 @@ impl Ipc {
                     Ok(p) => p,
                     Err(e) => return e,
                 };
+                // Not a port the user tied to a kernel object (a timer, a
+                // host notification target), nor a special reply port.
                 let p = self.port_mut(port);
                 if p.kobject.is_some() || p.specialreply {
                     return kr::INVALID_ARGUMENT;
                 }
-                p.impdonation = true;
                 if flavor == attr::TEMPOWNER {
-                    p.tempowner = true;
+                    // Its boosts leave the task that had them.
+                    self.imp_port_tempowner(port);
+                } else {
+                    p.impdonation = true;
                 }
                 kr::SUCCESS
             }

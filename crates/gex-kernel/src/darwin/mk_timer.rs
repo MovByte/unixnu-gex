@@ -180,6 +180,7 @@ impl Kernel {
                     keep_alive: true,
                     ppriority: 0,
                     qos_override: 0,
+                    imp: None,
                 };
                 // kernel_mach_msg_send_kmsg: a copy of the timer's send
                 // right goes with the message.

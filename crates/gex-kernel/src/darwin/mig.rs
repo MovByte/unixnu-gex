@@ -566,7 +566,7 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
                     Some(Err(e)) => Reply::err(e),
                     None => {
                         let mut r = Reply::err(KERN_FAILURE);
-                        r.unimplemented = Some("task_policy_get's TASK_POLICY_STATE (the importance subsystem's counts and marks)".into());
+                        r.unimplemented = Some("task_policy_get's TASK_POLICY_STATE (the requested and effective policies' bitfield encodings)".into());
                         r
                     }
                 }
@@ -592,6 +592,18 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
                 Ok(n) => Reply::ok(n.to_le_bytes().to_vec()),
                 Err(e) => Reply::err(e as i32),
             },
+            _ => bad(),
+        },
+        // mach_port_set_attributes(task, name, flavor, port_info[
+        // port_infoCnt]): at most 17 words.
+        (Kobject::Task, 3218) => match (arg(req, 0), arg(req, 1), arg(req, 2)) {
+            (Some(name), Some(flavor), Some(cnt)) if (cnt as u32) <= 17 => {
+                let info: Option<Vec<u32>> = (0..cnt as usize).map(|i| arg(req, 3 + i).map(|x| x as u32)).collect();
+                match info {
+                    Some(info) => Reply::err(k.ipc().mach_port_set_attributes(name as u32, flavor, &info) as i32),
+                    None => bad(),
+                }
+            }
             _ => bad(),
         },
         // mach_port_allocate_name(task, right, name): mach_port_allocate_full

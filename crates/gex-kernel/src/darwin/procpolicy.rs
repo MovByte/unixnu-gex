@@ -327,7 +327,7 @@ impl Kernel {
                     return Err(Errno::EINVAL);
                 }
                 if subtype == sub::IOS_DONATEIMP {
-                    self.darwin_policy_with(|p| p.imp.donor = true);
+                    self.darwin_policy_with(|p| p.imp.mark_donor(true));
                     return Ok(0);
                 }
                 self.darwin_legacy_external_assertion(subtype == sub::IOS_HOLDIMP)
@@ -364,7 +364,7 @@ impl Kernel {
                 if act != action::SET {
                     return Err(Errno::EINVAL);
                 }
-                self.darwin_policy_with(|p| p.imp.donor = true);
+                self.darwin_policy_with(|p| p.imp.mark_donor(true));
                 Ok(0)
             }
             _ => Err(Errno::EINVAL),
@@ -372,11 +372,22 @@ impl Kernel {
     }
 
     /// `task_importance_hold_legacy_external_assertion` (`hold`) or
-    /// `..._drop_...` of one assertion on the caller's task.
+    /// `..._drop_...` of one assertion on the caller's task: EOVERFLOW for
+    /// a task with no importance, and a refusal ENOTSUP for a hold (one
+    /// needs a legacy boost held already) and EOVERFLOW for a drop (more
+    /// than were held).
     fn darwin_legacy_external_assertion(&mut self, hold: bool) -> Result<u64, Errno> {
-        let what = if hold { "hold" } else { "drop" };
-        self.darwin_unimplemented(format!("process_policy's {what} of a legacy external importance assertion (ipc_importance_task_{what}_legacy_external_assertion): importance assertions are not modelled"));
-        Err(Errno::EINVAL)
+        let ipc = self.ipc();
+        let me = ipc.task;
+        let Some(t) = ipc.imp_base(me) else { return Err(Errno::EOVERFLOW) };
+        if hold {
+            if ipc.imp_hold_legacy_external(t, 1) != super::importance::kr::SUCCESS {
+                return Err(Errno::EOPNOTSUPP);
+            }
+        } else if ipc.imp_drop_legacy_external(t, 1) != super::importance::kr::SUCCESS {
+            return Err(Errno::EOVERFLOW);
+        }
+        Ok(0)
     }
 }
 
