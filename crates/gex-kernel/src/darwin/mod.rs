@@ -59,6 +59,7 @@ pub mod pipe;
 pub mod priority;
 pub mod procinfo;
 pub mod procpolicy;
+pub mod psem;
 pub mod psynch;
 pub mod reason;
 pub mod rlimit;
@@ -259,6 +260,8 @@ pub struct Task {
     /// `thread_guard_violation`'s pending exception of a guarded descriptor,
     /// its code and subcode, for the call's way out (`fd_guard_ast`).
     pub fd_guard: Option<(u64, u64)>,
+    /// Each thread waiting on a POSIX semaphore, and on which.
+    pub psem_waits: std::collections::HashMap<i32, psem::Waiting>,
     /// The files named to the image in `executable_file` and `dyld_file`
     /// (their file system, number and path), which `fsgetpath` is asked for.
     pub image_files: Vec<(u64, u64, String)>,

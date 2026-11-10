@@ -566,6 +566,10 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn as_posix_shm(self: Arc<Self>) -> Option<Arc<crate::darwin::shm::Pshm>> {
         None
     }
+    /// The POSIX semaphore (`sem_open`) this is a descriptor of.
+    fn as_posix_sem(self: Arc<Self>) -> Option<Arc<crate::darwin::psem::Psem>> {
+        None
+    }
     /// The kqueue (`kqueue()`) this is a descriptor of.
     fn as_kqueue(self: Arc<Self>) -> Option<Arc<crate::darwin::kevent::KqueueHandle>> {
         None

@@ -759,7 +759,7 @@ impl Kernel {
         }
     }
 
-    fn darwin_waker(&mut self) -> Waker {
+    pub(crate) fn darwin_waker(&mut self) -> Waker {
         Waker { pid: self.pid, tid: self.tid, inbox: Arc::clone(&self.dtask.lock_wakes), bell: self.darwin_timer_bell() }
     }
 

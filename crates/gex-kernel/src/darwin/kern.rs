@@ -309,6 +309,9 @@ impl Kernel {
         if let Some(r) = self.darwin_fixed_call(m, raw, a) {
             return Some(res(r));
         }
+        if let Some(r) = self.darwin_psem_call(m, raw, a) {
+            return Some(res(r));
+        }
         if let Some(r) = self.darwin_filesec_call(m, raw, a) {
             return Some(res(r));
         }

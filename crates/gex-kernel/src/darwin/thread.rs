@@ -312,6 +312,8 @@ pub enum Finish {
     Kevent(super::kevent::Cont),
     /// An advisory lock's wait (`lf_setlock`).
     Lockf(super::lockf::Cont),
+    /// A POSIX semaphore wait (`sem_wait`).
+    Psem(super::psem::Cont),
     /// An exception's handler's reply (`exception_deliver`).
     Exception(super::triage::Pending),
     /// `__sigwait`: the signals waited for, where the one taken goes.
@@ -409,6 +411,7 @@ impl Kernel {
             sys::KEVENT => Some(<Kq as KQueue>::kevent_legacy(self, m, a, false)),
             sys::POLL | sys::POLL_NOCANCEL => Some(self.darwin_poll(m, a)),
             sys::OPEN_EXTENDED => Some(self.darwin_open_extended(m, a)),
+            sys::SEM_WAIT | sys::SEM_WAIT_NOCANCEL => Some(self.darwin_sem_wait(m, a)),
             sys::SELECT | sys::SELECT_NOCANCEL => Some(self.darwin_select(m, a, false)),
             sys::PSELECT | sys::PSELECT_NOCANCEL => Some(self.darwin_select(m, a, true)),
             sys::KEVENT64 => Some(<Kq as KQueue>::kevent_legacy(self, m, a, true)),
@@ -818,6 +821,7 @@ impl Kernel {
             Finish::WorkqPark => return <Wq as WorkQueue>::wait_done(self, m, res),
             Finish::Kevent(c) => return <Kq as KQueue>::wait_done(self, m, c, res),
             Finish::Lockf(c) => return self.darwin_lockf_wait_done(m, c, res),
+            Finish::Psem(c) => return self.darwin_psem_wait_done(m, c, res),
             Finish::Exception(p) => return self.darwin_exc_wait_done(m, p, res),
             Finish::Psynch(c) => self.darwin_psynch_wait_done(m, c, res),
             Finish::Sigwait { siglist, sig } => return self.darwin_sigwait_done(m, siglist, sig, res),
