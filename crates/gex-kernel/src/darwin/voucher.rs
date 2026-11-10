@@ -1008,6 +1008,17 @@ impl Kernel {
         vkr::SUCCESS
     }
 
+    /// `thread_set_voucher_name(MACH_PORT_NULL)` as thread `tid` runs
+    /// it: the thread adopts no voucher.
+    pub(crate) fn darwin_thread_clear_voucher(&mut self, tid: i32) {
+        let Some(t) = self.dtask.threads.map.get_mut(&tid) else { return };
+        let old = t.voucher.take();
+        t.voucher_name = 0;
+        if let Some(o) = old {
+            self.ipc_voucher_release(o);
+        }
+    }
+
     /// The task's threads let go of the vouchers they adopted, as they end
     /// with it (`thread_deallocate_complete`).
     pub(crate) fn darwin_threads_vouchers_release(&mut self) {

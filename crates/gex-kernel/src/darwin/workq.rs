@@ -880,8 +880,10 @@ impl Kernel {
         if !first_use {
             flags |= upcall::REUSE;
         }
+        if setup_flags & setup::CLEAR_VOUCHER != 0 {
+            self.darwin_thread_clear_voucher(tid);
+        }
         let (stack, port) = (self.wqt(tid).stackaddr, self.wqt(tid).thport);
-        let _ = setup_flags;
         self.workq_setup_thread(m, tid, stack, port, setup::EXIT_THREAD, flags)
     }
 
@@ -1560,6 +1562,9 @@ impl Kernel {
                 let size = ((PTH_DEFAULT_STACKSIZE + page + PTHREAD_T_OFFSET - 1) & !(page - 1)) - page;
                 let _ = self.darwin_behavior_set(m, free, size, super::mman::act::REUSABLE);
             }
+            // Its voucher goes once it is on the idle list, as its
+            // importance may go with it.
+            self.darwin_thread_clear_voucher(tid);
             let t = self.wqt(tid);
             t.flags &= !ut::IDLE_CLEANUP;
             setup_flags &= !setup::CLEAR_VOUCHER;
@@ -1964,6 +1969,11 @@ impl Kernel {
 
     /// `workq_setup_and_run`.
     fn workq_setup_and_run(&mut self, m: &mut GuestMem<'_>, tid: i32, setup_flags: u32) -> SyscallOutcome {
+        // The voucher is reset as late as it can be, before the thread
+        // goes back out to user space.
+        if setup_flags & setup::CLEAR_VOUCHER != 0 {
+            self.darwin_thread_clear_voucher(tid);
+        }
         let t = self.wqt(tid);
         let mut upcall_flags = t.park.upcall_flags;
         if setup_flags & setup::FIRST_USE == 0 {
@@ -2401,8 +2411,9 @@ impl Kernel {
         if count == 0 {
             return Ok(None);
         }
-        // thread_set_voucher_name(MACH_PORT_NULL): the thread adopts no
-        // voucher; it holds none, vouchers not being made by this kernel.
+        // thread_set_voucher_name(MACH_PORT_NULL): the thread goes back
+        // out with the events and no voucher.
+        self.darwin_thread_clear_voucher(tid);
         let stack_top = top.unwrap_or(selfp & !(STK_ALIGN - 1));
         Ok(Some(self.workq_set_register_state(m, tid, selfp, stack_top, stackaddr + page, kport, list, upcall_flags, count)))
     }
