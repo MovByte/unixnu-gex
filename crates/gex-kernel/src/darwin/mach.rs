@@ -861,6 +861,9 @@ impl Kernel {
         let fixed = flags & vmf::ANYWHERE == 0;
         let start = if fixed { *addr & !PAGE_MASK } else { 0 };
         let Some(len) = size.checked_add(PAGE_MASK).map(|s| s & !PAGE_MASK).filter(|&l| l != 0) else { return kr::INVALID_ARGUMENT };
+        // vm_map_enter on an iOS map (VM_MAP_POLICY_WX_STRIP_X): a writable
+        // and executable protection loses execute.
+        let cur = if cur & prot::WRITE != 0 && cur & prot::EXECUTE != 0 { cur & !prot::EXECUTE } else { cur };
         let p = (cur & prot::ALL) as u64;
         let linux_prot = (p & 1) | (p & 2) | (p & 4);
         let attrs = super::vm::Attrs { alias: (flags >> 24) as u8, no_cache: flags & vmf::NO_CACHE != 0, ..Default::default() };
