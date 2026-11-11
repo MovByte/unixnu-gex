@@ -1574,7 +1574,8 @@ impl Kernel {
                     let ipc = self.ipc();
                     let Some(l) = ipc.links.values().find(|l| l.pid == pid).cloned() else { return Err(3) };
                     let ents = l.codesign.as_ref().map(|c| c.ents.clone()).unwrap_or_default();
-                    super::amfi::dyld_policy(false, l.csflags.load(std::sync::atomic::Ordering::Acquire), &ents)
+                    let sugid = self.darwin_public(pid).is_some_and(|(p, _)| p.sugid);
+                    super::amfi::dyld_policy(sugid, l.csflags.load(std::sync::atomic::Ordering::Acquire), &ents)
                 };
                 m.write_u64(out, p).map_err(fault)
             }
@@ -1738,9 +1739,8 @@ impl Kernel {
     fn darwin_dyld_policy(&self) -> u64 {
         let flags = self.dtask.csflags.load(std::sync::atomic::Ordering::Acquire);
         let ents = self.dtask.codesign.as_ref().map(|c| c.ents.clone()).unwrap_or_default();
-        // P_SUGID is not tracked: no credential change or setuid image sets
-        // it here.
-        super::amfi::dyld_policy(false, flags, &ents)
+        // P_SUGID: a credential changed since the last exec.
+        super::amfi::dyld_policy(self.dtask.sugid, flags, &ents)
     }
 
     /// Sandbox's `mpo_policy_syscall` (`0x...69f7e50`); its error, a Darwin
