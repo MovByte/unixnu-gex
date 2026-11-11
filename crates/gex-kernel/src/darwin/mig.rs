@@ -1589,6 +1589,9 @@ fn task_get_special_port(k: &mut Kernel, which: i32, f: u8) -> Reply {
         }
         // ipc_port_copy_send_mqueue: a copy of what was set; null when
         // nothing was, dead when it died.
+        TASK_BOOTSTRAP_PORT | TASK_ACCESS_PORT | TASK_DEBUG_CONTROL_PORT | TASK_RESOURCE_NOTIFY_PORT if k.dtask.kports.special_dead.contains(&which) => {
+            Reply { ret: KERN_SUCCESS, defer: None, out: Vec::new(), ports: Vec::new(), unimplemented: None }.with_null_port(super::ipc::PORT_DEAD)
+        }
         TASK_BOOTSTRAP_PORT | TASK_ACCESS_PORT | TASK_DEBUG_CONTROL_PORT | TASK_RESOURCE_NOTIFY_PORT => match k.dtask.kports.special.get(&which).copied() {
             Some(p) if k.ipc().port(p).active => {
                 k.ipc().copy_send(p);
@@ -1692,16 +1695,18 @@ fn task_set_special_port(k: &mut Kernel, which: i32, right: Option<Carried>) -> 
         Some(Carried::Port(p)) => Some(p),
         _ => None,
     };
+    let dead = matches!(right, Some(Carried::Dead));
     let mut kports = std::mem::take(&mut k.dtask.kports);
-    let r = set_special_port(&mut kports, k.ipc(), which, port);
+    let r = set_special_port(&mut kports, k.ipc(), which, port, dead);
     k.dtask.kports = kports;
     Reply::err(r)
 }
 
 /// `task_set_special_port` (the kernel's, which `posix_spawn`'s port
 /// actions call too) on the task whose ports are `kports`: the send right
-/// `port` stored as its special port `which`, the old one released.
-pub(crate) fn set_special_port(kports: &mut super::kobject::Kports, ipc: &mut super::ipc::Ipc, which: i32, port: Option<super::ipc::ObjId>) -> i32 {
+/// `port` (or `IP_DEAD`, when `dead`) stored as its special port `which`,
+/// the old one released.
+pub(crate) fn set_special_port(kports: &mut super::kobject::Kports, ipc: &mut super::ipc::Ipc, which: i32, port: Option<super::ipc::ObjId>, dead: bool) -> i32 {
     const TASK_KERNEL_PORT: i32 = 1;
     const TASK_HOST_PORT: i32 = 2;
     const TASK_BOOTSTRAP_PORT: i32 = 4;
@@ -1716,13 +1721,20 @@ pub(crate) fn set_special_port(kports: &mut super::kobject::Kports, ipc: &mut su
     match which {
         TASK_KERNEL_PORT | TASK_HOST_PORT => KERN_NO_ACCESS,
         TASK_BOOTSTRAP_PORT | TASK_DEBUG_CONTROL_PORT | TASK_RESOURCE_NOTIFY_PORT | TASK_ACCESS_PORT => {
-            if which == TASK_ACCESS_PORT && kports.special.get(&which).copied().is_some_and(|p| ipc.port(p).active) {
+            // Never overwritten once set, even after its port dies
+            // (IP_VALID of the right kept).
+            if which == TASK_ACCESS_PORT && kports.special.contains_key(&which) {
                 return KERN_NO_ACCESS;
             }
             let old = match port {
                 Some(p) => kports.special.insert(which, p),
                 None => kports.special.remove(&which),
             };
+            if dead {
+                kports.special_dead.insert(which);
+            } else {
+                kports.special_dead.remove(&which);
+            }
             if let Some(o) = old {
                 ipc.release_send(o);
             }

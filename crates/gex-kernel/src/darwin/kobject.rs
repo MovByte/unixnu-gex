@@ -32,6 +32,10 @@ pub struct Kports {
     pub special_reply: HashMap<i32, ObjId>,
     /// `task_set_special_port`'s ports, by which (send rights held).
     pub special: HashMap<i32, ObjId>,
+    /// The special ports that are `IP_DEAD`: a dead name set, or a dead
+    /// port's right inherited (`ipc_port_copy_send_mqueue`). Read back
+    /// dead, they are not `IP_VALID`.
+    pub special_dead: std::collections::HashSet<i32>,
     /// `itk_registered`: `mach_ports_register`'s ports (send rights held).
     pub registered: [Option<ObjId>; 3],
     /// `itk_resume`: the task's resume port, once a suspension made it.

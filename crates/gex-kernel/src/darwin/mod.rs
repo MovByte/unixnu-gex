@@ -159,7 +159,8 @@ pub struct Task {
     /// The send rights the next child task inherits (`ipc_task_init`):
     /// its special ports by kind, its registered ports, and its exception
     /// actions.
-    pub child_ports: std::sync::Mutex<Option<(std::collections::HashMap<i32, ipc::ObjId>, [Option<ipc::ObjId>; 3], exception::ExcActions)>>,
+    #[allow(clippy::type_complexity)]
+    pub child_ports: std::sync::Mutex<Option<(std::collections::HashMap<i32, ipc::ObjId>, std::collections::HashSet<i32>, [Option<ipc::ObjId>; 3], exception::ExcActions)>>,
     /// The kernel objects' ports.
     pub kports: kobject::Kports,
     pub semas: sema::Semas,

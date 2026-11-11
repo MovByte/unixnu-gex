@@ -264,7 +264,7 @@ impl Kernel {
     /// rest is the new task's own.
     pub(crate) fn darwin_fork_task(&self) -> super::Task {
         let t = &self.dtask;
-        let (special, registered, exc) = t.child_ports.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+        let (special, special_dead, registered, exc) = t.child_ports.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
         super::Task {
             live: std::sync::Arc::new(super::kinfo::Live {
                 acflag: super::kinfo::ac::AFORK.into(),
@@ -273,7 +273,7 @@ impl Kernel {
                 user_stack: t.live.user_stack.load(std::sync::atomic::Ordering::Relaxed).into(),
                 ..Default::default()
             }),
-            kports: super::kobject::Kports { special, registered, exc, ..Default::default() },
+            kports: super::kobject::Kports { special, special_dead, registered, exc, ..Default::default() },
             strict: t.strict,
             pthread: t.pthread,
             sigacts: t.sigacts.clone(),
@@ -378,10 +378,19 @@ impl Kernel {
         const TASK_BOOTSTRAP_PORT: i32 = 4;
         const TASK_ACCESS_PORT: i32 = 9;
         let k = &self.dtask.kports;
-        let special: Vec<(i32, super::ipc::ObjId)> = [TASK_BOOTSTRAP_PORT, TASK_ACCESS_PORT].into_iter().filter_map(|w| k.special.get(&w).map(|&p| (w, p))).collect();
+        let mut special: Vec<(i32, super::ipc::ObjId)> = [TASK_BOOTSTRAP_PORT, TASK_ACCESS_PORT].into_iter().filter_map(|w| k.special.get(&w).map(|&p| (w, p))).collect();
+        let mut dead: std::collections::HashSet<i32> = [TASK_BOOTSTRAP_PORT, TASK_ACCESS_PORT].into_iter().filter(|w| k.special_dead.contains(w)).collect();
         let registered = k.registered;
         let task_exc = k.exc;
         let ipc = self.ipc();
+        // A right to a port that has died copies as IP_DEAD.
+        special.retain(|&(w, p)| {
+            let live = ipc.port(p).active;
+            if !live {
+                dead.insert(w);
+            }
+            live
+        });
         let exc = super::exception::copy_all(ipc, &task_exc);
         for &(_, p) in &special {
             ipc.copy_send(p);
@@ -389,7 +398,7 @@ impl Kernel {
         for p in registered.into_iter().flatten() {
             ipc.copy_send(p);
         }
-        let old = self.dtask.child_ports.lock().unwrap_or_else(|e| e.into_inner()).replace((special.into_iter().collect(), registered, exc));
+        let old = self.dtask.child_ports.lock().unwrap_or_else(|e| e.into_inner()).replace((special.into_iter().collect(), dead, registered, exc));
         debug_assert!(old.is_none(), "a child's ports not taken");
     }
 
@@ -818,7 +827,8 @@ impl Kernel {
             };
             match kind {
                 PSPA_SPECIAL => {
-                    if super::mig::set_special_port(&mut child.dtask.kports, self.ipc(), which, port) != 0 {
+                    let dead = matches!(carried, Some(Carried::Dead));
+                    if super::mig::set_special_port(&mut child.dtask.kports, self.ipc(), which, port, dead) != 0 {
                         if let Some(p) = port {
                             self.ipc().release_send(p);
                         }

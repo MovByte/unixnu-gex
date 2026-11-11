@@ -509,7 +509,7 @@ impl Kernel {
         let kp = old.kports;
         self.dtask = super::Task {
             ipc_raw: old.ipc_raw,
-            kports: super::kobject::Kports { special: kp.special, registered: kp.registered, exc: kp.exc, ..Default::default() },
+            kports: super::kobject::Kports { special: kp.special, special_dead: kp.special_dead, registered: kp.registered, exc: kp.exc, ..Default::default() },
             strict: old.strict,
             // proc_resetregister: libpthread registers again.
             pthread: super::thread::Registration { registered: false, ..old.pthread },
