@@ -49,6 +49,12 @@ pub struct SoState {
     pub snd_used: u64,
     /// The buffers' `sb_hiwat`: receive, send.
     pub hiwat: (u64, u64),
+    /// The send buffer's `sb_lowat` as the protocol attaches it: 1 for a
+    /// unix datagram socket (`unp_attach`), else `soreserve`'s MCLBYTES.
+    pub snd_lowat: u64,
+    /// A unix stream socket, whose send space is its peer's receive buffer
+    /// (`SB_UNIX`; `unp_cc`, the bytes there, is `snd_used`).
+    pub unix_stream: bool,
 }
 
 /// What a kqueue's pipe filters read of an anonymous pipe end

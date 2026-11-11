@@ -71,6 +71,7 @@ pub mod select;
 pub mod shm;
 pub mod signal;
 pub mod sockaddr;
+pub mod sockopt;
 pub mod sockerr;
 pub mod spawn;
 pub mod kinfo;

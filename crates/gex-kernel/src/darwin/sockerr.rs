@@ -17,7 +17,7 @@ const IPPROTO_UDP: u64 = 17;
 
 /// A socket's protocol, as far as these checks need it.
 #[derive(Clone, Copy, PartialEq)]
-enum Proto {
+pub(crate) enum Proto {
     UnixStream,
     Tcp,
     /// No connections (`PR_CONNREQUIRED` clear), and no out-of-band data.
@@ -25,7 +25,7 @@ enum Proto {
 }
 
 impl Kernel {
-    fn darwin_sock_proto(&self, fd: i32) -> Option<Proto> {
+    pub(crate) fn darwin_sock_proto(&self, fd: i32) -> Option<Proto> {
         let io = self.fd_io();
         if io.dgram_of(fd).is_ok() {
             return Some(Proto::Datagram);

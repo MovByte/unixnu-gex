@@ -697,7 +697,7 @@ impl FileHandle for UnixSocket {
     /// `PIPSIZ` both ways, and a connected stream's send space is what the
     /// peer's receive buffer has left.
     fn so_state(&self) -> Option<crate::vfs::SoState> {
-        let mut st = crate::vfs::SoState { qlen: None, rcv: 0, cantrcv: false, cantsend: false, error: 0, can_write: false, snd_used: 0, hiwat: (PIPSIZ, PIPSIZ) };
+        let mut st = crate::vfs::SoState { qlen: None, rcv: 0, cantrcv: false, cantsend: false, error: 0, can_write: false, snd_used: 0, hiwat: (PIPSIZ, PIPSIZ), snd_lowat: 2048, unix_stream: true };
         match &*self.role.lock().unwrap() {
             Role::Listening { backlog, .. } => st.qlen = Some(backlog.lock().unwrap().len() as u64),
             Role::Connected { rx, tx, .. } => {
@@ -1095,7 +1095,7 @@ impl FileHandle for UnixDgram {
     /// buffer.
     fn so_state(&self) -> Option<crate::vfs::SoState> {
         let rcv = self.inbox.lock().unwrap().iter().map(|(d, _)| d.len() as u64).sum();
-        Some(crate::vfs::SoState { qlen: None, rcv, cantrcv: false, cantsend: false, error: 0, can_write: true, snd_used: 0, hiwat: (4096, 2048) })
+        Some(crate::vfs::SoState { qlen: None, rcv, cantrcv: false, cantsend: false, error: 0, can_write: true, snd_used: 0, hiwat: (4096, 2048), snd_lowat: 1, unix_stream: false })
     }
 
     fn as_unix_dgram(self: Arc<Self>) -> Option<Arc<UnixDgram>> {
@@ -2195,11 +2195,11 @@ impl crate::vfs::FileHandle for RemoteUnix {
     /// writable or not.
     fn so_state(&self) -> Option<crate::vfs::SoState> {
         if self.listening {
-            return Some(crate::vfs::SoState { qlen: Some(self.has_pending().into()), rcv: 0, cantrcv: false, cantsend: false, error: 0, can_write: false, snd_used: 0, hiwat: (PIPSIZ, PIPSIZ) });
+            return Some(crate::vfs::SoState { qlen: Some(self.has_pending().into()), rcv: 0, cantrcv: false, cantsend: false, error: 0, can_write: false, snd_used: 0, hiwat: (PIPSIZ, PIPSIZ), snd_lowat: 2048, unix_stream: true });
         }
         let hup = (self.remote.hup)(self.id);
         let full = (self.remote.writable)(self.id) == 0;
-        Some(crate::vfs::SoState { qlen: None, rcv: (self.remote.available)(self.id).max(0) as u64, cantrcv: hup & 2 != 0, cantsend: hup & 1 != 0, error: 0, can_write: true, snd_used: if full { PIPSIZ } else { 0 }, hiwat: (PIPSIZ, PIPSIZ) })
+        Some(crate::vfs::SoState { qlen: None, rcv: (self.remote.available)(self.id).max(0) as u64, cantrcv: hup & 2 != 0, cantsend: hup & 1 != 0, error: 0, can_write: true, snd_used: if full { PIPSIZ } else { 0 }, hiwat: (PIPSIZ, PIPSIZ), snd_lowat: 2048, unix_stream: true })
     }
 
     fn available(&self) -> Option<u64> {

@@ -42,6 +42,9 @@ pub struct OpenFile {
     pub darwin_lock_key: OnceLock<(u64, u64)>,
     /// Its vnode as the filesystems name it for vnode notes.
     pub darwin_vnote_key: OnceLock<crate::inotify::Key>,
+    /// A Darwin socket's socket-level options (`so_options`, `so_linger`,
+    /// its buffers' marks), once one is set or read.
+    pub darwin_sockopt: Mutex<Option<crate::darwin::sockopt::SockOpts>>,
     /// XNU's `fg_count`: the descriptors, file ports and messages in flight
     /// that hold it, which its other references (a lookup's, a mapping's)
     /// are not.
@@ -225,6 +228,7 @@ impl OpenFile {
             darwin_lflags: std::sync::atomic::AtomicU32::new(0),
             darwin_lock_key: OnceLock::new(),
             darwin_vnote_key: OnceLock::new(),
+            darwin_sockopt: Mutex::new(None),
             fg_count: std::sync::atomic::AtomicU32::new(0),
             darwin_closed: std::sync::atomic::AtomicBool::new(false),
         })
@@ -256,6 +260,7 @@ impl OpenFile {
             darwin_lflags: std::sync::atomic::AtomicU32::new(0),
             darwin_lock_key: OnceLock::new(),
             darwin_vnote_key: OnceLock::new(),
+            darwin_sockopt: Mutex::new(None),
             fg_count: std::sync::atomic::AtomicU32::new(0),
             darwin_closed: std::sync::atomic::AtomicBool::new(false),
         })

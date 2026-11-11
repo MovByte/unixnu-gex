@@ -1397,10 +1397,17 @@ impl Kernel {
         fp.handle.so_state().expect("a socket knote's socket")
     }
 
+    /// The socket's buffers' marks as its options left them.
+    fn knote_sockopts(&mut self, n: KnId, so: &crate::vfs::SoState) -> super::sockopt::SockOpts {
+        let fp = self.knote(n).fp.clone().expect("a socket knote's file");
+        Kernel::darwin_sockopts(&fp, so)
+    }
+
     /// `filt_soread_common`.
     fn filt_soread_common(&mut self, n: KnId, kev: Option<&mut Kev>) -> u32 {
         const NOTE_LOWAT: u32 = 0x1;
         let so = self.knote_so(n);
+        let opts = self.knote_sockopts(n, &so);
         let (mut retval, data);
         if let Some(qlen) = so.qlen {
             retval = qlen != 0;
@@ -1416,10 +1423,10 @@ impl Kernel {
                 retval = true;
             } else {
                 let k = self.knote(n);
-                let mut lowwat = 1i64;
+                let mut lowwat = i64::from(opts.rcv_lowat);
                 if k.sfflags & NOTE_LOWAT != 0 {
-                    if k.sdata > so.hiwat.0 as i64 {
-                        lowwat = so.hiwat.0 as i64;
+                    if k.sdata > i64::from(opts.rcv_hiwat) {
+                        lowwat = i64::from(opts.rcv_hiwat);
                     } else if k.sdata > lowwat {
                         lowwat = k.sdata;
                     }
@@ -1440,9 +1447,9 @@ impl Kernel {
     /// stream is the room left in the peer's receive buffer.
     fn filt_sowrite_common(&mut self, n: KnId, kev: Option<&mut Kev>) -> u32 {
         const NOTE_LOWAT: u32 = 0x1;
-        const MCLBYTES: i64 = 2048;
         let so = self.knote_so(n);
-        let hiwat = so.hiwat.1 as i64;
+        let opts = self.knote_sockopts(n, &so);
+        let hiwat = i64::from(opts.snd_hiwat);
         let data = (hiwat - so.snd_used as i64).max(0);
         let ret = if so.cantsend {
             let k = self.knote(n);
@@ -1455,7 +1462,7 @@ impl Kernel {
             false
         } else {
             let k = self.knote(n);
-            let mut lowwat = MCLBYTES.min(hiwat);
+            let mut lowwat = i64::from(opts.snd_lowat);
             if k.sfflags & NOTE_LOWAT != 0 {
                 if k.sdata > hiwat {
                     lowwat = hiwat;

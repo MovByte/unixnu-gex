@@ -1750,9 +1750,9 @@ impl FileHandle for Socket {
         const ECONNREFUSED: i32 = 61;
         if self.kind == Kind::Udp {
             let rcv = self.available().unwrap_or(0);
-            return Some(crate::vfs::SoState { qlen: None, rcv, cantrcv: false, cantsend: false, error: 0, can_write: true, snd_used: 0, hiwat: UDP_HIWAT });
+            return Some(crate::vfs::SoState { qlen: None, rcv, cantrcv: false, cantsend: false, error: 0, can_write: true, snd_used: 0, hiwat: UDP_HIWAT, snd_lowat: 2048, unix_stream: false });
         }
-        let mut st = crate::vfs::SoState { qlen: None, rcv: 0, cantrcv: false, cantsend: false, error: 0, can_write: false, snd_used: 0, hiwat: TCP_HIWAT };
+        let mut st = crate::vfs::SoState { qlen: None, rcv: 0, cantrcv: false, cantsend: false, error: 0, can_write: false, snd_used: 0, hiwat: TCP_HIWAT, snd_lowat: 2048, unix_stream: false };
         if let (Some(id), Some(r)) = (*self.remote_listener.lock().unwrap(), self.remote) {
             st.qlen = Some(((r.pending)(id) != 0).into());
             return Some(st);

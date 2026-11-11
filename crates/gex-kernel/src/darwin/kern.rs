@@ -631,6 +631,28 @@ impl Kernel {
                 }
                 neg(Errno::EAFNOSUPPORT)
             }
+            // A bind the protocols might have shared, refused: said.
+            sys::BIND => {
+                let mut la = *a;
+                let n = super::bsd::translate(raw, &mut la);
+                let r = self.canonical(m, n, la);
+                if r == Err(Errno::EADDRINUSE) {
+                    self.darwin_bind_refused(a[0] as i32);
+                }
+                res(r)
+            }
+            // A connection the host carries with SO_KEEPALIVE asked for: the
+            // probes are TCP's own, which the host's connection does not send.
+            sys::CONNECT | sys::CONNECT_NOCANCEL if self.darwin_keepalive_off_host(m, a[0] as i32, a[1], a[2]) => {
+                self.darwin_unimplemented("SO_KEEPALIVE on a connection the host carries (keepalive probes)".into());
+                neg(Errno::ENOPROTOOPT)
+            }
+            // A datagram to the limited broadcast address: delivery to an
+            // interface's broadcast domain is not modelled.
+            sys::SENDTO | sys::SENDTO_NOCANCEL if super::sockopt::is_broadcast(m, a[4], a[5]) => {
+                self.darwin_unimplemented("a datagram to the broadcast address (INADDR_BROADCAST)".into());
+                neg(Errno::EACCES)
+            }
             sys::SENDTO | sys::SENDTO_NOCANCEL | sys::RECVFROM | sys::RECVFROM_NOCANCEL | sys::SENDMSG | sys::SENDMSG_NOCANCEL | sys::RECVMSG | sys::RECVMSG_NOCANCEL
                 if super::sockaddr::msg_flags_unported(if matches!(raw, sys::SENDMSG | sys::SENDMSG_NOCANCEL | sys::RECVMSG | sys::RECVMSG_NOCANCEL) { a[2] } else { a[3] }).is_some() =>
             {
@@ -639,6 +661,8 @@ impl Kernel {
                 self.darwin_unimplemented(format!("socket message flag {name}"));
                 neg(Errno::EOPNOTSUPP)
             }
+            sys::SETSOCKOPT if let Some(r) = self.darwin_setsockopt(m, a) => res(r),
+            sys::GETSOCKOPT if let Some(r) = self.darwin_getsockopt(m, a) => res(r),
             sys::SETSOCKOPT | sys::GETSOCKOPT => match super::sockaddr::sockopt_to_linux(a[1], a[2]) {
                 Ok(_) => return None,
                 Err(what) => {
