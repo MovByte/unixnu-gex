@@ -670,7 +670,7 @@ impl Ipc {
     /// `mach_port_construct(options, context)`: a new receive right shaped
     /// by `options` (flags, qlimit). `hardened`: the task is a platform
     /// binary or has the hardened runtime (`task_is_hardened_binary`).
-    pub fn mach_port_construct(&mut self, flags: u32, qlimit: u32, union_word: u64, context: u64, hardened: bool, initproc: bool, read_info: impl FnOnce(u64) -> Option<Vec<u8>>) -> Result<u32, u64> {
+    pub fn mach_port_construct(&mut self, flags: u32, qlimit: u32, union_word: u64, context: u64, hardened: bool, initproc: bool, privileged: bool, read_info: impl FnOnce(u64) -> Option<Vec<u8>>) -> Result<u32, u64> {
         let one_of = |m: u32| {
             let f = flags & m;
             f & f.wrapping_sub(1) != 0
@@ -689,10 +689,8 @@ impl Ipc {
         let mut label = None;
         let mut filter = flags & mpo::FILTER_MSG != 0;
         if flags & mpo::SERVICE_PORT != 0 {
-            // task_is_in_privileged_coalition(COALITION_TYPE_JETSAM): the
-            // coalitions are not modelled, and only launchd's is privileged
-            // when the system starts.
-            if !initproc {
+            // task_is_in_privileged_coalition(COALITION_TYPE_JETSAM).
+            if !privileged {
                 return Err(kr::DENIED);
             }
             if union_word == 0 {

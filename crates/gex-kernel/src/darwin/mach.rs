@@ -350,8 +350,9 @@ impl Kernel {
                 let word = |at: usize| u32::from_le_bytes(opts[at..at + 4].try_into().unwrap());
                 let (flags, qlimit, union_word) = (word(0), word(4), u64::from(word(8)) | u64::from(word(12)) << 32);
                 let (hardened, initproc) = (self.darwin_hardened(), self.pid == crate::proc::INIT_PID);
+                let privileged = super::coalition::privileged(self.pid, super::coalition::ty::JETSAM);
                 let read = |at: u64| m.read(at, 256).ok().map(<[u8]>::to_vec);
-                match self.ipc().mach_port_construct(flags, qlimit, union_word, a[2], hardened, initproc, read) {
+                match self.ipc().mach_port_construct(flags, qlimit, union_word, a[2], hardened, initproc, privileged, read) {
                     Ok(name) => copyout32(m, a[3], name),
                     Err(e) => e,
                 }

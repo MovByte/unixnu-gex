@@ -10,6 +10,10 @@
 #include <string.h>
 #include <unistd.h>
 
+int coalition_create(uint64_t *cid_out, uint32_t flags);
+int coalition_terminate(uint64_t cid, uint32_t flags);
+int coalition_reap(uint64_t cid, uint32_t flags);
+
 static void *sleeper(void *arg) {
     (void)arg;
     pause();
@@ -84,11 +88,21 @@ int main(void) {
     if ((kr = mach_msg(&r.m.h, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof r, n, 0, MACH_PORT_NULL)) || r.m.h.msgh_id != MACH_NOTIFY_PORT_DESTROYED) return bad("the notification", kr ? kr : r.m.h.msgh_id, MACH_NOTIFY_PORT_DESTROYED);
     if (r.m.d.name != p || (kr = mach_port_type(task, p, &t)) || t != MACH_PORT_TYPE_SEND_RECEIVE) return bad("the right back from it", kr ? kr : t, MACH_PORT_TYPE_SEND_RECEIVE);
     if (works(p, "the name after the notification")) return 1;
-    // A service port is launchd's to make; a connection port needs one.
+    // A service port is a privileged jetsam coalition member's to make
+    // (launchd's, or a task still in the kernel's own coalitions, as one
+    // started without launchd is): one naming no service is refused for
+    // that, and anyone else is denied. A connection port needs one.
+    uint64_t cid = 0;
+    int privileged = coalition_create(&cid, 1 << 4) == 0;
+    if (privileged) {
+        coalition_terminate(cid, 0);
+        coalition_reap(cid, 0);
+    }
     mach_port_options_t sp_opts = {.flags = MPO_SERVICE_PORT};
     mach_port_t made = MACH_PORT_NULL;
-    if ((kr = mach_port_construct(mach_task_self(), &sp_opts, 0, &made)) != KERN_DENIED) {
-        printf("portrefs: a service port by anyone else: %d\n", kr);
+    kern_return_t want = privileged ? KERN_INVALID_ARGUMENT : KERN_DENIED;
+    if ((kr = mach_port_construct(mach_task_self(), &sp_opts, 0, &made)) != want) {
+        printf("portrefs: a service port naming nothing: %d, want %d\n", kr, want);
         return 1;
     }
     mach_port_options_t conn_opts = {.flags = MPO_CONNECTION_PORT};
