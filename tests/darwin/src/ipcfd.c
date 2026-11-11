@@ -171,12 +171,13 @@ int main(void) {
     int mfd2 = shm_open(mname, O_RDONLY);
     proc_pidfdinfo(getpid(), mfd2, PROC_PIDFDPSHMINFO, &mi, sizeof mi);
     fail |= mi.mappaddr != 0 || mi.pfi.openflags != 1 ? bad("another open's", mi.mappaddr, 0) : 0;
+    // A later mapping's address replaces it (the first let go before).
+    munmap(a, len);
     void *b = mmap(NULL, len / 2, PROT_READ, MAP_SHARED, mfd, 0);
     proc_pidfdinfo(getpid(), mfd, PROC_PIDFDPSHMINFO, &mi, sizeof mi);
     fail |= mi.mappaddr != (uint64_t)(uintptr_t)b ? bad("mapped again at", mi.mappaddr, (long)b) : 0;
     r = fdinfo(mfd, PROC_PIDFDPSEMINFO, &si, sizeof si);
     fail |= r != -1 || errno != EBADF ? bad("shared memory as a semaphore", errno, EBADF) : 0;
-    munmap(a, len);
     munmap(b, len / 2);
     close(mfd2);
     close(mfd);

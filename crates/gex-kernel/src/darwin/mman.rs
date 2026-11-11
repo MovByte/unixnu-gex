@@ -327,6 +327,17 @@ impl Kernel {
     /// descriptor cannot).
     fn darwin_pshm_mmap(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
         self.darwin_shm_mmap_check(a)?;
+        // Every mapping of an object is its one memory object's pages; here
+        // a mapping is a copy, so a second one of the same object in this
+        // task (through any open of it) would not see the first's writes.
+        let obj = self.fds.get(a[4] as i32).ok().and_then(|f| Arc::clone(&f.handle).as_posix_shm());
+        if let Some(h) = obj {
+            let mapped = self.mem.lock().log.shared_maps.iter().any(|s| Arc::clone(&s.file.handle).as_posix_shm().is_some_and(|o| Arc::ptr_eq(&o.0, &h.0)));
+            if mapped {
+                self.darwin_unimplemented(format!("a second mapping of POSIX shared memory object {:?} (pages two mappings share)", h.0.name));
+                return Err(Errno::EINVAL);
+            }
+        }
         let mut b = *a;
         // Anywhere: vm_map_enter's search from the rounded hint.
         if b[3] as u32 & map::FIXED == 0 {
