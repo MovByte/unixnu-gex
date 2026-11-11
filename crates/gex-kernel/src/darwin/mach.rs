@@ -868,7 +868,11 @@ impl Kernel {
         let linux_prot = (p & 1) | (p & 2) | (p & 4);
         let attrs = super::vm::Attrs { alias: (flags >> 24) as u8, no_cache: flags & vmf::NO_CACHE != 0, ..Default::default() };
         if fixed {
-            // ... the address is within bounds (`vm_map_enter`).
+            // vm_map_enter: the address meets the mask, then it is within
+            // bounds.
+            if start & mask != 0 {
+                return kr::NO_SPACE;
+            }
             if start < self.dtask.map_min || start.checked_add(len).is_none_or(|e| e > self.darwin_map_max()) {
                 return kr::INVALID_ADDRESS;
             }

@@ -1,6 +1,6 @@
 // Mapping rules of the VM map: a writable and executable mach_vm_map
 // loses execute on iOS (VM_MAP_POLICY_WX_STRIP_X; macOS's own maps fail
-// it).
+// it); a fixed address that does not meet the mask is KERN_NO_SPACE.
 
 #include <TargetConditionals.h>
 #include <errno.h>
@@ -47,6 +47,16 @@ int main(void) {
     if (prot_at(a) != (VM_PROT_READ | VM_PROT_WRITE)) return bad("its protection", prot_at(a), VM_PROT_READ | VM_PROT_WRITE);
     mach_vm_deallocate(mach_task_self(), a, page);
 #endif
+
+    // A fixed address against a mask it does not meet.
+    a = 0;
+    if ((kr = mach_vm_allocate(mach_task_self(), &a, 4 * page, VM_FLAGS_ANYWHERE))) return bad("room", kr, 0);
+    mach_vm_deallocate(mach_task_self(), a, 4 * page);
+    mach_vm_address_t odd = (a & ~(2 * page - 1)) + 2 * page + page;
+    mach_vm_address_t f = odd;
+    kr = mach_vm_map(mach_task_self(), &f, page, 2 * page - 1, VM_FLAGS_FIXED, MACH_PORT_NULL, 0, FALSE,
+        VM_PROT_DEFAULT, VM_PROT_ALL, VM_INHERIT_DEFAULT);
+    if (kr != KERN_NO_SPACE) return bad("a fixed address off its mask", kr, KERN_NO_SPACE);
 
     printf("vmwx ok\n");
     return 0;
