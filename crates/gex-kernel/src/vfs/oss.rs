@@ -915,8 +915,9 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(30));
         assert_eq!(h.write_at(0, &[0u8; 4]), Err(Errno::EAGAIN));
         assert_eq!(h.ready_in_ns(), Some(128 * 1_000_000_000 / 48000));
-        // It played 100 frames: 400 bytes of room, exactly.
-        PLAYER.lock().unwrap()[0].1 = (BUFSIZE / 4) as u32 - 100;
+        // It played 100 frames: 400 bytes of room, exactly. (Other tests'
+        // streams share the table: this one's entry, by its id.)
+        PLAYER.lock().unwrap().iter_mut().find(|e| e.0 == h.id).expect("this stream's entry").1 = (BUFSIZE / 4) as u32 - 100;
         assert_eq!(h.write_at(0, &vec![0u8; 1000]).unwrap(), 400);
         // It lets the stream go (another took the device, or it stopped):
         // back on the clock, which drains it.
