@@ -343,9 +343,9 @@ impl Kernel {
 
     /// `guarded_open_np`, `guarded_open_dprotected_np`,
     /// `open_dprotected_np` and `openat_dprotected_np`. The filesystems
-    /// here keep no data protection class, so a class for a new file goes
-    /// unused as F_SETPROTECTIONCLASS's does; opening a file's raw or
-    /// authenticated contents has no counterpart and is reported.
+    /// here keep no data protection class: a class for a file the open
+    /// makes is reported, as F_SETPROTECTIONCLASS is, and so is opening a
+    /// file's raw or authenticated contents.
     pub(crate) fn darwin_open_protected(&mut self, m: &mut GuestMem<'_>, raw: u64, a: &[u64; 6]) -> SyscallOutcome {
         match self.darwin_open_protected_args(m, raw, a) {
             Ok((call, args, guard)) => self.darwin_open_finish(m, call, args, guard),
@@ -370,6 +370,23 @@ impl Kernel {
             k.darwin_unimplemented(format!("an open of a file's raw or authenticated contents (dpflags {dpflags:#x}, content protection)"));
             Err(Errno::EINVAL)
         };
+        // A class for a file the open makes (openat_dprotected_internal's
+        // va_dataprotect_class): the key store's, which the filesystems
+        // here have no attribute for. An existing file keeps its own, and
+        // PROTECTION_CLASS_DEFAULT asks for none.
+        let new_class = |k: &mut Kernel, m: &GuestMem<'_>, dir: u64, path: u64, flags: u64, class: u64| -> Result<(), Errno> {
+            const PROTECTION_CLASS_DEFAULT: i32 = -1;
+            if flags & O_CREAT == 0 || class as u32 as i32 == PROTECTION_CLASS_DEFAULT {
+                return Ok(());
+            }
+            let abs = k.path_io().at_path(m, super::bsd::dirfd(dir) as i32, path)?;
+            if k.vfs.metadata(&abs).is_ok() {
+                return Ok(());
+            }
+            k.darwin_unimplemented(format!("a new file's data protection class {} (the key store's)", class as u32 as i32));
+            Err(Errno::EINVAL)
+        };
+        let cwd = super::bsd::AT_FDCWD as u64;
         let rawness = O_DP_GETRAWENCRYPTED | O_DP_GETRAWUNENCRYPTED;
         match raw {
             sys::GUARDED_OPEN_NP | sys::GUARDED_OPEN_DPROTECTED_NP => {
@@ -381,6 +398,7 @@ impl Kernel {
                 let mode = if raw == sys::GUARDED_OPEN_NP {
                     a[4]
                 } else {
+                    new_class(self, m, cwd, a[0], flags, a[4])?;
                     raw_dp(self, flags, a[5] & 0xffff_ffff, rawness)?;
                     seventh(self, m)
                 };
@@ -390,6 +408,7 @@ impl Kernel {
                 if a[3] & O_DP_AUTHENTICATE != 0 {
                     return Err(Errno::EINVAL);
                 }
+                new_class(self, m, cwd, a[0], a[1] & 0xffff_ffff, a[2])?;
                 raw_dp(self, a[1], a[3] & 0xffff_ffff, rawness)?;
                 Ok((sys::OPEN_NOCANCEL, [a[0], a[1] & 0xffff_ffff, a[4], 0, 0, 0], None))
             }
@@ -399,6 +418,7 @@ impl Kernel {
                 if dpflags & O_DP_AUTHENTICATE != 0 && flags & O_CREAT != 0 {
                     return Err(Errno::EINVAL);
                 }
+                new_class(self, m, a[0], a[1], flags, a[3])?;
                 raw_dp(self, flags, dpflags, rawness | O_DP_AUTHENTICATE)?;
                 Ok((sys::OPENAT_NOCANCEL, [a[0], a[1], flags, a[5], 0, 0], None))
             }

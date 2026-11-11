@@ -290,8 +290,8 @@ int main(int argc, char **argv) {
     if (expect("a kqueue's wrong guard", gclose(fd, &H), EPERM)) return 1;
     if (gclose(fd, &G) != 0) return bad("a kqueue's close", errno, 0);
 
-    // The protected opens: the class of a new file, and flags that need
-    // no contents read raw.
+    // The protected opens: a class with O_CREAT for a file that exists,
+    // which keeps its own, and flags that need no contents read raw.
     if ((fd = syscall(SYS_guarded_open_dprotected_np, file, &G, GUARD_DUP, O_RDWR | O_CREAT | O_CLOEXEC, 3, 0, 0644)) < 0) return bad("guarded_open_dprotected_np", errno, 0);
     if (gclose(fd, &G) != 0) return bad("its close", errno, 0);
     if ((fd = syscall(SYS_open_dprotected_np, file, O_RDWR | O_CREAT, 3, 0, 0644)) < 0) return bad("open_dprotected_np", errno, 0);

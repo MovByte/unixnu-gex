@@ -401,9 +401,10 @@ fn unpack_setattrs(alist: &AttrList, buf: &[u8]) -> Result<SetAttrs, Errno> {
         c.time()?;
         out.missing.push("ATTR_CMN_ADDEDTIME");
     }
-    // The class is ignored, as F_SETPROTECTIONCLASS's is.
+    // The class is the key store's, as F_SETPROTECTIONCLASS's is.
     if set.common & cmn::DATA_PROTECT_FLAGS != 0 {
         c.u32()?;
+        out.missing.push("ATTR_CMN_DATA_PROTECT_FLAGS");
     }
     if set.vol & vol::NAME != 0 {
         out.missing.push("ATTR_VOL_NAME");
