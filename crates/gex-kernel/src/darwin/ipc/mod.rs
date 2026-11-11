@@ -1069,18 +1069,7 @@ impl Ipc {
     /// `ipc_notify_send_once_and_unlock`: a send-once right to `port`
     /// destroyed unused.
     fn send_once_notify(&mut self, port: ObjId) {
-        let p = self.port_mut(port);
-        p.sorights -= 1;
-        // A thread's kernel reply port is a queue, not a kernel object.
-        let rpc_reply = matches!(p.kobject, Some(Kobject::RpcReply(_)));
-        if p.active && p.receiver == Receiver::Kernel && p.kobject.is_some() && !rpc_reply {
-            self.outbox.push(Notify::KobjectSendOnce { port });
-            return;
-        }
-        if p.active && (p.receiver != Receiver::Kernel || rpc_reply) {
-            self.outbox.push(Notify::SendOnce { to: port });
-        }
-        self.release(port);
+        self.send_once_destroyed(port);
     }
 
     /// `mach_port_guard_exception`: recorded for the kernel to raise.

@@ -135,16 +135,22 @@ impl Ipc {
     /// A send-once right destroyed unused (`ipc_notify_send_once_and_unlock`).
     pub fn send_once_destroyed(&mut self, port: ObjId) {
         let p = self.port_mut(port);
-        p.sorights -= 1;
         // A thread's kernel reply port is a queue, not a kernel object.
         let rpc_reply = matches!(p.kobject, Some(super::Kobject::RpcReply(_)));
         if p.active && p.receiver == Receiver::Kernel && p.kobject.is_some() && !rpc_reply {
+            p.sorights -= 1;
             self.outbox.push(Notify::KobjectSendOnce { port });
             return;
         }
+        // mach_notify_send_once: the right itself carries the notification
+        // (its reference and its count go with the message).
         if p.active && (p.receiver != Receiver::Kernel || rpc_reply) && (p.messages.len() as u32) < super::QLIMIT_KERNEL {
             self.outbox.push(Notify::SendOnce { to: port });
+            return;
         }
+        // ipc_port_release_sonce: inactive, or its queue full for the
+        // kernel.
+        p.sorights -= 1;
         self.release(port);
     }
 
