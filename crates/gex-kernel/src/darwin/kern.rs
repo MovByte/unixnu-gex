@@ -12,6 +12,9 @@ fn neg(e: Errno) -> u64 {
     (-(e.0 as i64)) as u64
 }
 
+/// Darwin's `O_CREAT`.
+const DARWIN_O_CREAT: u64 = 0x200;
+
 fn res(r: Result<u64, Errno>) -> u64 {
     r.unwrap_or_else(neg)
 }
@@ -634,6 +637,11 @@ impl Kernel {
                 }
                 neg(Errno::EAFNOSUPPORT)
             }
+            // lookup_validate_creation_path: a name made with a trailing
+            // slash that is not to be a directory, where nothing is, is
+            // ENOENT (Linux says ENOTDIR or EISDIR).
+            sys::OPEN | sys::OPEN_NOCANCEL if a[1] & DARWIN_O_CREAT != 0 && self.darwin_slash_creation(m, super::bsd::AT_FDCWD as u64, a[0]) => neg(Errno::ENOENT),
+            sys::OPENAT | sys::OPENAT_NOCANCEL if a[2] & DARWIN_O_CREAT != 0 && self.darwin_slash_creation(m, a[0], a[1]) => neg(Errno::ENOENT),
             // A bind the protocols might have shared, refused: said.
             sys::BIND => {
                 let mut la = *a;
@@ -1392,6 +1400,24 @@ impl Kernel {
             m.write_u32(old, mask_from_linux(blocked))?;
         }
         Ok(0)
+    }
+
+    /// Whether a creating call's name ends in a slash and names nothing:
+    /// `lookup_validate_creation_path`'s case.
+    pub(crate) fn darwin_slash_creation(&mut self, m: &GuestMem<'_>, dirfd: u64, path: u64) -> bool {
+        const MAXPATHLEN: usize = 1024;
+        let Ok(raw) = m.read_cstr(path, MAXPATHLEN) else { return false };
+        if raw.len() < 2 || !raw.ends_with(b"/") {
+            return false;
+        }
+        let Ok(given) = std::str::from_utf8(&raw) else { return false };
+        let Ok(abs) = self.path_io().at_path_str(super::bsd::dirfd(dirfd) as i32, given.trim_end_matches('/')) else { return false };
+        self.vfs.metadata_nofollow(&abs).is_err_and(|e| e == Errno::ENOENT) && self.vfs.metadata(&crate::vfs::parent_of(&abs)).is_ok_and(|md| md.file_type == crate::vfs::FileType::Directory)
+    }
+
+    /// Whether the name is a directory (a rename's source: `WILLBEDIR`).
+    pub(crate) fn darwin_is_dir(&mut self, m: &GuestMem<'_>, dirfd: u64, path: u64) -> bool {
+        self.path_io().at_path(m, super::bsd::dirfd(dirfd) as i32, path).is_ok_and(|p| self.vfs.metadata_nofollow(&p).is_ok_and(|md| md.file_type == crate::vfs::FileType::Directory))
     }
 
     /// `csops_internal(pid, ops, uaddr, usersize, uaudittoken)`: a

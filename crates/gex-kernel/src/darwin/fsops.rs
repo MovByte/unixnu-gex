@@ -334,21 +334,21 @@ impl Kernel {
             sys::FCHDIR => self.canonical(m, nr::FCHDIR, [a[0], 0, 0, 0, 0, 0]),
             // umask1: ALLPERMS of it kept; the old one back.
             sys::UMASK => self.canonical(m, nr::UMASK, [a[0] & ALLPERMS, 0, 0, 0, 0, 0]),
-            sys::SYMLINK => self.canonical(m, nr::SYMLINKAT, [a[0], cwd, a[1], 0, 0, 0]),
-            sys::SYMLINKAT => self.canonical(m, nr::SYMLINKAT, [a[0], dirfd(a[1]), a[2], 0, 0, 0]),
+            sys::SYMLINK => self.darwin_creating(m, cwd, a[1]).and_then(|()| self.canonical(m, nr::SYMLINKAT, [a[0], cwd, a[1], 0, 0, 0])),
+            sys::SYMLINKAT => self.darwin_creating(m, a[1], a[2]).and_then(|()| self.canonical(m, nr::SYMLINKAT, [a[0], dirfd(a[1]), a[2], 0, 0, 0])),
             // link follows a symlink it names, as linkat with
             // AT_SYMLINK_FOLLOW does; linkat takes that flag alone.
-            sys::LINK => self.canonical(m, nr::LINKAT, [cwd, a[0], cwd, a[1], L_AT_SYMLINK_FOLLOW, 0]),
+            sys::LINK => self.darwin_creating(m, cwd, a[1]).and_then(|()| self.canonical(m, nr::LINKAT, [cwd, a[0], cwd, a[1], L_AT_SYMLINK_FOLLOW, 0])),
             sys::LINKAT => {
                 if a[4] & !AT_SYMLINK_FOLLOW != 0 {
                     Err(Errno::EINVAL)
                 } else {
                     let f = if a[4] & AT_SYMLINK_FOLLOW != 0 { L_AT_SYMLINK_FOLLOW } else { 0 };
-                    self.canonical(m, nr::LINKAT, [dirfd(a[0]), a[1], dirfd(a[2]), a[3], f, 0])
+                    self.darwin_creating(m, a[2], a[3]).and_then(|()| self.canonical(m, nr::LINKAT, [dirfd(a[0]), a[1], dirfd(a[2]), a[3], f, 0]))
                 }
             }
-            sys::RENAME => self.canonical(m, nr::RENAMEAT2, [cwd, a[0], cwd, a[1], 0, 0]),
-            sys::RENAMEAT => self.canonical(m, nr::RENAMEAT2, [dirfd(a[0]), a[1], dirfd(a[2]), a[3], 0, 0]),
+            sys::RENAME => self.darwin_renaming(m, cwd, a[0], cwd, a[1]).and_then(|()| self.canonical(m, nr::RENAMEAT2, [cwd, a[0], cwd, a[1], 0, 0])),
+            sys::RENAMEAT => self.darwin_renaming(m, a[0], a[1], a[2], a[3]).and_then(|()| self.canonical(m, nr::RENAMEAT2, [dirfd(a[0]), a[1], dirfd(a[2]), a[3], 0, 0])),
             // RENAME_EXCL is Linux's RENAME_NOREPLACE.
             sys::RENAMEATX_NP => {
                 let flags = a[4] as u32 as u64;
@@ -364,7 +364,7 @@ impl Kernel {
                     // neither following its last component.
                     let r = if flags & RENAME_NOFOLLOW_ANY != 0 { self.darwin_no_link_on_the_way(m, a[0], a[1]).and_then(|()| self.darwin_no_link_on_the_way(m, a[2], a[3])) } else { Ok(()) };
                     let l = if flags & RENAME_EXCL != 0 { 1 } else { 0 };
-                    r.and_then(|()| self.canonical(m, nr::RENAMEAT2, [dirfd(a[0]), a[1], dirfd(a[2]), a[3], l, 0]))
+                    r.and_then(|()| self.darwin_renaming(m, a[0], a[1], a[2], a[3])).and_then(|()| self.canonical(m, nr::RENAMEAT2, [dirfd(a[0]), a[1], dirfd(a[2]), a[3], l, 0]))
                 }
             }
             // The mode's ALLPERMS.
@@ -427,6 +427,24 @@ impl Kernel {
     /// size set.
     /// NAMEI_NOFOLLOW_ANY's check of the path at `path` from directory
     /// `fd` (Darwin's numbering), its last component not followed.
+    /// `lookup_validate_creation_path` for a name being made that is not to
+    /// be a directory: with a trailing slash, where nothing is, ENOENT.
+    fn darwin_creating(&mut self, m: &GuestMem<'_>, fd: u64, path: u64) -> Result<(), Errno> {
+        if self.darwin_slash_creation(m, fd, path) {
+            return Err(Errno::ENOENT);
+        }
+        Ok(())
+    }
+
+    /// The same for a rename's new name, unless what moves is a directory
+    /// (`WILLBEDIR`).
+    fn darwin_renaming(&mut self, m: &GuestMem<'_>, from_fd: u64, from: u64, to_fd: u64, to: u64) -> Result<(), Errno> {
+        if !self.darwin_is_dir(m, from_fd, from) && self.darwin_slash_creation(m, to_fd, to) {
+            return Err(Errno::ENOENT);
+        }
+        Ok(())
+    }
+
     pub(crate) fn darwin_no_link_on_the_way(&mut self, m: &GuestMem<'_>, fd: u64, path: u64) -> Result<(), Errno> {
         const MAXPATHLEN: usize = 1024;
         let raw = m.read_cstr(path, MAXPATHLEN)?;
