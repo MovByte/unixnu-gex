@@ -1292,6 +1292,11 @@ impl Kernel {
                     body[off..off + 4].copy_from_slice(&name.to_le_bytes());
                     body[off + 10] = disp as u8;
                 }
+                // ipc_kmsg_copyout_guarded_port_descriptor: a receiver that
+                // did not ask for guarded descriptors (MACH_RCV_GUARDED_DESC)
+                // has the right destroyed and a null name in the
+                // descriptor, which keeps its guarded layout and flags; the
+                // sender taking its message back (a pseudo-receive) gets it.
                 Desc::Guarded { off, right, raw, disp, mut flags } => {
                     let mut ctx = 0u64;
                     let name = match right {
@@ -1299,23 +1304,16 @@ impl Kernel {
                             let recv_addr = 0;
                             self.copyout_object(c, disp, Some((&mut flags, &mut ctx, recv_addr)), &mut err)
                         }
-                        Some(c) => self.copyout_object(c, disp, None, &mut err),
+                        Some(c) => {
+                            self.ipc().object_destroy(c, disp);
+                            0
+                        }
                         None => raw,
                     };
-                    if options & opt::RCV_GUARDED_DESC != 0 {
-                        body[off..off + 8].copy_from_slice(&ctx.to_le_bytes());
-                        body[off + 8..off + 10].copy_from_slice(&(flags as u16).to_le_bytes());
-                        body[off + 10] = disp as u8;
-                        body[off + 12..off + 16].copy_from_slice(&name.to_le_bytes());
-                    } else {
-                        // A receiver that did not ask for guarded
-                        // descriptors gets a plain port descriptor, its
-                        // 16 bytes kept.
-                        body[off..off + 4].copy_from_slice(&name.to_le_bytes());
-                        body[off + 4..off + 10].copy_from_slice(&[0; 6]);
-                        body[off + 10] = disp as u8;
-                        body[off + 11] = dtype::PORT;
-                    }
+                    body[off..off + 8].copy_from_slice(&ctx.to_le_bytes());
+                    body[off + 8..off + 10].copy_from_slice(&(flags as u16).to_le_bytes());
+                    body[off + 10] = disp as u8;
+                    body[off + 12..off + 16].copy_from_slice(&name.to_le_bytes());
                 }
                 Desc::Ool { off, data, copy } => {
                     let (addr, size) = if data.is_empty() {
@@ -1419,7 +1417,8 @@ impl Kernel {
             b = bits::set(dest_type, reply_type, msgt::COPY_SEND, b);
         }
         let mut body = k.body;
-        err |= self.copyout_descriptors(m, &mut body, k.descs, 0);
+        // As ITH_KNOTE_PSEUDO: guarded descriptors come back as they went.
+        err |= self.copyout_descriptors(m, &mut body, k.descs, opt::RCV_GUARDED_DESC);
         let out = Out { bits: b, remote: dest_name, local: reply_name, voucher: voucher_name, id: k.id, body, sender: k.sender, aux: Vec::new() };
         let bufs = RecvBufs { msg_addr, msg_size, aux_addr: 0, aux_size: 0 };
         self.put_pseudo(m, out, bufs) | err
