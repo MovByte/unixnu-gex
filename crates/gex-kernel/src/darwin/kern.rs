@@ -1125,10 +1125,8 @@ impl Kernel {
         Ok(n as u64)
     }
 
-    /// `sysctl(name, namelen, old, oldlenp, new, newlen)`. Nodes are
-    /// read-only, except that a write is accepted and ignored where the
-    /// node exists.
-    /// `sysctl(name, namelen, old, oldlenp, new, newlen)`.
+    /// `sysctl(name, namelen, old, oldlenp, new, newlen)`. A write to a node
+    /// whose value is only read here is reported.
     fn darwin_sysctl(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
         let n = a[1] as usize;
         if !(2..=sysctl::CTL_MAXNAME).contains(&n) {
