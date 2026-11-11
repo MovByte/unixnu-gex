@@ -540,6 +540,12 @@ impl Kernel {
                     Some(_) if (a[1] as u32) >= 32 => neg(Errno::EINVAL),
                     _ if no_sigmask => neg(Errno::ESRCH),
                     Some(_) if workq_refuses => neg(Errno::EOPNOTSUPP),
+                    // SIGEMT and SIGINFO, which the signal machinery here
+                    // has no number for (as kill says).
+                    Some(_) if sig == 0 && a[1] as u32 != 0 => {
+                        self.darwin_unimplemented(format!("__pthread_kill with Darwin signal {}, which Linux has no number for", a[1] as u32));
+                        neg(Errno::EINVAL)
+                    }
                     Some(_) if sig == 0 => 0,
                     Some(tid) => {
                         self.darwin_thread_reason(tid, a[1] as u32);
