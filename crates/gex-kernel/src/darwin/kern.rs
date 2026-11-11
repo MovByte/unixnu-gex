@@ -13,7 +13,7 @@ fn neg(e: Errno) -> u64 {
 }
 
 /// Darwin's `O_CREAT`.
-const DARWIN_O_CREAT: u64 = 0x200;
+pub(crate) const DARWIN_O_CREAT: u64 = 0x200;
 
 fn res(r: Result<u64, Errno>) -> u64 {
     r.unwrap_or_else(neg)
@@ -640,8 +640,6 @@ impl Kernel {
             // lookup_validate_creation_path: a name made with a trailing
             // slash that is not to be a directory, where nothing is, is
             // ENOENT (Linux says ENOTDIR or EISDIR).
-            sys::OPEN | sys::OPEN_NOCANCEL if a[1] & DARWIN_O_CREAT != 0 && self.darwin_slash_creation(m, super::bsd::AT_FDCWD as u64, a[0]) => neg(Errno::ENOENT),
-            sys::OPENAT | sys::OPENAT_NOCANCEL if a[2] & DARWIN_O_CREAT != 0 && self.darwin_slash_creation(m, a[0], a[1]) => neg(Errno::ENOENT),
             // A bind the protocols might have shared, refused: said.
             sys::BIND => {
                 let mut la = *a;

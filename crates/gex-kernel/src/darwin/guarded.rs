@@ -56,15 +56,9 @@ const O_LOCKS: u64 = 0x30;
 /// `O_EXEC` (`FEXEC`), and with O_DIRECTORY `O_SEARCH`.
 const O_EXEC: u64 = 0x4000_0000;
 const O_DIRECTORY: u64 = 0x10_0000;
-/// The open flags a plain renumbering does not carry: an open with one
-/// goes through [`Kernel::darwin_open_finish`].
+/// The open flags a plain renumbering does not carry, which
+/// [`Kernel::darwin_open_finish`] carries out itself.
 pub(crate) const OPEN_FINISHED: u64 = O_LOCKS | O_CLOFORK | O_SYMLINK | O_NOFOLLOW_ANY | O_EXEC;
-
-/// Whether an open's flags need [`Kernel::darwin_open_finish`]: one a plain
-/// renumbering does not carry, or both access mode bits (open1's EINVAL).
-pub(crate) fn open_needs_finish(flags: u64) -> bool {
-    flags & OPEN_FINISHED != 0 || flags & 3 == 3
-}
 const O_DP_GETRAWENCRYPTED: u64 = 0x1;
 const O_DP_GETRAWUNENCRYPTED: u64 = 0x2;
 const O_DP_AUTHENTICATE: u64 = 0x4;
@@ -271,6 +265,11 @@ impl Kernel {
         let at = if raw == sys::OPEN || raw == sys::OPEN_NOCANCEL { 1 } else { 2 };
         let dflags = a[at];
         self.darwin_open_mode(dflags)?;
+        // A creation whose last component ends in a slash: namei's ENOENT.
+        let (dirfd, path) = if at == 1 { (super::bsd::AT_FDCWD as u64, a[0]) } else { (a[0], a[1]) };
+        if dflags & super::kern::DARWIN_O_CREAT != 0 && self.darwin_slash_creation(m, dirfd, path) {
+            return Err(Errno::ENOENT);
+        }
         let symlink = self.darwin_open_links(m, at, &a)?;
         let mut la = a;
         la[at] &= !OPEN_FINISHED;
