@@ -1,8 +1,9 @@
 // vm_protect with VM_PROT_COPY: a read-only private mapping and one of a
 // shared file become the task's own copy, writable, the file untouched; an
-// executable copy is refused. Also a port's context read and set by the
-// mach_port routines.
+// executable copy is refused only where write and execute fail (not on
+// iOS). Also a port's context read and set by the mach_port routines.
 
+#include <TargetConditionals.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <mach/mach.h>
@@ -67,9 +68,14 @@ int main(void) {
     if (pread(fd, got, 8, 0) != 8 || memcmp(got, "original", 8)) return bad("the file", got[0], 'o');
     if (pread(fd, got, 1, PAGE - 1) != 1 || got[0] != 0) return bad("its last byte", got[0], 0);
 
-    // An executable copy is refused.
+    // An executable copy: refused where write and execute fail
+    // (VM_MAP_POLICY_WX_FAIL, macOS's own maps), made on iOS.
     kr = vm_protect(mach_task_self(), (vm_address_t)m + PAGE, PAGE, FALSE, VM_PROT_READ | VM_PROT_EXECUTE | VM_PROT_COPY);
+#if TARGET_OS_OSX
     if (kr != KERN_PROTECTION_FAILURE) return bad("an executable copy", kr, KERN_PROTECTION_FAILURE);
+#else
+    if (kr != KERN_SUCCESS) return bad("an executable copy", kr, KERN_SUCCESS);
+#endif
 
     // Unmapped memory is refused.
     char *hole = mmap(NULL, PAGE, PROT_READ, MAP_ANON | MAP_PRIVATE, -1, 0);

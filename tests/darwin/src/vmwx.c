@@ -1,8 +1,9 @@
 // Mapping and protection rules of the VM map: a writable and executable
 // mach_vm_map loses execute on iOS (VM_MAP_POLICY_WX_STRIP_X; macOS's own
 // maps fail it); a fixed address that does not meet the mask is
-// KERN_NO_SPACE; and mprotect walks entry by entry, so a protection the
-// first entry's maximum forbids is EACCES even with a hole after it.
+// KERN_NO_SPACE; mprotect walks entry by entry, so a protection the first
+// entry's maximum forbids is EACCES even with a hole after it; and an
+// executable VM_PROT_COPY is refused only where write and execute fail.
 
 #include <TargetConditionals.h>
 #include <errno.h>
@@ -76,6 +77,16 @@ int main(void) {
     munmap(m, page);
     unlink(path);
 
+    // An executable copy of anonymous memory.
+    a = 0;
+    mach_vm_allocate(mach_task_self(), &a, page, VM_FLAGS_ANYWHERE);
+    kr = mach_vm_protect(mach_task_self(), a, page, FALSE, VM_PROT_COPY | VM_PROT_READ | VM_PROT_EXECUTE);
+#if TARGET_OS_OSX
+    if (kr != KERN_PROTECTION_FAILURE) return bad("an executable copy on macOS", kr, KERN_PROTECTION_FAILURE);
+#else
+    if (kr) return bad("an executable copy", kr, 0);
+    if (prot_at(a) != (VM_PROT_READ | VM_PROT_EXECUTE)) return bad("the copy's protection", prot_at(a), VM_PROT_READ | VM_PROT_EXECUTE);
+#endif
     printf("vmwx ok\n");
     return 0;
 }

@@ -1197,10 +1197,8 @@ impl Kernel {
         if size == 0 {
             return kr::SUCCESS;
         }
-        // VM_MAP_POLICY_WX_FAIL: code signing's map takes no executable copy.
-        if new & prot::COPY != 0 && new & prot::EXECUTE != 0 {
-            return kr2::PROTECTION_FAILURE;
-        }
+        // An executable VM_PROT_COPY is refused only by a map with
+        // VM_MAP_POLICY_WX_FAIL, which an iOS map is not.
         let (s, e) = (start & !PAGE_MASK, (start + size + PAGE_MASK) & !PAGE_MASK);
         let vmas: Vec<(u64, u64, u64)> = {
             let mm = self.mem.lock();
