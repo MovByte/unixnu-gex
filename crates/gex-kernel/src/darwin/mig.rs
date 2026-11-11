@@ -519,6 +519,14 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             None => Reply { ret: KERN_SUCCESS, defer: None, out: Vec::new(), ports: Vec::new(), unimplemented: None }.with_null_port(0),
         },
         (Kobject::IoNotification(_), 2803) => Reply::ok(Vec::new()),
+        // io_iterator_reset and io_iterator_is_valid on an iterator over a
+        // set of entries: back to its first; and valid, its set never
+        // changing (no entry comes or goes once the registry is built).
+        (Kobject::IoIterator(id), 2803) => {
+            super::iokit::iterator_reset(*id);
+            Reply::ok(Vec::new())
+        }
+        (Kobject::IoIterator(_), 2834) => Reply::ok(1u32.to_le_bytes().to_vec()),
         (Kobject::IoNotification(_), 2834) => Reply::ok(1u32.to_le_bytes().to_vec()),
         // io_iterator_next(iterator) -> object, or none left.
         (Kobject::IoIterator(id), 2802) => match super::iokit::iterator_next(*id) {

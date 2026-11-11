@@ -229,20 +229,31 @@ pub fn unserialize_dict(b: &[u8]) -> Option<Vec<(String, DictValue)>> {
     Some(out)
 }
 
-/// The iterators handed out, each the entries still to come.
-static ITERATORS: std::sync::Mutex<Vec<Vec<u32>>> = std::sync::Mutex::new(Vec::new());
+/// The iterators handed out (`OSCollectionIterator`s over a fixed set),
+/// each its items and how far it has come.
+static ITERATORS: std::sync::Mutex<Vec<(Vec<u32>, usize)>> = std::sync::Mutex::new(Vec::new());
 
 /// A new iterator over `items`, by number.
-pub fn iterator_new(mut items: Vec<u32>) -> u32 {
-    items.reverse();
+pub fn iterator_new(items: Vec<u32>) -> u32 {
     let mut t = ITERATORS.lock().unwrap_or_else(|e| e.into_inner());
-    t.push(items);
+    t.push((items, 0));
     (t.len() - 1) as u32
 }
 
 /// The iterator's next entry.
 pub fn iterator_next(id: u32) -> Option<u32> {
-    ITERATORS.lock().unwrap_or_else(|e| e.into_inner()).get_mut(id as usize)?.pop()
+    let mut t = ITERATORS.lock().unwrap_or_else(|e| e.into_inner());
+    let (items, at) = t.get_mut(id as usize)?;
+    let next = items.get(*at).copied()?;
+    *at += 1;
+    Some(next)
+}
+
+/// `OSCollectionIterator::reset`: back to the first entry.
+pub fn iterator_reset(id: u32) {
+    if let Some((_, at)) = ITERATORS.lock().unwrap_or_else(|e| e.into_inner()).get_mut(id as usize) {
+        *at = 0;
+    }
 }
 
 /// An `IOServiceUserNotification`: the services its matching notification

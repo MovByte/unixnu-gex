@@ -1,6 +1,7 @@
 // IOKit from a task: the main port, the device tree's entries and their
 // properties, a path that does not exist, the APFS volumes as services
-// with their roles and the container above them, and a matching
+// with their roles and the container above them (an iterator over them
+// reset to its first), and a matching
 // notification: the volumes already there, the last first, then none; a
 // termination notification has none, and an unknown kind is refused.
 
@@ -64,6 +65,15 @@ int main(void) {
         CFRelease(role);
         IOObjectRelease(v);
     }
+    // Reset: the same volumes again, from the first; still valid.
+    if (!IOIteratorIsValid(it)) return bad("the iterator valid", 0, 1);
+    IOIteratorReset(it);
+    int again = 0;
+    while ((v = IOIteratorNext(it)) != IO_OBJECT_NULL) {
+        again++;
+        IOObjectRelease(v);
+    }
+    if (again != volumes) return bad("volumes after a reset", again, volumes);
     IOObjectRelease(it);
     if (volumes != 6) return bad("volumes", volumes, 6);
     if (system != 1) return bad("system volumes", system, 1);
