@@ -394,8 +394,10 @@ impl Kernel {
                 ALL_PIDS => true,
                 PGRP_ONLY => pgid == info as i32,
                 PPID_ONLY => ppid == info as i32,
-                // No process has a controlling terminal, nor kdebug tracing.
-                TTY_ONLY | KDBG_ONLY => false,
+                // Its session's terminal device, while it has it.
+                TTY_ONLY => pid != 0 && super::ctty::proc_tty(&self.procs, pid).is_some_and(|(dev, _)| dev == info),
+                // No process is traced by kdebug.
+                KDBG_ONLY => false,
                 UID_ONLY | RUID_ONLY => {
                     let c = if pid == 0 { Some(super::cred::Cred::default()) } else { self.darwin_public(pid).map(|(p, _)| p.cred) };
                     c.is_some_and(|c| (if ty == UID_ONLY { c.uid } else { c.ruid }) == info)
@@ -1079,11 +1081,16 @@ impl Kernel {
         if !zombie {
             w(&mut b, 96, p.fds.as_ref().map_or(0, |f| f.nfiles()) as u32);
         }
-        // e_tdev: NODEV without a controlling terminal.
         let pgid = self.procs.pgid(pid, pid).unwrap_or(0);
         w(&mut b, 100, pgid as u32);
         w(&mut b, 104, self.darwin_pjobc(pgid));
-        w(&mut b, 108, u32::MAX);
+        // e_tdev and e_tpgid: the session's terminal while the process has
+        // it, else NODEV.
+        w(&mut b, 108, super::ctty::NODEV);
+        if let Some((tdev, tpgid)) = super::ctty::proc_tty(&self.procs, pid) {
+            w(&mut b, 108, tdev);
+            w(&mut b, 112, tpgid as u32);
+        }
         let nice = self.procs.live_nice(pid).map_or(0, |(_, n)| n);
         b[116..120].copy_from_slice(&nice.to_le_bytes());
         b[120..128].copy_from_slice(&p.start.0.to_le_bytes());
@@ -1111,6 +1118,10 @@ impl Kernel {
         }
         if self.procs.sid(pid, pid).ok() == Some(pid) {
             f |= PROC_FLAG_SLEADER;
+        }
+        const PROC_FLAG_CONTROLT: u32 = 0x80;
+        if self.procs.controlt(pid) {
+            f |= PROC_FLAG_CONTROLT;
         }
         // PROC_CONTROL_STATE and PROC_ACTION_STATE.
         const PROC_FLAG_PC_THROTTLE: u32 = 0x200;

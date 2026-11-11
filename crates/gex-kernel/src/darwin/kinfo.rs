@@ -18,6 +18,7 @@ const KERN_PROCSLOP: u64 = 5 * KINFO_SIZE as u64;
 
 /// `p_flag` (`bsd/sys/proc.h`).
 mod pf {
+    pub const CONTROLT: u32 = 0x2;
     pub const LP64: u32 = 0x4;
     pub const NOCLDSTOP: u32 = 0x8;
     pub const SUGID: u32 = 0x100;
@@ -98,9 +99,12 @@ impl Kernel {
                 _ => {}
             }
             if buflen >= KINFO_SIZE as u64 {
-                // No process has a controlling terminal.
                 match cmd {
-                    "tty" => continue,
+                    // Its session's terminal device, while it has it.
+                    "tty" if super::ctty::proc_tty(&self.procs, *pid).is_none_or(|(dev, _)| dev == NODEV || dev != arg as u32) =>
+                    {
+                        continue
+                    }
                     "uid" if p.cred.uid != arg as u32 => continue,
                     "ruid" if p.cred.ruid != arg as u32 => continue,
                     _ => {}
@@ -158,7 +162,13 @@ impl Kernel {
         put32(&mut b, 560, ppid as u32);
         put32(&mut b, 564, pgid as u32);
         put32(&mut b, 568, self.procs.jobc(pgid).max(0) as u32);
+        // e_tdev and e_tpgid: the session's terminal while the process
+        // has it.
         put32(&mut b, 572, NODEV);
+        if let Some((tdev, tpgid)) = (pid != 0).then(|| super::ctty::proc_tty(&self.procs, pid)).flatten() {
+            put32(&mut b, 572, tdev);
+            put32(&mut b, 576, tpgid as u32);
+        }
         if pid != 0 && self.procs.sid(pid, pid).ok() == Some(pid) {
             put32(&mut b, 612, EPROC_SLEADER);
         }
@@ -271,6 +281,9 @@ impl Kernel {
         }
         if self.procs.exiting(pid) {
             f |= pf::WEXIT;
+        }
+        if self.procs.controlt(pid) {
+            f |= pf::CONTROLT;
         }
         let (nocldstop, nocldwait) = self.procs.nocld(pid);
         if nocldstop {

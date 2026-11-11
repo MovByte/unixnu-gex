@@ -107,6 +107,18 @@ pub fn session(sid: i32, leader: Option<i32>) -> Arc<Session> {
     Arc::clone(g.get_or_insert_with(HashMap::new).entry(sid).or_insert_with(|| Session::new(sid, leader)))
 }
 
+/// A process's controlling terminal as kinfo and proc_info report it:
+/// its session's `s_ttydev` and `s_ttypgrpid` while it has P_CONTROLT.
+pub fn proc_tty(procs: &crate::proc::ProcTable, pid: i32) -> Option<(u32, i32)> {
+    if !procs.controlt(pid) {
+        return None;
+    }
+    let sid = procs.sid(pid, pid).ok()?;
+    let s = session(sid, None);
+    let st = s.lock();
+    Some((st.ttydev, st.ttypgrpid))
+}
+
 /// `setsid`'s new session for `pid`, in place of any older one of that
 /// number.
 pub fn new_session(pid: i32) -> Arc<Session> {

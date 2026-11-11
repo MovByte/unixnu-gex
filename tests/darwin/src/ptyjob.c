@@ -16,10 +16,28 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/proc.h>
 #include <sys/select.h>
+#include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
+
+// libproc's, which the iOS SDK has no header for.
+int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buffersize);
+int proc_listpids(uint32_t type, uint32_t typeinfo, void *buffer, int buffersize);
+struct bsdinfo {
+    uint32_t flags, status, xstatus, pid, ppid, uid, gid, ruid, rgid, svuid, svgid, rfu;
+    char comm[16];
+    char name[32];
+    uint32_t nfiles, pgid, pjobc, tdev, tpgid;
+    int32_t nice;
+    uint64_t start_sec, start_usec;
+};
+#define PROC_PIDTBSDINFO 3
+#define PROC_TTY_ONLY 3
+#define PROC_FLAG_CONTROLT 0x80
 
 static int rp[2];
 static volatile sig_atomic_t got_int, got_ttin, got_hup;
@@ -63,6 +81,28 @@ static void child(const char *name) {
     if (ioctl(s, TIOCSCTTY, 0)) fail("TIOCSCTTY of the session's own terminal", errno, 0);
     if (tcgetpgrp(s) != getpid()) fail("the foreground group", tcgetpgrp(s), getpid());
     if (tcgetsid(s) != getpid()) fail("TIOCGSID", tcgetsid(s), getpid());
+    // The terminal as kinfo_proc and proc_info report it.
+    struct stat ss;
+    fstat(s, &ss);
+    struct kinfo_proc kp;
+    size_t kl = sizeof kp;
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
+    if (sysctl(mib, 4, &kp, &kl, NULL, 0)) fail("kern.proc.pid", errno, 0);
+    if (kp.kp_eproc.e_tdev != ss.st_rdev) fail("e_tdev", kp.kp_eproc.e_tdev, ss.st_rdev);
+    if (kp.kp_eproc.e_tpgid != getpid()) fail("e_tpgid", kp.kp_eproc.e_tpgid, getpid());
+    if (!(kp.kp_proc.p_flag & P_CONTROLT)) fail("P_CONTROLT", kp.kp_proc.p_flag, P_CONTROLT);
+    int tmib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_TTY, (int)ss.st_rdev};
+    kl = 0;
+    if (sysctl(tmib, 4, NULL, &kl, NULL, 0) || kl < sizeof kp) fail("kern.proc.tty's size", (long)kl, sizeof kp);
+    struct bsdinfo bi;
+    if (proc_pidinfo(getpid(), PROC_PIDTBSDINFO, 0, &bi, sizeof bi) != sizeof bi) fail("PROC_PIDTBSDINFO", errno, 0);
+    if (bi.tdev != (uint32_t)ss.st_rdev || bi.tpgid != (uint32_t)getpid()) fail("pbi e_tdev", bi.tdev, ss.st_rdev);
+    if (!(bi.flags & PROC_FLAG_CONTROLT)) fail("PROC_FLAG_CONTROLT", bi.flags, PROC_FLAG_CONTROLT);
+    int pids[64];
+    int pn = proc_listpids(PROC_TTY_ONLY, (uint32_t)ss.st_rdev, pids, sizeof pids) / (int)sizeof(int);
+    int found = 0;
+    for (int i = 0; i < pn; i++) found |= pids[i] == getpid();
+    if (!found) fail("PROC_TTY_ONLY", pn, 1);
     int t = open("/dev/tty", O_RDWR);
     if (t < 0) fail("opening /dev/tty", errno, 0);
     struct pollfd p = {t, POLLIN, 0};
