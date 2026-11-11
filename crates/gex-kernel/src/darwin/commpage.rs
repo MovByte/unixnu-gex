@@ -35,6 +35,7 @@ pub mod off {
     pub const APPROX_TIME: usize = 0x0c0;
     pub const APPROX_TIME_SUPPORTED: usize = 0x0c8;
     pub const KDEBUG_ENABLE: usize = 0x100;
+    pub const ATM_DIAGNOSTIC_CONFIG: usize = 0x104;
     pub const NEWTIMEOFDAY_DATA: usize = 0x120;
     pub const REMOTETIME_PARAMS: usize = 0x148;
     pub const DYLD_FLAGS: usize = 0x160;
@@ -200,8 +201,20 @@ pub fn set_dyld_flags(v: u64) {
     DYLD_FLAGS.store(v, Ordering::Relaxed);
 }
 
+/// `atm_diagnostic_config`: zero, no boot argument or `/defaults`
+/// `kern.atm_diagnostic_config` giving another.
+static ATM_DIAGNOSTIC_CONFIG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// `atm_set_diagnostic_config`'s `commpage_update_atm_diagnostic_config`:
+/// every process's page has it at its next [`tick`].
+pub fn set_atm_diagnostic_config(v: u32) {
+    ATM_DIAGNOSTIC_CONFIG.store(v, Ordering::Relaxed);
+}
+
 pub fn tick(mem: &mut [u8], abstime: u64) {
     set_word(mem, off::DYLD_FLAGS, DYLD_FLAGS.load(Ordering::Relaxed));
+    let at = placements()[1] as usize + off::ATM_DIAGNOSTIC_CONFIG;
+    mem[at..at + 4].copy_from_slice(&ATM_DIAGNOSTIC_CONFIG.load(Ordering::Relaxed).to_le_bytes());
     if word(mem, off::APPROX_TIME) < abstime {
         set_word(mem, off::APPROX_TIME, abstime);
     }

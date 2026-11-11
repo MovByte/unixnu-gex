@@ -221,6 +221,19 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             Some(_) => Reply::err(KERN_INVALID_ARGUMENT),
             None => bad(),
         },
+        // host_set_atm_diagnostic_flag(host, diagnostic_flag): for a task
+        // entitled to it, atm_set_diagnostic_config (CONFIG_ATM; ATM is not
+        // disabled by a boot argument or /defaults).
+        (Kobject::Host | Kobject::HostPriv, 225) => match arg(req, 0) {
+            Some(flag) => {
+                if !k.darwin_entitled("com.apple.private.set-atm-diagnostic-flag") {
+                    return Reply::err(KERN_NO_ACCESS);
+                }
+                super::commpage::set_atm_diagnostic_config(flag as u32);
+                Reply::ok(Vec::new())
+            }
+            None => bad(),
+        },
         // host_create_mach_voucher(host, recipes) -> voucher: the raw
         // recipes, counted and padded (MIG's `_WALIGN_`).
         (Kobject::Host | Kobject::HostPriv, 222) => {

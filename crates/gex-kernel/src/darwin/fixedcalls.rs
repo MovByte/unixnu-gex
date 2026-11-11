@@ -14,7 +14,7 @@ use crate::GuestMem;
 const CROSSARCH_MAX_VALID_NAMESPACE: u64 = 0;
 
 impl Kernel {
-    fn darwin_entitled(&self, name: &str) -> bool {
+    pub(crate) fn darwin_entitled(&self, name: &str) -> bool {
         self.dtask.codesign.as_ref().is_some_and(|c| c.entitled(name))
     }
 
