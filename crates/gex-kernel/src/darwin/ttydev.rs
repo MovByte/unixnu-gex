@@ -197,6 +197,13 @@ pub struct Opened {
     pub fflag: i32,
 }
 
+/// A device's close a close(2) takes on as its own call, which may sleep.
+pub struct CloseJob {
+    cell: Arc<TtyCell>,
+    minor: u32,
+    fflag: i32,
+}
+
 /// A terminal device's vnode as a descriptor holds it.
 pub struct TtyDev {
     pub node: Node,
@@ -204,6 +211,9 @@ pub struct TtyDev {
     dev: Mutex<u32>,
     opened: Mutex<Option<Opened>>,
     procs: Mutex<Option<Arc<ProcTable>>>,
+    /// A close(2) is closing it: its device's close is that call's.
+    defer: std::sync::atomic::AtomicBool,
+    deferred: Mutex<Option<CloseJob>>,
 }
 
 impl std::fmt::Debug for TtyDev {
@@ -215,7 +225,7 @@ impl std::fmt::Debug for TtyDev {
 impl TtyDev {
     /// A vnode from a lookup of `node`, not yet opened.
     pub fn new(node: Node) -> Arc<TtyDev> {
-        Arc::new(TtyDev { node, dev: Mutex::new(lookup_dev(node)), opened: Mutex::new(None), procs: Mutex::new(None) })
+        Arc::new(TtyDev { node, dev: Mutex::new(lookup_dev(node)), opened: Mutex::new(None), procs: Mutex::new(None), defer: Default::default(), deferred: Mutex::new(None) })
     }
 
     /// `v_rdev`.
@@ -379,6 +389,11 @@ impl TtyDev {
             }
         }
         if last || revoke {
+            // A replica's close a close(2) is making waits as that call.
+            if !revoke && !self.primary() && self.defer.load(Ordering::Acquire) {
+                *self.deferred.lock().unwrap_or_else(|e| e.into_inner()) = Some(CloseJob { cell: o.cell, minor: self.minor(), fflag: o.fflag });
+                return;
+            }
             d_close(&o.cell, self.primary(), self.minor(), o.fflag, revoke, procs, caller);
         }
     }
@@ -514,7 +529,7 @@ fn ttyvp_handle(v: &TtyVnode) -> Option<Arc<TtyDev>> {
         ptmx::Got::Tty(t) => t,
         _ => return None,
     };
-    let h = Arc::new(TtyDev { node, dev: Mutex::new(v.dev), opened: Mutex::new(None), procs: Mutex::new(None) });
+    let h = Arc::new(TtyDev { node, dev: Mutex::new(v.dev), opened: Mutex::new(None), procs: Mutex::new(None), defer: Default::default(), deferred: Mutex::new(None) });
     *h.opened.lock().unwrap_or_else(|e| e.into_inner()) = Some(Opened { cell: slot_tty, vid: v.vid, fflag: tty::FREAD | tty::FWRITE });
     Some(h)
 }
@@ -727,6 +742,7 @@ pub enum Op {
     Write { fd: i32, iov: Iov, st: tty::WriteState, ptc: ptmx::PtcWrite },
     Ioctl { fd: i32, com: u64, data: Vec<u8>, udata: u64, st: ptmx::PtyIoctl },
     Open { fd: i32, dflags: u64, minor: u32, st: ptmx::PtsOpen },
+    Close { minor: u32, fflag: i32, st: ptmx::PtsClose },
 }
 
 /// A sleeping call, its terminal, the sleep and the thread's place on the
@@ -1069,7 +1085,43 @@ impl Kernel {
             Op::Write { fd, iov, st, ptc } => self.darwin_tty_write_step(m, fd, dev, iov, st, ptc, resumed),
             Op::Ioctl { fd, com, data, udata, st } => self.darwin_tty_ioctl_step(m, fd, dev, com, data, udata, st, resumed),
             Op::Open { fd, dflags, minor, st } => self.darwin_pts_open(m, fd, dflags, dev, minor, st, resumed),
+            Op::Close { minor, fflag, st } => self.darwin_pts_close_step(m, dev, cell, minor, fflag, st, resumed),
         })
+    }
+
+    /// `close` of a replica's descriptor: the descriptor goes, and if that
+    /// was the device's last open file, its `ptsclose` runs as this call,
+    /// draining the output as long as it may (`ttylclose`).
+    pub(crate) fn darwin_tty_close(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> SyscallOutcome {
+        let Some((_, dev)) = self.darwin_tty_of(a[0]) else { return self.darwin_tty_result(m, Err(Errno::EBADF)) };
+        if self.dtask.ladvlock {
+            // The process's POSIX locks on it go first.
+            self.darwin_closing(a[0] as i32);
+        }
+        dev.defer.store(true, Ordering::Release);
+        let r = self.canonical(m, crate::syscalls::nr::CLOSE, [a[0], 0, 0, 0, 0, 0]);
+        dev.defer.store(false, Ordering::Release);
+        if let Err(e) = r {
+            return self.darwin_tty_result(m, Err(e));
+        }
+        let job = dev.deferred.lock().unwrap_or_else(|e| e.into_inner()).take();
+        match job {
+            Some(j) => self.darwin_pts_close_step(m, dev, j.cell, j.minor, j.fflag, ptmx::PtsClose::default(), None),
+            None => self.darwin_tty_result(m, Ok(0)),
+        }
+    }
+
+    /// `ptsclose` as a close(2), until it ends or sleeps; the call's
+    /// result is 0 (`ttylclose`'s).
+    #[allow(clippy::too_many_arguments)]
+    fn darwin_pts_close_step(&mut self, m: &mut GuestMem<'_>, dev: Arc<TtyDev>, cell: Arc<TtyCell>, minor: u32, fflag: i32, mut st: ptmx::PtsClose, resumed: Option<(SleepReq, Woke)>) -> SyscallOutcome {
+        let mut env = self.darwin_tty_env();
+        let r = ptmx::ptsclose(&cell, minor, fflag, false, &mut env, &mut st, resumed);
+        self.darwin_tty_env_done(env);
+        match r {
+            Io::Done(_) => self.darwin_tty_result(m, Ok(0)),
+            Io::Sleep(req) => self.darwin_tty_sleep(m, Op::Close { minor, fflag, st }, dev, cell, req),
+        }
     }
 
     /// A call's end: its result, or its restart (ERESTART).
