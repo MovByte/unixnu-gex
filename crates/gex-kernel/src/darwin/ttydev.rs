@@ -1393,6 +1393,40 @@ impl Kernel {
         Some(self.darwin_tty_ioctl_step(m, a[0] as i32, dev, com, data, udata, ptmx::PtyIoctl::default(), None))
     }
 
+    /// `VNOP_IOCTL` of a terminal's vnode with command `com`, which has no
+    /// argument (`sys_fcntl_nocancel`'s default, which sends a command it
+    /// does not know down to the vnode with an empty argument and flag 0):
+    /// through `/dev/tty` to the session's terminal. A revoked vnode is
+    /// VBAD on the dead mount, so VNOP_IOCTL refuses a 64-bit caller's
+    /// argument for it (ENOTTY) before deadfs is reached.
+    pub(crate) fn darwin_tty_vnop_ioctl(&mut self, fd: i32, com: u32) -> Option<Result<u64, Errno>> {
+        let (_, dev) = self.darwin_tty_of(fd as u64)?;
+        let target = match self.darwin_tty_target(&dev) {
+            Ok(t) => t,
+            Err(e) => return Some(Err(e)),
+        };
+        if dev.dead() {
+            return Some(Err(Errno::ENOTTY));
+        }
+        let Some(o) = target.opened() else { return Some(Err(Errno::ENOTTY)) };
+        let p = self.darwin_tty_caller();
+        let mut env = self.darwin_tty_env();
+        let mut data = vec![0u8; 8];
+        let mut st = ptmx::PtyIoctl::default();
+        let r = {
+            let mut tp = o.cell.lock();
+            ptmx::ptyioctl(&o.cell, &mut tp, target.dev(), u64::from(com), &mut data, 0, &p, &mut env, &mut st, None)
+        };
+        self.darwin_tty_env_done(env);
+        Some(match r {
+            Io::Done(r) => r.map(|()| 0),
+            Io::Sleep(_) => {
+                self.darwin_unimplemented(format!("fcntl {com} of a terminal, which sleeps in its driver"));
+                Err(Errno::EINVAL)
+            }
+        })
+    }
+
     /// `vn_ioctl` and `ptyioctl` of a terminal, until they end or sleep.
     #[allow(clippy::too_many_arguments)]
     fn darwin_tty_ioctl_step(&mut self, m: &mut GuestMem<'_>, fd: i32, dev: Arc<TtyDev>, com: u64, mut data: Vec<u8>, udata: u64, mut st: ptmx::PtyIoctl, resumed: Option<(SleepReq, Woke)>) -> SyscallOutcome {

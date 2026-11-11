@@ -882,8 +882,11 @@ impl Kernel {
         if self.darwin_vnode_of(&file).is_none() || file.handle.metadata().is_ok_and(|md| md.file_type == crate::vfs::FileType::Socket) {
             return Err(Errno::EBADF);
         }
+        if let Some(r) = self.darwin_tty_vnop_ioctl(fd, c) {
+            return r;
+        }
         if file.is_tty() {
-            self.darwin_unimplemented(format!("fcntl {c} of a terminal (ttioctl)"));
+            self.darwin_unimplemented(format!("fcntl {c} of a terminal that is not a Darwin one"));
             return Err(Errno::EINVAL);
         }
         match file.metadata()?.file_type {
