@@ -16,6 +16,9 @@ pub struct Node {
     pub service_props: Vec<(String, Prop)>,
     pub parent: Option<u32>,
     pub children: Vec<u32>,
+    /// A `kernel-only` node: a release kernel's `IODeviceTreeAlloc` makes
+    /// each of its properties unserializable, so a task reads them empty.
+    pub kernel_only: bool,
 }
 
 /// A property of a service, as `OSSerialize` writes it.
@@ -34,6 +37,8 @@ fn superclasses(class: &str) -> &'static [&'static str] {
         "AppleAPFSMedia" => &["AppleAPFSMedia", "IOMedia", "IOStorage", "IOService", "IORegistryEntry"],
         "AppleAPFSContainer" => &["AppleAPFSContainer", "IOStorage", "IOService", "IORegistryEntry"],
         "IOMedia" => &["IOMedia", "IOStorage", "IOService", "IORegistryEntry"],
+        "IOPlatformExpertDevice" => &["IOPlatformExpertDevice", "IOService", "IORegistryEntry"],
+        "IORegistryEntry" => &["IORegistryEntry"],
         _ => &[],
     }
 }
@@ -59,7 +64,8 @@ pub fn parse(b: &[u8]) -> Result<Vec<Node>, String> {
         }
         let name = props.iter().find(|(k, _)| k == "name").map_or(String::new(), |(_, v)| String::from_utf8_lossy(&v[..v.iter().position(|&c| c == 0).unwrap_or(v.len())]).into_owned());
         let id = out.len() as u32;
-        out.push(Node { name, props, class: "", service_props: Vec::new(), parent, children: Vec::new() });
+        let kernel_only = props.iter().any(|(k, _)| k == "kernel-only");
+        out.push(Node { name, props, class: "", service_props: Vec::new(), parent, children: Vec::new(), kernel_only });
         for _ in 0..nchildren {
             let c = node(b, at, Some(id), out)?;
             out[id as usize].children.push(c);
@@ -77,8 +83,111 @@ pub fn parse(b: &[u8]) -> Result<Vec<Node>, String> {
 pub fn set_tree(b: &[u8]) -> Result<(), String> {
     let mut t = parse(b)?;
     add_volumes(&mut t);
+    add_root(&mut t);
     let _ = TREE.set(t);
     Ok(())
+}
+
+/// `IORegistryEntry::initialize`: the registry's root, "Root"; the device
+/// tree hangs from it in the `IODeviceTree` plane.
+fn add_root(t: &mut Vec<Node>) {
+    t.push(Node { name: "Root".to_string(), props: Vec::new(), class: "IORegistryEntry", service_props: Vec::new(), parent: None, children: vec![0], kernel_only: false });
+}
+
+/// Whether the kernel sets the root entry's property `name`: the planes
+/// (`IORegistryEntry::initialize`), IOKit's build version and diagnostics
+/// and the OS build version (`StartIOKit`), the console's lock and users
+/// (`IOService::updateConsoleUsers`), and the kernel's CPU type and the
+/// kernel collection's kext count (`OSKext`). The root has no other.
+pub fn root_has(name: &str) -> bool {
+    matches!(
+        name,
+        "IORegistryPlanes" | "IOKitBuildVersion" | "IOKitDiagnostics" | "OS Build Version" | "IOConsoleLocked" | "IOConsoleUsers" | "OSKernelCPUType" | "OSKernelCPUSubtype" | "OSPrelinkKextCount"
+    )
+}
+
+/// The registry's root entry (`IORegistryEntry::getRegistryRoot`), the
+/// last of the tree; none when the boot payload had no device tree.
+pub fn root() -> Option<u32> {
+    tree().len().checked_sub(1).map(|i| i as u32)
+}
+
+/// A registry plane (`IORegistryEntry::getPlane`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Plane {
+    Service,
+    DeviceTree,
+}
+
+/// The plane of a name; `Err` for one whose links are not here: the power
+/// plane, and the planes families make (and a name that is none, which
+/// xnu answers as no plane).
+pub fn plane(name: &[u8]) -> Result<Plane, String> {
+    match name {
+        b"IOService" => Ok(Plane::Service),
+        b"IODeviceTree" => Ok(Plane::DeviceTree),
+        _ => Err(format!("the {} plane", String::from_utf8_lossy(name))),
+    }
+}
+
+/// `getParentSetReference` or `getChildSetReference` in `plane`: the
+/// entries the entry is linked to there, in the order they were attached;
+/// `Err` for links that drivers make. The device tree is all of the
+/// `IODeviceTree` plane (the platform expert's `deleteList` takes none
+/// away). Its root is the `IOPlatformExpertDevice`, also the root's child
+/// in the `IOService` plane, where the platform's drivers hang from it and
+/// the other device tree entries are its nubs or not.
+pub fn links(t: &[Node], i: u32, plane: Plane, parents: bool) -> Result<Vec<u32>, String> {
+    let Some(n) = t.get(i as usize) else { return Ok(Vec::new()) };
+    let root = t.len() as u32 - 1;
+    if i == root {
+        return match (plane, parents) {
+            (_, true) => Ok(Vec::new()),
+            (Plane::DeviceTree, false) => Ok(n.children.clone()),
+            (Plane::Service, false) => Err("the registry root's children in the IOService plane (IOResources, IOUserResources and the platform)".to_string()),
+        };
+    }
+    if n.class.is_empty() {
+        return match (plane, parents) {
+            (Plane::DeviceTree, true) => Ok(vec![n.parent.unwrap_or(root)]),
+            (Plane::DeviceTree, false) => Ok(n.children.clone()),
+            (Plane::Service, true) if i == 0 => Ok(vec![root]),
+            (Plane::Service, false) if i == 0 => Err("the platform expert device's children in the IOService plane (its drivers)".to_string()),
+            (Plane::Service, _) => Err(format!("whether the platform made {} a nub in the IOService plane", n.name)),
+        };
+    }
+    match (plane, parents) {
+        (Plane::DeviceTree, _) => Ok(Vec::new()),
+        (Plane::Service, true) => n.parent.map(|p| vec![p]).ok_or_else(|| format!("the provider of {} (the storage controller)", n.name)),
+        (Plane::Service, false) => Ok(n.children.clone()),
+    }
+}
+
+/// `IORegistryEntry::getName()`: the device tree root's is its first
+/// `compatible` name (`IODeviceTreeAlloc`), its `IODeviceTree` plane name
+/// staying `device-tree`.
+pub fn name(t: &[Node], i: u32) -> String {
+    let Some(n) = t.get(i as usize) else { return String::new() };
+    if i == 0 {
+        if let Some((_, v)) = n.props.iter().find(|(k, _)| k == "compatible") {
+            return String::from_utf8_lossy(&v[..v.iter().position(|&c| c == 0).unwrap_or(v.len())]).into_owned();
+        }
+    }
+    n.name.clone()
+}
+
+/// The entry's class: a device tree entry other than the root is an
+/// `IOService` that the platform expert may have replaced with a nub of
+/// its own class, which is the platform's to say.
+pub fn class(t: &[Node], i: u32) -> Result<&'static str, String> {
+    let Some(n) = t.get(i as usize) else { return Err("no such entry".to_string()) };
+    if !n.class.is_empty() {
+        return Ok(n.class);
+    }
+    if i == 0 {
+        return Ok("IOPlatformExpertDevice");
+    }
+    Err(format!("the class of the device tree entry {}", n.name))
 }
 
 /// One `AppleAPFSVolume` for each volume of `/filesystems/fstab`, in its
@@ -98,6 +207,7 @@ fn add_volumes(t: &mut Vec<Node>) {
         service_props: bsd.map_or(Vec::new(), |b| vec![("BSD Name".to_string(), Prop::Str(b.to_string()))]),
         parent,
         children: Vec::new(),
+        kernel_only: false,
     };
     let store = t.len() as u32;
     t.push(service("disk0s1", "IOMedia", None, Some("disk0s1")));
@@ -121,7 +231,7 @@ fn add_volumes(t: &mut Vec<Node>) {
             ("Role".to_string(), Prop::Strs(vec![name.clone()])),
         ];
         let id = t.len() as u32;
-        t.push(Node { name, props: Vec::new(), class: "AppleAPFSVolume", service_props, parent: Some(container), children: Vec::new() });
+        t.push(Node { name, props: Vec::new(), class: "AppleAPFSVolume", service_props, parent: Some(container), children: Vec::new(), kernel_only: false });
         t[container as usize].children.push(id);
     }
 }
@@ -139,20 +249,39 @@ pub fn matching(tree: &[Node], dict: &[(String, DictValue)]) -> Result<Vec<u32>,
             _ => return Err(format!("the matching key {k} ({v:?})")),
         }
     }
+    // The platform expert device is registered (`IOPlatformExpertDevice`
+    // calls `registerService`); its properties are partly the platform's.
+    if class == Some("IOPlatformExpertDevice") {
+        if !props.is_empty() {
+            return Err(format!("the platform expert device by its properties {props:?}"));
+        }
+        return Ok(if tree.is_empty() { Vec::new() } else { vec![0] });
+    }
     let wanted = |n: &Node| {
-        !n.class.is_empty()
+        superclasses(n.class).contains(&"IOService")
             && class.map_or(true, |c| superclasses(n.class).contains(&c))
             && props.iter().all(|&(k, v)| n.service_props.iter().any(|(pk, pv)| pk == k && matches!(pv, Prop::Str(s) if s == v)))
     };
-    Ok(tree.iter().enumerate().filter(|(_, n)| wanted(n)).map(|(i, _)| i as u32).collect())
+    let found: Vec<u32> = tree.iter().enumerate().filter(|(_, n)| wanted(n)).map(|(i, _)| i as u32).collect();
+    // APFS's own classes are all here. Of the classes above them (and of
+    // services by property alone) the storage drivers' and the whole disk's
+    // are not, so those are answered only by a BSD name found here.
+    let complete = matches!(class, Some("AppleAPFSVolume" | "AppleAPFSContainer" | "AppleAPFSMedia" | "AppleAPFSContainerScheme"));
+    let by_name = props.iter().any(|&(k, _)| k == "BSD Name");
+    if !complete && !(by_name && !found.is_empty()) {
+        return Err(format!("the services of class {class:?} with {props:?}: the drivers' own are not here"));
+    }
+    Ok(found)
 }
 
-/// `OSObject::metaCast`: whether the node is, or inherits from, `class`.
-pub fn conforms(n: &Node, class: &str) -> bool {
-    if n.class.is_empty() {
-        return matches!(class, "IOPlatformDevice" | "IOService" | "IORegistryEntry");
+/// `OSObject::metaCast`: whether the entry is, or inherits from, `class`.
+/// Every device tree entry is an `IOService`, whatever nub replaced it.
+pub fn conforms(t: &[Node], i: u32, class: &str) -> Result<bool, String> {
+    match self::class(t, i) {
+        Ok(c) => Ok(superclasses(c).contains(&class)),
+        Err(_) if matches!(class, "IOService" | "IORegistryEntry") => Ok(true),
+        Err(what) => Err(what),
     }
-    superclasses(n.class).contains(&class)
 }
 
 /// `IORegistryEntry::getLocation`: of a volume, its index in the container,
@@ -229,30 +358,176 @@ pub fn unserialize_dict(b: &[u8]) -> Option<Vec<(String, DictValue)>> {
     Some(out)
 }
 
-/// The iterators handed out (`OSCollectionIterator`s over a fixed set),
-/// each its items and how far it has come.
-static ITERATORS: std::sync::Mutex<Vec<(Vec<u32>, usize)>> = std::sync::Mutex::new(Vec::new());
+/// An iterator handed out: an `OSCollectionIterator` over a fixed set,
+/// or an `IORegistryIterator`.
+enum Iter {
+    Set(Vec<u32>, usize),
+    Registry(RegistryIter),
+}
 
-/// A new iterator over `items`, by number.
-pub fn iterator_new(items: Vec<u32>) -> u32 {
+/// `IORegistryIterator`: its root and plane, its options, the stack of
+/// cursors entered (`where`, the first being `start`), and the entries
+/// already recursed into (`done`).
+struct RegistryIter {
+    root: u32,
+    plane: Plane,
+    options: u32,
+    cursors: Vec<Cursor>,
+    done: Vec<u32>,
+}
+
+/// `IORegCursor`: the entry whose links it walks, or last gave, and the
+/// links once it has started on them.
+struct Cursor {
+    current: Option<u32>,
+    links: Option<(Vec<u32>, usize)>,
+}
+
+const K_IO_REGISTRY_ITERATE_RECURSIVELY: u32 = 1;
+const K_IO_REGISTRY_ITERATE_PARENTS: u32 = 2;
+/// `kIORegistryIteratorInvalidFlag`, which `iterateOver` clears.
+const K_IO_REGISTRY_ITERATOR_INVALID_FLAG: u32 = 0x8000_0000;
+
+impl RegistryIter {
+    /// `getNextObjectFlat`: the next link of the cursor's entry, which it
+    /// then holds as its current.
+    fn next_flat(&mut self, t: &[Node]) -> Result<Option<u32>, String> {
+        let parents = self.options & K_IO_REGISTRY_ITERATE_PARENTS != 0;
+        let w = self.cursors.last_mut().expect("the start cursor");
+        if w.links.is_none() {
+            if let Some(c) = w.current {
+                w.links = Some((links(t, c, self.plane, parents)?, 0));
+            }
+        }
+        let next = match &mut w.links {
+            Some((l, at)) => {
+                let n = l.get(*at).copied();
+                if n.is_some() {
+                    *at += 1;
+                }
+                n
+            }
+            None => None,
+        };
+        w.current = next;
+        Ok(next)
+    }
+
+    /// `getNextObjectRecursive`: depth first, each entry entered the first
+    /// time it is given.
+    fn next_recursive(&mut self, t: &[Node]) -> Result<Option<u32>, String> {
+        let next = loop {
+            let n = self.next_flat(t)?;
+            if n.is_some() || !self.exit() {
+                break n;
+            }
+        };
+        if let Some(n) = next {
+            if !self.done.contains(&n) {
+                self.done.push(n);
+                self.enter();
+            }
+        }
+        Ok(next)
+    }
+
+    fn next(&mut self, t: &[Node]) -> Result<Option<u32>, String> {
+        if self.options & K_IO_REGISTRY_ITERATE_RECURSIVELY != 0 { self.next_recursive(t) } else { self.next_flat(t) }
+    }
+
+    fn new(root: u32, plane: Plane, options: u32) -> Self {
+        let start = Cursor { current: Some(root), links: None };
+        RegistryIter { root, plane, options: options & !K_IO_REGISTRY_ITERATOR_INVALID_FLAG, cursors: vec![start], done: Vec::new() }
+    }
+
+    /// `enterEntry`: a cursor over the links of the entry last given.
+    fn enter(&mut self) {
+        let current = self.cursors.last().expect("the start cursor").current;
+        self.cursors.push(Cursor { current, links: None });
+    }
+
+    /// `exitEntry`: the cursor's links dropped, and it popped unless it is
+    /// the start; whether it was.
+    fn exit(&mut self) -> bool {
+        self.cursors.last_mut().expect("the start cursor").links = None;
+        if self.cursors.len() > 1 {
+            self.cursors.pop();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `reset`: every cursor exited, the done set dropped, and the start
+    /// back on the root.
+    fn reset(&mut self) {
+        while self.exit() {}
+        self.done.clear();
+        self.cursors[0].current = Some(self.root);
+        self.options &= !K_IO_REGISTRY_ITERATOR_INVALID_FLAG;
+    }
+}
+
+static ITERATORS: std::sync::Mutex<Vec<Iter>> = std::sync::Mutex::new(Vec::new());
+
+fn iterator_add(it: Iter) -> u32 {
     let mut t = ITERATORS.lock().unwrap_or_else(|e| e.into_inner());
-    t.push((items, 0));
+    t.push(it);
     (t.len() - 1) as u32
 }
 
-/// The iterator's next entry.
-pub fn iterator_next(id: u32) -> Option<u32> {
-    let mut t = ITERATORS.lock().unwrap_or_else(|e| e.into_inner());
-    let (items, at) = t.get_mut(id as usize)?;
-    let next = items.get(*at).copied()?;
-    *at += 1;
-    Some(next)
+/// A new iterator over `items`, by number.
+pub fn iterator_new(items: Vec<u32>) -> u32 {
+    iterator_add(Iter::Set(items, 0))
 }
 
-/// `OSCollectionIterator::reset`: back to the first entry.
+/// `IORegistryIterator::iterateOver(root, plane, options)`, by number.
+pub fn registry_iterator_new(root: u32, plane: Plane, options: u32) -> u32 {
+    iterator_add(Iter::Registry(RegistryIter::new(root, plane, options)))
+}
+
+/// The iterator's next entry; `Err` for links that are not here.
+pub fn iterator_next(id: u32) -> Result<Option<u32>, String> {
+    let mut t = ITERATORS.lock().unwrap_or_else(|e| e.into_inner());
+    match t.get_mut(id as usize) {
+        Some(Iter::Set(items, at)) => {
+            let next = items.get(*at).copied();
+            if next.is_some() {
+                *at += 1;
+            }
+            Ok(next)
+        }
+        Some(Iter::Registry(r)) => r.next(tree()),
+        None => Ok(None),
+    }
+}
+
+/// `OSIterator::reset`: back to the first entry.
 pub fn iterator_reset(id: u32) {
-    if let Some((_, at)) = ITERATORS.lock().unwrap_or_else(|e| e.into_inner()).get_mut(id as usize) {
-        *at = 0;
+    match ITERATORS.lock().unwrap_or_else(|e| e.into_inner()).get_mut(id as usize) {
+        Some(Iter::Set(_, at)) => *at = 0,
+        Some(Iter::Registry(r)) => r.reset(),
+        None => {}
+    }
+}
+
+/// `enterEntry` on a registry iterator; `false` for another iterator.
+pub fn iterator_enter(id: u32) -> bool {
+    match ITERATORS.lock().unwrap_or_else(|e| e.into_inner()).get_mut(id as usize) {
+        Some(Iter::Registry(r)) => {
+            r.enter();
+            true
+        }
+        _ => false,
+    }
+}
+
+/// `exitEntry` on a registry iterator: whether it left an entry; `None`
+/// for another iterator.
+pub fn iterator_exit(id: u32) -> Option<bool> {
+    match ITERATORS.lock().unwrap_or_else(|e| e.into_inner()).get_mut(id as usize) {
+        Some(Iter::Registry(r)) => Some(r.exit()),
+        _ => None,
     }
 }
 
@@ -389,5 +664,70 @@ mod tests {
         assert_eq!(from_path(&t, "IODeviceTree:/nothing").unwrap(), None);
         assert!(from_path(&t, "IOService:/").is_err());
         assert_eq!(t[1].props[1].1, b"local\0");
+    }
+
+    fn node(b: &mut Vec<u8>, name: &str, props: &[(&str, &[u8])], children: u32) {
+        b.extend_from_slice(&(props.len() as u32 + 1).to_le_bytes());
+        b.extend_from_slice(&children.to_le_bytes());
+        prop(b, "name", format!("{name}\0").as_bytes());
+        for (k, v) in props {
+            prop(b, k, v);
+        }
+    }
+
+    /// device-tree { chosen { memory-map }, arm-io }, under the root.
+    fn small_tree() -> Vec<Node> {
+        let mut b = Vec::new();
+        node(&mut b, "device-tree", &[("compatible", b"J120AP\0iPad7,1\0AppleARM\0")], 2);
+        node(&mut b, "chosen", &[], 1);
+        node(&mut b, "memory-map", &[("kernel-only", b"")], 0);
+        node(&mut b, "arm-io", &[], 0);
+        let mut t = parse(&b).unwrap();
+        add_root(&mut t);
+        t
+    }
+
+    fn all(t: &[Node], r: &mut RegistryIter) -> Vec<u32> {
+        std::iter::from_fn(|| r.next(t).unwrap()).collect()
+    }
+
+    #[test]
+    fn registry_iterators_walk_the_device_tree_plane() {
+        let t = small_tree();
+        let root = t.len() as u32 - 1;
+        assert_eq!(name(&t, 0), "J120AP");
+        assert_eq!(t[0].name, "device-tree");
+        assert_eq!(class(&t, 0), Ok("IOPlatformExpertDevice"));
+        assert_eq!(class(&t, root), Ok("IORegistryEntry"));
+        assert!(t[2].kernel_only && !t[1].kernel_only);
+        assert!(class(&t, 1).is_err());
+        assert_eq!(conforms(&t, 1, "IOService"), Ok(true));
+        assert_eq!(conforms(&t, root, "IOService"), Ok(false));
+        // Flat: the root's one child; recursive: depth first.
+        let mut flat = RegistryIter::new(root, Plane::DeviceTree, 0);
+        assert_eq!(all(&t, &mut flat), vec![0]);
+        let mut deep = RegistryIter::new(root, Plane::DeviceTree, K_IO_REGISTRY_ITERATE_RECURSIVELY);
+        assert_eq!(all(&t, &mut deep), vec![0, 1, 2, 3]);
+        deep.reset();
+        assert_eq!(all(&t, &mut deep), vec![0, 1, 2, 3]);
+        // Entered by hand: the children of the entry last given, and out
+        // again to its siblings; no way out of the start.
+        let mut hand = RegistryIter::new(0, Plane::DeviceTree, 0);
+        assert_eq!(hand.next(&t).unwrap(), Some(1));
+        hand.enter();
+        assert_eq!(hand.next(&t).unwrap(), Some(2));
+        assert_eq!(hand.next(&t).unwrap(), None);
+        assert!(hand.exit());
+        assert_eq!(hand.next(&t).unwrap(), Some(3));
+        assert_eq!(hand.next(&t).unwrap(), None);
+        assert!(!hand.exit());
+        // Parents: up to the root, and none above it.
+        let mut up = RegistryIter::new(2, Plane::DeviceTree, K_IO_REGISTRY_ITERATE_PARENTS | K_IO_REGISTRY_ITERATE_RECURSIVELY);
+        assert_eq!(all(&t, &mut up), vec![1, 0, root]);
+        // The IOService plane below the root is the drivers'.
+        let mut svc = RegistryIter::new(root, Plane::Service, 0);
+        assert!(svc.next(&t).is_err());
+        assert_eq!(links(&t, 0, Plane::Service, true), Ok(vec![root]));
+        assert!(links(&t, 1, Plane::Service, false).is_err());
     }
 }

@@ -28,6 +28,7 @@ for p in hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lo
 done
 cc -O2 -framework CoreFoundation -o "$OUT/cfrunloop" "$HERE/src/cfrunloop.c"
 cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/iokit" "$HERE/src/iokit.c"
+cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/ioreg" "$HERE/src/ioreg.c"
 # amfi's: a program in no trust cache, and one holding get-task-allow.
 cc -O2 -o "$OUT/untrusted" "$HERE/src/hello.c"
 cc -O2 -o "$OUT/gta" "$HERE/src/hello.c"

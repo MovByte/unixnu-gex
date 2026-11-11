@@ -88,6 +88,45 @@ pub(crate) fn arg_after(req: &Kmsg, ndesc: usize, i: usize) -> Option<i32> {
 
 /// An out `io_name_t` as MIG sends it: an unused offset, the count with its
 /// terminator, the characters padded.
+/// io_registry_entry_get_child_iterator / _parent_iterator(entry, plane):
+/// an iterator over the entry's links in the plane (`getChildIterator`).
+fn link_iterator(k: &mut Kernel, req: &Kmsg, i: u32, parents: bool) -> Reply {
+    let Some((plane, _)) = inline_cstr(req, 0, 128) else { return Reply::err(MIG_BAD_ARGUMENTS) };
+    let links = super::iokit::plane(plane).and_then(|p| super::iokit::links(super::iokit::tree(), i, p, parents));
+    match links {
+        Ok(l) => {
+            let id = super::iokit::iterator_new(l);
+            let port = k.ipc().global_port(Kobject::IoIterator(id));
+            k.ipc().copy_send(port);
+            Reply::port(Carried::Port(port))
+        }
+        Err(what) => {
+            let mut r = Reply { ret: KERN_SUCCESS, defer: None, out: Vec::new(), ports: Vec::new(), unimplemented: None }.with_null_port(0);
+            r.unimplemented = Some(format!("the {} links of an entry: {what}", if parents { "parent" } else { "child" }));
+            r
+        }
+    }
+}
+
+/// `IORegistryIterator::iterateOver(entry, plane, options)` for a task.
+fn registry_iterator(k: &mut Kernel, req: &Kmsg, entry: u32) -> Reply {
+    let Some((plane, next)) = inline_cstr(req, 0, 128) else { return Reply::err(MIG_BAD_ARGUMENTS) };
+    let Some(options) = i32_at(&req.body, next) else { return Reply::err(MIG_BAD_ARGUMENTS) };
+    match super::iokit::plane(plane) {
+        Ok(p) => {
+            let id = super::iokit::registry_iterator_new(entry, p, options as u32);
+            let port = k.ipc().global_port(Kobject::IoIterator(id));
+            k.ipc().copy_send(port);
+            Reply::port(Carried::Port(port))
+        }
+        Err(what) => {
+            let mut r = Reply::err(0xe00002c2_u32 as i32);
+            r.unimplemented = Some(format!("an IORegistryIterator in {what}"));
+            r
+        }
+    }
+}
+
 fn io_name_reply(name: &str) -> Vec<u8> {
     let bytes = name.as_bytes();
     let n = (bytes.len() + 1) as u32;
@@ -237,14 +276,35 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             const IO_STRUCT_INBAND_MAX: usize = 4096;
             let Some((name, next)) = inline_cstr(req, 0, 128) else { return bad() };
             let Some(cnt) = i32_at(&req.body, next) else { return bad() };
+            const K_IO_RETURN_BAD_ARGUMENT: i32 = 0xe00002c2_u32 as i32;
             let Some(node) = super::iokit::tree().get(*i as usize) else { return bad() };
             let name = String::from_utf8_lossy(name);
-            let Some((_, value)) = node.props.iter().find(|(k, _)| *k == name) else { return Reply::err(K_IO_RETURN_NO_RESOURCES) };
+            // An OSString's bytes and its NUL, an OSBoolean's "Yes" or "No";
+            // a collection is not bytes.
+            let typed = node.service_props.iter().find(|(k, _)| *k == name).map(|(_, p)| match p {
+                super::iokit::Prop::Str(s) => Some([s.as_bytes(), b"\0"].concat()),
+                super::iokit::Prop::Bool(b) => Some(if *b { b"Yes\0".to_vec() } else { b"No\0".to_vec() }),
+                super::iokit::Prop::Strs(_) => None,
+            });
+            let value = match (typed, node.props.iter().find(|(k, _)| *k == name)) {
+                (Some(Some(v)), _) => v,
+                (Some(None), _) => return Reply::err(K_IO_RETURN_BAD_ARGUMENT),
+                (None, Some(_)) if node.kernel_only => Vec::new(),
+                (None, Some((_, v))) => v.clone(),
+                (None, None) => {
+                    let mut r = Reply::err(K_IO_RETURN_NO_RESOURCES);
+                    let root = Some(*i) == super::iokit::root();
+                    if (!node.class.is_empty() || *i == 0) && !(root && !super::iokit::root_has(&name)) {
+                        r.unimplemented = Some(format!("the {} property {name:?}", super::iokit::name(super::iokit::tree(), *i)));
+                    }
+                    return r;
+                }
+            };
             if (cnt as u32 as usize).min(IO_STRUCT_INBAND_MAX) < value.len() {
                 return Reply::err(K_IO_RETURN_IPC_ERROR);
             }
             let mut o = (value.len() as u32).to_le_bytes().to_vec();
-            o.extend_from_slice(value);
+            o.extend_from_slice(&value);
             o.resize((o.len() + 3) & !3, 0);
             Reply::ok(o)
         }
@@ -268,11 +328,14 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             let bin = if let Some((_, p)) = node.service_props.iter().find(|(k, _)| *k == name) {
                 super::iokit::serialize_prop(p)
             } else if let Some((_, value)) = node.props.iter().find(|(k, _)| *k == name) {
-                super::iokit::serialize_data(value)
+                super::iokit::serialize_data(if node.kernel_only { &[] } else { value })
             } else {
+                // The platform expert device has the platform's properties
+                // besides the device tree's.
                 let mut r = Reply::err(K_IO_RETURN_NOT_FOUND);
-                if !node.class.is_empty() {
-                    r.unimplemented = Some(format!("the {} property {name:?}", node.class));
+                let root = Some(*i) == super::iokit::root();
+                if (!node.class.is_empty() || *i == 0) && !(root && !super::iokit::root_has(&name)) {
+                    r.unimplemented = Some(format!("the {} property {name:?}", super::iokit::name(super::iokit::tree(), *i)));
                 }
                 return r;
             };
@@ -325,16 +388,7 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         // ids are the entries' own; these name the same entries for as long.
         (Kobject::IoEntry(i), 2871) => Reply::ok((0x1_0000_0000u64 + u64::from(*i)).to_le_bytes().to_vec()),
         // io_registry_entry_get_parent_iterator(entry, plane) -> iterator.
-        (Kobject::IoEntry(i), 2814) => {
-            let Some((plane, _)) = inline_cstr(req, 0, 128) else { return bad() };
-            let Some(node) = super::iokit::tree().get(*i as usize) else { return bad() };
-            let wanted = if node.class.is_empty() { b"IODeviceTree".as_slice() } else { b"IOService".as_slice() };
-            let parents = node.parent.filter(|_| plane == wanted).map_or(Vec::new(), |p| vec![p]);
-            let id = super::iokit::iterator_new(parents);
-            let port = k.ipc().global_port(Kobject::IoIterator(id));
-            k.ipc().copy_send(port);
-            Reply::port(Carried::Port(port))
-        }
+        (Kobject::IoEntry(i), 2814) => link_iterator(k, req, *i, true),
         // io_service_get_matching_service_bin(main_port, matching) -> first
         // service, of the dictionary's matches.
         (Kobject::IoMain, 2880) => {
@@ -354,7 +408,7 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
                         k.ipc().copy_send(port);
                         Reply::port(Carried::Port(port))
                     }
-                    None => Reply { ret: KERN_SUCCESS, defer: None, out: Vec::new(), ports: Vec::new(), unimplemented: None }.with_null_port(0),
+                    None => Reply::err(0xe00002f0_u32 as i32),
                 },
                 Err(what) => {
                     let mut r = Reply::err(K_IO_RETURN_NOT_READY);
@@ -364,33 +418,89 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             }
         }
         // io_registry_entry_get_child_iterator(entry, plane) -> iterator.
-        (Kobject::IoEntry(i), 2813) => {
-            let Some((plane, _)) = inline_cstr(req, 0, 128) else { return bad() };
-            let Some(node) = super::iokit::tree().get(*i as usize) else { return bad() };
-            let wanted = if node.class.is_empty() { b"IODeviceTree".as_slice() } else { b"IOService".as_slice() };
-            let children = if plane == wanted { node.children.clone() } else { Vec::new() };
-            let id = super::iokit::iterator_new(children);
-            let port = k.ipc().global_port(Kobject::IoIterator(id));
-            k.ipc().copy_send(port);
-            Reply::port(Carried::Port(port))
-        }
+        (Kobject::IoEntry(i), 2813) => link_iterator(k, req, *i, false),
+        // io_registry_get_root_entry(main_port) -> root.
+        (Kobject::IoMain, 2827) => match super::iokit::root() {
+            Some(r) => {
+                let port = k.ipc().global_port(Kobject::IoEntry(r));
+                k.ipc().copy_send(port);
+                Reply::port(Carried::Port(port))
+            }
+            None => {
+                let mut r = Reply::err(0xe00002c7_u32 as i32);
+                r.unimplemented = Some("the registry root with no device tree".to_string());
+                r
+            }
+        },
+        // io_registry_create_iterator(main_port, plane, options) and
+        // io_registry_entry_create_iterator(entry, plane, options) ->
+        // iterator: an IORegistryIterator over the root's links, or the
+        // entry's, in the plane.
+        (Kobject::IoMain, 2806) => match super::iokit::root() {
+            Some(r) => registry_iterator(k, req, r),
+            None => {
+                let mut r = Reply::err(0xe00002c7_u32 as i32);
+                r.unimplemented = Some("the registry root with no device tree".to_string());
+                r
+            }
+        },
+        (Kobject::IoEntry(i), 2833) => registry_iterator(k, req, *i),
+        // io_registry_iterator_enter_entry and _exit_entry: on a registry
+        // iterator only (kIOReturnBadArgument), the exit kIOReturnNoDevice
+        // at the start.
+        (Kobject::IoIterator(id), 2807) => match super::iokit::iterator_enter(*id) {
+            true => Reply::ok(Vec::new()),
+            false => Reply::err(0xe00002c2_u32 as i32),
+        },
+        (Kobject::IoIterator(id), 2808) => match super::iokit::iterator_exit(*id) {
+            Some(true) => Reply::ok(Vec::new()),
+            Some(false) => Reply::err(0xe00002c0_u32 as i32),
+            None => Reply::err(0xe00002c2_u32 as i32),
+        },
+        (Kobject::IoNotification(_), 2807 | 2808) => Reply::err(0xe00002c2_u32 as i32),
         // io_object_conforms_to(object, className) -> conforms.
         (Kobject::IoEntry(i), 2801) => {
             let Some((name, _)) = inline_cstr(req, 0, 128) else { return bad() };
-            let Some(node) = super::iokit::tree().get(*i as usize) else { return bad() };
-            let yes = super::iokit::conforms(node, &String::from_utf8_lossy(name));
-            Reply::ok(u32::from(yes).to_le_bytes().to_vec())
+            match super::iokit::conforms(super::iokit::tree(), *i, &String::from_utf8_lossy(name)) {
+                Ok(yes) => Reply::ok(u32::from(yes).to_le_bytes().to_vec()),
+                Err(what) => {
+                    let mut r = Reply::err(0xe00002c7_u32 as i32);
+                    r.unimplemented = Some(what);
+                    r
+                }
+            }
         }
         // io_object_get_class(object) -> className.
         (Kobject::IoEntry(i), 2800) => {
-            let Some(node) = super::iokit::tree().get(*i as usize) else { return bad() };
-            let name = if node.class.is_empty() { "IOPlatformDevice" } else { node.class };
-            Reply::ok(io_name_reply(name))
+            match super::iokit::class(super::iokit::tree(), *i) {
+                Ok(c) => Reply::ok(io_name_reply(c)),
+                Err(what) => {
+                    let mut r = Reply::err(0xe00002c7_u32 as i32);
+                    r.unimplemented = Some(what);
+                    r
+                }
+            }
         }
         // io_registry_entry_get_name(entry) -> name.
-        (Kobject::IoEntry(i), 2810) => {
-            let Some(node) = super::iokit::tree().get(*i as usize) else { return bad() };
-            Reply::ok(io_name_reply(&node.name))
+        (Kobject::IoEntry(i), 2810) => Reply::ok(io_name_reply(&super::iokit::name(super::iokit::tree(), *i))),
+        // io_registry_entry_get_name_in_plane(entry, plane) -> name: the
+        // entry's name there, which only the device tree root has its own
+        // of (`device-tree`); no plane is the entry's name.
+        (Kobject::IoEntry(i), 2843) => {
+            let Some((plane, _)) = inline_cstr(req, 0, 128) else { return bad() };
+            let t = super::iokit::tree();
+            if plane.is_empty() {
+                return Reply::ok(io_name_reply(&super::iokit::name(t, *i)));
+            }
+            match super::iokit::plane(plane) {
+                Ok(super::iokit::Plane::DeviceTree) if *i == 0 => Reply::ok(io_name_reply(&t[0].name)),
+                Ok(_) => Reply::ok(io_name_reply(&super::iokit::name(t, *i))),
+                Err(what) => {
+                    let mut r = Reply::err(0xe00002c7_u32 as i32);
+                    r.unimplemented = Some(format!("an entry's name in {what}"));
+                    r
+                }
+            }
         }
         // io_registry_entry_get_location_in_plane(entry, plane) -> location:
         // a volume's index in its container.
@@ -405,6 +515,9 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         // properties) -> connection, result: the user client, whose methods
         // are reported when they are called.
         (Kobject::IoEntry(i), 2862) => {
+            if super::iokit::conforms(super::iokit::tree(), *i, "IOService") != Ok(true) {
+                return Reply::err(0xe00002c2_u32 as i32);
+            }
             let port = k.ipc().global_port(Kobject::IoConnect(*i));
             k.ipc().copy_send(port);
             let mut r = Reply::port(Carried::Port(port));
@@ -516,7 +629,7 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
                 k.ipc().copy_send(port);
                 Reply::port(Carried::Port(port))
             }
-            None => Reply { ret: KERN_SUCCESS, defer: None, out: Vec::new(), ports: Vec::new(), unimplemented: None }.with_null_port(0),
+            None => Reply::err(0xe00002c0_u32 as i32),
         },
         (Kobject::IoNotification(_), 2803) => Reply::ok(Vec::new()),
         // io_iterator_reset and io_iterator_is_valid on an iterator over a
@@ -528,14 +641,20 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         }
         (Kobject::IoIterator(_), 2834) => Reply::ok(1u32.to_le_bytes().to_vec()),
         (Kobject::IoNotification(_), 2834) => Reply::ok(1u32.to_le_bytes().to_vec()),
-        // io_iterator_next(iterator) -> object, or none left.
+        // io_iterator_next(iterator) -> object, or kIOReturnNoDevice for
+        // none left.
         (Kobject::IoIterator(id), 2802) => match super::iokit::iterator_next(*id) {
-            Some(i) => {
+            Ok(Some(i)) => {
                 let port = k.ipc().global_port(Kobject::IoEntry(i));
                 k.ipc().copy_send(port);
                 Reply::port(Carried::Port(port))
             }
-            None => Reply { ret: KERN_SUCCESS, defer: None, out: Vec::new(), ports: Vec::new(), unimplemented: None }.with_null_port(0),
+            Ok(None) => Reply::err(0xe00002c0_u32 as i32),
+            Err(what) => {
+                let mut r = Reply::err(0xe00002c0_u32 as i32);
+                r.unimplemented = Some(format!("an IORegistryIterator reaching {what}"));
+                r
+            }
         },
         // host_get_special_port(host_priv, node, which) -> port
         (Kobject::Host | Kobject::HostPriv, 412) => match (arg(req, 0), arg(req, 1)) {
