@@ -3879,7 +3879,13 @@ impl PathIo<'_> {
         let tail = Self::path_tail(m, path)?;
         let p = self.at_path(m, dirfd, path)?;
         if flags & AT_REMOVEDIR != 0 {
-            // rmdir("dir/.") is EINVAL, rmdir("dir/..") ENOTEMPTY
+            // rmdir("dir/.") is EINVAL, rmdir("dir/..") ENOTEMPTY, once the
+            // walk has found a directory there ("file/." is ENOTDIR).
+            if tail.1 != 0 {
+                if self.ns.metadata(&p)?.file_type != FileType::Directory {
+                    return Err(Errno::ENOTDIR);
+                }
+            }
             match tail.1 {
                 1 => return Err(Errno::EINVAL),
                 2 => return Err(Errno::ENOTEMPTY),
