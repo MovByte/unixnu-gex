@@ -278,9 +278,13 @@ pub fn out_unnamed() -> Vec<u8> {
 /// How an address is copied out and its length reported.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Rule {
-    /// `accept`, `getsockname`, `getpeername`: at most the caller's length,
-    /// and the whole length is what is reported.
+    /// `accept`: with an address asked for, at most the caller's length
+    /// (which must be readable), and the whole length is what is reported.
     Name,
+    /// `getsockname`, `getpeername`: as `accept`, but the length is read
+    /// first whether or not an address is asked for, and the address is
+    /// written wherever it points.
+    Sock,
     /// `recvfrom`, `recvmsg` (`copyout_sa`): a caller who gave no room is
     /// told there is none (length 0), not how much there would be.
     Recv,
@@ -291,21 +295,28 @@ pub enum Rule {
 pub fn out_lengths(rule: Rule, room: u32, sa: &[u8]) -> (u32, usize) {
     let whole = sa.len() as u32;
     match rule {
-        Rule::Name => (whole, (room.min(whole)) as usize),
+        Rule::Name | Rule::Sock => (whole, (room.min(whole)) as usize),
         Rule::Recv if room == 0 => (0, 0),
         Rule::Recv => (whole, room.min(whole) as usize),
     }
 }
 
 /// Copy `sa` out to `addr`, with the length at `lenp` read first and set
-/// after. No `addr`, no copy; no `lenp`, the whole structure.
+/// after. `accept` with no `addr` copies nothing; `recvfrom` with no `lenp`
+/// has no room (`msg_namelen` 0); `getsockname` and `getpeername` copy the
+/// length in unconditionally, so none is EFAULT.
 pub fn put(m: &mut GuestMem<'_>, addr: u64, lenp: u64, sa: &[u8], rule: Rule) -> Result<(), Errno> {
-    if addr == 0 {
-        return Ok(());
-    }
-    let room = if lenp != 0 { m.read_u32(lenp)? } else { sa.len() as u32 };
+    let room = match rule {
+        Rule::Sock => m.read_u32(lenp)?,
+        _ if addr == 0 => return Ok(()),
+        Rule::Name => m.read_u32(lenp)?,
+        Rule::Recv if lenp == 0 => 0,
+        Rule::Recv => m.read_u32(lenp)?,
+    };
     let (report, n) = out_lengths(rule, room, sa);
-    m.write(addr, &sa[..n])?;
+    if n > 0 {
+        m.write(addr, &sa[..n])?;
+    }
     if lenp != 0 {
         m.write_u32(lenp, report)?;
     }

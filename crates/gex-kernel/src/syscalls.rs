@@ -4925,8 +4925,8 @@ impl NetIo<'_> {
             nr::SENDMMSG => sendmmsg(io, m, fd, a[1], a[2]),
             nr::RECVMMSG => recvmmsg(io, m, fd, a[1], a[2], a[3]),
             nr::GETPEERNAME if io.dgram_of(fd).is_ok() => match io.dgram_of(fd)?.peer_name()? {
-                Some(p) => io.put_unix(m, a[1], a[2], &p, Rule::Name).map(|_| 0),
-                None => io.put_unnamed(m, a[1], a[2], Rule::Name),
+                Some(p) => io.put_unix(m, a[1], a[2], &p, Rule::Sock).map(|_| 0),
+                None => io.put_unnamed(m, a[1], a[2], Rule::Sock),
             },
             // A unix stream socket: the name it connected to (an accepted
             // end's peer is unnamed: the family alone).
@@ -4942,13 +4942,13 @@ impl NetIo<'_> {
                     }
                 };
                 match peer {
-                    Some(p) => io.put_unix(m, a[1], a[2], &p, Rule::Name).map(|_| 0),
-                    None => io.put_unnamed(m, a[1], a[2], Rule::Name),
+                    Some(p) => io.put_unix(m, a[1], a[2], &p, Rule::Sock).map(|_| 0),
+                    None => io.put_unnamed(m, a[1], a[2], Rule::Sock),
                 }
             }
             nr::GETPEERNAME => {
                 let (ip, port) = io.socket_of(fd)?.peer().ok_or(Errno::ENOTCONN)?;
-                io.put_inet(m, ip, port, a[1], a[2], Rule::Name)
+                io.put_inet(m, ip, port, a[1], a[2], Rule::Sock)
             }
             // An unbound, unconnected socket is at 0.0.0.0; a connected one
             // not bound to an address is on the interface its peer is
@@ -4962,7 +4962,7 @@ impl NetIo<'_> {
             nr::GETSOCKNAME => match socket_family_type(io, fd) {
                 // A bound datagram socket has its name.
                 Ok((1, 2)) if io.dgram_of(fd)?.name().is_some() => {
-                    io.put_unix(m, a[1], a[2], &io.dgram_of(fd)?.name().unwrap(), Rule::Name).map(|_| 0)
+                    io.put_unix(m, a[1], a[2], &io.dgram_of(fd)?.name().unwrap(), Rule::Sock).map(|_| 0)
                 }
                 // A unix stream socket: its name (bound, listening, or its
                 // listener's when accepted), else unnamed. A listener in the
@@ -4973,8 +4973,8 @@ impl NetIo<'_> {
                         Err(_) => io.remote_unix_of(fd).ok().filter(|r| r.listening).and_then(|r| r.peer.clone()),
                     };
                     match name {
-                        Some(p) => io.put_unix(m, a[1], a[2], &p, Rule::Name).map(|_| 0),
-                        None => io.put_unnamed(m, a[1], a[2], Rule::Name),
+                        Some(p) => io.put_unix(m, a[1], a[2], &p, Rule::Sock).map(|_| 0),
+                        None => io.put_unnamed(m, a[1], a[2], Rule::Sock),
                     }
                 }
                 _ => {
@@ -4985,7 +4985,7 @@ impl NetIo<'_> {
                             (local, _) => local,
                         })
                         .unwrap_or((0, 0));
-                    io.put_inet(m, ip, port, a[1], a[2], Rule::Name)
+                    io.put_inet(m, ip, port, a[1], a[2], Rule::Sock)
                 }
             },
             // Nothing here has an option worth setting -- no timeouts, no
@@ -5350,6 +5350,11 @@ fn inet_connect(io: &FdIo<'_>, m: &GuestMem<'_>, fd: i32, addr: u64, len: u64) -
 
 /// `accept`: a unix listener's, else a TCP listener's (`net::Socket`).
 fn accept(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, addr: u64, len_out: u64, flags: u64) -> SysResult {
+    // Darwin's accept copies the length in before it takes a connection,
+    // so a bad one leaves the connection queued.
+    if io.darwin && addr != 0 {
+        m.read_u32(len_out)?;
+    }
     match unix_accept(io, m, fd, addr, len_out, flags) {
         Err(Errno::ENOTSOCK) => inet_accept(io, m, fd, addr, len_out, flags),
         other => other,
