@@ -3145,6 +3145,17 @@ enum Seen {
 }
 
 impl PathIo<'_> {
+    /// The longest path a call takes, its NUL included: Linux's PATH_MAX,
+    /// or for a Darwin process MAXPATHLEN (1024), namei's `copyinstr`
+    /// limit.
+    fn path_max(&self) -> usize {
+        if self.darwin {
+            1024
+        } else {
+            4096
+        }
+    }
+
     /// The path call `n` (canonical; [`is_path`]), or `None` for another.
     ///
     /// A descriptor's directory, or the working directory, is found where
@@ -3566,7 +3577,7 @@ impl PathIo<'_> {
         flags: u64,
         buf: u64,
     ) -> SysResult {
-        let raw = m.read_cstr(path, 4096)?;
+        let raw = m.read_cstr(path, self.path_max())?;
         let (md, mnt_id) = if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
             let f = self.map.fds.get(dirfd)?;
             let id = if f.path.starts_with('/') { self.ns.mount_id_of(&f.path) } else { 1 };
@@ -3681,7 +3692,7 @@ impl PathIo<'_> {
         let raw: &[u8] = match m.read_cstr_into(path, &mut small)? {
             Some(n) => &small[..n],
             None => {
-                long = m.read_cstr(path, 4096)?;
+                long = m.read_cstr(path, self.path_max())?;
                 &long
             }
         };
@@ -3748,7 +3759,7 @@ impl PathIo<'_> {
     /// identity (the open directory), so it follows a rename as Linux's
     /// does.
     pub fn sys_chdir(&self, m: &GuestMem<'_>, path: u64) -> SysResult {
-        let raw = m.read_cstr(path, 4096)?;
+        let raw = m.read_cstr(path, self.path_max())?;
         let p = String::from_utf8(raw).map_err(|_| Errno::EINVAL)?;
         if p.is_empty() {
             return Err(Errno::ENOENT);
@@ -3850,7 +3861,7 @@ impl PathIo<'_> {
         // "link/" where link dangles: the name is taken (EEXIST); resolving
         // the slash would say ENOENT
         if Self::path_tail(m, path)?.0 {
-            let raw = String::from_utf8(m.read_cstr(path, 4096)?).map_err(|_| Errno::EINVAL)?;
+            let raw = String::from_utf8(m.read_cstr(path, self.path_max())?).map_err(|_| Errno::EINVAL)?;
             let bare = self.at_path_str(dirfd, raw.trim_end_matches('/'))?;
             if self.ns.metadata_nofollow(&bare).is_ok() {
                 return Err(Errno::EEXIST);
@@ -3937,7 +3948,7 @@ impl PathIo<'_> {
         // "." or ".." as the last component of either name: EINVAL (the
         // normalised paths would name the directory itself)
         for ptr in [old, new] {
-            let raw = m.read_cstr(ptr, 4096)?;
+            let raw = m.read_cstr(ptr, self.path_max())?;
             let last = raw.split(|&b| b == b'/').filter(|c| !c.is_empty()).next_back();
             if matches!(last, Some(b".") | Some(b"..")) {
                 return Err(Errno::EINVAL);
@@ -3947,7 +3958,7 @@ impl PathIo<'_> {
         // "x" to "link/" where link is a symlink: the slash asks to follow
         // it, and rename never replaces through a link (ENOTDIR, as GNU)
         if Self::path_tail(m, new)?.0 {
-            let raw = String::from_utf8(m.read_cstr(new, 4096)?).map_err(|_| Errno::EINVAL)?;
+            let raw = String::from_utf8(m.read_cstr(new, self.path_max())?).map_err(|_| Errno::EINVAL)?;
             let bare = self.at_path_str(new_fd, raw.trim_end_matches('/'))?;
             if self.ns.metadata_nofollow(&bare).is_ok_and(|md| md.file_type == FileType::Symlink) {
                 return Err(Errno::ENOTDIR);
@@ -4043,7 +4054,7 @@ impl PathIo<'_> {
         newdirfd: i32,
         path: u64,
     ) -> SysResult {
-        let t = String::from_utf8(m.read_cstr(target, 4096)?).map_err(|_| Errno::EINVAL)?;
+        let t = String::from_utf8(m.read_cstr(target, self.path_max())?).map_err(|_| Errno::EINVAL)?;
         let p = self.at_path(m, newdirfd, path)?;
         self.new_name_check(m, path, &p)?;
         self.ns.symlink(&t, &p).map(|_| 0)
@@ -4163,7 +4174,7 @@ impl PathIo<'_> {
     }
 
     pub fn at_path(&self, m: &GuestMem<'_>, dirfd: i32, path: u64) -> Result<String, Errno> {
-        let raw = m.read_cstr(path, 4096)?;
+        let raw = m.read_cstr(path, self.path_max())?;
         self.at_path_str(dirfd, std::str::from_utf8(&raw).map_err(|_| Errno::EINVAL)?)
     }
 
