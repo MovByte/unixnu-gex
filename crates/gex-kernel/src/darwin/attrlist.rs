@@ -491,6 +491,9 @@ impl AttrBuf {
     }
 }
 
+/// `kTextEncodingMacUnicode`, what a vnode with no encoding is given.
+const ENCODING_UTF8: u32 = 0x7e;
+
 /// What a vnode's attributes are, as the code that packs them needs them.
 /// `unsupported` names what the filesystem cannot give for it
 /// (`va_supported`), as the fixup after the attributes are fetched sees it.
@@ -538,6 +541,9 @@ pub struct Vn {
     pub unsupported: AttrSet,
     /// A reply asking for this has no way to be answered: said once.
     pub missing: Vec<String>,
+    /// The filesystem's ids are 32 bits (no `VA_64BITOBJIDS`): an object
+    /// id is an `fsobj_id_t`, the number cut to 32 bits and generation 0.
+    pub obj32: bool,
 }
 
 pub mod vtype {
@@ -633,8 +639,12 @@ pub fn getattrlist(al: &AttrList, buffer_size: usize, options: u64, vn: &Vn) -> 
     if pack_invalid {
         valid = al.set;
     }
-    // Attributes the filesystem did not return.
-    let un = wanted_unsupported(&al.set, &vn.unsupported, isdir, use_fork);
+    // Attributes the filesystem did not return. With no encoding, one not
+    // asking what is returned is given UTF-8's (`vattr_get_alt_data`).
+    let mut un = wanted_unsupported(&al.set, &vn.unsupported, isdir, use_fork);
+    if !return_valid {
+        un.common &= !cmn::SCRIPT;
+    }
     if un != AttrSet::default() {
         if return_valid && pack_invalid {
             fixup(&mut valid, &un, use_fork);
@@ -734,23 +744,30 @@ fn pack_common(al: &AttrSet, ab: &mut AttrBuf, vn: &Vn, return_valid: bool, pack
         ab.pack4(vn.tag);
         ab.actual.common |= cmn::OBJTAG;
     }
-    // APFS ids are 64 bits (`VA_64BITOBJIDS`), and a file has no link id of
-    // its own beside its file id.
+    // APFS ids are 64 bits (`VA_64BITOBJIDS`), another filesystem's an
+    // `fsobj_id_t`; a file has no link id of its own beside its file id.
+    let objid = |id: u64| if vn.obj32 { u64::from(id as u32) } else { id };
     if c & cmn::OBJID != 0 {
-        ab.pack8u(vn.fileid);
+        ab.pack8u(objid(vn.fileid));
         ab.actual.common |= cmn::OBJID;
     }
     if c & cmn::OBJPERMANENTID != 0 {
-        ab.pack8u(vn.fileid);
+        ab.pack8u(objid(vn.fileid));
         ab.actual.common |= cmn::OBJPERMANENTID;
     }
     if c & cmn::PAROBJID != 0 {
-        ab.pack8u(vn.parentid);
+        ab.pack8u(objid(vn.parentid));
         ab.actual.common |= cmn::PAROBJID;
     }
     if c & cmn::SCRIPT != 0 {
-        ab.pack4(vn.encoding);
-        ab.actual.common |= cmn::SCRIPT;
+        if vn.unsupported.common & cmn::SCRIPT != 0 && return_valid {
+            if fill {
+                ab.pack4(ENCODING_UTF8);
+            }
+        } else {
+            ab.pack4(vn.encoding);
+            ab.actual.common |= cmn::SCRIPT;
+        }
     }
     for (bit, t) in [(cmn::CRTIME, vn.crtime), (cmn::MODTIME, vn.modtime), (cmn::CHGTIME, vn.chgtime), (cmn::ACCTIME, vn.acctime), (cmn::BKUPTIME, vn.bkuptime)] {
         if c & bit != 0 {
@@ -945,7 +962,7 @@ fn pack_ext(al: &AttrSet, ab: &mut AttrBuf, vn: &Vn, return_valid: bool, pack_in
     }
     // A file that was never cloned is its own clone.
     if x & ext::CLONEID != 0 {
-        ab.pack8u(vn.fileid);
+        ab.pack8u(if vn.unsupported.fork & ext::CLONEID != 0 { 0 } else { vn.fileid });
         ab.actual.fork |= ext::CLONEID;
     }
     for (bit, wide) in [(ext::EXT_FLAGS, true), (ext::RECURSIVE_GENCOUNT, true), (ext::ATTRIBUTION_TAG, true), (ext::CLONE_REFCNT, false)] {
@@ -1099,8 +1116,16 @@ pub struct VolInfo {
     pub modify_time: (i64, i64),
     pub access_time: (i64, i64),
     pub backup_time: (i64, i64),
-    /// `ATTR_VOL_*` with no value (`unsupported.vol`).
+    /// What the filesystem returns no value for: `ATTR_VOL_*`, and the
+    /// volume times among the common attributes.
     pub unsupported: AttrSet,
+    /// `f_objcount`, `f_filecount`, `f_dircount`, `f_vol_name`.
+    pub objcount: u32,
+    pub filecount: u32,
+    pub dircount: u32,
+    pub vol_name: String,
+    /// `vfs_extendedsecurity`: the mount keeps ACLs and UUIDs.
+    pub ext_security: bool,
 }
 
 /// `getattrlist_findnamecomp`: the last component of a path.
@@ -1133,17 +1158,27 @@ pub fn getvolattrlist(al: &AttrList, buffer_size: usize, options: u64, vi: &VolI
         parsetab(VOL_TAB, alp.vol, &mut fixedsize)?;
     }
     // Attributes the filesystem has no value for (`f_active & ~f_supported`).
+    const VOL_TIMES: u32 = cmn::CRTIME | cmn::MODTIME | cmn::CHGTIME | cmn::ACCTIME | cmn::BKUPTIME;
     let un = vi.unsupported.vol & alp.vol;
-    if un != 0 {
+    let unc = vi.unsupported.common & VOL_TIMES & alp.common;
+    if un != 0 || unc != 0 {
         if return_valid {
             if pack_invalid {
                 valid.vol &= !un;
+                valid.common &= !unc;
             } else {
                 alp.vol &= !un;
+                alp.common &= !unc;
             }
         } else {
             return Err(Errno::EINVAL);
         }
+    }
+    // The root's encoding, where it has none: UTF-8's, unless the reply
+    // says what it returns and does not pack the rest.
+    let root_script_un = vi.root.unsupported.common & cmn::SCRIPT != 0;
+    if root_script_un && alp.common & cmn::SCRIPT != 0 && return_valid && !pack_invalid {
+        alp.common &= !cmn::SCRIPT;
     }
     let name = if vi.mntonname == "/" { vi.root.name.as_str() } else { last_component(&vi.mntonname) };
     let mut varsize = 0;
@@ -1152,6 +1187,9 @@ pub fn getvolattrlist(al: &AttrList, buffer_size: usize, options: u64, vi: &VolI
     }
     if alp.vol & vol::MOUNTPOINT != 0 {
         varsize += roundup4(vi.mntonname.len() + 1);
+    }
+    if alp.vol & vol::NAME != 0 {
+        varsize += roundup4(vi.vol_name.len() + 1);
     }
     if alp.vol & vol::MOUNTEDDEVICE != 0 {
         varsize += roundup4(vi.mntfromname.len() + 1);
@@ -1207,7 +1245,7 @@ pub fn getvolattrlist(al: &AttrList, buffer_size: usize, options: u64, vi: &VolI
         }
     }
     if c & cmn::SCRIPT != 0 {
-        ab.pack4(root.encoding);
+        ab.pack4(if root_script_un { ENCODING_UTF8 } else { root.encoding });
         ab.actual.common |= cmn::SCRIPT;
     }
     if c & cmn::CRTIME != 0 {
@@ -1240,8 +1278,9 @@ pub fn getvolattrlist(al: &AttrList, buffer_size: usize, options: u64, vi: &VolI
         ab.pack4(root.gid);
         ab.actual.common |= cmn::GRPID;
     }
+    // The root's `va_mode`, with its type.
     if c & cmn::ACCESSMASK != 0 {
-        ab.pack4(root.mode);
+        ab.pack4(root.mode | type_bits(root.vtype).unwrap_or(0));
         ab.actual.common |= cmn::ACCESSMASK;
     }
     if c & cmn::FLAGS != 0 {
@@ -1289,8 +1328,12 @@ pub fn getvolattrlist(al: &AttrList, buffer_size: usize, options: u64, vi: &VolI
     put(&mut ab, vol::MINALLOCATION, &|ab| ab.pack8u(bsize));
     put(&mut ab, vol::ALLOCATIONCLUMP, &|ab| ab.pack8u(bsize));
     put(&mut ab, vol::IOBLOCKSIZE, &|ab| ab.pack4(vi.iosize));
+    put(&mut ab, vol::OBJCOUNT, &|ab| ab.pack4(vi.objcount));
+    put(&mut ab, vol::FILECOUNT, &|ab| ab.pack4(vi.filecount));
+    put(&mut ab, vol::DIRCOUNT, &|ab| ab.pack4(vi.dircount));
     put(&mut ab, vol::MAXOBJCOUNT, &|ab| ab.pack4(vi.max_objcount));
     put(&mut ab, vol::MOUNTPOINT, &|ab| ab.pack_string(Some(vi.mntonname.as_bytes())));
+    put(&mut ab, vol::NAME, &|ab| ab.pack_string(Some(vi.vol_name.as_bytes())));
     put(&mut ab, vol::MOUNTFLAGS, &|ab| ab.pack4(vi.mnt_flag));
     put(&mut ab, vol::MOUNTEDDEVICE, &|ab| ab.pack_string(Some(vi.mntfromname.as_bytes())));
     if v & vol::ENCODINGSUSED != 0 && fill {
@@ -1300,7 +1343,12 @@ pub fn getvolattrlist(al: &AttrList, buffer_size: usize, options: u64, vi: &VolI
         let mut caps = vi.caps;
         // The filesystem is asked about attribute lists, and says yes; the
         // mount adds what it does for every filesystem here.
-        caps.capabilities[1] |= volcap::INT_ATTRLIST | volcap::INT_EXTENDED_SECURITY | volcap::INT_USERACCESS;
+        caps.capabilities[1] |= volcap::INT_ATTRLIST | volcap::INT_USERACCESS;
+        if vi.ext_security {
+            caps.capabilities[1] |= volcap::INT_EXTENDED_SECURITY;
+        } else {
+            caps.capabilities[1] &= !volcap::INT_EXTENDED_SECURITY;
+        }
         caps.valid[1] |= volcap::INT_ATTRLIST | volcap::INT_EXTENDED_SECURITY | volcap::INT_USERACCESS;
         for bit in [volcap::FMT_NO_IMMUTABLE_FILES, volcap::FMT_NO_PERMISSIONS] {
             if caps.valid[0] & bit == 0 {
@@ -1319,14 +1367,21 @@ pub fn getvolattrlist(al: &AttrList, buffer_size: usize, options: u64, vi: &VolI
     put(&mut ab, vol::QUOTA_SIZE, &|ab| ab.pack8u(bsize * vi.quota));
     put(&mut ab, vol::RESERVED_SIZE, &|ab| ab.pack8u(bsize * vi.reserved));
     if v & vol::ATTRIBUTES != 0 {
-        let mut valid_attr = vi.attributes[0];
-        valid_attr.common |= DFLT_CMN | cmn::EXTENDED_SECURITY | cmn::UUID | cmn::GRPUUID;
+        let (mut valid_attr, mut native) = (vi.attributes[0], vi.attributes[1]);
+        valid_attr.common |= DFLT_CMN;
         valid_attr.vol |= DFLT_VOL;
         valid_attr.dir |= DFLT_DIR;
         valid_attr.file |= DFLT_FILE;
+        const SECURITY: u32 = cmn::EXTENDED_SECURITY | cmn::UUID | cmn::GRPUUID;
+        if vi.ext_security {
+            valid_attr.common |= SECURITY;
+        } else {
+            valid_attr.common &= !SECURITY;
+            native.common &= !SECURITY;
+        }
         let mut b = [0u8; 40];
         b[..20].copy_from_slice(&valid_attr.to_bytes());
-        b[20..].copy_from_slice(&vi.attributes[1].to_bytes());
+        b[20..].copy_from_slice(&native.to_bytes());
         ab.pack_fixed(&b);
         ab.actual.vol |= vol::ATTRIBUTES;
     }

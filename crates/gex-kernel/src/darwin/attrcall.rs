@@ -107,8 +107,13 @@ fn last(path: &str) -> &str {
 fn vnode(pio: &PathIo<'_>, path: &str, md: &Metadata, name: Option<&str>, want_children: bool) -> Result<Vn, Errno> {
     let mnt: &Mount = mount_of(path);
     if mnt.fs == super::kern::Fs::Devfs {
-        super::note_unimplemented(format!("getattrlist of {path} (devfs_getattr's attributes in getattrlist)"));
-        return Err(Errno::EOPNOTSUPP);
+        // A listing of the directory devfs is mounted on finds the
+        // directory it covers, not devfs's root.
+        if name.is_some() && path == mnt.on {
+            super::note_unimplemented(format!("getattrlistbulk's entry {path}: the directory devfs covers on the root volume"));
+            return Err(Errno::EOPNOTSUPP);
+        }
+        return Ok(devfs_vnode(pio, mnt, path, md, name));
     }
     let st = Kernel::stat_from(md);
     let is_dir = md.file_type == FileType::Directory;
@@ -185,7 +190,78 @@ fn vnode(pio: &PathIo<'_>, path: &str, md: &Metadata, name: Option<&str>, want_c
         dataprotect: DATAPROTECT,
         unsupported: AttrSet { fork: ext::PRIVATESIZE, ..Default::default() },
         missing: Vec::new(),
+        // APFS sets VA_64BITOBJIDS.
+        obj32: false,
     })
+}
+
+/// `VT_DEVFS`.
+const VT_DEVFS: u32 = 18;
+
+/// A devfs vnode's attributes (`devfs_getattr`, then `vnode_getattr`'s and
+/// `vattr_get_alt_data`'s defaults): the node's owner, mode and times; 32-bit
+/// ids; the sizes allotted in the mount's 512-byte blocks; `MAXPHYSIO` for a
+/// device's I/O size; the root hidden, with no parent to name (a mount's
+/// root vnode has none). devfs keeps no creation, backup or added time, no
+/// encoding, generation, document id, protection class, child count,
+/// clone or extended flags, and no extended security.
+fn devfs_vnode(pio: &PathIo<'_>, mnt: &Mount, path: &str, md: &Metadata, name: Option<&str>) -> Vn {
+    use al::cmn;
+    let is_root = path == mnt.on;
+    let (uid, gid) = if is_root {
+        (0, 0)
+    } else if let Some(n) = super::devfs::node_of(md) {
+        (n.uid, n.gid)
+    } else {
+        super::ttydev::node_owner(md).unwrap_or((0, 0))
+    };
+    let parentid = if is_root { 0 } else { super::devfs::root_ino() };
+    let t = |s: i64, ns: u32| (s, i64::from(ns));
+    let st = Kernel::stat_from(md);
+    let mut unsupported = AttrSet {
+        // (the UUIDs and ACL too: with no extended security they are not
+        // asked of it, and the fixup goes by what it returned)
+        common: cmn::CRTIME | cmn::BKUPTIME | cmn::SCRIPT | cmn::GEN_COUNT | cmn::DOCUMENT_ID | cmn::ADDEDTIME | cmn::DATA_PROTECT_FLAGS | cmn::UUID | cmn::GRPUUID | cmn::EXTENDED_SECURITY,
+        dir: dir::ENTRYCOUNT,
+        fork: ext::PRIVATESIZE | ext::CLONEID | ext::EXT_FLAGS | ext::RECURSIVE_GENCOUNT | ext::ATTRIBUTION_TAG | ext::CLONE_REFCNT,
+        ..Default::default()
+    };
+    if is_root {
+        unsupported.common |= cmn::PAROBJID | cmn::PARENTID;
+    }
+    let is_chr = md.file_type == FileType::CharDevice;
+    Vn {
+        vtype: vtype_of(md.file_type),
+        tag: VT_DEVFS,
+        name: match name {
+            Some(n) => n.to_string(),
+            None => last(path).to_string(),
+        },
+        path: path.to_string(),
+        relpath: path.strip_prefix(mnt.on).filter(|r| !r.is_empty()).unwrap_or("/").to_string(),
+        fsid: (mnt.fsid as u32, super::kern::DEVFS_TYPENUM),
+        is_mount_point: is_root,
+        fileid: md.ino,
+        parentid,
+        mode: md.mode & 0o7777,
+        uid,
+        gid,
+        flags: if is_root { super::devfs::UF_HIDDEN } else { 0 },
+        nlink: md.nlink.max(1),
+        modtime: t(st.mtime, st.mtime_ns),
+        chgtime: t(st.ctime, st.ctime_ns),
+        acctime: t(st.atime, st.atime_ns),
+        data_size: md.size,
+        data_alloc: roundup(md.size, 512),
+        rdev: if is_chr { darwin_dev(st.rdev) } else { 0 },
+        iosize: if is_chr { super::devfs::MAXPHYSIO as u32 } else { 512 },
+        // `perms` as vnode_authorize grants them: the attribute call's.
+        user_access: user_access(md.mode, md.file_type == FileType::Directory, pio.creds.uid() == 0, false),
+        encoding: ENCODING,
+        unsupported,
+        obj32: true,
+        ..Default::default()
+    }
 }
 
 /// The volume's UUID. The root image keeps none, so each volume is given a
@@ -211,8 +287,7 @@ fn volume_uuid(mnt: &Mount) -> [u8; 16] {
 /// The volume `mnt` as `getvolattrlist` has it.
 fn volume(pio: &PathIo<'_>, mnt: &Mount) -> Result<VolInfo, Errno> {
     if mnt.fs == super::kern::Fs::Devfs {
-        super::note_unimplemented("getattrlist of devfs's volume attributes (devfs_vfs_getattr)".into());
-        return Err(Errno::EOPNOTSUPP);
+        return devfs_volume(pio, mnt);
     }
     let md = pio.ns.metadata(mnt.on)?;
     let root = vnode(pio, mnt.on, &md, None, false)?;
@@ -241,6 +316,95 @@ fn volume(pio: &PathIo<'_>, mnt: &Mount) -> Result<VolInfo, Errno> {
         access_time: root.acctime,
         backup_time: (0, 0),
         unsupported: AttrSet { vol: VOL_UNSUPPORTED, ..Default::default() },
+        objcount: 0,
+        filecount: 0,
+        dircount: 0,
+        vol_name: String::new(),
+        ext_security: true,
+        root,
+    })
+}
+
+/// devfs's volume (`devfs_vfs_getattr`): its devnodes for the object
+/// counts, `devfs_statfs`'s blocks, the capabilities and attributes it
+/// names; no times, file or directory counts, name, UUID, quota or
+/// reserve; no extended security.
+fn devfs_volume(pio: &PathIo<'_>, mnt: &Mount) -> Result<VolInfo, Errno> {
+    use al::cmn;
+    let md = pio.ns.metadata(mnt.on)?;
+    let root = devfs_vnode(pio, mnt, mnt.on, &md, None);
+    let nodes = super::devfs::stats().0 as u32;
+    // VOL_CAP_FMT_SYMBOLICLINKS, _HARDLINKS, _NO_ROOT_TIMES,
+    // _CASE_SENSITIVE, _CASE_PRESERVING, _FAST_STATFS, _2TB_FILESIZE,
+    // _HIDDEN_FILES; of the interfaces, VOL_CAP_INT_ATTRLIST. Valid: the
+    // format bits through NO_VOLUME_SIZES, the interfaces through
+    // EXTENDED_ATTR.
+    let caps = VolCaps { capabilities: [0x2f26, 0x2, 0, 0], valid: [0xffff, 0x7fff, 0, 0] };
+    let common = cmn::NAME
+        | cmn::DEVID
+        | cmn::FSID
+        | cmn::OBJTYPE
+        | cmn::OBJTAG
+        | cmn::OBJID
+        | cmn::PAROBJID
+        | cmn::MODTIME
+        | cmn::CHGTIME
+        | cmn::ACCTIME
+        | cmn::OWNERID
+        | cmn::GRPID
+        | cmn::ACCESSMASK
+        | cmn::FLAGS
+        | cmn::USERACCESS
+        | cmn::FILEID;
+    let vols = vol::FSTYPE
+        | vol::SIZE
+        | vol::SPACEFREE
+        | vol::SPACEAVAIL
+        | vol::MINALLOCATION
+        | vol::OBJCOUNT
+        | vol::MAXOBJCOUNT
+        | vol::MOUNTPOINT
+        | vol::MOUNTFLAGS
+        | vol::MOUNTEDDEVICE
+        | vol::CAPABILITIES
+        | vol::ATTRIBUTES;
+    let files = file::LINKCOUNT | file::TOTALSIZE | file::IOBLOCKSIZE | file::DEVTYPE | file::DATALENGTH;
+    let attributes = [
+        AttrSet { common, vol: vols, dir: dir::LINKCOUNT | dir::MOUNTSTATUS, file: files, fork: 0 },
+        AttrSet { common, vol: vols, dir: dir::MOUNTSTATUS, file: files, fork: 0 },
+    ];
+    Ok(VolInfo {
+        typenum: super::kern::DEVFS_TYPENUM,
+        typename: "devfs".into(),
+        mntonname: mnt.on.into(),
+        mntfromname: mnt.from.into(),
+        mnt_flag: mnt.flags,
+        bsize: 512,
+        iosize: 512,
+        blocks: super::devfs::statfs_blocks(),
+        bfree: 0,
+        bavail: 0,
+        fssubtype: 0,
+        caps,
+        attributes,
+        uuid: [0; 16],
+        max_objcount: nodes,
+        quota: 0,
+        reserved: 0,
+        create_time: (0, 0),
+        modify_time: (0, 0),
+        access_time: (0, 0),
+        backup_time: (0, 0),
+        unsupported: AttrSet {
+            common: cmn::CRTIME | cmn::MODTIME | cmn::CHGTIME | cmn::ACCTIME | cmn::BKUPTIME,
+            vol: vol::FILECOUNT | vol::DIRCOUNT | vol::NAME | vol::UUID | vol::QUOTA_SIZE | vol::RESERVED_SIZE,
+            ..Default::default()
+        },
+        objcount: nodes,
+        filecount: 0,
+        dircount: 0,
+        vol_name: String::new(),
+        ext_security: false,
         root,
     })
 }
@@ -424,6 +588,27 @@ fn unpack_setattrs(alist: &AttrList, buf: &[u8]) -> Result<SetAttrs, Errno> {
 }
 
 impl Kernel {
+    /// `ATTR_CMN_USERACCESS`'s `perms`: what `vnode_authorize` grants the
+    /// caller of read, write and execute (search, for a directory) by the
+    /// owner, group and other bits; the superuser all but executing a file
+    /// with no execute bit.
+    fn darwin_dac_perms(&self, uid: u32, gid: u32, mode: u32, is_dir: bool) -> u32 {
+        let c = &self.dtask.cred;
+        if c.uid == 0 {
+            let x = is_dir || mode & 0o111 != 0;
+            return 4 | 2 | u32::from(x);
+        }
+        let bits = if c.uid == uid {
+            mode >> 6
+        } else if c.gid() == gid || c.groups.contains(&gid) {
+            mode >> 3
+        } else {
+            mode
+        } & 7;
+        // R_OK 4, W_OK 2, X_OK 1, the bits' own order.
+        bits
+    }
+
     /// `setattrlist(path, alist, attributeBuffer, bufferSize, options)`.
     pub(crate) fn darwin_setattrlist(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
         self.darwin_setattrlist_at(m, dirfd(super::bsd::AT_FDCWD as u64) as i32, a[0], a[1], a[2], a[3], a[4])
@@ -594,15 +779,23 @@ impl Kernel {
             if alist.set.file != 0 || alist.set.dir != 0 || (alist.set.fork != 0 && !use_fork) {
                 return (Err(Errno::EINVAL), missing);
             }
-            let r = volume(pio, mount_of(path)).and_then(|vi| {
-                missing = volume_missing(alist);
+            let r = volume(pio, mount_of(path)).and_then(|mut vi| {
+                if vi.root.tag == VT_DEVFS {
+                    vi.root.user_access = self.darwin_dac_perms(vi.root.uid, vi.root.gid, vi.root.mode, true);
+                } else {
+                    missing = volume_missing(alist);
+                }
                 al::getvolattrlist(alist, size, options, &vi)
             });
             return (r, missing);
         }
         let want_children = alist.set.dir & dir::ENTRYCOUNT != 0;
-        let r = vnode(pio, path, md, name, want_children).and_then(|vn| {
-            missing = vnode_missing(alist, options);
+        let r = vnode(pio, path, md, name, want_children).and_then(|mut vn| {
+            if vn.tag == VT_DEVFS {
+                vn.user_access = self.darwin_dac_perms(vn.uid, vn.gid, vn.mode, vn.vtype == al::vtype::VDIR);
+            } else {
+                missing = vnode_missing(alist, options);
+            }
             al::getattrlist(alist, size, options, &vn)
         });
         (r, missing)
