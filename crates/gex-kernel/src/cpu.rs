@@ -178,6 +178,52 @@ impl ThreadCpu {
     }
 }
 
+/// `absolutetime_to_microtime` of a time kept in nanoseconds: its Mach
+/// time's whole seconds (`rtclock_sec_divisor`) and the microseconds past
+/// them (`rtclock_usec_divisor`).
+fn microtime(ns: u64) -> (u64, u32) {
+    let (numer, denom) = crate::darwin::mach::TIMEBASE;
+    let abs = (u128::from(ns) * u128::from(denom) / u128::from(numer)) as u64;
+    let sec_divisor = 1_000_000_000 * u64::from(denom) / u64::from(numer);
+    let secs = abs / sec_divisor;
+    (secs, ((abs - secs * sec_divisor) / (sec_divisor / 1_000_000)) as u32)
+}
+
+/// `time_value_add` (and `timeradd`): seconds and microseconds, carried.
+fn tv_add(a: (u64, u32), b: (u64, u32)) -> (u64, u32) {
+    let (mut s, mut us) = (a.0 + b.0, a.1 + b.1);
+    if us >= 1_000_000 {
+        us -= 1_000_000;
+        s += 1;
+    }
+    (s, us)
+}
+
+/// `calcru`: a process's user and system time as `timeval`s, from its
+/// ended threads' times (`MACH_TASK_BASIC_INFO`'s, converted once) and each
+/// live thread's (`TASK_THREAD_TIMES_INFO`'s, converted thread by thread and
+/// added), all in nanoseconds.
+pub(crate) fn calcru(dead: (u64, u64), live: &[(u64, u64)]) -> [(u64, u32); 2] {
+    let (mut user, mut sys) = ((0, 0), (0, 0));
+    for &(u, s) in live {
+        user = tv_add(user, microtime(u));
+        sys = tv_add(sys, microtime(s));
+    }
+    [tv_add(microtime(dead.0), user), tv_add(microtime(dead.1), sys)]
+}
+
+/// Every thread's of `threads` user and system time so far, in
+/// nanoseconds; None without the host's clocks.
+pub(crate) fn live_times(threads: &crate::signal::ThreadSigs) -> Option<Vec<(u64, u64)>> {
+    let mut v = Vec::new();
+    for tid in threads.tids() {
+        if let Some(t) = threads.get(tid) {
+            v.push(t.cpu.times()?);
+        }
+    }
+    Some(v)
+}
+
 impl crate::syscalls::Kernel {
     /// This task's user and system time (`calcru`): its threads that have
     /// ended, and each of the others so far. None without the host's
@@ -200,22 +246,25 @@ impl crate::syscalls::Kernel {
     pub(crate) fn darwin_getrusage(&mut self, m: &mut crate::GuestMem<'_>, who: i32, at: u64) -> Result<u64, crate::Errno> {
         const RUSAGE_SELF: i32 = 0;
         const RUSAGE_CHILDREN: i32 = -1;
-        let (user, sys) = match who {
-            RUSAGE_SELF => match self.task_times() {
-                Some(t) => t,
+        let tvs = match who {
+            RUSAGE_SELF => match live_times(&self.thread_signals) {
+                Some(live) => calcru(self.procs.dead_cpu(self.pid), &live),
                 None => {
                     self.darwin_unimplemented("getrusage's times on a host without per-thread clocks".into());
                     return Err(crate::Errno::ENOSYS);
                 }
             },
-            RUSAGE_CHILDREN => self.procs.children_cpu(self.pid),
+            RUSAGE_CHILDREN => {
+                let (user, sys) = self.procs.children_cpu(self.pid);
+                [user, sys].map(|ns| (ns / 1_000_000_000, (ns % 1_000_000_000 / 1000) as u32))
+            }
             _ => return Err(crate::Errno::EINVAL),
         };
         // struct user64_rusage: the two timevals, then fourteen longs.
         let mut b = [0u8; 144];
-        for (i, ns) in [user, sys].into_iter().enumerate() {
-            b[16 * i..16 * i + 8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
-            b[16 * i + 8..16 * i + 12].copy_from_slice(&((ns % 1_000_000_000 / 1000) as u32).to_le_bytes());
+        for (i, (secs, usecs)) in tvs.into_iter().enumerate() {
+            b[16 * i..16 * i + 8].copy_from_slice(&secs.to_le_bytes());
+            b[16 * i + 8..16 * i + 12].copy_from_slice(&usecs.to_le_bytes());
         }
         m.write(at, &b)?;
         Ok(0)

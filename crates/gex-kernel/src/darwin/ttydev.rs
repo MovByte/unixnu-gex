@@ -677,9 +677,39 @@ impl Env for KEnv {
         pick.map(|p| p.0)
     }
 
-    fn fg_info(&mut self, _pid: i32) -> Option<Result<FgInfo, ()>> {
-        self.unimplemented.push("a terminal's status line: another process's first thread's run state and its times (thread_info, calcru)".into());
-        None
+    fn fg_info(&mut self, pid: i32) -> Option<Result<FgInfo, ()>> {
+        let Some(procs) = self.procs.clone() else {
+            self.unimplemented.push("a terminal's status line's foreground process, with no process table to find it in".into());
+            return None;
+        };
+        if procs.is_shared() {
+            self.unimplemented.push("a terminal's status line's foreground process in another of the browser's Workers".into());
+            return None;
+        }
+        // proc_find: nothing for a process that is gone, or a zombie.
+        let (record, zombie) = procs.darwin(pid)?;
+        if zombie {
+            return None;
+        }
+        let public = record.downcast::<super::procinfo::Public>().ok()?;
+        // p_uthlist's first: its oldest thread.
+        let Some(threads) = public.threads.clone() else { return Some(Err(())) };
+        let Some(&first) = threads.tids_in_order().first() else { return Some(Err(())) };
+        // thread_info's run state; a thread that has not yet come into the
+        // kernel is running.
+        let run_state = procs.sched.state(first).map_or(1, super::sched::RunState::th_state);
+        let Some(live) = crate::cpu::live_times(&threads) else {
+            self.unimplemented.push("a terminal's status line's process times on a host without per-thread clocks".into());
+            return None;
+        };
+        let [u, s] = crate::cpu::calcru(procs.dead_cpu(pid), &live);
+        Some(Ok(FgInfo {
+            comm: String::from_utf8_lossy(&public.comm).into_owned(),
+            pid,
+            run_state,
+            utime: (u.0 as i64, u.1 as i32),
+            stime: (s.0 as i64, s.1 as i32),
+        }))
     }
 
     fn set_controlt(&mut self) {
