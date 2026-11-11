@@ -956,8 +956,10 @@ impl Kernel {
                 let timed = matches!(c, cmd::F_SETLKWTIMEOUT | cmd::F_OFD_SETLKWTIMEOUT);
                 let mut fl = Flock::read(m, argp)?;
                 let deadline = if timed {
+                    // lf_setlock's msleep: a zero timeout waits as long as
+                    // F_SETLKW does.
                     let (sec, nsec) = (m.read_u64(argp + 24)? as i64, m.read_u64(argp + 32)? as i64);
-                    Some(std::time::Instant::now() + std::time::Duration::new(sec.max(0) as u64, nsec.clamp(0, 999_999_999) as u32))
+                    super::mach::msleep_deadline(sec, nsec)
                 } else {
                     None
                 };

@@ -135,6 +135,24 @@ pub(crate) fn system_nanotime() -> (u64, u32) {
     (secs, (u128::from(rest) * 1_000_000_000 / u128::from(divisor)) as u32)
 }
 
+/// `msleep`'s deadline for a timespec: none for a zero one (no timeout);
+/// else its nanoseconds as `(uint64_t)tv_sec * NSEC_PER_SEC + tv_nsec`
+/// computes them (wrapping), as counter ticks after now, saturating
+/// (`clock_absolutetime_interval_to_deadline`).
+pub(crate) fn msleep_deadline(sec: i64, nsec: i64) -> Option<Instant> {
+    if sec == 0 && nsec == 0 {
+        return None;
+    }
+    let ns = (sec as u64).wrapping_mul(1_000_000_000).wrapping_add(nsec as u64);
+    let divisor = 1_000_000_000 * u64::from(TIMEBASE.1) / u64::from(TIMEBASE.0);
+    let whole = ns / 1_000_000_000;
+    let ticks = whole * divisor + (ns - whole * 1_000_000_000) * divisor / 1_000_000_000;
+    let deadline = absolute_time().checked_add(ticks).unwrap_or(u64::MAX);
+    // Past what an instant here can name (centuries on): no deadline.
+    let ns = u128::from(deadline) * u128::from(TIMEBASE.0) / u128::from(TIMEBASE.1);
+    time_origin().checked_add(Duration::from_nanos(ns.min(u128::from(u64::MAX)) as u64))
+}
+
 /// `nanoseconds_to_absolutetime`.
 pub(crate) fn ns_to_abs(ns: u64) -> u64 {
     (u128::from(ns) * u128::from(TIMEBASE.1) / u128::from(TIMEBASE.0)).min(u128::from(u64::MAX)) as u64

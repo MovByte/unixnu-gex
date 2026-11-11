@@ -1,6 +1,7 @@
 // Timeouts as the kernel takes them: kevent64's must be a valid timespec
 // (no more than INT32_MAX seconds, up to a whole second of nanoseconds,
-// which waits that second).
+// which waits that second); F_SETLKWTIMEOUT's zero timeout waits as
+// F_SETLKW does, a short one gives ETIMEDOUT.
 
 #include <errno.h>
 #include <fcntl.h>
@@ -45,6 +46,40 @@ int main(void) {
     if (n != 0) return bad("a second of nanoseconds", n == -1 ? errno : n, 0);
     if (waited < 0.9) return bad("its wait, in ms", (long)(waited * 1000), 1000);
 
+    // A lock held by a child: a short timeout runs out, a zero one waits
+    // for the child to let go.
+    char path[] = "/tmp/gex-timeouts-XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) return bad("a file", errno, 0);
+    unlink(path);
+    int go[2], held[2];
+    pipe(go);
+    pipe(held);
+    pid_t c = fork();
+    if (c == 0) {
+        struct flock fl = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
+        if (fcntl(fd, F_SETLK, &fl)) _exit(10);
+        write(held[1], "h", 1);
+        char b;
+        read(go[0], &b, 1);
+        usleep(300000);
+        _exit(0);
+    }
+    char b;
+    read(held[0], &b, 1);
+    struct flocktimeout ft = {.fl = {.l_type = F_WRLCK, .l_whence = SEEK_SET}, .timeout = {0, 100000000}};
+    int r = fcntl(fd, F_SETLKWTIMEOUT, &ft);
+    if (r != -1 || errno != ETIMEDOUT) return bad("a short timeout", r == -1 ? errno : r, ETIMEDOUT);
+    write(go[1], "g", 1);
+    ft.timeout.tv_nsec = 0;
+    t0 = now();
+    r = fcntl(fd, F_SETLKWTIMEOUT, &ft);
+    waited = now() - t0;
+    if (r != 0) return bad("a zero timeout", errno, 0);
+    if (waited < 0.2) return bad("its wait, in ms", (long)(waited * 1000), 300);
+    int st;
+    waitpid(c, &st, 0);
+    if (!WIFEXITED(st) || WEXITSTATUS(st)) return bad("the child", st, 0);
     printf("timeouts ok\n");
     return 0;
 }
