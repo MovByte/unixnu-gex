@@ -840,6 +840,31 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         },
         // mach_port_allocate_name(task, right, name): mach_port_allocate_full
         // with the name asked for; a dead name takes any.
+        // mach_port_extract_right(task, name, msgt_name) -> poly: the right
+        // taken from the space as if the space had sent it; an immovable
+        // send right may be copied out of the caller's own space.
+        (Kobject::Task, 3215) => match (arg(req, 0), arg(req, 1)) {
+            (Some(name), Some(t)) => {
+                let (name, t) = (name as u32, t as u32);
+                if !super::ipc::right::msgt::any(t) {
+                    return Reply::err(KERN_INVALID_VALUE);
+                }
+                if !super::ipc::name_valid(name) {
+                    return Reply::err(KERN_INVALID_RIGHT);
+                }
+                let own = k.dtask.kcaller == 0 || k.dtask.kcaller == k.ipc().task;
+                let flags = super::ipc::right::CopyinFlags { allow_immovable_send: own && t == super::ipc::right::msgt::COPY_SEND, ..Default::default() };
+                match k.ipc().object_copyin(name, t, flags, 0, None) {
+                    Ok(c) => {
+                        let mut r = Reply::ok(Vec::new());
+                        r.ports.push(PortOut::Right(c, super::ipc::right::msgt::copyin_type(t)));
+                        r
+                    }
+                    Err(e) => Reply::err(e as i32),
+                }
+            }
+            _ => bad(),
+        },
         (Kobject::Task, 3203) => match (arg(req, 0), arg(req, 1)) {
             (Some(right), Some(name)) => {
                 let name = name as u32;
