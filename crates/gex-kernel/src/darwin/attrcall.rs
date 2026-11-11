@@ -63,7 +63,7 @@ pub fn apfs_attributes() -> [AttrSet; 2] {
 const VOL_UNSUPPORTED: u32 = vol::OBJCOUNT | vol::FILECOUNT | vol::DIRCOUNT | vol::NAME;
 
 /// Darwin's `makedev` from Linux's encoding of a device number.
-fn darwin_dev(linux: u64) -> u32 {
+pub(crate) fn darwin_dev(linux: u64) -> u32 {
     let major = ((linux >> 8) & 0xfff) | ((linux >> 32) & !0xfff);
     let minor = (linux & 0xff) | ((linux >> 12) & !0xff);
     ((major as u32) << 24) | (minor as u32 & 0x00ff_ffff)

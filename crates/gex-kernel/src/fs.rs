@@ -166,7 +166,8 @@ impl Stat {
         b[8..16].copy_from_slice(&self.ino.to_le_bytes());
         b[16..20].copy_from_slice(&self.uid.to_le_bytes());
         b[20..24].copy_from_slice(&self.gid.to_le_bytes());
-        b[24..28].copy_from_slice(&(self.rdev as u32).to_le_bytes());
+        // st_rdev as Darwin's dev_t (major << 24 | minor).
+        b[24..28].copy_from_slice(&crate::darwin::attrcall::darwin_dev(self.rdev).to_le_bytes());
         let [at, mt, ct] = self.times();
         for (off, (t, ns)) in [32usize, 48, 64, 80].into_iter().zip([at, mt, ct, mt]) {
             b[off..off + 8].copy_from_slice(&t.to_le_bytes());
@@ -190,7 +191,7 @@ impl Stat {
         b[10..12].copy_from_slice(&(self.nlink.min(u16::MAX as u32) as u16).to_le_bytes());
         b[12..16].copy_from_slice(&self.uid.to_le_bytes());
         b[16..20].copy_from_slice(&self.gid.to_le_bytes());
-        b[20..24].copy_from_slice(&(self.rdev as u32).to_le_bytes());
+        b[20..24].copy_from_slice(&crate::darwin::attrcall::darwin_dev(self.rdev).to_le_bytes());
         for (off, (t, ns)) in [24usize, 40, 56].into_iter().zip(self.times()) {
             b[off..off + 8].copy_from_slice(&t.to_le_bytes());
             b[off + 8..off + 16].copy_from_slice(&(ns as i64).to_le_bytes());
