@@ -223,7 +223,7 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         },
         // host_create_mach_voucher(host, recipes) -> voucher: the raw
         // recipes, counted and padded (MIG's `_WALIGN_`).
-        (Kobject::Host | Kobject::HostPriv, 225) => {
+        (Kobject::Host | Kobject::HostPriv, 222) => {
             const MAX_RAW_RECIPE_ARRAY_SIZE: usize = 5120;
             let Some(n) = arg(req, 0) else { return bad() };
             let n = n as u32 as usize;
