@@ -1359,6 +1359,8 @@ impl FileHandle for TmpHandle {
         file.materialize()?;
         let mut data = file.data.lock().unwrap();
         let start = offset as usize;
+        // ubc_setsize's NOTE_EXTEND, for a write past the end.
+        let grew = start + buf.len() > data.len();
         if start + buf.len() > data.len() {
             let was = data.capacity();
             reserve(&mut data, start + buf.len())?;
@@ -1371,7 +1373,7 @@ impl FileHandle for TmpHandle {
         file.touch();
         self.note_write();
         self.note_here(crate::inotify::mask::MODIFY);
-        self.vnote_here(crate::vnote::note::WRITE);
+        self.vnote_here(crate::vnote::note::WRITE | if grew { crate::vnote::note::EXTEND } else { 0 });
         Ok(buf.len() as u64)
     }
 
@@ -1511,8 +1513,10 @@ impl FileHandle for TmpHandle {
         };
         file.materialize()?;
         self.note_write();
+        let grew;
         {
             let mut data = file.data.lock().unwrap();
+            grew = len as usize > data.len();
             let was = data.capacity();
             reserve(&mut data, len as usize)?;
             data.resize(len as usize, 0);
@@ -1521,8 +1525,9 @@ impl FileHandle for TmpHandle {
         }
         file.touch();
         self.note_here(crate::inotify::mask::MODIFY);
-        // A size set is VNOP_SETATTR's.
-        self.vnote_here(crate::vnote::note::ATTRIB);
+        // A size set is VNOP_SETATTR's; one that grows the file is also
+        // ubc_setsize's NOTE_EXTEND.
+        self.vnote_here(crate::vnote::note::ATTRIB | if grew { crate::vnote::note::EXTEND } else { 0 });
         Ok(())
     }
 

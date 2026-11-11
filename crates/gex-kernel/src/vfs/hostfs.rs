@@ -313,14 +313,15 @@ impl FileHandle for HostHandle {
     /// `ftruncate`. The trait default answers `EINVAL`; apt truncates a file to
     /// 0 before hashing a download and reported that as "Unable to truncate".
     fn truncate(&self, len: u64) -> Result<(), Errno> {
-        self.file
-            .lock()
-            .unwrap()
-            .set_len(len)
-            .map_err(|e| Errno::from_io(&e))?;
+        let f = self.file.lock().unwrap();
+        let was = if crate::vnote::any() { f.metadata().map(|m| m.len()).ok() } else { None };
+        f.set_len(len).map_err(|e| Errno::from_io(&e))?;
+        drop(f);
         self.note(crate::inotify::mask::MODIFY);
-        // A size set is VNOP_SETATTR's.
-        self.vnote(crate::vnote::note::ATTRIB);
+        // A size set is VNOP_SETATTR's; one that grows the file is also
+        // ubc_setsize's NOTE_EXTEND.
+        let grew = was.is_some_and(|w| len > w);
+        self.vnote(crate::vnote::note::ATTRIB | if grew { crate::vnote::note::EXTEND } else { 0 });
         Ok(())
     }
 
@@ -341,10 +342,14 @@ impl FileHandle for HostHandle {
             f.seek(SeekFrom::Start(offset))
                 .map_err(|e| Errno::from_io(&e))?;
         }
+        // The size before, for a write that grows the file: the
+        // filesystem's ubc_setsize posts NOTE_EXTEND.
+        let was = if !self.stream && crate::vnote::any() { f.metadata().map(|m| m.len()).ok() } else { None };
         let n = f.write(buf).map(|n| n as u64).map_err(|e| Errno::from_io(&e))?;
         drop(f);
         self.note(crate::inotify::mask::MODIFY);
-        self.vnote(crate::vnote::note::WRITE);
+        let grew = was.is_some_and(|w| offset + n > w);
+        self.vnote(crate::vnote::note::WRITE | if grew { crate::vnote::note::EXTEND } else { 0 });
         Ok(n)
     }
 

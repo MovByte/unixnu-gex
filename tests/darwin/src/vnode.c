@@ -1,6 +1,7 @@
-// EVFILT_VNODE by kpi_vfs.c's notes: a write is NOTE_WRITE, a chmod
-// NOTE_ATTRIB, a link NOTE_LINK, a flock unlock NOTE_FUNLOCK, a rename
-// NOTE_RENAME, an unlink NOTE_DELETE|NOTE_LINK; a directory hears
+// EVFILT_VNODE by kpi_vfs.c's notes: a write is NOTE_WRITE (with
+// ubc_setsize's NOTE_EXTEND when it grows the file), a chmod NOTE_ATTRIB, a
+// link NOTE_LINK, a flock unlock NOTE_FUNLOCK, a rename NOTE_RENAME, an
+// unlink NOTE_DELETE|NOTE_LINK; a directory hears
 // NOTE_WRITE for a name made and NOTE_WRITE|NOTE_LINK for a directory made;
 // an EVFILT_READ at the end of a file wakes when it grows; and devfs's
 // directory takes a knote, which hears nothing while no node comes or goes.
@@ -41,7 +42,8 @@ int main(void) {
     unsigned v;
     if ((v = got(f)) != 0) return bad("a note before anything happened", v);
     write(f, "abc", 3);
-    if ((v = got(f)) != NOTE_WRITE) return bad("write", v);
+    // A write past the end grows the file: NOTE_EXTEND with it.
+    if ((v = got(f)) != (NOTE_WRITE | NOTE_EXTEND)) return bad("write", v);
     fchmod(f, 0600);
     if ((v = got(f)) != NOTE_ATTRIB) return bad("chmod", v);
     link(D "/f", D "/g");
