@@ -594,6 +594,9 @@ impl Kernel {
                     res(self.canonical(m, nr::UNLINKAT, [fd, path, 0x200, 0, 0, 0]))
                 } else {
                     match self.canonical(m, nr::UNLINKAT, [fd, path, 0, 0, 0, 0]) {
+                        // unlinkat_internal: a mount point (VROOT) is EBUSY
+                        // before a directory's EPERM.
+                        Err(Errno::EISDIR) if self.path_io().at_path(m, fd as i32, path).is_ok_and(|p| self.vfs.is_mount_point(&p)) => neg(Errno::EBUSY),
                         Err(Errno::EISDIR) => neg(Errno::EPERM),
                         r => res(r),
                     }

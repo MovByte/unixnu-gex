@@ -1263,6 +1263,17 @@ pub struct Namespace {
     pub cwd: String,
 }
 
+/// A name that is a mount point (the root of the filesystem it resolves
+/// to) is busy: removing or renaming it is EBUSY (XNU's `VROOT` check in
+/// rmdir and rename; Linux's too), not the mounted filesystem's own answer
+/// for its root.
+fn busy_if_mounted(rel: &str) -> Result<(), Errno> {
+    if rel.is_empty() {
+        return Err(Errno::EBUSY);
+    }
+    Ok(())
+}
+
 impl Namespace {
     fn new() -> Namespace {
         Namespace {
@@ -1548,6 +1559,11 @@ impl Namespace {
 
     pub fn unlink(&self, path: &str) -> Result<(), Errno> {
         let (fs, rel) = self.resolve(path)?;
+        // A mount point is a directory, which unlink refuses first (Linux's
+        // EISDIR; the Darwin layer gives XNU's EBUSY for it).
+        if rel.is_empty() {
+            return Err(Errno::EISDIR);
+        }
         fs.unlink(&rel)
     }
 
@@ -1558,6 +1574,7 @@ impl Namespace {
 
     pub fn rmdir(&self, path: &str) -> Result<(), Errno> {
         let (fs, rel) = self.resolve(path)?;
+        busy_if_mounted(&rel)?;
         fs.rmdir(&rel)
     }
 
@@ -1570,6 +1587,8 @@ impl Namespace {
     pub fn rename2(&self, from: &str, to: &str, noreplace: bool) -> Result<(), Errno> {
         let (fs, rel_from) = self.resolve(from)?;
         let (fs_to, rel_to) = self.resolve(to)?;
+        busy_if_mounted(&rel_from)?;
+        busy_if_mounted(&rel_to)?;
         // Crossing a mount boundary needs a copy, which Linux also refuses.
         if !Arc::ptr_eq(fs, fs_to) {
             return Err(Errno::EXDEV);
