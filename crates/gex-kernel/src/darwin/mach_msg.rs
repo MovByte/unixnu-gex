@@ -1169,10 +1169,15 @@ impl Kernel {
         (r, msgr)
     }
 
-    /// `mach_msg_receive_error`: the message's header copied out with its
-    /// body's rights destroyed (`ipc_kmsg_copyout_dest_to_user`), then put.
+    /// `mach_msg_receive_error`: the message made a bare header
+    /// (`ipc_kmsg_copyout_dest_to_user`): its destination copied out, its
+    /// reply, voucher, descriptors and memory destroyed, then a header of
+    /// its own size alone (its port types and other bits kept), a kernel
+    /// trailer, and a bare aux header if it had aux data; then put.
     #[allow(clippy::too_many_arguments)]
     fn receive_error(&mut self, m: &mut GuestMem<'_>, kmsg: Box<Kmsg>, seqno: u32, bufs: RecvBufs, options: u64, r: u32, msgr: &mut Msgr) -> u32 {
+        /// `sizeof(mach_msg_aux_header_t)`.
+        const AUX_HEADER: u32 = 8;
         let k = *kmsg;
         let ipc = &mut self.ipc();
         let dest_name = if ipc.port(k.dest).active {
@@ -1181,7 +1186,10 @@ impl Kernel {
             ipc.release(k.dest);
             super::ipc::PORT_DEAD
         };
+        // A reply that is a right is destroyed; one that is not (null, or
+        // a dead name) is carried as its name.
         let reply_name = match k.reply {
+            Some(Carried::Dead) => super::ipc::PORT_DEAD,
             Some(c) => {
                 ipc.object_destroy(c, bits::local(k.bits));
                 0
@@ -1192,21 +1200,9 @@ impl Kernel {
             ipc.object_destroy(Carried::Port(v), msgt::PORT_SEND);
         }
         ipc.descs_destroy(&k.descs);
-        let mut body = k.body.clone();
-        for d in &k.descs {
-            match d {
-                Desc::Port { off, .. } => body[*off..*off + 4].copy_from_slice(&0u32.to_le_bytes()),
-                Desc::Guarded { off, .. } => body[*off + 12..*off + 16].copy_from_slice(&0u32.to_le_bytes()),
-                Desc::Ool { off, .. } | Desc::OolPorts { off, .. } => {
-                    body[*off..*off + 8].copy_from_slice(&0u64.to_le_bytes());
-                    if matches!(d, Desc::Ool { .. }) {
-                        body[*off + 12..*off + 16].copy_from_slice(&0u32.to_le_bytes());
-                    }
-                }
-            }
-        }
-        let header_bits = bits::set(bits::local(k.bits), bits::remote(k.bits), 0, k.bits);
-        let out = Out { bits: header_bits, remote: reply_name, local: dest_name, voucher: 0, id: k.id, body, sender: k.sender, aux: k.aux };
+        let header_bits = bits::set(bits::local(k.bits), bits::remote(k.bits), bits::voucher(k.bits), k.bits);
+        let aux = if k.aux.is_empty() { Vec::new() } else { [AUX_HEADER.to_le_bytes(), 0u32.to_le_bytes()].concat() };
+        let out = Out { bits: header_bits, remote: reply_name, local: dest_name, voucher: 0, id: k.id, body: Vec::new(), sender: Sender::KERNEL, aux };
         let context = 0;
         self.put_to_user(m, out, seqno, context, bufs, options, r, msgr)
     }
