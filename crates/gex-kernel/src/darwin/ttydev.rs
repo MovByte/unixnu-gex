@@ -1409,7 +1409,11 @@ impl Kernel {
             return self.darwin_tty_result(m, Err(Errno::EBADF));
         }
         let size = (com >> 16) & IOCPARM_MASK;
-        let r: Result<(), Errno> = if resumed.is_none() && matches!(com, tty::cmd::TIOCREVOKE | tty::cmd::TIOCREVOKECLEAR) {
+        let r: Result<(), Errno> = if resumed.is_none() && dev.dead() {
+            // vn_ioctl: a revoked vnode is VBAD, which its switch sends to
+            // ENOTTY whatever the command.
+            Err(Errno::ENOTTY)
+        } else if resumed.is_none() && matches!(com, tty::cmd::TIOCREVOKE | tty::cmd::TIOCREVOKECLEAR) {
             // vn_ioctl: a revoke's commands are the kernel's.
             Err(Errno::ENOTTY)
         } else if resumed.is_none() && com == DKIOCSETBLOCKSIZE {
@@ -1446,8 +1450,8 @@ impl Kernel {
                 Err(e) => return self.darwin_tty_result(m, Err(e)),
             };
             match target.opened() {
-                // deadfs: EBADF.
-                None => Err(Errno::EBADF),
+                // Revoked since: VBAD's ENOTTY.
+                None => Err(Errno::ENOTTY),
                 Some(o) => {
                     let p = self.darwin_tty_caller();
                     let mut env = self.darwin_tty_env();
@@ -1500,11 +1504,15 @@ impl Kernel {
     /// `vn_ioctl` of a terminal for a command that never sleeps, a
     /// TIOCSCTTY's session given the vnode.
     fn darwin_tty_vn_ioctl(&mut self, dev: &Arc<TtyDev>, file: &Arc<OpenFile>, com: u64, data: &mut [u8]) -> Result<(), Errno> {
+        // A revoked vnode is VBAD: ENOTTY whatever the command.
+        if dev.dead() {
+            return Err(Errno::ENOTTY);
+        }
         if dev.node == Node::Ctty && com == tty::cmd::TIOCSCTTY {
             return Err(if self.darwin_cttyvp().is_some() { Errno::EINVAL } else { Errno::EIO });
         }
         let target = self.darwin_tty_target(dev)?;
-        let o = target.opened().ok_or(Errno::EBADF)?;
+        let o = target.opened().ok_or(Errno::ENOTTY)?;
         let p = self.darwin_tty_caller();
         let mut env = self.darwin_tty_env();
         let mut st = ptmx::PtyIoctl::default();
