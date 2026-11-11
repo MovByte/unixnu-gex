@@ -165,7 +165,7 @@ impl Kernel {
             f if f == id(evfilt::WORKLOOP) => self.filt_wldetach(n),
             filtid::MACH_PORT | filtid::MACH_PORT_SET => self.filt_machportdetach(n),
             filtid::KQREAD => self.filt_kqdetach(n),
-            filtid::PIPE_N | filtid::PIPE_R | filtid::PIPE_W | filtid::SO_R | filtid::SO_W => self.filt_pipedetach(n),
+            filtid::PIPE_N | filtid::PIPE_R | filtid::PIPE_W | filtid::SO_R | filtid::SO_W | filtid::PTSD | filtid::PTMX => self.filt_pipedetach(n),
             filtid::VN => {
                 if let Some(id) = self.knote(n).vnote.take() {
                     crate::vnote::unlisten(id);
@@ -198,6 +198,7 @@ impl Kernel {
             filtid::PIPE_W => self.filt_pipewrite_common(n, None),
             filtid::SO_R => self.filt_soread_common(n, None),
             filtid::SO_W => self.filt_sowrite_common(n, None),
+            filtid::PTSD | filtid::PTMX => self.filt_tty_common(n, None),
             filtid::VN => self.filt_vnode_common(n, hint as u32, None),
             f if f == id(evfilt::MEMORYSTATUS) => self.filt_memorystatus(n, hint),
             f if f == id(evfilt::SIGNAL) => {
@@ -246,6 +247,13 @@ impl Kernel {
                     self.filt_sowrite_common(n, None)
                 }
             }
+            filtid::PTSD | filtid::PTMX => {
+                // The new state accepted, the fired state captured again.
+                let k = self.knote(n);
+                k.sfflags = kev.fflags;
+                k.sdata = kev.data;
+                self.filt_tty_common(n, None)
+            }
             filtid::VN => {
                 self.knote(n).sfflags = kev.fflags;
                 self.filt_vnode_common(n, 0, None)
@@ -287,6 +295,7 @@ impl Kernel {
             filtid::PIPE_W => self.filt_pipewrite_common(n, Some(kev)),
             filtid::SO_R => self.filt_soread_common(n, Some(kev)),
             filtid::SO_W => self.filt_sowrite_common(n, Some(kev)),
+            filtid::PTSD | filtid::PTMX => self.filt_tty_common(n, Some(kev)),
             filtid::VN => self.filt_vnode_common(n, 0, Some(kev)),
             // filt_procprocess: the collected events, the exit status as
             // the data.
@@ -1294,6 +1303,9 @@ impl Kernel {
         if fp.path.starts_with("pipe:[") && fp.handle.pipe_state().is_some() {
             return self.pipe_kqfilter(n, &fp);
         }
+        if let Some(dev) = std::sync::Arc::clone(&fp.handle).darwin_tty() {
+            return self.tty_kqfilter(n, &fp, dev);
+        }
         let file_type = fp.handle.metadata().map(|md| md.file_type);
         if file_type == Ok(crate::vfs::FileType::Socket) && fp.handle.so_state().is_some() {
             return self.soo_kqfilter(n, &fp);
@@ -1603,6 +1615,89 @@ impl Kernel {
     /// may have changed.
     pub fn darwin_pipe_watch(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
         std::sync::Arc::clone(&self.dtask.kevents.pipe_watch)
+    }
+
+    /// `vn_kqfilter` of a terminal device's vnode: EVFILT_VNODE as any
+    /// vnode's; EVFILT_READ and EVFILT_WRITE through `spec_kqfilter`, to a
+    /// replica's (`ptsd_kqfilter`) or a primary's (`ptmx_kqfilter`) own
+    /// filter. `/dev/tty` is no kqueue-capable device: the select fallback
+    /// (`filt_specattach`) takes only NOTE_LOWAT of 1.
+    fn tty_kqfilter(&mut self, n: KnId, fp: &std::sync::Arc<crate::file::OpenFile>, dev: std::sync::Arc<super::ttydev::TtyDev>) -> u32 {
+        const NOTE_LOWAT: u32 = 0x1;
+        // No knote on a dead vnode.
+        if dev.dead() {
+            self.knote(n).set_error(Errno::ENOENT);
+            return 0;
+        }
+        let filter = self.knote(n).filter;
+        match filter {
+            evfilt::READ | evfilt::WRITE => {}
+            evfilt::VNODE => return self.vn_kqfilter(n, fp, crate::vfs::FileType::CharDevice),
+            _ => {
+                self.knote(n).set_error(Errno::EINVAL);
+                return 0;
+            }
+        }
+        let fid = match dev.node {
+            super::ttydev::Node::Pts(_) => filtid::PTSD,
+            super::ttydev::Node::Ptmx => filtid::PTMX,
+            // select's cttyselect: the session's terminal's select, or
+            // ready (to meet EOF or the error) without one.
+            super::ttydev::Node::Ctty if self.dtask.kevents.select_scan => match dev.ctty_target() {
+                Some(t) if t.primary() => filtid::PTMX,
+                _ => filtid::PTSD,
+            },
+            super::ttydev::Node::Ctty => {
+                let k = self.knote(n);
+                if k.sfflags & NOTE_LOWAT == 0 || k.sdata != 1 {
+                    k.set_error(Errno::EINVAL);
+                    return 0;
+                }
+                self.darwin_unimplemented("kevent on /dev/tty by NOTE_LOWAT of 1 (filt_specattach's select fallback through cttyselect)".into());
+                self.knote(n).set_error(Errno::EOPNOTSUPP);
+                return 0;
+            }
+        };
+        if dev.node != super::ttydev::Node::Ctty && dev.opened().is_none() {
+            self.knote(n).set_error(Errno::ENXIO);
+            return 0;
+        }
+        let (_, _, _, revokes) = dev.knote(filter == evfilt::READ);
+        let polled = fp.handle.wait_queue() == 0;
+        let k = self.knote(n);
+        k.filtid = fid;
+        k.revokes = revokes;
+        k.seen = fp.handle.wakes();
+        self.dtask.kevents.pipe_klist.push(n);
+        if polled {
+            self.dtask.kevents.polled_knotes.insert(n);
+        }
+        self.dtask.kevents.pipe_watch.fetch_add(if polled { 1 + POLLED_KNOTE } else { 1 }, std::sync::atomic::Ordering::Release);
+        self.filt_tty_common(n, None)
+    }
+
+    /// `ptsd_kqops_common` and `ptmx_kqops_common`, and their NOTE_REVOKE:
+    /// a revoke since the knote was attached is EOF, once.
+    fn filt_tty_common(&mut self, n: KnId, kev: Option<&mut Kev>) -> u32 {
+        let fp = self.knote(n).fp.clone().expect("a terminal knote's file");
+        let Some(dev) = std::sync::Arc::clone(&fp.handle).darwin_tty() else { return 0 };
+        let read = self.knote(n).filter == evfilt::READ;
+        let (ready, data, eof, revokes) = dev.knote(read);
+        let k = self.knote(n);
+        if revokes != k.revokes {
+            k.flags |= ev::EOF | ev::ONESHOT;
+            k.revokes = revokes;
+        }
+        if eof {
+            k.flags |= ev::EOF;
+        }
+        let ret = ready || k.flags & ev::EOF != 0;
+        if ret {
+            if let Some(kev) = kev {
+                *kev = self.knote(n).fill_kevent(data);
+            }
+        }
+        u32::from(ret)
     }
 
     /// `vn_kqfilter`: EVFILT_READ and EVFILT_WRITE on a regular file;

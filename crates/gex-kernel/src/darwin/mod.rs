@@ -25,6 +25,7 @@ pub mod commpage;
 pub mod ptmx;
 pub mod ctty;
 pub mod tty;
+pub mod ttydev;
 pub mod cpumon;
 pub mod cred;
 pub mod errno;
@@ -113,6 +114,8 @@ pub fn boot(trust_cache: Option<&[u8]>, sandbox_platform: Option<Vec<u8>>, devic
         None => None,
     };
     trustcache::set_static(m);
+    // devfs's terminal nodes: ptmx, its replicas, tty.
+    crate::vfs::devfs::set_darwin_ttys();
     mac::set_platform_profile(sandbox_platform)
 }
 
@@ -227,6 +230,8 @@ pub struct Task {
     pub ladvlock: bool,
     /// Threads whose lock requests another thread or process woke.
     pub lock_wakes: std::sync::Arc<std::sync::Mutex<Vec<i32>>>,
+    /// Each thread's terminal call asleep on its terminal.
+    pub ttyops: std::collections::HashMap<i32, ttydev::Pending>,
     /// `p_sigacts` and `p_sigignore`.
     pub sigacts: signal::Sigacts,
     /// `p_limit`.

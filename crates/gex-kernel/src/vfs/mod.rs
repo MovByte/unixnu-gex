@@ -582,6 +582,15 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// The Darwin terminal device vnode this is a descriptor of.
+    fn darwin_tty(self: Arc<Self>) -> Option<Arc<crate::darwin::ttydev::TtyDev>> {
+        None
+    }
+
+    /// `vn_close`: the open file's last hold went (`closef` at the end of
+    /// `fg_count`), for a device that is told of its close.
+    fn vn_close(&self) {}
+
     /// A short description of this handle's state, for a diagnostic: the
     /// buffer behind a descriptor -- empty, full, which way it points -- that
     /// the fd number and path cannot show.

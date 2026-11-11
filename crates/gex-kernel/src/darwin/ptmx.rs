@@ -162,7 +162,9 @@ pub fn ptmx_get_ioctl(minor: u32, open_flag: u32) -> Got {
         let tty = TtyCell::new();
         {
             let mut tp = tty.lock();
-            tp.pti = Some(Pti { flags: 0, selr: crate::wait::Queue::new(), selw: crate::wait::Queue::new(), selr_revokes: 0, selw_revokes: 0, send: 0, ucntl: 0, minor });
+            let (selr, selw) = (crate::wait::Queue::new(), crate::wait::Queue::new());
+            crate::wait::chain(selw.id(), selr.id());
+            tp.pti = Some(Pti { flags: 0, selr, selw, selr_revokes: 0, selw_revokes: 0, send: 0, ucntl: 0, minor });
         }
         // The replica's node: /dev/ttysNNN, root's, group tty, 0620.
         s.list[m] = Some(Slot { tty, open: pf::OPEN_M, node: Some(PtsNode { uid: UID_ROOT, gid: GID_TTY, mode: 0o620 }) });
@@ -946,8 +948,8 @@ mod tests {
         fn pgrp_find(&mut self, _pgid: i32) -> Option<(Pgrp, Arc<Session>)> {
             None
         }
-        fn loadavg(&mut self) -> u32 {
-            0
+        fn loadavg(&mut self) -> Option<u32> {
+            Some(0)
         }
         fn fg_pick(&mut self, _pg: Pgrp) -> Option<i32> {
             None
@@ -961,6 +963,9 @@ mod tests {
         }
         fn namei(&mut self, _path: &str) -> Result<(), Errno> {
             Ok(())
+        }
+        fn suser_acflag(&mut self) -> bool {
+            false
         }
     }
 

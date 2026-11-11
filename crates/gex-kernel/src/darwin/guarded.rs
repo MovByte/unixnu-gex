@@ -52,7 +52,7 @@ const O_CLOFORK: u64 = 0x0800_0000;
 const O_NOFOLLOW: u64 = 0x100;
 const O_SYMLINK: u64 = 0x0020_0000;
 const O_NOFOLLOW_ANY: u64 = 0x2000_0000;
-const O_LOCKS: u64 = 0x30;
+pub(crate) const O_LOCKS: u64 = 0x30;
 /// `O_EXEC` (`FEXEC`), and with O_DIRECTORY `O_SEARCH`.
 const O_EXEC: u64 = 0x4000_0000;
 const O_DIRECTORY: u64 = 0x10_0000;
@@ -239,12 +239,28 @@ impl Kernel {
     }
 
     /// `open1` for an `open` or `openat` a plain renumbering cannot do:
+    /// An open's O_EXLOCK or O_SHLOCK once its file is open, or its
+    /// descriptor.
+    pub(crate) fn darwin_open_finish_locks(&mut self, m: &mut GuestMem<'_>, fd: i32, dflags: u64) -> SyscallOutcome {
+        if dflags & O_LOCKS != 0 {
+            return self.darwin_open_lock(m, fd, dflags);
+        }
+        let _ = super::set_result(m, self.ctx_addr, fd as u64);
+        SyscallOutcome::Continue
+    }
+
     /// [`Kernel::darwin_open1`], then O_EXLOCK or O_SHLOCK taken after.
     pub(crate) fn darwin_open_finish(&mut self, m: &mut GuestMem<'_>, raw: u64, a: [u64; 6], guard: Option<FdGuard>) -> SyscallOutcome {
         let at = if raw == sys::OPEN || raw == sys::OPEN_NOCANCEL { 1 } else { 2 };
         let dflags = a[at];
         match self.darwin_open1(m, raw, a, guard) {
             Ok(fd) => {
+                // spec_open: a terminal device's own open, which may wait.
+                if self.darwin_tty_of(fd as u64).is_some_and(|(_, d)| !d.is_open()) {
+                    if let Some(out) = self.darwin_tty_open(m, fd, dflags) {
+                        return out;
+                    }
+                }
                 if dflags & O_LOCKS != 0 {
                     return self.darwin_open_lock(m, fd, dflags);
                 }

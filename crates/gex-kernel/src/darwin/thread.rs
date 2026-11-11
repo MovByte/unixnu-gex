@@ -326,6 +326,8 @@ pub enum Finish {
     Exception(super::triage::Pending),
     /// `__sigwait`: the signals waited for, where the one taken goes.
     Sigwait { siglist: u32, sig: u64 },
+    /// A terminal call's `ttysleep` (the call is kept by its thread).
+    Tty,
 }
 
 /// `wait_result_to_return_code` (`sys_ulock.c`).
@@ -413,10 +415,21 @@ impl Kernel {
             sys::FCNTL | sys::FCNTL_NOCANCEL if super::lockf::is_lock_cmd(a[1]) => Some(self.darwin_fcntl_lock(m, a)),
             sys::FLOCK => Some(self.darwin_flock(m, a)),
             // open1's O_EXLOCK and O_SHLOCK: the open, then the lock.
-            // open1, with any lock after it.
+            // open1, with any lock and a device's open after it.
             sys::OPEN | sys::OPEN_NOCANCEL | sys::OPENAT | sys::OPENAT_NOCANCEL => Some(self.darwin_open_finish(m, raw, *a, None)),
             sys::GUARDED_OPEN_NP | sys::GUARDED_OPEN_DPROTECTED_NP | sys::OPEN_DPROTECTED_NP | sys::OPENAT_DPROTECTED_NP => Some(self.darwin_open_protected(m, raw, a)),
             sys::WRITE | sys::WRITE_NOCANCEL | sys::WRITEV | sys::WRITEV_NOCANCEL if self.darwin_pipe_of(a[0]).is_some() => Some(self.darwin_pipe_write(m, raw, a)),
+            sys::READ | sys::READ_NOCANCEL | sys::READV | sys::READV_NOCANCEL | sys::WRITE | sys::WRITE_NOCANCEL | sys::WRITEV | sys::WRITEV_NOCANCEL if self.darwin_tty_of(a[0]).is_some() => Some(self.darwin_tty_rw(m, raw, a)),
+            // valid_for_random_access: a terminal (VISTTY) takes no offset.
+            sys::PREAD | sys::PREAD_NOCANCEL | sys::PWRITE | sys::PWRITE_NOCANCEL | sys::PREADV | sys::PREADV_NOCANCEL | sys::PWRITEV | sys::PWRITEV_NOCANCEL if self.darwin_tty_of(a[0]).is_some() => {
+                // preparefileread's and preparefilewrite's EBADF first.
+                let (file, _) = self.darwin_tty_of(a[0])?;
+                let write = matches!(raw, sys::PWRITE | sys::PWRITE_NOCANCEL | sys::PWRITEV | sys::PWRITEV_NOCANCEL);
+                let e = if (write && !file.writable) || (!write && !file.readable) { Errno::EBADF } else { Errno::ENXIO };
+                let _ = super::set_result(m, self.ctx_addr, e.as_return());
+                Some(SyscallOutcome::Continue)
+            }
+            sys::IOCTL => self.darwin_tty_ioctl(m, a),
             sys::KEVENT => Some(<Kq as KQueue>::kevent_legacy(self, m, a, false)),
             sys::POLL | sys::POLL_NOCANCEL => Some(self.darwin_poll(m, a)),
             sys::OPEN_EXTENDED => Some(self.darwin_open_extended(m, a)),
@@ -864,6 +877,7 @@ impl Kernel {
             Finish::Exception(p) => return self.darwin_exc_wait_done(m, p, res),
             Finish::Psynch(c) => self.darwin_psynch_wait_done(m, c, res),
             Finish::Sigwait { siglist, sig } => return self.darwin_sigwait_done(m, siglist, sig, res),
+            Finish::Tty => return self.darwin_tty_wait_done(m, res),
             Finish::Ulock { addr, no_errno } => {
                 // A waiter that was not woken is still on the queue.
                 if res != WaitResult::Awakened {

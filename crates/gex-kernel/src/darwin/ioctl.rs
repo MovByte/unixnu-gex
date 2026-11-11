@@ -43,6 +43,8 @@ pub const FCNTLFLAGS: u64 = 0x8 | 0x40 | 0x80 | 0x40_0000 | 0x4;
 
 /// What an open file is, for `fo_ioctl`.
 enum Kind {
+    /// A terminal device's vnode.
+    Tty(Arc<super::ttydev::TtyDev>),
     Pipe(Arc<crate::pipe::Pipe>, bool),
     Socket,
     /// The host's standard stream: a terminal, or a pipe or file there.
@@ -122,6 +124,9 @@ impl Kernel {
     }
 
     fn darwin_file_kind(&self, file: &Arc<OpenFile>) -> Kind {
+        if let Some(dev) = Arc::clone(&file.handle).darwin_tty() {
+            return Kind::Tty(dev);
+        }
         if let Some((pipe, write)) = file.handle.pipe_end() {
             if file.path.starts_with("pipe:[") {
                 return if pipe.is_xnu() { Kind::Pipe(pipe, write) } else { Kind::Other };
@@ -231,6 +236,8 @@ impl Kernel {
     /// The file type's `fo_ioctl`.
     pub(crate) fn darwin_fo_ioctl(&mut self, file: &Arc<OpenFile>, com: u64, data: &mut [u8]) -> Result<(), Errno> {
         match self.darwin_file_kind(file) {
+            // vn_ioctl to the device's ptyioctl.
+            Kind::Tty(dev) => self.darwin_tty_fo_ioctl(&dev, file, com, data),
             // pipe_ioctl.
             Kind::Pipe(pipe, write) => match com {
                 cmd::FIONBIO => Ok(()),
@@ -391,7 +398,7 @@ impl Kernel {
         const F_PEOFPOSMODE: i32 = 3;
         const F_VOLPOSMODE: i32 = 4;
         let file = self.fds.get(fd)?;
-        if !matches!(self.darwin_file_kind(&file), Kind::Vnode(_) | Kind::HostStream(_)) {
+        if !matches!(self.darwin_file_kind(&file), Kind::Vnode(_) | Kind::HostStream(_) | Kind::Tty(_)) {
             return Err(Errno::EBADF);
         }
         let set = |bit: u32, on: bool| {

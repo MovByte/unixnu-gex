@@ -3671,6 +3671,12 @@ impl PathIo<'_> {
     /// `fstat` said root, so only 32-bit programs (whose libc stats through
     /// `statx`) passed.
     fn stat_owned(&self, md: &crate::vfs::Metadata) -> Stat {
+        // A Darwin terminal node's owner is devfs's: its own.
+        if self.darwin {
+            if let Some((uid, gid)) = crate::darwin::ttydev::node_owner(md) {
+                return Stat { uid, gid, ..Kernel::stat_from(md) };
+            }
+        }
         Stat { uid: self.creds.uid(), gid: self.creds.gid(), ..Kernel::stat_from(md) }
     }
 
@@ -11117,6 +11123,8 @@ impl Kernel {
         self.fds.close_all();
         if self.darwin {
             crate::darwin::lockf::process_gone(self.pid);
+            // proc_exit after fdt_invalidate: a session leader's terminal.
+            self.darwin_tty_proc_exit();
         }
     }
 

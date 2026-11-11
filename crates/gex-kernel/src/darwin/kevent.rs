@@ -57,9 +57,11 @@ pub mod filtid {
     pub const PIPE_N: u8 = 19;
     pub const PIPE_R: u8 = 20;
     pub const PIPE_W: u8 = 21;
-    pub const SO_R: u8 = 22;
-    pub const SO_W: u8 = 23;
+    pub const PTSD: u8 = 22;
+    pub const SO_R: u8 = 23;
+    pub const SO_W: u8 = 24;
     pub const VN: u8 = 34;
+    pub const PTMX: u8 = 36;
     pub const MACH_PORT: u8 = 37;
     pub const MACH_PORT_SET: u8 = 38;
     pub const DETACHED: u8 = 39;
@@ -266,6 +268,9 @@ pub struct Knote {
     /// A vnode knote's place on its vnode's list (`v_knotes`,
     /// [`crate::vnote::listen`]).
     pub vnote: Option<u64>,
+    /// A terminal knote: the NOTE_REVOKEs its selinfo had when it was
+    /// attached.
+    pub revokes: u64,
     /// `kn_thcall`, while armed.
     pub thcall: Option<(Instant, u64)>,
 }
@@ -408,6 +413,10 @@ pub struct Kevents {
     /// there are, for a host thread that says when descriptors may have
     /// changed.
     pub pipe_klist: Vec<KnId>,
+    /// `select`'s registrations are being made: what it registers stands
+    /// for `fo_select` (`/dev/tty`'s `cttyselect` reaching its session's
+    /// terminal), not for a kevent.
+    pub select_scan: bool,
     pub pipe_watch: Arc<std::sync::atomic::AtomicU64>,
     /// The knotes on [`pipe_klist`](Self::pipe_klist) whose descriptor no
     /// event announces (a socket the host carries): counted in `pipe_watch`

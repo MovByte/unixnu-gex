@@ -227,6 +227,9 @@ struct Proc {
     /// raised), and the pid that sent each. Under the table's lock.
     killed: u64,
     senders: [i32; 64],
+    /// Darwin's `P_CONTROLT`: the process has its session's terminal as
+    /// its controlling terminal.
+    controlt: bool,
     /// Every signal `kill` posted to it, in order and each time (where
     /// `pending` keeps one bit a signal), for a process that asked
     /// ([`ProcTable::record_posts`]): Darwin's knotes count each post.
@@ -325,6 +328,11 @@ struct Table {
     /// Each process group's `pg_jobc`: how many of its members have a
     /// parent in another group of its session (`fixjobc`).
     jobc: std::collections::HashMap<i32, i32>,
+    /// Each process group's serial, given when the group is made: a later
+    /// group of the same number has another (a terminal's `t_pgrp` names
+    /// the group it was given, not its number).
+    pgserial: std::collections::HashMap<i32, u64>,
+    next_pgserial: u64,
 }
 
 impl Table {
@@ -373,6 +381,8 @@ impl Table {
             Some(s) => s,
             None => {
                 self.jobc.insert(pgid, 0);
+                self.next_pgserial += 1;
+                self.pgserial.insert(pgid, self.next_pgserial);
                 if mksess { pid } else { mysid }
             }
         };
@@ -449,6 +459,8 @@ impl ProcTable {
                 next_pid: INIT_PID + 1,
                 threads: std::collections::HashMap::new(),
                 jobc: std::collections::HashMap::new(),
+                pgserial: std::collections::HashMap::new(),
+                next_pgserial: 1,
                 zseq: 0,
                 procs: vec![Proc {
                     pid: INIT_PID,
@@ -459,6 +471,7 @@ impl ProcTable {
                     pending: Arc::new(AtomicU64::new(0)),
                     killed: 0,
                     senders: [0; 64],
+                    controlt: false,
                     posts: None,
                     xhighbits: 0,
                     uid: 0,
@@ -544,6 +557,7 @@ impl ProcTable {
             pending: Arc::new(AtomicU64::new(0)),
             killed: 0,
             senders: [0; 64],
+            controlt: false,
             posts,
             xhighbits: 0,
             uid,
@@ -978,9 +992,63 @@ impl ProcTable {
         }
         let mut orphaned = Vec::new();
         t.enterpgrp(pid, pid, true, &mut orphaned);
+        // A new session has no terminal (enterpgrp's mksess).
+        if let Some(p) = t.procs.iter_mut().find(|p| p.pid == pid) {
+            p.controlt = false;
+        }
         drop(t);
+        crate::darwin::ctty::new_session(pid);
         self.orphanpg(pid, &orphaned);
         Ok(pid)
+    }
+
+    /// `P_CONTROLT` of `pid`.
+    pub fn controlt(&self, pid: i32) -> bool {
+        self.lock().procs.iter().find(|p| p.pid == pid).is_some_and(|p| p.controlt)
+    }
+
+    /// Set or clear `pid`'s `P_CONTROLT`.
+    pub fn set_controlt(&self, pid: i32, on: bool) {
+        if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
+            p.controlt = on;
+        }
+    }
+
+    /// The serial of group `pgid` while it has a live member; none once it
+    /// has none.
+    pub fn pgrp_serial(&self, pgid: i32) -> Option<u64> {
+        let mut t = self.lock();
+        let live = t.procs.iter().any(|p| p.pgid == pgid && !p.child.status.lock().map(|s| s.is_some()).unwrap_or(true));
+        if !live {
+            return None;
+        }
+        // The first groups (the first process's, which no enterpgrp made)
+        // take theirs when first asked.
+        if !t.pgserial.contains_key(&pgid) {
+            t.next_pgserial += 1;
+            let n = t.next_pgserial;
+            t.pgserial.insert(pgid, n);
+        }
+        t.pgserial.get(&pgid).copied()
+    }
+
+    /// The session of group `pgid`, while it has a live member.
+    pub fn pgrp_sid(&self, pgid: i32) -> Option<i32> {
+        self.lock().procs.iter().find(|p| p.pgid == pgid && !p.child.status.lock().map(|s| s.is_some()).unwrap_or(true)).map(|p| p.sid)
+    }
+
+    /// Darwin's `pgsignal(pg, signum, checkctty)`: `signo` (Linux's
+    /// number) posted by the kernel to each member of the group that is
+    /// still the one of that serial, only those with `P_CONTROLT` when
+    /// `checkctty`.
+    pub fn pgsignal(&self, pgid: i32, serial: u64, signo: u32, checkctty: bool) {
+        if signo == 0 || signo > 64 || self.pgrp_serial(pgid) != Some(serial) {
+            return;
+        }
+        let pids: Vec<i32> = self.lock().procs.iter().filter(|p| p.pgid == pgid && (!checkctty || p.controlt)).map(|p| p.pid).collect();
+        for pid in pids {
+            self.post_kernel(pid, signo);
+        }
     }
 
     /// `setpgid(target, pgid)`, either zero meaning the caller. You may move

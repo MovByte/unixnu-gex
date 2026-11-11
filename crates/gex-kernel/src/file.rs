@@ -175,6 +175,7 @@ impl OpenFile {
         if self.darwin_lock_key.get().is_some() && !self.darwin_closed.swap(true, Ordering::AcqRel) {
             crate::darwin::lockf::last_close(self);
         }
+        self.handle.vn_close();
     }
 
     /// `fg_count`.

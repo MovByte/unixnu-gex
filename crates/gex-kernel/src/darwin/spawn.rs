@@ -352,6 +352,7 @@ impl Kernel {
         let mapped: Vec<(u64, u64)> = self.mem.lock().vmas().iter().map(|v| (v.start, v.end)).collect();
         self.dtask.vm.fork(&mapped);
         let pid = self.procs.spawn(self.pid);
+        self.darwin_fork_controlt(pid);
         // task_create_internal: the child's task is in its parent's
         // coalitions.
         super::coalition::fork(self.pid, pid);
@@ -586,6 +587,7 @@ impl Kernel {
         child.dtask.csflags.fetch_and(!super::amfi::cs::GET_TASK_ALLOW, std::sync::atomic::Ordering::AcqRel);
         child.signals.thread().set_tsd(0);
         let pid = self.procs.spawn(self.pid);
+        self.darwin_fork_controlt(pid);
         // Its task in the coalitions named, with its roles, or its parent's.
         match coals {
             Some(c) => c.place(self.pid, pid),
@@ -1017,6 +1019,15 @@ impl Kernel {
                     // open1, as an open syscall's.
                     let la = [Scratch::AT, u64::from(oflag), u64::from(mode), 0, 0, 0];
                     let got = self.darwin_open1(&mut gm, super::bsd::sys::OPEN, la, None)?;
+                    // A terminal device's own open, and open1's controlling
+                    // terminal for an open that takes no lock.
+                    if let Err(e) = self.darwin_tty_open_now(got) {
+                        let _ = self.darwin_close(got);
+                        return Err(e);
+                    }
+                    if oflag & 0x30 == 0 {
+                        self.darwin_open_ctty(got, u64::from(oflag));
+                    }
                     // open1's O_EXLOCK or O_SHLOCK: the new open file's flock.
                     if oflag & 0x30 != 0 {
                         if let Err(e) = self.darwin_open_lock_now(got, u64::from(oflag)) {

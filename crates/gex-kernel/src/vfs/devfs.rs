@@ -94,6 +94,22 @@ impl FileHandle for DevHandle {
     }
 }
 
+/// Whether a Darwin kernel runs here: devfs then has XNU's terminal nodes,
+/// `ptmx`, the `ttysNNN` replicas and `tty` ([`crate::darwin::ttydev`]).
+static DARWIN_TTYS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Give devfs the Darwin terminal nodes.
+pub fn set_darwin_ttys() {
+    DARWIN_TTYS.store(true, std::sync::atomic::Ordering::Release);
+}
+
+fn darwin_tty(path: &str) -> Option<crate::darwin::ttydev::Node> {
+    if !DARWIN_TTYS.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    crate::darwin::ttydev::lookup(path)
+}
+
 /// The `/dev` filesystem.
 pub struct DevFs {
     /// Nodes the host added, by name without a leading slash.
@@ -187,6 +203,11 @@ impl FileSystem for DevFs {
         if super::writes(flags) && self.metadata(path).is_ok_and(|md| md.file_type == FileType::Directory) {
             return Err(Errno::EISDIR);
         }
+        // A lookup of a Darwin terminal node: its vnode, which the open
+        // then opens (`spec_open`).
+        if let Some(node) = darwin_tty(path) {
+            return Ok(crate::darwin::ttydev::TtyDev::new(node));
+        }
         if let Some(device) = Self::device_of(path) {
             return Ok(Arc::new(DevHandle { device }));
         }
@@ -222,6 +243,10 @@ impl FileSystem for DevFs {
         }
         if let Some((_, open)) = self.per_open.iter().find(|(n, _)| n == path) {
             return open().metadata();
+        }
+        if let Some(node) = darwin_tty(path) {
+            let dev = crate::darwin::ttydev::lookup_dev(node);
+            return Ok(crate::darwin::ttydev::node_metadata(node, dev));
         }
         if let Some(device) = Self::device_of(path) {
             return Ok(Metadata {
@@ -375,10 +400,17 @@ impl FileHandle for DevDir {
                 ino: 1,
             },
         ];
+        let darwin = DARWIN_TTYS.load(std::sync::atomic::Ordering::Acquire);
+        if darwin {
+            for (name, ino) in crate::darwin::ttydev::list() {
+                out.push(DirEntry { name, file_type: FileType::CharDevice, ino });
+            }
+        }
         for name in [
             "null", "zero", "full", "random", "urandom", "tty", "console",
         ]
         .iter()
+        .filter(|n| !(darwin && **n == "tty"))
         .map(|s| s.to_string())
         .chain(self.extra.iter().cloned())
         {

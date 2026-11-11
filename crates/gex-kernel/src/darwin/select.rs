@@ -139,6 +139,7 @@ impl Kernel {
         let kqid = self.kq_new(0, 1, 1);
         let mut fds = Vec::with_capacity(wanted.len());
         let mut rfds = 0;
+        self.dtask.kevents.select_scan = true;
         for (i, &(set, fd)) in wanted.iter().enumerate() {
             let events = [pollev::IN, pollev::OUT, pollev::PRI][set];
             let mut revents = 0;
@@ -154,6 +155,7 @@ impl Kernel {
             }
             fds.push(PollFd { fd: fd as i32, events, revents });
         }
+        self.dtask.kevents.select_scan = false;
         let tid = self.tid;
         let select = Select { sets, ni, which: wanted, oldmask };
         self.kev().poll.insert(tid, (0, fds));

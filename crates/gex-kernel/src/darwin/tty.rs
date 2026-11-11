@@ -412,7 +412,48 @@ pub enum Chan {
 struct Sleeper {
     chan: Chan,
     token: u64,
-    waker: Waker,
+    waker: Wake,
+}
+
+/// How a sleeper is woken: a thread waiting as a call does, or one
+/// waiting here and now (a close outside a call, an exit).
+enum Wake {
+    Thread(Waker),
+    Sync(Arc<SyncWake>),
+}
+
+/// A wait taken here and now on a terminal's channel.
+#[derive(Default)]
+pub struct SyncWake {
+    woken: Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
+impl SyncWake {
+    /// Wait until woken (true) or `until` passes (false).
+    pub fn wait(&self, until: Option<std::time::Instant>) -> bool {
+        let mut g = self.woken.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if *g {
+                return true;
+            }
+            match until {
+                None => g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner()),
+                Some(t) => {
+                    let now = std::time::Instant::now();
+                    if now >= t {
+                        return false;
+                    }
+                    g = self.cv.wait_timeout(g, t - now).unwrap_or_else(|e| e.into_inner()).0;
+                }
+            }
+        }
+    }
+
+    fn wake(&self) {
+        *self.woken.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.cv.notify_all();
+    }
 }
 
 /// A sleep a function asks for (`ttysleep(tp, chan, pri, wmesg, timo)`):
@@ -505,8 +546,9 @@ pub trait Env {
     fn psignal(&mut self, pid: i32, signum: u32);
     /// `pgrp_find(pgid)` and the group's session.
     fn pgrp_find(&mut self, pgid: i32) -> Option<(Pgrp, Arc<Session>)>;
-    /// `averunnable.ldavg[0]`, fixed-point with `FSHIFT` 11.
-    fn loadavg(&mut self) -> u32;
+    /// `averunnable.ldavg[0]`, fixed-point with `FSHIFT` 11; none where it
+    /// is not kept (the environment reports that).
+    fn loadavg(&mut self) -> Option<u32>;
     /// The group member `proc_compare` picks, if the group has members.
     fn fg_pick(&mut self, pg: Pgrp) -> Option<i32>;
     /// That process's command, its first thread's state and its times, if
@@ -518,6 +560,9 @@ pub trait Env {
     fn session_leader(&mut self, s: &Arc<Session>) -> Option<i32>;
     /// `namei` of `path` in the caller's namespace: whether it is there.
     fn namei(&mut self, path: &str) -> Result<(), Errno>;
+    /// `suser(kauth_cred_get(), &p->p_acflag)`: root, the process then
+    /// marked as having used it (ASU).
+    fn suser_acflag(&mut self) -> bool;
 }
 
 /// `constty`: the terminal the console's output goes to (`TIOCCONS`).
@@ -629,7 +674,11 @@ impl Drop for TtyGuard<'_> {
 impl TtyCell {
     /// `ttymalloc`.
     pub fn new() -> Arc<TtyCell> {
-        Arc::new(TtyCell { tty: Mutex::new(Tty::new()), state: std::sync::atomic::AtomicU32::new(0) })
+        let tp = Tty::new();
+        // A waiter registers on the read selinfo's queue; the write
+        // selinfo's wakeups reach it there too.
+        crate::wait::chain(tp.wsel.id(), tp.rsel.id());
+        Arc::new(TtyCell { tty: Mutex::new(tp), state: std::sync::atomic::AtomicU32::new(0) })
     }
 
     /// `tty_lock`.
@@ -702,7 +751,15 @@ impl Tty {
     pub fn enqueue(&mut self, req: &SleepReq, waker: Waker) -> u64 {
         let token = self.next_token;
         self.next_token += 1;
-        self.sleepers.push(Sleeper { chan: req.chan, token, waker });
+        self.sleepers.push(Sleeper { chan: req.chan, token, waker: Wake::Thread(waker) });
+        token
+    }
+
+    /// [`Self::enqueue`] for a wait taken here and now.
+    pub fn enqueue_sync(&mut self, req: &SleepReq, w: Arc<SyncWake>) -> u64 {
+        let token = self.next_token;
+        self.next_token += 1;
+        self.sleepers.push(Sleeper { chan: req.chan, token, waker: Wake::Sync(w) });
         token
     }
 
@@ -732,7 +789,10 @@ impl Tty {
         while i < self.sleepers.len() {
             if self.sleepers[i].chan == chan {
                 let s = self.sleepers.swap_remove(i);
-                wake(&s.waker);
+                match &s.waker {
+                    Wake::Thread(w) => wake(w),
+                    Wake::Sync(w) => w.wake(),
+                }
             } else {
                 i += 1;
             }
@@ -1986,7 +2046,8 @@ impl Tty {
             return;
         }
         // FSHIFT 11.
-        let load = ((u64::from(env.loadavg()) * 100 + 1024) >> 11) as i64;
+        let Some(ldavg) = env.loadavg() else { return };
+        let load = ((u64::from(ldavg) * 100 + 1024) >> 11) as i64;
         self.ttyprintf(&format!("load: {}.{:02} ", load / 100, load % 100));
         if self.session.is_none() {
             self.ttyprintf("not a controlling terminal\n");
@@ -2328,7 +2389,7 @@ impl Tty {
                     if constty.as_ref().is_some_and(|c| !Arc::ptr_eq(c, me) && c.state_unlocked() & ts::CONNECTED != 0) {
                         return done(Err(Errno::EBUSY));
                     }
-                    if !p.suser {
+                    if !env.suser_acflag() {
                         return done(Err(Errno::EPERM));
                     }
                     if !is_me {
@@ -2521,7 +2582,7 @@ impl Tty {
                 }
             }
             TIOCSDRAINWAIT => {
-                if !p.suser {
+                if !env.suser_acflag() {
                     return done(Err(Errno::EPERM));
                 }
                 self.timeout = int(data).wrapping_mul(HZ);
