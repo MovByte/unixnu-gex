@@ -2062,7 +2062,7 @@ impl FdIo<'_> {
         m: &GuestMem<'_>,
         control: u64,
         len: u64,
-    ) -> Result<Vec<Arc<OpenFile>>, Errno> {
+    ) -> Result<Vec<crate::file::InFlight>, Errno> {
         const SCM_RIGHTS: u32 = 1;
         let sol_socket = self.sol_socket();
         let (hdr, w) = (self.cmsg_hdr(), self.msg_word());
@@ -2079,7 +2079,10 @@ impl FdIo<'_> {
                 let n = (cmsg_len - hdr) / 4;
                 for i in 0..n.min(253) {
                     let fd = m.read_u32(control + at + hdr + i * 4)? as i32;
-                    out.push(self.fds.get(fd)?);
+                    // Held from here (unp_internalize's fg_ref), so a
+                    // close by another thread cannot end the file before
+                    // the message holds it.
+                    out.push(self.fds.get_held(fd)?);
                 }
             }
             at += self.cmsg_align(cmsg_len);
@@ -2178,8 +2181,9 @@ impl FdIo<'_> {
                 if !self.fds.get(fd)?.writable {
                     return Err(Errno::EBADF);
                 }
-                // The bytes and their descriptors in one step (`send_with`).
-                return sock.send_with(&data, files);
+                // The bytes and their descriptors in one step (`send_with`);
+                // the holds taken above go once the message has its own.
+                return sock.send_with(&data, files.iter().map(|f| Arc::clone(f)).collect());
             } else if let Ok(sock) = self.remote_unix_of(fd) {
                 // The far end is in another memory, where an `OpenFile` means
                 // nothing: each descriptor goes as a description the host
@@ -2403,7 +2407,10 @@ impl FdIo<'_> {
             }
         }
         let given = !received.is_empty();
-        let written = self.write_scm_rights(m, control, controllen, received)?;
+        // Each keeps its in-flight hold until it is in this table.
+        let files = received.iter().map(|f| Arc::clone(f.file())).collect();
+        let written = self.write_scm_rights(m, control, controllen, files)?;
+        drop(received);
         self.hdr_wr(m, msg, 5, written)?;
         // msg_flags (int): MSG_CTRUNC when descriptors were closed for want
         // of room.

@@ -34,7 +34,7 @@ struct Session {
     /// protocol refers to one by that, not the client's descriptor number),
     /// and the next index. Held only while the compositor may still need
     /// one: a client makes a pool, and so a descriptor, per buffer.
-    fds: HashMap<u32, Arc<OpenFile>>,
+    fds: HashMap<u32, gex_kernel::file::InFlight>,
     next_fd: u32,
     /// Indices that have arrived and that nothing has used yet: a message
     /// can arrive in pieces, so a descriptor whose `create_pool` is still in
@@ -1008,7 +1008,7 @@ impl Session {
 struct PoolView<'a, 'm> {
     kernel: &'a Kernel,
     mem: &'a GuestMem<'m>,
-    fds: &'a HashMap<u32, Arc<OpenFile>>,
+    fds: &'a HashMap<u32, gex_kernel::file::InFlight>,
 }
 
 impl Buffers for PoolView<'_, '_> {

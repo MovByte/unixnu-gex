@@ -46,6 +46,8 @@ pub struct OpenFile {
     /// that hold it, which its other references (a lookup's, a mapping's)
     /// are not.
     fg_count: std::sync::atomic::AtomicU32,
+    /// Its `vn_closefile` has run.
+    darwin_closed: std::sync::atomic::AtomicBool,
     /// A path to unlink when the last descriptor to this file closes. Set for
     /// `O_TMPFILE`: Linux makes such a file nameless at once, but gex keeps it
     /// named (`.gex-tmpfile-*`) so the `linkat("/proc/self/fd/N", target,
@@ -67,6 +69,39 @@ pub struct OpenFile {
     ino: OnceLock<u64>,
 }
 
+/// An open file in flight in a unix socket's message (`unp_internalize`'s
+/// hold on it), until the guard goes: it holds the file's `fg_count` while
+/// a `recvmsg` puts it in the receiver's table, or for as long as a host
+/// peer (the compositor) keeps it, so the count never passes zero on the
+/// way.
+#[derive(Debug)]
+pub struct InFlight(Arc<OpenFile>);
+
+impl InFlight {
+    /// The file taken into flight.
+    pub fn new(file: Arc<OpenFile>) -> InFlight {
+        file.fg_retain();
+        InFlight(file)
+    }
+
+    pub fn file(&self) -> &Arc<OpenFile> {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for InFlight {
+    type Target = Arc<OpenFile>;
+    fn deref(&self) -> &Arc<OpenFile> {
+        &self.0
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fg_drop();
+    }
+}
+
 /// An `O_TMPFILE`'s name, and the namespace it was made in.
 pub struct TmpName {
     pub path: String,
@@ -84,10 +119,9 @@ impl Drop for OpenFile {
         if let Some(locks) = self.locks.get() {
             locks.release(self as *const OpenFile as usize);
         }
-        // A Darwin open file's flock and OFD locks (vn_closefile).
-        if self.darwin_lock_key.get().is_some() {
-            crate::darwin::lockf::last_close(self);
-        }
+        // A Darwin open file's flock and OFD locks (vn_closefile), unless
+        // its last descriptor took them already.
+        self.fg_closed();
         // If a `linkat` gave it another name (the atomic-write idiom), that
         // name keeps the inode.
         if let Some(t) = &self.unlink_on_close {
@@ -107,9 +141,37 @@ impl OpenFile {
         self.fg_count.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// `fg_drop`: one of those lets go.
-    pub fn fg_release(&self) {
-        let _ = self.fg_count.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+    /// `fg_ref` through a descriptor still open: another hold, unless its
+    /// last descriptor closed in the meantime (as `fp_lookup` would not
+    /// find it).
+    #[must_use]
+    pub fn fg_retain_live(&self) -> bool {
+        self.fg_count.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n > 0).then_some(n + 1)).is_ok()
+    }
+
+    /// `fg_drop`: one of those lets go. Whether it was the last, the file
+    /// then closed ([`OpenFile::fg_closed`] is for the caller to run, out
+    /// of any table's lock).
+    #[must_use]
+    pub fn fg_release(&self) -> bool {
+        self.fg_count.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)) == Ok(1)
+    }
+
+    /// [`OpenFile::fg_release`], and [`OpenFile::fg_closed`] if it was the
+    /// last.
+    pub fn fg_drop(&self) {
+        if self.fg_release() {
+            self.fg_closed();
+        }
+    }
+
+    /// `closef` at `fg_count`'s end: a Darwin open file's flock and OFD
+    /// locks go (`vn_closefile`), though a mapping or a lookup may keep the
+    /// description itself a while longer. Once.
+    pub fn fg_closed(&self) {
+        if self.darwin_lock_key.get().is_some() && !self.darwin_closed.swap(true, Ordering::AcqRel) {
+            crate::darwin::lockf::last_close(self);
+        }
     }
 
     /// `fg_count`.
@@ -164,6 +226,7 @@ impl OpenFile {
             darwin_lock_key: OnceLock::new(),
             darwin_vnote_key: OnceLock::new(),
             fg_count: std::sync::atomic::AtomicU32::new(0),
+            darwin_closed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -194,6 +257,7 @@ impl OpenFile {
             darwin_lock_key: OnceLock::new(),
             darwin_vnote_key: OnceLock::new(),
             fg_count: std::sync::atomic::AtomicU32::new(0),
+            darwin_closed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -521,11 +585,10 @@ impl Clone for FdTable {
 impl Drop for FdTable {
     /// The table's descriptors let their files go.
     fn drop(&mut self) {
-        self.read(|t| {
-            for f in t.entries.iter().flatten() {
-                f.fg_release();
-            }
-        });
+        let closed: Vec<Arc<OpenFile>> = self.read(|t| t.entries.iter().flatten().filter(|f| f.fg_release()).cloned().collect());
+        for f in closed {
+            f.fg_closed();
+        }
     }
 }
 
@@ -560,24 +623,32 @@ impl FdTable {
     /// before (a failed one included).
     fn update<R, E>(&self, f: impl FnOnce(&mut Table) -> Result<R, E>) -> Result<R, E> {
         self.generation.fetch_add(1, Ordering::Relaxed);
-        self.cur.write(|old| {
+        let mut closed = Vec::new();
+        let r = self.cur.write(|old| {
             let mut t = old.clone();
             match f(&mut t) {
                 Ok(r) => {
                     // A descriptor that now names another file (or none)
-                    // lets the old one go and holds the new.
+                    // holds the new and lets the old one go: every new
+                    // hold first, so a file moved between descriptors is
+                    // never at none on the way.
                     let n = old.entries.len().max(t.entries.len());
-                    for i in 0..n {
+                    let changed = |i: usize| {
                         let (a, b) = (old.entries.get(i).and_then(Option::as_ref), t.entries.get(i).and_then(Option::as_ref));
                         match (a, b) {
-                            (Some(a), Some(b)) if Arc::ptr_eq(a, b) => {}
-                            _ => {
-                                if let Some(b) = b {
-                                    b.fg_retain();
-                                }
-                                if let Some(a) = a {
-                                    a.fg_release();
-                                }
+                            (Some(a), Some(b)) if Arc::ptr_eq(a, b) => (None, None),
+                            _ => (a, b),
+                        }
+                    };
+                    for i in 0..n {
+                        if let (_, Some(b)) = changed(i) {
+                            b.fg_retain();
+                        }
+                    }
+                    for i in 0..n {
+                        if let (Some(a), _) = changed(i) {
+                            if a.fg_release() {
+                                closed.push(Arc::clone(a));
                             }
                         }
                     }
@@ -585,7 +656,12 @@ impl FdTable {
                 }
                 Err(e) => (None, Err(e)),
             }
-        })
+        });
+        // Out of the table's lock: what its last descriptor closed.
+        for f in closed {
+            f.fg_closed();
+        }
+        r
     }
 
     /// `RLIMIT_NOFILE`'s soft limit (descriptors already above it stay).
@@ -601,6 +677,17 @@ impl FdTable {
 
     pub fn limit(&self) -> usize {
         self.limit.load(Ordering::Relaxed)
+    }
+
+    /// [`FdTable::get`], held as a file port or a message in flight holds
+    /// it: EBADF if its descriptor closes before the hold is taken.
+    pub fn get_held(&self, fd: i32) -> Result<InFlight, Errno> {
+        let f = self.get(fd)?;
+        if f.fg_retain_live() {
+            Ok(InFlight(f))
+        } else {
+            Err(Errno::EBADF)
+        }
     }
 
     pub fn get(&self, fd: i32) -> Result<Arc<OpenFile>, Errno> {
@@ -1011,6 +1098,23 @@ mod tests {
         assert_eq!(r.fg_count(), 0);
         drop(t);
         assert_eq!(w.fg_count(), 0);
+    }
+
+    /// A hold through a descriptor counts while it lasts; once the last
+    /// descriptor has closed none can be taken through it.
+    #[test]
+    fn a_held_file_outlives_its_descriptor() {
+        let (r, _w) = pipe_pair();
+        let t = FdTable::new();
+        let a = t.insert(Arc::clone(&r), false).unwrap() as i32;
+        let held = t.get_held(a).unwrap();
+        assert_eq!(r.fg_count(), 2);
+        t.close(a).unwrap();
+        assert_eq!(r.fg_count(), 1);
+        drop(held);
+        assert_eq!(r.fg_count(), 0);
+        assert!(!r.fg_retain_live());
+        assert_eq!(r.fg_count(), 0);
     }
 
     /// A close drops the description when it returns, with readers about:

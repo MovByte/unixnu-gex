@@ -11,7 +11,7 @@
 //! the descriptors must still be queued.
 
 use crate::errno::{Errno, SysResult};
-use crate::file::OpenFile;
+use crate::file::{InFlight, OpenFile};
 use crate::vfs::{FileHandle, FileType, Metadata};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -29,7 +29,7 @@ struct Stream {
     /// Descriptors in flight, each tagged with the absolute byte offsets of
     /// the write that carried it, start and end (from connection start, so
     /// draining `bytes` does not disturb them).
-    fds: VecDeque<(u64, u64, Arc<OpenFile>)>,
+    fds: VecDeque<(u64, u64, InFlight)>,
     /// Total bytes ever written to this direction.
     written: u64,
     /// Total bytes ever read from it.
@@ -38,14 +38,6 @@ struct Stream {
     closed: bool,
 }
 
-impl Drop for Stream {
-    /// Descriptors never read go with it.
-    fn drop(&mut self) {
-        for (_, _, f) in &self.fds {
-            f.fg_release();
-        }
-    }
-}
 
 #[derive(Debug, Default)]
 struct Pipe {
@@ -112,8 +104,7 @@ impl Pipe {
         let at = s.written;
         for fd in fds {
             // In flight, it holds the file (unp_internalize).
-            fd.fg_retain();
-            s.fds.push_back((at, at + n as u64, fd));
+            s.fds.push_back((at, at + n as u64, InFlight::new(fd)));
         }
         s.bytes.extend(&buf[..n]);
         s.written += n as u64;
@@ -131,7 +122,7 @@ impl Pipe {
     /// read never holds two writes' descriptors. Of those, `max_fds` (the
     /// room the caller's control buffer has) are handed over and the rest
     /// closed; the third value says some were (`MSG_CTRUNC`).
-    fn recv(&self, buf: &mut [u8], max_fds: usize, peek: bool) -> Result<(u64, Vec<Arc<OpenFile>>, bool), Errno> {
+    fn recv(&self, buf: &mut [u8], max_fds: usize, peek: bool) -> Result<(u64, Vec<InFlight>, bool), Errno> {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if s.bytes.is_empty() {
             // Empty buffer means end-of-file or nothing yet: a stream socket
@@ -160,7 +151,6 @@ impl Pipe {
         if let Some((at, _)) = group {
             while s.fds.front().is_some_and(|f| f.0 == at) {
                 let (_, _, file) = s.fds.pop_front().unwrap();
-                file.fg_release();
                 if out.len() < max_fds {
                     out.push(file);
                 } else {
@@ -236,7 +226,7 @@ pub struct UnixSocket {
     /// the syscall layer can move them across in one step.
     pending_send: Mutex<Vec<Arc<OpenFile>>>,
     /// Descriptors the last `recvmsg` took off the stream.
-    pending_recv: Mutex<Vec<Arc<OpenFile>>>,
+    pending_recv: Mutex<Vec<InFlight>>,
     /// Who waits on this end (`crate::wait`): readers, writers, and for a
     /// listener `accept`.
     queue: crate::wait::Queue,
@@ -514,7 +504,7 @@ impl UnixSocket {
 
     /// Descriptors the last read collected. One owner only, as
     /// [`Self::stage_send`]; the guest's `recvmsg` uses [`Self::recv_with`].
-    pub fn take_received(&self) -> Vec<Arc<OpenFile>> {
+    pub fn take_received(&self) -> Vec<InFlight> {
         std::mem::take(&mut *self.pending_recv.lock().unwrap())
     }
 
@@ -536,13 +526,13 @@ impl UnixSocket {
     /// shares the process's server socket) each get their own message's
     /// descriptors, which [`Self::recv`] then [`Self::take_received`] could
     /// swap.
-    pub fn recv_with(&self, buf: &mut [u8], max_fds: usize, peek: bool) -> Result<(u64, Vec<Arc<OpenFile>>), Errno> {
+    pub fn recv_with(&self, buf: &mut [u8], max_fds: usize, peek: bool) -> Result<(u64, Vec<InFlight>), Errno> {
         self.recv_msg(buf, max_fds, peek).map(|(n, fds, _)| (n, fds))
     }
 
     /// [`Self::recv_with`], also saying whether descriptors that did not
     /// fit in `max_fds` were closed (`recvmsg`'s `MSG_CTRUNC`).
-    pub fn recv_msg(&self, buf: &mut [u8], max_fds: usize, peek: bool) -> Result<(u64, Vec<Arc<OpenFile>>, bool), Errno> {
+    pub fn recv_msg(&self, buf: &mut [u8], max_fds: usize, peek: bool) -> Result<(u64, Vec<InFlight>, bool), Errno> {
         let role = self.role.lock().unwrap();
         let Role::Connected { rx, .. } = &*role else {
             return Err(Errno::ENOTCONN);
@@ -1257,7 +1247,7 @@ mod tests {
                     assert_eq!(n as usize, per, "a message split");
                     assert_eq!(fds.len(), 1, "message {got} came with {} descriptors", fds.len());
                     let tag = usize::from_le_bytes(buf[1..].try_into().unwrap());
-                    assert_eq!(Arc::as_ptr(&fds[0]) as usize, tag, "another sender's descriptor");
+                    assert_eq!(Arc::as_ptr(fds[0].file()) as usize, tag, "another sender's descriptor");
                     got += 1;
                 }
                 Err(Errno::EAGAIN) => std::thread::yield_now(),

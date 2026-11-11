@@ -80,7 +80,7 @@ struct SessionClip {
     /// Its text, for the client's receives of the offer.
     text: Vec<u8>,
     /// Text still to write into a client's receive descriptor.
-    writes: Vec<(Arc<OpenFile>, usize)>,
+    writes: Vec<(gex_kernel::file::InFlight, usize)>,
     /// The client's own selection being read: the read end and what came.
     read: Option<(Arc<OpenFile>, Vec<u8>)>,
 }
@@ -446,7 +446,7 @@ struct Session {
     idx: u32,
     /// `None` once given back: a drag's receive descriptor, closed so the
     /// client reads to its end.
-    fds: Vec<Option<Arc<OpenFile>>>,
+    fds: Vec<Option<gex_kernel::file::InFlight>>,
     /// The page's drag over this client: its serial, its data, and what was
     /// last said of it.
     drag: Option<SessionDrag>,
@@ -1176,7 +1176,7 @@ impl HostListener for WaylandDevice {
 struct PoolView<'a, 'm> {
     maps: &'a gex_kernel::syscalls::SharedMapView,
     mem: &'a GuestMem<'m>,
-    fds: &'a [Option<Arc<OpenFile>>],
+    fds: &'a [Option<gex_kernel::file::InFlight>],
 }
 
 impl Buffers for PoolView<'_, '_> {

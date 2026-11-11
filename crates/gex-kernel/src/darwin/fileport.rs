@@ -4,7 +4,7 @@
 
 use super::ipc::Kobject;
 use crate::errno::Errno;
-use crate::file::OpenFile;
+use crate::file::{InFlight, OpenFile};
 use crate::syscalls::Kernel;
 use crate::GuestMem;
 use std::collections::HashMap;
@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 /// The open files the file ports hold, by port number. A file stays open
 /// for as long as its port lives.
-fn files() -> &'static Mutex<HashMap<u32, Arc<OpenFile>>> {
-    static FILES: OnceLock<Mutex<HashMap<u32, Arc<OpenFile>>>> = OnceLock::new();
+fn files() -> &'static Mutex<HashMap<u32, InFlight>> {
+    static FILES: OnceLock<Mutex<HashMap<u32, InFlight>>> = OnceLock::new();
     FILES.get_or_init(Default::default)
 }
 
@@ -23,9 +23,9 @@ static NEXT: AtomicU32 = AtomicU32::new(1);
 /// The last send right to file port `id` went: its open file with it
 /// (`fileport_notify`).
 pub fn fileport_no_senders(id: u32) {
-    if let Some(f) = files().lock().unwrap_or_else(|e| e.into_inner()).remove(&id) {
-        f.fg_release();
-    }
+    // The port's hold goes with it (fg_drop), out of the table's lock.
+    let held = files().lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    drop(held);
 }
 
 impl Kernel {
@@ -39,21 +39,29 @@ impl Kernel {
         if let Some(g) = self.fds.guard(fd).filter(|g| g.has(super::guarded::attr::FILEPORT)) {
             return Err(self.darwin_fp_guard_exception(fd, g, super::guarded::flavor::FILEPORT));
         }
+        // The port holds the file (fg_ref), unless its descriptor closed
+        // meanwhile.
+        let held = self.fds.get_held(fd)?;
+        drop(file);
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
-        // The port holds the file (fg_ref).
-        file.fg_retain();
-        files().lock().unwrap_or_else(|e| e.into_inner()).insert(id, file);
+        files().lock().unwrap_or_else(|e| e.into_inner()).insert(id, held);
         // fileport_alloc: IPC_KOBJECT_ALLOC_MAKE_SEND | IPC_KOBJECT_ALLOC_NSREQUEST,
         // so the file goes with the last send right.
         let ipc = &mut self.ipc();
         let port = ipc.kobject_port(Kobject::FilePort(id));
         ipc.make_send(port);
         ipc.port_mut(port).nsrequest_kobject = true;
+        // A copyout that fails destroys the right, and the port's last send
+        // right takes the file's hold with it; a name that cannot be written
+        // out is deallocated, as xnu does whatever another thread did to it.
         let name = self.darwin_copyout_send(port);
         if name == 0 {
             return Err(Errno::EINVAL);
         }
-        m.write_u32(out, name)?;
+        if let Err(e) = m.write_u32(out, name) {
+            let _ = self.ipc().mach_port_deallocate(name);
+            return Err(e);
+        }
         Ok(0)
     }
 
@@ -64,7 +72,7 @@ impl Kernel {
         let ipc = &mut self.ipc();
         let Ok(port) = ipc.translate_send(name) else { return Err(Errno::EINVAL) };
         let Some(Kobject::FilePort(id)) = ipc.port(port).kobject else { return Err(Errno::EINVAL) };
-        files().lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned().ok_or(Errno::EINVAL)
+        files().lock().unwrap_or_else(|e| e.into_inner()).get(&id).map(|f| Arc::clone(f)).ok_or(Errno::EINVAL)
     }
 
     /// The open file of the file port a send right names in process `pid`'s
@@ -86,7 +94,7 @@ impl Kernel {
             })
             .flatten()
             .ok_or(Errno::EINVAL)?;
-        files().lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned().ok_or(Errno::EINVAL)
+        files().lock().unwrap_or_else(|e| e.into_inner()).get(&id).map(|f| Arc::clone(f)).ok_or(Errno::EINVAL)
     }
 
     /// `fileport_makefd(port)`: a new close-on-exec descriptor of the port's
