@@ -128,6 +128,10 @@ pub struct RecvArgs {
     pub bufs: RecvBufs,
     pub options: u64,
     pub timeout_ms: u32,
+    /// What its arguments' validation found, reported when the receive
+    /// would start (`MACH_RCV_INVALID_ARGUMENTS`); 0 when they are good.
+    /// Bad receive arguments do not stop a combined send.
+    pub invalid: u32,
 }
 
 /// `mach_msg_priority_qos`, `mach_msg_priority_overide_qos`: the QoS
@@ -236,16 +240,19 @@ impl Kernel {
         let mut then = None;
         if options & opt::RCV_MSG != 0 {
             let rcv_name = (dc_rn >> 32) as u32;
+            // mach_msg_validate_data_vectors for the receive, after the
+            // send.
+            let mut invalid = 0;
             let bufs = if options & opt::MSG_VECTOR != 0 {
                 let rcv_count = rs_pr as u32;
                 if rcv_count == 0 {
-                    return self.mach_result(m, mr::RCV_INVALID_ARGUMENTS);
+                    invalid = mr::RCV_INVALID_ARGUMENTS;
                 }
                 let mut aux = RecvBufs { msg_addr: 0, msg_size: 0, aux_addr: 0, aux_size: 0 };
                 if rcv_count == 2 {
                     let rcv_addr = if aux_vec[1] != 0 { aux_vec[1] } else { aux_vec[0] };
                     if rcv_addr == 0 || (aux_vec[3] as u32) < AUX_HEADER {
-                        return self.mach_result(m, mr::RCV_INVALID_ARGUMENTS);
+                        invalid = mr::RCV_INVALID_ARGUMENTS;
                     }
                     aux.aux_addr = rcv_addr;
                     aux.aux_size = aux_vec[3] as u32;
@@ -254,7 +261,7 @@ impl Kernel {
             } else {
                 RecvBufs { msg_addr: data, msg_size: rs_pr as u32, aux_addr: 0, aux_size: 0 }
             };
-            then = Some(RecvArgs { rcv_name, bufs, options, timeout_ms: timeout });
+            then = Some(RecvArgs { rcv_name, bufs, options, timeout_ms: timeout, invalid });
         }
         if options & opt::SEND_MSG != 0 {
             let mut u = SendUctx {
@@ -319,7 +326,7 @@ impl Kernel {
         let mut then = None;
         if options & opt::RCV_MSG != 0 {
             let addr = if rcv_msg != 0 { rcv_msg } else { msg };
-            then = Some(RecvArgs { rcv_name, bufs: RecvBufs { msg_addr: addr, msg_size: rcv_size, aux_addr: 0, aux_size: 0 }, options, timeout_ms: timeout });
+            then = Some(RecvArgs { rcv_name, bufs: RecvBufs { msg_addr: addr, msg_size: rcv_size, aux_addr: 0, aux_size: 0 }, options, timeout_ms: timeout, invalid: 0 });
         }
         if options & opt::SEND_MSG != 0 {
             // mach_msg_copyin_user_header
@@ -1007,6 +1014,9 @@ impl Kernel {
 
     /// `mach_msg_trap_receive`: receive on `r.rcv_name`, or wait.
     fn mach_msg_receive(&mut self, m: &mut GuestMem<'_>, r: RecvArgs) -> SyscallOutcome {
+        if r.invalid != 0 {
+            return self.mach_result(m, r.invalid);
+        }
         let object = match self.ipc().mqueue_copyin(r.rcv_name) {
             Ok(o) => o,
             Err(e) => return self.mach_result(m, e),

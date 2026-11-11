@@ -1,10 +1,16 @@
 // A message too large for the receive buffer, without MACH_RCV_LARGE:
 // MACH_RCV_TOO_LARGE with the message made a bare header (its size the
-// header's, its id and ports kept) and a trailer, the message gone.
+// header's, its id and ports kept) and a trailer, the message gone. And a
+// combined mach_msg2 send and receive with bad receive vectors sends
+// first, then says MACH_RCV_INVALID_ARGUMENTS.
 
 #include <mach/mach.h>
 #include <stdio.h>
 #include <string.h>
+
+extern mach_msg_return_t mach_msg2_internal(void *data, uint64_t option64, uint64_t bits_and_send_size,
+    uint64_t remote_and_local_port, uint64_t voucher_and_id, uint64_t desc_count_and_rcv_name,
+    uint64_t rcv_size_and_priority, uint64_t timeout);
 
 static int bad(const char *what, long got, long want) {
     printf("rcvlarge: %s: %#lx, want %#lx\n", what, got, want);
@@ -51,6 +57,26 @@ int main(void) {
         if (kr != MACH_RCV_TIMED_OUT) return bad("the message afterwards", kr, MACH_RCV_TIMED_OUT);
     }
 
+    // mach_msg2: send a vector, receive with none.
+    const uint64_t send_msg = 1, rcv_msg = 2, msg_vector = 0x0000000100000000ull, mq_call = 0x0000000400000000ull;
+    struct {
+        mach_msg_header_t head;
+    } s = {{MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0), sizeof s, q, MACH_PORT_NULL, MACH_PORT_NULL, 50}};
+    struct {
+        uint64_t data, rcv_addr;
+        uint32_t send_size, rcv_size;
+    } vec = {(uint64_t)&s, 0, sizeof s, 0};
+    uint32_t bits = s.head.msgh_bits;
+    kern_return_t kr = mach_msg2_internal(&vec, send_msg | rcv_msg | msg_vector | mq_call,
+        (uint64_t)1 << 32 | bits, (uint64_t)MACH_PORT_NULL << 32 | q, (uint64_t)50 << 32,
+        (uint64_t)q << 32, 0, 0);
+    if (kr != MACH_RCV_INVALID_ARGUMENTS) return bad("a combined call with no receive vector", kr, MACH_RCV_INVALID_ARGUMENTS);
+    struct {
+        mach_msg_header_t head;
+        mach_msg_trailer_t trailer;
+    } got;
+    kr = mach_msg(&got.head, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof got, q, 0, MACH_PORT_NULL);
+    if (kr || got.head.msgh_id != 50) return bad("the message it sent", kr ? kr : got.head.msgh_id, 50);
     printf("rcvlarge ok\n");
     return 0;
 }
