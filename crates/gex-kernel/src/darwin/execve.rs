@@ -429,6 +429,14 @@ impl Kernel {
         }
         self.darwin_exec_switch_body(spawn);
         self.darwin_ipc_leave();
+        // posix_spawn's exec_failure_reason past the point of no return:
+        // SIGKILL, carrying OS_REASON_EXEC's EXEC_EXIT_REASON_BAD_PSATTR.
+        if spawn.is_some_and(|s| s.bad_psattr) {
+            const OS_REASON_EXEC: u32 = 9;
+            const EXEC_EXIT_REASON_BAD_PSATTR: u64 = 19;
+            let r = super::reason::OsReason::new(OS_REASON_EXEC, EXEC_EXIT_REASON_BAD_PSATTR);
+            self.darwin_psignal_try_thread(super::signal::dsig::SIGKILL, Some(std::sync::Arc::new(r)));
+        }
     }
 
     /// The new image takes the process over, once it is loaded: what

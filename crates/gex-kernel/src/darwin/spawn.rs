@@ -190,6 +190,9 @@ pub struct After {
     pub pcontrol: Option<i32>,
     /// `psa_cpumonitor_percent` and `psa_cpumonitor_interval` (seconds).
     pub cpumonitor: (u64, u64),
+    /// An exec in place whose process group or session could not be set:
+    /// it is killed once its image is in.
+    pub bad_psattr: bool,
 }
 
 /// The `p_pcaction` a spawn's `psa_pcontrol` gives (`POSIX_SPAWN_PCONTROL_*`
@@ -623,7 +626,7 @@ impl Kernel {
     fn darwin_spawn_child(&mut self, m: &GuestMem<'_>, child: &mut Kernel, attr: Option<&Attr>, file_actions: Option<&[u8]>, port_actions: Option<&[u8]>, creds: &SpawnCreds, path: u64, argv: u64, envv: u64) -> Result<(), Errno> {
         let flags = attr.map_or(0, |a| a.flags);
         let policy = attr.map_or((0, 0, 0), |a| super::taskpolicy::spawn_attrs(a.apptype, a.qos_clamp, a.darwin_role));
-        let mut after = After { flags, policy, sigmask: attr.map_or(0, |a| a.sigmask), sigdefault: attr.map_or(0, |a| a.sigdefault), inherit: Vec::new(), max_addr: attr.map_or(0, |a| a.max_addr), crash_behavior: if self.dtask.codesign.as_ref().is_some_and(|c| c.entitled("com.apple.private.spawn-panic-crash-behavior")) { attr.map_or(0, |a| a.crash_behavior) } else { 0 }, pcontrol: attr.map(|a| a.pcontrol), cpumonitor: attr.map_or((0, 0), |a| (a.cpumonitor_percent, a.cpumonitor_interval)) };
+        let mut after = After { flags, policy, sigmask: attr.map_or(0, |a| a.sigmask), sigdefault: attr.map_or(0, |a| a.sigdefault), inherit: Vec::new(), max_addr: attr.map_or(0, |a| a.max_addr), crash_behavior: if self.dtask.codesign.as_ref().is_some_and(|c| c.entitled("com.apple.private.spawn-panic-crash-behavior")) { attr.map_or(0, |a| a.crash_behavior) } else { 0 }, pcontrol: attr.map(|a| a.pcontrol), cpumonitor: attr.map_or((0, 0), |a| (a.cpumonitor_percent, a.cpumonitor_interval)), bad_psattr: false };
         if let Some(fa) = file_actions {
             let mut fileports = self.darwin_spawn_fileports(fa);
             after.inherit = child.darwin_file_actions(fa, flags, &mut fileports)?;
@@ -871,7 +874,7 @@ impl Kernel {
                 });
             }
         }
-        let mut after = After { flags: at.flags, policy: super::taskpolicy::spawn_attrs(at.apptype, at.qos_clamp, at.darwin_role), sigmask: at.sigmask, sigdefault: at.sigdefault, inherit: Vec::new(), max_addr: at.max_addr, crash_behavior: if self.dtask.codesign.as_ref().is_some_and(|c| c.entitled("com.apple.private.spawn-panic-crash-behavior")) { at.crash_behavior } else { 0 }, pcontrol: Some(at.pcontrol), cpumonitor: (at.cpumonitor_percent, at.cpumonitor_interval) };
+        let mut after = After { flags: at.flags, policy: super::taskpolicy::spawn_attrs(at.apptype, at.qos_clamp, at.darwin_role), sigmask: at.sigmask, sigdefault: at.sigdefault, inherit: Vec::new(), max_addr: at.max_addr, crash_behavior: if self.dtask.codesign.as_ref().is_some_and(|c| c.entitled("com.apple.private.spawn-panic-crash-behavior")) { at.crash_behavior } else { 0 }, pcontrol: Some(at.pcontrol), cpumonitor: (at.cpumonitor_percent, at.cpumonitor_interval), bad_psattr: false };
         let mut fileports = file_actions.map(|fa| self.darwin_spawn_fileports(fa)).unwrap_or_default();
         let activated = (|| {
             if let Some(fa) = file_actions {
@@ -901,17 +904,19 @@ impl Kernel {
             let mut gm = GuestMem::new(&mut s.0);
             self.canonical(&mut gm, nr::CHDIR, [Scratch::AT, 0, 0, 0, 0, 0])?;
         }
-        if at.flags & flag::SETPGROUP != 0 {
-            let _ = self.procs.darwin_setpgid(self.pid, self.pid, at.pgroup);
-        }
-        if at.flags & flag::SETSID != 0 {
-            let _ = self.procs.setsid(self.pid);
+        // After the image's activation in xnu, so a failure here kills the
+        // process once its new image is in (bad_px_sa's
+        // EXEC_EXIT_REASON_BAD_PSATTR); a setpgid that fails leaves the
+        // session as it was.
+        let mut bad_psattr = at.flags & flag::SETPGROUP != 0 && self.procs.darwin_setpgid(self.pid, self.pid, at.pgroup).is_err();
+        if !bad_psattr && at.flags & flag::SETSID != 0 {
+            bad_psattr = self.procs.setsid(self.pid).is_err();
         }
         // exec_activate_image's new task, and its ledger, before the
         // spawn's limits are set on it.
         self.procs.jetsam().ledgers.insert(self.pid, super::footprint::Ledger::default());
         self.darwin_spawn_jetsam(self.pid, at);
-        img.spawn = Some(after);
+        img.spawn = Some(After { bad_psattr, ..after });
         // The copy's thread (cloneproc's, for an exec in place) is the one
         // this process goes on in.
         img.thread_id = copy.signals.thread().darwin_id();
