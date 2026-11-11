@@ -78,6 +78,13 @@ pub trait Transport: Send + Sync + std::fmt::Debug {
         let _ = buf;
         Err(Errno::EOPNOTSUPP)
     }
+    /// Whether this end can send no more (`SS_CANTSENDMORE`), `closed`
+    /// being whether `status` says Closed: a transport whose writes after
+    /// that are `EPIPE` has none, one that knows a peer's half-close
+    /// (`send_closed`) says itself.
+    fn send_over(&self, closed: bool) -> bool {
+        closed
+    }
     /// This connection as a name another process can hold it by (a socket
     /// passed over `SCM_RIGHTS`, or inherited across a fork, in a page where
     /// each process has its own memory), counted as one more holder: the
@@ -342,6 +349,13 @@ impl Transport for LoopEnd {
     }
     fn send_closed(&self, data: &[u8]) -> Result<usize, Errno> {
         self.send(data)
+    }
+    /// A peer's FIN ends only the reading (`socantrcvmore`): sending is
+    /// over once this end shut it down, or once the write after the
+    /// peer's close has met its reset.
+    fn send_over(&self, _closed: bool) -> bool {
+        let tx = self.tx.lock().unwrap();
+        tx.writer_gone || tx.reset
     }
     fn peek(&self, buf: &mut [u8]) -> Result<usize, Errno> {
         let rx = self.rx.lock().unwrap();
@@ -1753,12 +1767,13 @@ impl FileHandle for Socket {
                 Status::Open => {
                     st.can_write = true;
                     st.rcv = t.available() as u64;
+                    st.cantsend = t.send_over(false);
                 }
                 Status::Closed => {
                     st.can_write = true;
                     st.rcv = t.available() as u64;
                     st.cantrcv = true;
-                    st.cantsend = true;
+                    st.cantsend = t.send_over(true);
                 }
                 Status::Refused => {
                     st.cantrcv = true;
