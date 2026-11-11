@@ -2,7 +2,8 @@
 // the child's name port names it (pid_for_task) and its kernel answers
 // task_info for it (its audit token); a name port is not enough for
 // TASK_DYLD_INFO; a pid with no process gives null and KERN_FAILURE; and
-// once the child has ended its name port is dead.
+// once the child has ended its name port is dead. task_policy takes no
+// name port without its entitlement, and no thread port.
 
 #include <errno.h>
 #include <limits.h>
@@ -64,6 +65,18 @@ int main(int argc, char **argv) {
     if (waitpid(pid, &st, 0) != pid || !WIFEXITED(st) || WEXITSTATUS(st)) return bad("the child's status", st, 0);
     mach_port_type_t t;
     if ((kr = mach_port_type(mach_task_self(), n, &t)) || t != MACH_PORT_TYPE_DEAD_NAME) return bad("its name port after it ended", kr ? kr : t, MACH_PORT_TYPE_DEAD_NAME);
+    // task_policy through a name port, unentitled, or a thread's port: no
+    // task.
+    mach_port_t own = MACH_PORT_NULL;
+    if ((kr = task_name_for_pid(mach_task_self(), getpid(), &own)) || !MACH_PORT_VALID(own)) return bad("its own name port", kr ? kr : own, 1);
+    integer_t pw[16];
+    mach_msg_type_number_t pc = 1;
+    boolean_t pd = FALSE;
+    if ((kr = task_policy_get(own, TASK_CATEGORY_POLICY, pw, &pc, &pd)) != KERN_INVALID_ARGUMENT) return bad("task_policy_get on a name port", kr, KERN_INVALID_ARGUMENT);
+    pw[0] = TASK_FOREGROUND_APPLICATION;
+    if ((kr = task_policy_set(own, TASK_CATEGORY_POLICY, pw, 1)) != KERN_INVALID_ARGUMENT) return bad("task_policy_set on a name port", kr, KERN_INVALID_ARGUMENT);
+    pc = 1;
+    if ((kr = task_policy_get(mach_thread_self(), TASK_CATEGORY_POLICY, pw, &pc, &pd)) != KERN_INVALID_ARGUMENT) return bad("task_policy_get on a thread port", kr, KERN_INVALID_ARGUMENT);
     printf("taskname ok\n");
     return 0;
 }

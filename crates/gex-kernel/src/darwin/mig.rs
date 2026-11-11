@@ -190,6 +190,22 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
                 }
             }
         }
+        // convert_port_to_task_policy_mig: a name port takes task_policy_set
+        // and _get only for a caller entitled to com.apple.private.task_policy
+        // (and a thread port never); else TASK_NULL, KERN_INVALID_ARGUMENT.
+        Kobject::TaskName if matches!(req.id, 3420 | 3421) => {
+            let own = k.dtask.kcaller == 0 || k.dtask.kcaller == k.ipc().task;
+            if !own {
+                let mut r = Reply::err(KERN_INVALID_ARGUMENT);
+                r.unimplemented = Some("task_policy through another task's name port (its caller's com.apple.private.task_policy)".into());
+                return r;
+            }
+            if !k.darwin_entitled("com.apple.private.task_policy") {
+                return Reply::err(KERN_INVALID_ARGUMENT);
+            }
+            as_control = Kobject::Task;
+            &as_control
+        }
         _ => obj,
     };
     match (obj, req.id) {
@@ -750,6 +766,8 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             }
             r
         }
+        // task_policy_set and _get through a thread's port: no task.
+        (Kobject::Thread(_), 3420 | 3421) => Reply::err(KERN_INVALID_ARGUMENT),
         // task_policy_set(task, flavor, policy_info[policy_infoCnt]): at
         // most TASK_POLICY_INFO_MAX (16) words.
         (Kobject::Task, 3420) => match (arg(req, 0), arg(req, 1)) {
