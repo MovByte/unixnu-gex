@@ -37,6 +37,19 @@ pub fn family_exists(d: u64) -> bool {
     (3..=40).contains(&d)
 }
 
+/// The message flags a socket call takes that change what it does and that
+/// the sockets here do not carry: `MSG_EOF` (a stream's send that ends its
+/// writing, PRUS_EOF), `MSG_WAITSTREAM` (soreceive's wait for the request)
+/// and `MSG_NBIO` (fifofs's no-wait, which xnu looks at in other places
+/// than MSG_DONTWAIT). The rest either have no effect on a socket here
+/// (`MSG_NEEDSA`'s address always allocates; no content filter for
+/// `MSG_SKIPCFIL`) or none in xnu (the deprecated hold flags, the output
+/// ones).
+pub fn msg_flags_unported(f: u64) -> Option<&'static str> {
+    const NAMED: [(u64, &str); 3] = [(0x100, "MSG_EOF"), (0x200, "MSG_WAITSTREAM"), (0x2_0000, "MSG_NBIO")];
+    NAMED.iter().find(|&&(bit, _)| f & bit != 0).map(|&(_, name)| name)
+}
+
 /// A Darwin `MSG_*` flag word as Linux's. `MSG_NOSIGNAL` is 0x80000 there.
 pub fn msg_flags_to_linux(f: u64) -> u64 {
     // (Darwin, Linux): OOB, PEEK, DONTROUTE, EOR, TRUNC, CTRUNC, WAITALL,
@@ -337,6 +350,12 @@ mod tests {
         assert_eq!(msg_flags_to_linux(0x80), 0x40);
         assert_eq!(msg_flags_to_linux(0x40 | 0x2), 0x100 | 0x2);
         assert_eq!(msg_flags_to_linux(0x80000), 0x4000);
+        // Flags that change a call and are not carried: said; those of no
+        // effect here or in xnu: not.
+        assert_eq!(msg_flags_unported(0x100 | 0x2), Some("MSG_EOF"));
+        assert_eq!(msg_flags_unported(0x200), Some("MSG_WAITSTREAM"));
+        assert_eq!(msg_flags_unported(0x2_0000), Some("MSG_NBIO"));
+        assert_eq!(msg_flags_unported(0x1_0000 | 0x4_0000 | 0x800 | 0x80 | 0x40), None);
         assert_eq!(msg_flags_from_linux(0x20 | 0x8), 0x10 | 0x20);
     }
 

@@ -625,6 +625,14 @@ impl Kernel {
                 }
                 neg(Errno::EAFNOSUPPORT)
             }
+            sys::SENDTO | sys::SENDTO_NOCANCEL | sys::RECVFROM | sys::RECVFROM_NOCANCEL | sys::SENDMSG | sys::SENDMSG_NOCANCEL | sys::RECVMSG | sys::RECVMSG_NOCANCEL
+                if super::sockaddr::msg_flags_unported(if matches!(raw, sys::SENDMSG | sys::SENDMSG_NOCANCEL | sys::RECVMSG | sys::RECVMSG_NOCANCEL) { a[2] } else { a[3] }).is_some() =>
+            {
+                let f = if matches!(raw, sys::SENDMSG | sys::SENDMSG_NOCANCEL | sys::RECVMSG | sys::RECVMSG_NOCANCEL) { a[2] } else { a[3] };
+                let name = super::sockaddr::msg_flags_unported(f).unwrap_or_default();
+                self.darwin_unimplemented(format!("socket message flag {name}"));
+                neg(Errno::EOPNOTSUPP)
+            }
             sys::SETSOCKOPT | sys::GETSOCKOPT => match super::sockaddr::sockopt_to_linux(a[1], a[2]) {
                 Ok(_) => return None,
                 Err(what) => {
