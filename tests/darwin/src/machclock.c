@@ -1,5 +1,6 @@
 // The host's clocks, each its own port: the system clock reads the time
-// since boot (as mach_absolute_time does), the calendar the time of day.
+// since boot (as mach_absolute_time does), the calendar the time of day;
+// and host_info's internal debug flavor is a development kernel's only.
 
 #include <mach/clock.h>
 #include <mach/mach.h>
@@ -40,6 +41,12 @@ int main(void) {
     if (clock_get_time(cal, &t) != KERN_SUCCESS) return bad("the calendar's time", 0, 1);
     long d = (long)t.tv_sec - (long)tv.tv_sec;
     if (d < -1 || d > 1) return bad("the calendar's seconds", t.tv_sec, tv.tv_sec);
+
+    // HOST_DEBUG_INFO_INTERNAL on a release kernel.
+    integer_t info[64];
+    mach_msg_type_number_t n = 64;
+    kr = host_info(host, 10, info, &n);
+    if (kr != KERN_NOT_SUPPORTED) return bad("host_info's internal debug flavor", kr, KERN_NOT_SUPPORTED);
 
     printf("machclock ok\n");
     return 0;

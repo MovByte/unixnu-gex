@@ -1350,6 +1350,9 @@ fn host_info(flavor: i32, count: u32) -> Reply {
             }
             Reply::ok(words(&[0]))
         }
+        // HOST_DEBUG_INFO_INTERNAL: a DEVELOPMENT or DEBUG kernel's only;
+        // this is a release kernel.
+        10 => Reply::err(KERN_NOT_SUPPORTED),
         HOST_PREFERRED_USER_ARCH => {
             if count < 2 {
                 return Reply::err(KERN_FAILURE);
