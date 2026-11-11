@@ -383,10 +383,7 @@ impl Kernel {
                     r.and_then(|()| self.canonical(m, nr::FCHMODAT, [dirfd(a[0]), a[1], a[2] & ALLPERMS, if flag & (AT_SYMLINK_NOFOLLOW | AT_SYMLINK_NOFOLLOW_ANY) != 0 { 0x100 } else { 0 }, 0, 0]))
                 }
             }
-            sys::CHOWN | sys::LCHOWN | sys::FCHOWN | sys::FCHOWNAT => {
-                self.darwin_unimplemented("the chown family (the filesystems here keep no owners)".into());
-                Err(Errno::EOPNOTSUPP)
-            }
+            sys::CHOWN | sys::LCHOWN | sys::FCHOWN | sys::FCHOWNAT => self.darwin_chown(m, raw, a),
             sys::TRUNCATE => self.darwin_truncate(m, a[0], a[1] as i64),
             sys::MKFIFO | sys::MKFIFOAT | sys::MKNOD | sys::MKNODAT => {
                 self.darwin_unimplemented("mkfifo and mknod (no named FIFO or device nodes in the filesystems here)".into());
@@ -443,6 +440,55 @@ impl Kernel {
             return Err(Errno::ENOENT);
         }
         Ok(())
+    }
+
+    /// `chown`, `lchown`, `fchown` and `fchownat` (`vn_chown_internal`):
+    /// the file looked up as the call names it; an owner and group of -1
+    /// (VNOVAL) each set nothing, which needs no authorization and changes
+    /// nothing. Another owner or group is reported: the filesystems here
+    /// keep none.
+    fn darwin_chown(&mut self, m: &GuestMem<'_>, raw: u64, a: &[u64; 6]) -> Result<u64, Errno> {
+        const VNOVAL: u32 = u32::MAX;
+        let cwd = super::bsd::AT_FDCWD as u64;
+        let (uid, gid) = match raw {
+            sys::FCHOWNAT => (a[2] as u32, a[3] as u32),
+            _ => (a[1] as u32, a[2] as u32),
+        };
+        match raw {
+            sys::FCHOWN => {
+                let file = self.fds.get(a[0] as i32)?;
+                if self.darwin_vnode_of(&file).is_none() {
+                    return Err(Errno::EINVAL);
+                }
+            }
+            _ => {
+                let (fd, path, follow) = match raw {
+                    sys::CHOWN => (cwd, a[0], true),
+                    sys::LCHOWN => (cwd, a[0], false),
+                    _ => {
+                        let flag = a[4] as u32 as u64;
+                        if flag & !(AT_SYMLINK_NOFOLLOW | AT_SYMLINK_NOFOLLOW_ANY) != 0 {
+                            return Err(Errno::EINVAL);
+                        }
+                        if flag & AT_SYMLINK_NOFOLLOW_ANY != 0 {
+                            self.darwin_no_link_on_the_way(m, a[0], a[1])?;
+                        }
+                        (a[0], a[1], flag & (AT_SYMLINK_NOFOLLOW | AT_SYMLINK_NOFOLLOW_ANY) == 0)
+                    }
+                };
+                let abs = self.path_io().at_path(m, dirfd(fd) as i32, path)?;
+                if follow {
+                    self.vfs.metadata(&abs)?;
+                } else {
+                    self.vfs.metadata_nofollow(&abs)?;
+                }
+            }
+        }
+        if uid == VNOVAL && gid == VNOVAL {
+            return Ok(0);
+        }
+        self.darwin_unimplemented("the chown family setting an owner or group (the filesystems here keep none)".into());
+        Err(Errno::EOPNOTSUPP)
     }
 
     pub(crate) fn darwin_no_link_on_the_way(&mut self, m: &GuestMem<'_>, fd: u64, path: u64) -> Result<(), Errno> {
