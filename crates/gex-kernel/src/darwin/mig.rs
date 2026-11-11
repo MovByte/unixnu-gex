@@ -218,6 +218,12 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             (Some(flavor), Some(count)) => host_info(flavor, count as u32),
             _ => bad(),
         },
+        // host_statistics(host, flavor, out, &count) and host_statistics64
+        // (host_statistics_from_user, host_statistics64_from_user).
+        (Kobject::Host | Kobject::HostPriv, id @ (216 | 219)) => match (arg(req, 0), arg(req, 1)) {
+            (Some(flavor), Some(count)) => host_statistics(k, id == 219, flavor, count as u32),
+            _ => bad(),
+        },
         // host_page_size(host) -> vm_size_t
         (Kobject::Host | Kobject::HostPriv, 202) => Reply::ok(u64::from(machine::PAGE_SIZE).to_le_bytes().to_vec()),
         // host_get_io_main(host) -> io_main_t.
@@ -1457,6 +1463,103 @@ fn task_info(flavor: i32, count: u32, dyld_infos: (u64, u64), audit: [u32; 8]) -
 
 /// `thread_info` of thread `t`: KERN_TERMINATED once it has ended, else
 /// `thread_info_internal` with the caller's count checked as XNU checks it.
+/// `host_statistics`'s flavors (`mach/host_info.h`).
+mod hstat {
+    pub const LOAD_INFO: i32 = 1;
+    pub const VM_INFO: i32 = 2;
+    pub const CPU_LOAD_INFO: i32 = 3;
+    pub const VM_INFO64: i32 = 4;
+    pub const EXTMOD_INFO64: i32 = 5;
+    pub const EXPIRED_TASK_INFO: i32 = 6;
+    /// `HOST_LOAD_INFO_COUNT`: `avenrun[3]` and `mach_factor[3]`.
+    pub const LOAD_INFO_COUNT: u32 = 6;
+}
+
+/// `g_host_stats_cache[HOST_LOAD_INFO_REV0]`: the window a third-party
+/// task's requests are counted in, and what the last one was given.
+struct StatsCache {
+    last_access: u64,
+    current_requests: u64,
+    max_requests: u64,
+    data: [u32; 6],
+}
+
+static LOAD_CACHE: std::sync::Mutex<StatsCache> = std::sync::Mutex::new(StatsCache { last_access: 0, current_requests: 0, max_requests: 0, data: [0; 6] });
+
+/// `host_statistics_from_user` and `host_statistics64_from_user`: a task
+/// that is not a platform binary is rate limited (`rate_limit_host_
+/// statistics`: a random 2 to 10 requests in each second, past which it is
+/// given what the last request was), then `host_statistics64` (whose own
+/// flavors are the VM's) or `host_statistics`.
+fn host_statistics(k: &mut Kernel, is64: bool, flavor: i32, count: u32) -> Reply {
+    use hstat::*;
+    // MIG's bound on the out array: HOST_INFO64_MAX or HOST_INFO_MAX.
+    let count = count.min(if is64 { 256 } else { 1024 });
+    let unkept = match flavor {
+        VM_INFO => Some("HOST_VM_INFO (the VM's page counts and events)"),
+        CPU_LOAD_INFO => Some("HOST_CPU_LOAD_INFO (each CPU's ticks by state)"),
+        EXPIRED_TASK_INFO => Some("HOST_EXPIRED_TASK_INFO (the ended tasks' power usage)"),
+        VM_INFO64 if is64 => Some("HOST_VM_INFO64 (the VM's page counts and events)"),
+        EXTMOD_INFO64 if is64 => Some("HOST_EXTMOD_INFO64 (the counts of other tasks' changes to tasks)"),
+        _ => None,
+    };
+    if let Some(what) = unkept {
+        k.darwin_unimplemented(format!("host_statistics {what}"));
+        return Reply::err(KERN_NOT_SUPPORTED);
+    }
+    let limited = !k.darwin_task_platform_binary();
+    if limited {
+        // get_host_info_data_index.
+        match flavor {
+            LOAD_INFO if count < LOAD_INFO_COUNT => return Reply::err(KERN_FAILURE),
+            LOAD_INFO => {}
+            _ => return Reply::err(KERN_INVALID_ARGUMENT),
+        }
+        // mach_continuous_time: no sleep is kept here, so it is the
+        // absolute time. HOST_STATISTICS_TIME_WINDOW is a second.
+        let mut c = LOAD_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let window = 24_000_000u64;
+        let mut set_last_access = true;
+        if c.last_access > super::mach::absolute_time().wrapping_sub(window) {
+            set_last_access = false;
+            let n = c.current_requests;
+            c.current_requests += 1;
+            if n >= c.max_requests {
+                return Reply::ok(words(&c.data));
+            }
+        }
+        if set_last_access {
+            c.current_requests = 1;
+            // HOST_STATISTICS_MIN_REQUESTS to HOST_STATISTICS_MAX_REQUESTS.
+            c.max_requests = super::mach::absolute_time() % (10 - 2 + 1) + 2;
+            c.last_access = super::mach::absolute_time();
+        }
+    }
+    // host_statistics.
+    let data = match flavor {
+        LOAD_INFO => {
+            if count < LOAD_INFO_COUNT {
+                return Reply::err(KERN_FAILURE);
+            }
+            let (avenrun, mach_factor) = match k.procs.sched.host_load() {
+                Ok(l) => l,
+                Err(why) => {
+                    k.darwin_unimplemented(why.into());
+                    return Reply::err(KERN_NOT_SUPPORTED);
+                }
+            };
+            [avenrun[0], avenrun[1], avenrun[2], mach_factor[0], mach_factor[1], mach_factor[2]]
+        }
+        _ => return Reply::err(KERN_INVALID_ARGUMENT),
+    };
+    // cache_host_statistics: a third party's answer is the one the limit
+    // gives back.
+    if limited {
+        LOAD_CACHE.lock().unwrap_or_else(|e| e.into_inner()).data = data;
+    }
+    Reply::ok(words(&data))
+}
+
 fn thread_info(k: &mut Kernel, t: i32, flavor: i32, count: u32) -> Reply {
     const THREAD_IDENTIFIER_INFO: i32 = 4;
     const THREAD_IDENTIFIER_INFO_COUNT: u32 = 6;
