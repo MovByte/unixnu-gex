@@ -1,6 +1,8 @@
-// Mapping rules of the VM map: a writable and executable mach_vm_map
-// loses execute on iOS (VM_MAP_POLICY_WX_STRIP_X; macOS's own maps fail
-// it); a fixed address that does not meet the mask is KERN_NO_SPACE.
+// Mapping and protection rules of the VM map: a writable and executable
+// mach_vm_map loses execute on iOS (VM_MAP_POLICY_WX_STRIP_X; macOS's own
+// maps fail it); a fixed address that does not meet the mask is
+// KERN_NO_SPACE; and mprotect walks entry by entry, so a protection the
+// first entry's maximum forbids is EACCES even with a hole after it.
 
 #include <TargetConditionals.h>
 #include <errno.h>
@@ -57,6 +59,22 @@ int main(void) {
     kr = mach_vm_map(mach_task_self(), &f, page, 2 * page - 1, VM_FLAGS_FIXED, MACH_PORT_NULL, 0, FALSE,
         VM_PROT_DEFAULT, VM_PROT_ALL, VM_INHERIT_DEFAULT);
     if (kr != KERN_NO_SPACE) return bad("a fixed address off its mask", kr, KERN_NO_SPACE);
+
+    // A read-only file's shared mapping, then a hole: asking for write is
+    // the mapping's refusal, not the hole's.
+    char path[] = "/tmp/gex-vmwx-XXXXXX";
+    int w = mkstemp(path);
+    ftruncate(w, (off_t)page);
+    int fd = open(path, O_RDONLY);
+    char *m = mmap(NULL, 2 * page, PROT_READ, MAP_SHARED, fd, 0);
+    if (m == MAP_FAILED) return bad("the mapping", errno, 0);
+    munmap(m + page, page);
+    int r = mprotect(m, 2 * page, PROT_READ | PROT_WRITE);
+    if (r != -1 || errno != EACCES) return bad("write on a read-only mapping before a hole", r == -1 ? errno : r, EACCES);
+    r = mprotect(m, 2 * page, PROT_READ);
+    if (r != -1 || errno != ENOMEM) return bad("a hole alone", r == -1 ? errno : r, ENOMEM);
+    munmap(m, page);
+    unlink(path);
 
     printf("vmwx ok\n");
     return 0;

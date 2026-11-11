@@ -1208,17 +1208,27 @@ impl Kernel {
             v.sort();
             v
         };
+        // vm_map_protect's first pass: entry by entry, a hole before it is
+        // KERN_INVALID_ADDRESS and a protection its maximum does not allow
+        // KERN_PROTECTION_FAILURE, whichever comes first. A copy is remapped
+        // before that, its holes found then.
+        let copy = new & prot::COPY != 0;
+        let want = new & prot::ALL;
+        let pieces = self.dtask.vm.pieces(s, e);
         let mut at = s;
         for &(vs, ve, _) in &vmas {
             if vs > at {
                 return kr::INVALID_ADDRESS;
+            }
+            if !copy && pieces.iter().any(|&(ps, pe, a)| ps < ve && vs < pe && want & u64::from(a.max) != want) {
+                return kr2::PROTECTION_FAILURE;
             }
             at = at.max(ve);
         }
         if at < e {
             return kr::INVALID_ADDRESS;
         }
-        if new & prot::COPY != 0 {
+        if copy {
             // vm_map_remap in place, copy on write: the range's entries
             // become this task's own memory, with write access allowed,
             // their file-backed pages no longer written back. The shared
