@@ -1094,9 +1094,12 @@ impl Kernel {
     /// `kevent_register_validate_priority`.
     fn kevent_register_validate_priority(&self, kqid: KqId, n: Option<KnId>, kev: &Kev) -> Result<(), Errno> {
         if kev.flags & (ev::DISABLE | ev::DELETE) == 0 && self.kq_state(kqid) & kq::WORKLOOP != 0 {
+            // A knote that is there keeps its own priority (kevent_register
+            // does not take the incoming one), so its own is checked; a new
+            // one's is the incoming.
             let q = match n {
-                Some(n) if kev.flags & ev::ADD == 0 || kev.qos == 0 => self.dtask.kevents.knotes[&n].qos,
-                _ => kev.qos,
+                Some(n) => self.dtask.kevents.knotes[&n].qos,
+                None => kev.qos,
             };
             if pp::qos(q as u32 as u64) == qos::UNSPECIFIED {
                 return Err(Errno::ERANGE);
