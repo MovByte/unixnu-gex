@@ -1,5 +1,5 @@
 // thread_policy_set and thread_policy_get by thread_policy.c on embedded:
-// timesharing until set fixed; the realtime time constraints validated
+// timesharing until set fixed (timeshare TRUE alone keeps it); the realtime time constraints validated
 // (50 us to 50 ms of computation, no more than the constraint, raised to
 // half of it), their defaults (a 10 ms quantum) reported with get_default
 // set when the thread is not realtime, and a priority only
@@ -59,6 +59,14 @@ int main(void) {
     if (pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0) != EPERM) return bad("a QoS once opted out", 0, EPERM);
     cnt = 1; def = FALSE;
     if ((kr = thread_policy_get(me, THREAD_EXTENDED_POLICY, w, &cnt, &def)) || w[0] != 0) return bad("fixed priority, read", kr ? kr : w[0], 0);
+    // Timesharing is TRUE itself: any other true value asks for a fixed
+    // priority.
+    w[0] = 1;
+    cnt = 1; def = FALSE;
+    if ((kr = thread_policy_set(me, THREAD_EXTENDED_POLICY, w, 1)) || (kr = thread_policy_get(me, THREAD_EXTENDED_POLICY, w, &cnt, &def)) || w[0] != 1) return bad("timesharing again", kr ? kr : w[0], 1);
+    w[0] = 2;
+    cnt = 1; def = FALSE;
+    if ((kr = thread_policy_set(me, THREAD_EXTENDED_POLICY, w, 1)) || (kr = thread_policy_get(me, THREAD_EXTENDED_POLICY, w, &cnt, &def)) || w[0] != 0) return bad("timeshare 2", kr ? kr : w[0], 0);
 
     cnt = 4; def = FALSE;
     if ((kr = thread_policy_get(me, THREAD_TIME_CONSTRAINT_POLICY, w, &cnt, &def)) || !def || w[0] != 0 || (uint32_t)w[1] != abs_us(5000) || (uint32_t)w[2] != abs_us(10000) || w[3] != 1) return bad("the realtime defaults", kr ? kr : w[1], abs_us(5000));

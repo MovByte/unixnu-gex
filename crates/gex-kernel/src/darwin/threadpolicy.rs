@@ -111,7 +111,9 @@ impl Kernel {
         let n = info.len();
         match flavor {
             flavor::EXTENDED => {
-                let timeshare = if n >= 1 { info[0] != 0 } else { true };
+                // TH_MODE_TIMESHARE only for `timeshare == TRUE`; any other
+                // value is TH_MODE_FIXED.
+                let timeshare = if n >= 1 { info[0] == 1 } else { true };
                 th.realtime = None;
                 th.policy.timeshare = Some(timeshare);
             }
