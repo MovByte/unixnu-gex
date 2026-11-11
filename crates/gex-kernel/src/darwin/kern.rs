@@ -669,7 +669,7 @@ impl Kernel {
                 self.darwin_closing(a[0] as i32);
                 return None;
             }
-            sys::SIGPROCMASK | sys::PTHREAD_SIGMASK => res(self.darwin_sigprocmask(m, a[0], a[1], a[2])),
+            sys::SIGPROCMASK | sys::PTHREAD_SIGMASK => res(self.darwin_sigprocmask(m, a[0], a[1], a[2], raw == sys::SIGPROCMASK)),
             sys::TASK_READ_FOR_PID => res(self.darwin_task_flavor_for_pid(m, a[0] as u32, a[1] as i32, a[2], super::amfi::flavor::READ)),
             sys::TASK_INSPECT_FOR_PID => res(self.darwin_task_flavor_for_pid(m, a[0] as u32, a[1] as i32, a[2], super::amfi::flavor::INSPECT)),
             sys::CSOPS => res(self.darwin_csops(m, a[0] as i32, a[1] as u32, a[2], a[3], None)),
@@ -1324,20 +1324,36 @@ impl Kernel {
         Ok(())
     }
 
-    fn darwin_sigprocmask(&mut self, m: &mut GuestMem<'_>, how: u64, set: u64, old: u64) -> Result<u64, Errno> {
-        // The old mask is the one before the call, copied out after the new
-        // one is read (they may be the same word).
+    /// `sigprocmask` (`process`): the process's mask, which is every
+    /// thread's (`block_procsigmask`, `unblock_procsigmask`,
+    /// `set_procsigmask` walk `p_uthlist`); `__pthread_sigmask` changes the
+    /// calling thread's alone.
+    fn darwin_sigprocmask(&mut self, m: &mut GuestMem<'_>, how: u64, set: u64, old: u64, process: bool) -> Result<u64, Errno> {
+        // The old mask is the calling thread's before the call, copied out
+        // after the new one is read (they may be the same word).
         let blocked = self.signals.blocked();
         if set != 0 {
             let mask = mask_to_linux(m.read_u32(set)?);
-            let next = match how {
-                1 => blocked | mask,
-                2 => blocked & !mask,
-                3 => (blocked & !mask_to_linux(!0)) | mask,
-                _ => return Err(Errno::EINVAL),
-            };
+            if !(1..=3).contains(&how) {
+                return Err(Errno::EINVAL);
+            }
             let unblockable = (1u64 << (crate::signal::sig::SIGKILL - 1)) | (1u64 << (crate::signal::sig::SIGSTOP - 1));
-            self.signals.set_blocked(next & !unblockable);
+            let next = |was: u64| {
+                let n = match how {
+                    1 => was | mask,
+                    2 => was & !mask,
+                    _ => (was & !mask_to_linux(!0)) | mask,
+                };
+                n & !unblockable
+            };
+            if process {
+                for tid in self.thread_signals.tids_in_order() {
+                    if let Some(t) = self.thread_signals.get(tid) {
+                        t.set_blocked(next(t.blocked()));
+                    }
+                }
+            }
+            self.signals.set_blocked(next(blocked));
         }
         if old != 0 {
             m.write_u32(old, mask_from_linux(blocked))?;
