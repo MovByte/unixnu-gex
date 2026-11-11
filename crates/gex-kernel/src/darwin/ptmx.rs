@@ -46,9 +46,129 @@ pub mod pkt {
     pub const IOCTL: u8 = 0x40;
 }
 
-/// `UID_ROOT`, `GID_TTY`.
+/// `UID_ROOT`, `GID_WHEEL`, `GID_TTY`.
 const UID_ROOT: u32 = 0;
+const GID_WHEEL: u32 = 0;
 pub const GID_TTY: u32 = 4;
+
+/// The BSD ptys' majors (`bsd/sys/tty.h`). cdevsw has the primary's
+/// functions at PTS_MAJOR, whose nodes `pty_init` names `ttypN`, and the
+/// replica's at PTC_MAJOR, its `ptypN`.
+pub const PTS_MAJOR: u32 = 4;
+pub const PTC_MAJOR: u32 = 5;
+/// `NPTY`: the configuration's `pseudo-device pty 16` (xsmall).
+pub const NPTY: u32 = 16;
+
+/// `struct tty_dev_t`: a pseudo-terminal driver, by its majors and its
+/// behaviors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TtyDevT {
+    pub primary: u32,
+    pub replica: u32,
+    pub fix_7828447: bool,
+    pub fix_7070978: bool,
+    pub mac_notify: bool,
+    pub open_reset: bool,
+}
+
+/// `_ptmx_driver` (MAC notifies, as CONFIG_MACF has it).
+pub const PTMX_DRIVER: TtyDevT = TtyDevT { primary: PTMX_MAJOR, replica: PTSD_MAJOR, fix_7828447: true, fix_7070978: true, mac_notify: true, open_reset: false };
+/// `_pty_driver`.
+pub const PTY_DRIVER: TtyDevT = TtyDevT { primary: PTC_MAJOR, replica: PTS_MAJOR, fix_7828447: false, fix_7070978: false, mac_notify: false, open_reset: true };
+
+/// `pty_get_driver`: the driver whose primary or replica major `dev` has.
+pub fn driver(dev: u32) -> Option<TtyDevT> {
+    match dev >> 24 {
+        PTMX_MAJOR | PTSD_MAJOR => Some(PTMX_DRIVER),
+        PTS_MAJOR | PTC_MAJOR => Some(PTY_DRIVER),
+        _ => None,
+    }
+}
+
+/// Whether `dev`'s cdevsw entry is the primary's (`d_open == ptcopen`).
+pub fn is_ptc(dev: u32) -> bool {
+    matches!(dev >> 24, PTMX_MAJOR | PTS_MAJOR)
+}
+
+/// The BSD ptys (`pt_ioctl[NPTY]`): each one's terminal once an open has
+/// made it, and its `ttypN` node's attributes (`pt_devhandle`).
+struct Bsd {
+    ttys: Vec<Option<Arc<TtyCell>>>,
+    nodes: Vec<PtsNode>,
+}
+
+static BSD: Mutex<Option<Bsd>> = Mutex::new(None);
+
+fn bsd<R>(f: impl FnOnce(&mut Bsd) -> R) -> R {
+    let mut g = BSD.lock().unwrap_or_else(|e| e.into_inner());
+    // pty_init's nodes: root's, group wheel, 0666.
+    let b = g.get_or_insert_with(|| Bsd { ttys: vec![None; NPTY as usize], nodes: vec![PtsNode { uid: UID_ROOT, gid: GID_WHEEL, mode: 0o666 }; NPTY as usize] });
+    f(b)
+}
+
+/// `pty_get_ioctl` (tty_pty.c's): the pty's terminal, made by an open of
+/// either side.
+fn bsd_get_ioctl(minor: u32, open_flag: u32) -> Got {
+    if minor >= NPTY {
+        return Got::None;
+    }
+    bsd(|b| {
+        let slot = &mut b.ttys[minor as usize];
+        if open_flag & (pf::OPEN_M | pf::OPEN_S) != 0 && slot.is_none() {
+            *slot = Some(new_tty(PTY_DRIVER, minor));
+        }
+        slot.as_ref().map_or(Got::None, |t| Got::Tty(Arc::clone(t)))
+    })
+}
+
+/// The attributes of BSD pty `minor`'s `ttypN` node.
+pub fn bsd_node(minor: u32) -> Option<PtsNode> {
+    (minor < NPTY).then(|| bsd(|b| b.nodes[minor as usize]))
+}
+
+/// A terminal for a driver's pty, its `ptmx_ioctl` zeroed.
+fn new_tty(drv: TtyDevT, minor: u32) -> Arc<TtyCell> {
+    let tty = TtyCell::new();
+    {
+        let mut tp = tty.lock();
+        let (selr, selw) = (crate::wait::Queue::new(), crate::wait::Queue::new());
+        crate::wait::chain(selw.id(), selr.id());
+        tp.pti = Some(Pti { drv, flags: 0, selr, selw, selr_revokes: 0, selw_revokes: 0, send: 0, ucntl: 0, minor });
+    }
+    tty
+}
+
+/// `pty_get_ioctl(dev, open_flag)` through the device's driver.
+pub fn get_ioctl(dev: u32, open_flag: u32) -> Got {
+    let minor = dev & 0x00ff_ffff;
+    match dev >> 24 {
+        PTMX_MAJOR | PTSD_MAJOR => ptmx_get_ioctl(minor, open_flag),
+        PTS_MAJOR | PTC_MAJOR => bsd_get_ioctl(minor, open_flag),
+        _ => Got::None,
+    }
+}
+
+/// `pty_free_ioctl`: the driver's `free`, which only ptmx's has.
+pub fn free_ioctl(dev: u32, open_flag: u32) -> i32 {
+    match dev >> 24 {
+        PTMX_MAJOR | PTSD_MAJOR => ptmx_free_ioctl(dev & 0x00ff_ffff, open_flag),
+        _ => 0,
+    }
+}
+
+/// `pty_get_name`: TIOCPTYGNAME's answer.
+pub fn get_name(dev: u32) -> String {
+    let minor = dev & 0x00ff_ffff;
+    match dev >> 24 {
+        PTMX_MAJOR | PTSD_MAJOR => ptmx_get_name(minor),
+        _ => format!("/dev/tty{}{:x}", (b'p' + (minor / 16) as u8) as char, minor % 16),
+    }
+}
+
+/// The path of the node a grant changes (`pt_devhandle`'s name).
+pub fn devhandle_path(dev: u32) -> String {
+    get_name(dev)
+}
 
 /// A replica's devfs node (`pt_devhandle`): its owner, group and mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,6 +181,8 @@ pub struct PtsNode {
 /// `struct ptmx_ioctl`, but for the open bits, which `_state` keeps: the
 /// driver's state beside its terminal, under the terminal's lock.
 pub struct Pti {
+    /// The driver it is of.
+    pub drv: TtyDevT,
     /// `pt_flags` (PKT, STOPPED, NOSTOP, UCNTL, UNLOCKED).
     pub flags: u32,
     /// `pt_selr`, `pt_selw`: the primary's readers and writers.
@@ -159,13 +281,7 @@ pub fn ptmx_get_ioctl(minor: u32, open_flag: u32) -> Got {
         if s.list[m].is_some() {
             return Got::Raced;
         }
-        let tty = TtyCell::new();
-        {
-            let mut tp = tty.lock();
-            let (selr, selw) = (crate::wait::Queue::new(), crate::wait::Queue::new());
-            crate::wait::chain(selw.id(), selr.id());
-            tp.pti = Some(Pti { flags: 0, selr, selw, selr_revokes: 0, selw_revokes: 0, send: 0, ucntl: 0, minor });
-        }
+        let tty = new_tty(PTMX_DRIVER, minor);
         // The replica's node: /dev/ttysNNN, root's, group tty, 0620.
         s.list[m] = Some(Slot { tty, open: pf::OPEN_M, node: Some(PtsNode { uid: UID_ROOT, gid: GID_TTY, mode: 0o620 }) });
         s.free -= 1;
@@ -214,19 +330,41 @@ pub fn pts_node(minor: u32) -> Option<PtsNode> {
     state().list.get(minor as usize).and_then(|e| e.as_ref()).and_then(|s| s.node)
 }
 
-/// `_devfs_setattr(pt_devhandle, mode, uid, gid)`: the replica's node
-/// set, or ERESTART when there is none (a grant that lost a race with the
+/// `_devfs_setattr(pt_devhandle, mode, uid, gid)`: the pty's node set,
+/// or ERESTART when there is none (a grant that lost a race with the
 /// clone).
-fn devfs_setattr(minor: u32, mode: u32, uid: u32, gid: u32) -> Result<(), Errno> {
-    let mut s = state();
-    match s.list.get_mut(minor as usize).and_then(|e| e.as_mut()).and_then(|s| s.node.as_mut()) {
-        Some(n) => {
-            n.uid = uid;
-            n.gid = gid;
-            n.mode = mode & 0o7777;
+fn devfs_setattr(dev: u32, mode: u32, uid: u32, gid: u32) -> Result<(), Errno> {
+    let set = |n: &mut PtsNode| {
+        n.uid = uid;
+        n.gid = gid;
+        n.mode = mode & 0o7777;
+    };
+    let minor = dev & 0x00ff_ffff;
+    match dev >> 24 {
+        PTMX_MAJOR | PTSD_MAJOR => {
+            let mut s = state();
+            match s.list.get_mut(minor as usize).and_then(|e| e.as_mut()).and_then(|s| s.node.as_mut()) {
+                Some(n) => {
+                    set(n);
+                    Ok(())
+                }
+                None => Err(tty::ERESTART),
+            }
+        }
+        _ if minor < NPTY => {
+            bsd(|b| set(&mut b.nodes[minor as usize]));
             Ok(())
         }
-        None => Err(tty::ERESTART),
+        _ => Err(tty::ERESTART),
+    }
+}
+
+/// Whether `dev`'s pty has its grant node (`pt_devhandle`).
+fn has_devhandle(dev: u32) -> bool {
+    let minor = dev & 0x00ff_ffff;
+    match dev >> 24 {
+        PTMX_MAJOR | PTSD_MAJOR => pts_node(minor).is_some(),
+        _ => minor < NPTY,
     }
 }
 
@@ -298,17 +436,17 @@ pub struct PtsOpen {
 
 /// `ptsopen`: a replica opened, once its primary is (`TS_CARR_ON`).
 #[allow(clippy::too_many_arguments)]
-pub fn ptsopen(minor: u32, flag: i32, p: &Caller, env: &mut dyn Env, st: &mut PtsOpen, resumed: Option<(SleepReq, Woke)>) -> Io<Result<Arc<TtyCell>, Errno>> {
+pub fn ptsopen(dev: u32, flag: i32, p: &Caller, env: &mut dyn Env, st: &mut PtsOpen, resumed: Option<(SleepReq, Woke)>) -> Io<Result<Arc<TtyCell>, Errno>> {
     let begun = st.tty.is_some();
     let cell = match &st.tty {
         Some(t) => Arc::clone(t),
-        None => match ptmx_get_ioctl(minor, pf::OPEN_S) {
+        None => match get_ioctl(dev, pf::OPEN_S) {
             Got::Tty(t) => t,
             _ => return Io::Done(Err(Errno::ENXIO)),
         },
     };
     let fail = |e: Errno| {
-        ptmx_free_ioctl(minor, pf::OPEN_S);
+        free_ioctl(dev, pf::OPEN_S);
         Io::Done(Err(e))
     };
     let mut tp = cell.lock();
@@ -353,7 +491,7 @@ pub fn ptsopen(minor: u32, flag: i32, p: &Caller, env: &mut dyn Env, st: &mut Pt
             }
         }
     }
-    let error = tp.ttyopen(makedev(PTSD_MAJOR, minor));
+    let error = tp.ttyopen(dev);
     // Open by the replica now.
     tp.state &= !ts::IOCTL_NOT_OK;
     if error == 0 {
@@ -372,7 +510,7 @@ pub struct PtsClose {
 
 /// `ptsclose`: the replica's last close, or its revoke.
 #[allow(clippy::too_many_arguments)]
-pub fn ptsclose(cell: &Arc<TtyCell>, minor: u32, flag: i32, revoke: bool, env: &mut dyn Env, st: &mut PtsClose, resumed: Option<(SleepReq, Woke)>) -> Io<i32> {
+pub fn ptsclose(cell: &Arc<TtyCell>, dev: u32, flag: i32, revoke: bool, env: &mut dyn Env, st: &mut PtsClose, resumed: Option<(SleepReq, Woke)>) -> Io<i32> {
     let mut tp = cell.lock();
     // FIX_VSX_HANG: the drain bounded at sixty ticks.
     let save_timeout = match st.save_timeout {
@@ -392,11 +530,12 @@ pub fn ptsclose(cell: &Arc<TtyCell>, minor: u32, flag: i32, revoke: bool, env: &
     // The primary told, its waiters woken.
     ptsstop(&mut tp, FREAD | FWRITE);
     tp.timeout = save_timeout;
-    if revoke {
+    // The driver's revoke: ptmx's only.
+    if revoke && dev >> 24 == PTSD_MAJOR {
         ptsd_revoke_knotes(&mut tp, env);
     }
     drop(tp);
-    ptmx_free_ioctl(minor, pf::OPEN_S);
+    free_ioctl(dev, pf::OPEN_S);
     Io::Done(err)
 }
 
@@ -434,9 +573,10 @@ pub fn ptswrite(tp: &mut Tty, uio: &mut dyn Uio, flag: i32, p: &Caller, env: &mu
     tp.ttwrite(uio, flag, p, env, st, resumed)
 }
 
-/// `ptcopen`: the primary of `minor` opened (the clone's minor).
-pub fn ptcopen(minor: u32, env: &mut dyn Env) -> Result<Arc<TtyCell>, Errno> {
-    let cell = match ptmx_get_ioctl(minor, pf::OPEN_M) {
+/// `ptcopen`: the primary of `dev` opened (for ptmx, the clone's minor).
+pub fn ptcopen(dev: u32, env: &mut dyn Env) -> Result<Arc<TtyCell>, Errno> {
+    let Some(drv) = driver(dev) else { return Err(Errno::ENXIO) };
+    let cell = match get_ioctl(dev, pf::OPEN_M) {
         Got::Tty(t) => t,
         Got::None => return Err(Errno::ENXIO),
         // EREDRIVEOPEN: the open is made again, with a new clone.
@@ -448,7 +588,7 @@ pub fn ptcopen(minor: u32, env: &mut dyn Env) -> Result<Arc<TtyCell>, Errno> {
         let oproc = tp.oproc;
         drop(tp);
         if !oproc {
-            ptmx_free_ioctl(minor, pf::OPEN_M);
+            free_ioctl(dev, pf::OPEN_M);
         }
         return Err(Errno::EBUSY);
     }
@@ -457,6 +597,12 @@ pub fn ptcopen(minor: u32, env: &mut dyn Env) -> Result<Arc<TtyCell>, Errno> {
     tp.state |= ts::IOCTL_NOT_OK;
     tp.ttymodem(true, env);
     tp.termios.lflag &= !lflag::EXTPROC;
+    if drv.open_reset {
+        let p = pti(&mut tp);
+        p.flags = pf::UNLOCKED;
+        p.send = 0;
+        p.ucntl = 0;
+    }
     drop(tp);
     Ok(cell)
 }
@@ -470,7 +616,7 @@ pub const EREDRIVEOPEN: Errno = Errno(-6);
 pub fn ptmx_open(env: &mut dyn Env) -> Result<(u32, Arc<TtyCell>), Errno> {
     loop {
         let minor = ptmx_clone();
-        match ptcopen(minor, env) {
+        match ptcopen(makedev(PTMX_MAJOR, minor), env) {
             Err(e) if e == EREDRIVEOPEN => continue,
             r => return r.map(|t| (minor, t)),
         }
@@ -478,7 +624,7 @@ pub fn ptmx_open(env: &mut dyn Env) -> Result<(u32, Arc<TtyCell>), Errno> {
 }
 
 /// `ptcclose`: the primary's close: the replica hung up.
-pub fn ptcclose(cell: &Arc<TtyCell>, minor: u32, env: &mut dyn Env) {
+pub fn ptcclose(cell: &Arc<TtyCell>, dev: u32, env: &mut dyn Env) {
     let mut tp = cell.lock();
     // The console's terminal no more (KMIOCDISABLCONS is nothing here).
     tty::clear_constty_if(cell);
@@ -498,7 +644,7 @@ pub fn ptcclose(cell: &Arc<TtyCell>, minor: u32, env: &mut dyn Env) {
     p.selw_revokes += 1;
     p.selw.notify();
     drop(tp);
-    ptmx_free_ioctl(minor, pf::OPEN_M);
+    free_ioctl(dev, pf::OPEN_M);
 }
 
 /// `ptcread`: the terminal's output to the primary, after any packet.
@@ -658,13 +804,17 @@ pub struct PtyIoctl {
     tt: Option<IoctlState>,
 }
 
-/// `ptyioctl`: both sides' ioctls; `primary` for `/dev/ptmx`'s.
+/// `ptyioctl`: both sides' ioctls, of device `dev`.
 #[allow(clippy::too_many_arguments)]
-pub fn ptyioctl(cell: &Arc<TtyCell>, tp: &mut Tty, primary: bool, com: u64, data: &mut [u8], flag: i32, p: &Caller, env: &mut dyn Env, st: &mut PtyIoctl, resumed: Option<(SleepReq, Woke)>) -> Io<Result<(), Errno>> {
-    let minor = pti(tp).minor;
+pub fn ptyioctl(cell: &Arc<TtyCell>, tp: &mut Tty, dev: u32, com: u64, data: &mut [u8], flag: i32, p: &Caller, env: &mut dyn Env, st: &mut PtyIoctl, resumed: Option<(SleepReq, Woke)>) -> Io<Result<(), Errno>> {
+    let drv = pti(tp).drv;
+    // The device whose cdevsw entry is the primary's, and the driver's
+    // primary major (which for the BSD ptys is the other one).
+    let primary = is_ptc(dev);
+    let drv_primary = dev >> 24 == drv.primary;
     if st.tt.is_none() {
         // The primary's extended ioctls wait for the replica's first open.
-        let allow_ext_ioctl = !(primary && tp.state & ts::IOCTL_NOT_OK != 0);
+        let allow_ext_ioctl = !(drv_primary && drv.fix_7070978 && tp.state & ts::IOCTL_NOT_OK != 0);
         // A controller's stty must flush, or ttywflush would hang on the
         // output.
         if com == cmd::TIOCEXT && allow_ext_ioctl {
@@ -740,28 +890,33 @@ pub fn ptyioctl(cell: &Arc<TtyCell>, tp: &mut Tty, primary: bool, com: u64, data
                     return Io::Done(Ok(()));
                 }
                 cmd::TIOCPTYGRANT => {
-                    // grantpt(3): the replica the caller's, group tty, 0620,
-                    // by its name in the caller's namespace. Under MAC the
-                    // grant's error stands.
-                    if pts_node(minor).is_none() {
-                        return Io::Done(Err(tty::ERESTART));
+                    // grantpt(3): the pty's node the caller's, group tty,
+                    // 0620, by its name in the caller's namespace. On the
+                    // driver's primary major without MAC notification the
+                    // grant is 0 whatever; otherwise its error stands.
+                    let r = if !has_devhandle(dev) {
+                        Err(tty::ERESTART)
+                    } else {
+                        env.namei(&devhandle_path(dev)).and_then(|()| devfs_setattr(dev, 0o620, p.uid, GID_TTY))
+                    };
+                    if drv_primary && !drv.mac_notify {
+                        return Io::Done(Ok(()));
                     }
-                    if let Err(e) = env.namei(&ptmx_get_name(minor)) {
-                        return Io::Done(Err(e));
-                    }
-                    return Io::Done(devfs_setattr(minor, 0o620, p.uid, GID_TTY));
+                    return Io::Done(r);
                 }
                 cmd::TIOCPTYGNAME => {
                     // ptsname(3), as devfs_make_node's template made it.
-                    let name = ptmx_get_name(minor);
+                    let name = get_name(dev);
                     let n = name.len().min(127);
                     data[..128].fill(0);
                     data[..n].copy_from_slice(&name.as_bytes()[..n]);
                     return Io::Done(Ok(()));
                 }
                 cmd::TIOCPTYUNLK => {
-                    // unlockpt(3).
-                    pti(tp).flags |= pf::UNLOCKED;
+                    // unlockpt(3), on the driver's primary major.
+                    if drv_primary {
+                        pti(tp).flags |= pf::UNLOCKED;
+                    }
                     return Io::Done(Ok(()));
                 }
                 _ => {}
@@ -862,8 +1017,8 @@ pub fn ptcselect(tp: &mut Tty, rw: i32) -> i32 {
     let isopen = tp.state & ts::ISOPEN != 0;
     match rw {
         FREAD if isopen && !tp.outq.is_empty() && tp.state & ts::TTSTOP == 0 => {
-            // fix_7828447: the count, not 1.
-            tp.outq.len() as i32
+            // fix_7828447: the count, else 1.
+            if pti(tp).drv.fix_7828447 { tp.outq.len() as i32 } else { 1 }
         }
         FREAD | 0 => {
             let p = pti(tp);
@@ -873,7 +1028,7 @@ pub fn ptcselect(tp: &mut Tty, rw: i32) -> i32 {
             if isopen {
                 let room = (TTYHOG - 2) as i32 - (tp.rawq.len() + tp.canq.len()) as i32;
                 if room > 0 {
-                    return room;
+                    return if pti(tp).drv.fix_7828447 { room } else { 1 };
                 }
                 if tp.canq.is_empty() && tp.termios.lflag & lflag::ICANON != 0 {
                     return 1;
@@ -1021,9 +1176,9 @@ mod tests {
         let p = caller();
         let mut st = PtyIoctl::default();
         let mut d = [0u8; 8];
-        assert_eq!(ptyioctl(&cell, &mut cell.lock(), true, cmd::TIOCPTYUNLK, &mut d, 0, &p, env, &mut st, None), Io::Done(Ok(())));
+        assert_eq!(ptyioctl(&cell, &mut cell.lock(), makedev(PTMX_MAJOR, minor), cmd::TIOCPTYUNLK, &mut d, 0, &p, env, &mut st, None), Io::Done(Ok(())));
         let mut ost = PtsOpen::default();
-        match ptsopen(minor, 0, &p, env, &mut ost, None) {
+        match ptsopen(makedev(PTSD_MAJOR, minor), 0, &p, env, &mut ost, None) {
             Io::Done(Ok(_)) => {}
             r => panic!("ptsopen: {:?}", r.map_err()),
         }
@@ -1079,8 +1234,8 @@ mod tests {
         assert_eq!(ptswrite(&mut cell.lock(), &mut u, 0, &caller(), &mut env, &mut ws, None), Io::Done(Ok(())));
         assert_eq!(master_read(&cell), b"out\r\n");
         let mut cs = PtsClose::default();
-        assert_eq!(ptsclose(&cell, minor, 0, false, &mut env, &mut cs, None), Io::Done(0));
-        ptcclose(&cell, minor, &mut env);
+        assert_eq!(ptsclose(&cell, makedev(PTSD_MAJOR, minor), 0, false, &mut env, &mut cs, None), Io::Done(0));
+        ptcclose(&cell, makedev(PTMX_MAJOR, minor), &mut env);
     }
 
     #[test]
@@ -1094,8 +1249,8 @@ mod tests {
         assert_eq!(master_read(&cell), b"^C");
         assert_eq!(slave_read(&cell, &mut env), Err(Errno::EWOULDBLOCK));
         let mut cs = PtsClose::default();
-        ptsclose(&cell, minor, 0, false, &mut env, &mut cs, None);
-        ptcclose(&cell, minor, &mut env);
+        ptsclose(&cell, makedev(PTSD_MAJOR, minor), 0, false, &mut env, &mut cs, None);
+        ptcclose(&cell, makedev(PTMX_MAJOR, minor), &mut env);
     }
 
     #[test]
@@ -1103,9 +1258,9 @@ mod tests {
         let mut env = Rec::default();
         let (minor, cell) = ptmx_open(&mut env).unwrap();
         let mut ost = PtsOpen::default();
-        assert_eq!(ptsopen(minor, 0, &caller(), &mut env, &mut ost, None).map_err(), Some(Errno::EAGAIN));
+        assert_eq!(ptsopen(makedev(PTSD_MAJOR, minor), 0, &caller(), &mut env, &mut ost, None).map_err(), Some(Errno::EAGAIN));
         assert!(pts_node(minor).is_some());
-        ptcclose(&cell, minor, &mut env);
+        ptcclose(&cell, makedev(PTMX_MAJOR, minor), &mut env);
         // The slot is free again, its replica node gone.
         assert!(pts_node(minor).is_none());
     }
@@ -1119,8 +1274,8 @@ mod tests {
             assert_eq!((tp.lowat, tp.hiwat), (256, 1248));
         }
         let mut cs = PtsClose::default();
-        ptsclose(&cell, minor, 0, false, &mut env, &mut cs, None);
-        ptcclose(&cell, minor, &mut env);
+        ptsclose(&cell, makedev(PTSD_MAJOR, minor), 0, false, &mut env, &mut cs, None);
+        ptcclose(&cell, makedev(PTMX_MAJOR, minor), &mut env);
     }
 
     #[test]
@@ -1130,28 +1285,28 @@ mod tests {
         let mut d = [0u8; 8];
         d[..4].copy_from_slice(&1i32.to_le_bytes());
         let mut st = PtyIoctl::default();
-        assert_eq!(ptyioctl(&cell, &mut cell.lock(), true, cmd::TIOCPKT, &mut d, 0, &caller(), &mut env, &mut st, None), Io::Done(Ok(())));
+        assert_eq!(ptyioctl(&cell, &mut cell.lock(), makedev(PTMX_MAJOR, minor), cmd::TIOCPKT, &mut d, 0, &caller(), &mut env, &mut st, None), Io::Done(Ok(())));
         let mut u = VecUio::writer(b"z");
         let mut ws = WriteState::default();
         ptswrite(&mut cell.lock(), &mut u, 0, &caller(), &mut env, &mut ws, None);
         assert_eq!(master_read(&cell), b"\0z");
         let mut cs = PtsClose::default();
-        ptsclose(&cell, minor, 0, false, &mut env, &mut cs, None);
-        ptcclose(&cell, minor, &mut env);
+        ptsclose(&cell, makedev(PTSD_MAJOR, minor), 0, false, &mut env, &mut cs, None);
+        ptcclose(&cell, makedev(PTMX_MAJOR, minor), &mut env);
     }
 
     #[test]
     fn the_replica_hangs_up_when_the_primary_closes() {
         let mut env = Rec::default();
         let (minor, cell) = pair(&mut env);
-        ptcclose(&cell, minor, &mut env);
+        ptcclose(&cell, makedev(PTMX_MAJOR, minor), &mut env);
         // EOF on the replica, and EIO for its writes.
         assert_eq!(slave_read(&cell, &mut env).unwrap(), b"");
         let mut u = VecUio::writer(b"x");
         let mut ws = WriteState::default();
         assert_eq!(ptswrite(&mut cell.lock(), &mut u, 0, &caller(), &mut env, &mut ws, None), Io::Done(Err(Errno::EIO)));
         let mut cs = PtsClose::default();
-        ptsclose(&cell, minor, 0, false, &mut env, &mut cs, None);
+        ptsclose(&cell, makedev(PTSD_MAJOR, minor), 0, false, &mut env, &mut cs, None);
         assert!(pts_node(minor).is_none());
     }
 }

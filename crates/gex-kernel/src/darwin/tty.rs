@@ -818,7 +818,8 @@ impl Tty {
 
     /// `ttystop`: the device's `d_stop`.
     fn ttystop(&mut self, rw: i32) {
-        if self.dev >> 24 == super::ptmx::PTSD_MAJOR {
+        // cdevsw's d_stop of the replica: ptsstop, ptmx's or a BSD pty's.
+        if matches!(self.dev >> 24, super::ptmx::PTSD_MAJOR | super::ptmx::PTC_MAJOR) {
             super::ptmx::ptsstop(self, rw);
         }
     }

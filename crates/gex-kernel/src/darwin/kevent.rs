@@ -271,6 +271,9 @@ pub struct Knote {
     /// A terminal knote: the NOTE_REVOKEs its selinfo had when it was
     /// attached.
     pub revokes: u64,
+    /// A terminal knote `select` made: it stands for the device's
+    /// `d_select`, not a kqueue filter.
+    pub select: bool,
     /// `kn_thcall`, while armed.
     pub thcall: Option<(Instant, u64)>,
 }

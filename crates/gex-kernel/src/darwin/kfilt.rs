@@ -1638,15 +1638,31 @@ impl Kernel {
                 return 0;
             }
         }
+        // select's fo_select: the device's d_select (ptcselect, ptsselect,
+        // cttyselect), whichever kqueue makes of the node.
+        if self.dtask.kevents.select_scan {
+            let polled = fp.handle.wait_queue() == 0;
+            let k = self.knote(n);
+            k.filtid = if dev.primary() { filtid::PTMX } else { filtid::PTSD };
+            k.select = true;
+            k.seen = fp.handle.wakes();
+            self.dtask.kevents.pipe_klist.push(n);
+            if polled {
+                self.dtask.kevents.polled_knotes.insert(n);
+            }
+            self.dtask.kevents.pipe_watch.fetch_add(if polled { 1 + POLLED_KNOTE } else { 1 }, std::sync::atomic::Ordering::Release);
+            return self.filt_tty_common(n, None);
+        }
         let fid = match dev.node {
             super::ttydev::Node::Pts(_) => filtid::PTSD,
             super::ttydev::Node::Ptmx => filtid::PTMX,
-            // select's cttyselect: the session's terminal's select, or
-            // ready (to meet EOF or the error) without one.
-            super::ttydev::Node::Ctty if self.dtask.kevents.select_scan => match dev.ctty_target() {
-                Some(t) if t.primary() => filtid::PTMX,
-                _ => filtid::PTSD,
-            },
+            // pty_init marks PTC_MAJOR as the primary's and PTS_MAJOR as
+            // the replica's, the other way from their cdevsw entries: each
+            // kqfilter finds the wrong d_open, and vn_kqfilter has EINVAL.
+            super::ttydev::Node::Ttyp(_) | super::ttydev::Node::Ptyp(_) => {
+                self.knote(n).set_error(Errno::EINVAL);
+                return 0;
+            }
             super::ttydev::Node::Ctty => {
                 let k = self.knote(n);
                 if k.sfflags & NOTE_LOWAT == 0 || k.sdata != 1 {
@@ -1658,8 +1674,10 @@ impl Kernel {
                 return 0;
             }
         };
+        // No pty state: the kqfilter's ENXIO, which vn_kqfilter makes
+        // EINVAL.
         if dev.node != super::ttydev::Node::Ctty && dev.opened().is_none() {
-            self.knote(n).set_error(Errno::ENXIO);
+            self.knote(n).set_error(Errno::EINVAL);
             return 0;
         }
         let (_, _, _, revokes) = dev.knote(filter == evfilt::READ);
@@ -1682,6 +1700,16 @@ impl Kernel {
         let fp = self.knote(n).fp.clone().expect("a terminal knote's file");
         let Some(dev) = std::sync::Arc::clone(&fp.handle).darwin_tty() else { return 0 };
         let read = self.knote(n).filter == evfilt::READ;
+        if self.knote(n).select {
+            let (r, w, _) = dev.select_ready();
+            let ready = if read { r } else { w };
+            if ready {
+                if let Some(kev) = kev {
+                    *kev = self.knote(n).fill_kevent(0);
+                }
+            }
+            return u32::from(ready);
+        }
         let (ready, data, eof, revokes) = dev.knote(read);
         let k = self.knote(n);
         if revokes != k.revokes {
