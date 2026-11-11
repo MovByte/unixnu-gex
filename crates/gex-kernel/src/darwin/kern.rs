@@ -1351,6 +1351,7 @@ impl Kernel {
                 None => Err(Errno::ENOENT),
             },
             "kern.dyld_flags" => self.darwin_sysctl_dyld_flags(m, req),
+            "vm.loadavg" => self.darwin_sysctl_loadavg(m, req),
             _ => match sysctl::value(node.path) {
                 Some(_) if req.new != 0 => {
                     self.darwin_unimplemented(format!("sysctl write of {}", node.path));
@@ -1366,6 +1367,26 @@ impl Kernel {
                 }
             },
         }
+    }
+
+    /// `sysctl_loadavg`: `averunnable` as a 64-bit process's `struct
+    /// user64_loadavg` (every process here is one): the three averages,
+    /// padding, and `fscale` as a 64-bit `long`.
+    fn darwin_sysctl_loadavg(&mut self, m: &mut GuestMem<'_>, req: &mut SysctlReq) -> Result<(), Errno> {
+        let ldavg = match self.procs.darwin_loadavg() {
+            Ok(l) => l,
+            Err(why) => {
+                self.darwin_unimplemented(why.into());
+                return Err(Errno::EOPNOTSUPP);
+            }
+        };
+        let mut b = Vec::with_capacity(24);
+        for v in ldavg {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.extend_from_slice(&[0; 4]);
+        b.extend_from_slice(&i64::from(super::sched::FSCALE).to_le_bytes());
+        req.out(m, &b)
     }
 
     /// `sysctl_hostname`: a platform binary (or an entitled one) sees and

@@ -631,9 +631,17 @@ impl Env for KEnv {
     }
 
     fn loadavg(&mut self) -> Option<u32> {
-        // averunnable: the scheduler's load average is not kept here.
-        self.unimplemented.push("the load average a terminal's status line (VSTATUS, TIOCSTAT) prints (averunnable)".into());
-        None
+        let Some(procs) = self.procs.as_ref() else {
+            self.unimplemented.push("the load average a terminal's status line prints, with no process table to count from".into());
+            return None;
+        };
+        match procs.darwin_loadavg() {
+            Ok(l) => Some(l[0]),
+            Err(why) => {
+                self.unimplemented.push(why.into());
+                None
+            }
+        }
     }
 
     fn fg_pick(&mut self, pg: Pgrp) -> Option<i32> {

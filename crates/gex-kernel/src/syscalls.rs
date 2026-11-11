@@ -9053,7 +9053,15 @@ impl Kernel {
         self.ctx_addr = t.ctx_addr;
         self.tid = t.tid;
         if self.darwin {
-            self.dtask.threads.map.entry(t.tid).or_default().ctx_addr = t.ctx_addr;
+            let th = self.dtask.threads.map.entry(t.tid).or_default();
+            th.ctx_addr = t.ctx_addr;
+            // A thread the scheduler has not counted yet runs: it is here.
+            if !th.sched_seen {
+                th.sched_seen = true;
+                if !th.offcpu {
+                    self.procs.sched.set_state(self.pid, t.tid, crate::darwin::sched::RunState::Run);
+                }
+            }
         }
         self.switch_signals(t.tid);
     }
@@ -9880,7 +9888,7 @@ impl Kernel {
                 Delivery::Resume(pc) => SyscallOutcome::Resume(pc),
                 Delivery::Terminate { signal, core } => match self.dtask.crash_notify.take() {
                     // proc_prepareexit's task_exception_notify, waited for.
-                    Some((code, subcode)) => self.darwin_exception_triage(m, crate::darwin::exception::EXC_CRASH, &[code, subcode], crate::darwin::triage::Then::Exit { signal, core }),
+                    Some((code, subcode)) => self.darwin_task_exception_notify(m, crate::darwin::exception::EXC_CRASH, &[code, subcode], crate::darwin::triage::Then::Exit { signal, core }),
                     None => SyscallOutcome::Killed { signal, core },
                 },
             };
@@ -10683,7 +10691,7 @@ impl Kernel {
                         Delivery::Resume(pc) => SyscallOutcome::Resume(pc),
                         Delivery::Terminate { signal, core } => match self.dtask.crash_notify.take() {
                             // proc_prepareexit's task_exception_notify, waited for.
-                            Some((code, subcode)) => self.darwin_exception_triage(m, crate::darwin::exception::EXC_CRASH, &[code, subcode], crate::darwin::triage::Then::Exit { signal, core }),
+                            Some((code, subcode)) => self.darwin_task_exception_notify(m, crate::darwin::exception::EXC_CRASH, &[code, subcode], crate::darwin::triage::Then::Exit { signal, core }),
                             None => SyscallOutcome::Killed { signal, core },
                         },
                     };

@@ -70,6 +70,15 @@ pub struct Wait {
     pub cont: super::thread::Finish,
 }
 
+impl Wait {
+    /// Whether the thread waits at `THREAD_UNINT`: the reply to an
+    /// exception `task_exception_notify` raised, which it waits for at that
+    /// interrupt level (`thread_interrupt_level(THREAD_UNINT)`).
+    pub fn uninterruptible(&self) -> bool {
+        matches!(self.cont, super::thread::Finish::Exception(p) if p.uninterruptible())
+    }
+}
+
 impl Kernel {
     /// The word `tid` sleeps on: its context's (`gex_abi::ctx::WAIT`).
     fn darwin_wait_word(&mut self, tid: i32) -> u64 {

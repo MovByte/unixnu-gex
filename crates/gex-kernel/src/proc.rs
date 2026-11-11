@@ -426,6 +426,8 @@ pub struct ProcTable {
     pub darwin_ipc: std::sync::Arc<crate::darwin::ipc::IpcCell>,
     /// Every process's memorystatus state and the jetsam bands.
     pub jetsam: Mutex<crate::darwin::memorystatus::Jetsam>,
+    /// The scheduler's runnable threads and averages, the whole system's.
+    pub sched: crate::darwin::sched::Sched,
 }
 
 impl std::fmt::Debug for ProcTable {
@@ -450,6 +452,7 @@ impl ProcTable {
     pub fn new() -> ProcTable {
         let t = ProcTable {
             jetsam: Default::default(),
+            sched: Default::default(),
             halting: AtomicBool::new(false),
             halt_code: AtomicI32::new(0),
             remote: None,
@@ -633,6 +636,16 @@ impl ProcTable {
             return (r.end_tid)(tid);
         }
         self.lock().threads.remove(&tid);
+        self.sched.thread_gone(tid);
+    }
+
+    /// `averunnable.ldavg`, the whole system's: none from a table in
+    /// another memory, whose processes' threads this one cannot count.
+    pub fn darwin_loadavg(&self) -> Result<[u32; 3], &'static str> {
+        if self.remote.is_some() {
+            return Err("the scheduler's averages across the browser's Workers (a process table in another memory)");
+        }
+        self.sched.averunnable()
     }
 
     /// The process task `id` is part of: `id` itself when it is a process
@@ -743,6 +756,8 @@ impl ProcTable {
         }
         // proc_exit's memorystatus_remove.
         self.jetsam().remove(pid);
+        // Its threads are not runnable any more.
+        self.sched.task_gone(pid);
         let virtual_init = self.virtual_init.load(Ordering::Acquire);
         let mut jobc_orphaned = Vec::new();
         let (cell, done, was_ppid, own_q, orphans) = {

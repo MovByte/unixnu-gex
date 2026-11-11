@@ -806,6 +806,8 @@ impl Kernel {
         }
         let t = WqThread { flags: ut::NEW, pri: Pri::init(qos::LEGACY), stackaddr: stack, ctx: req.ctx_addr, unstarted: Some(req), enter_kernel: true, sched_qos: qos::LEGACY, ..WqThread::default() };
         self.dtask.threads.map.entry(tid).or_default().wq = Some(Box::new(t));
+        // thread_create_workq_waiting: it starts in an interruptible wait.
+        self.procs.sched.set_state(self.pid, tid, super::sched::RunState::Wait);
         let wq = self.wq();
         wq.creations += 1;
         wq.thidlecount += 1;

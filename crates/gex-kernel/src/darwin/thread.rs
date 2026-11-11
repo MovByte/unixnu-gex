@@ -222,6 +222,9 @@ pub struct DThread {
     /// Off its CPU: parked by a hold, or waiting in a call (what
     /// `thread_wait` waits for).
     pub offcpu: bool,
+    /// The scheduler has counted it since it first came into the kernel
+    /// ([`crate::darwin::sched`]).
+    pub sched_seen: bool,
     /// Where its registers are kept while it is in the kernel.
     pub ctx_addr: u64,
     /// thread_get_state's and thread_set_state's holds (thread_stop).
@@ -631,13 +634,19 @@ impl Kernel {
             let how = if suspended { ", suspended" } else { "" };
             eprintln!("[gex:{}] bsdthread_create(func {func:#x}, stack {stack:#x}) = thread {} (port {port:#x}){how}", self.pid, req.tid);
         }
+        use super::sched::RunState;
         if suspended {
             thread.suspend = 1;
             thread.unstarted = Some(req);
             self.dtask.threads.map.insert(req.tid, thread);
+            // Made and not started: TH_WAIT | TH_UNINT until it is.
+            self.procs.sched.set_state(self.pid, req.tid, RunState::Unint);
             return Ok(None);
         }
+        // thread_create_running: started, in TH_RUN.
+        thread.sched_seen = true;
         self.dtask.threads.map.insert(req.tid, thread);
+        self.procs.sched.set_state(self.pid, req.tid, RunState::Run);
         Ok(Some(req))
     }
 
@@ -690,6 +699,8 @@ impl Kernel {
         self.darwin_workq_thread_terminate(self.tid);
         self.darwin_workq_settle(m);
         self.dtask.threads.map.remove(&self.tid);
+        // thread_terminate_self: gone from the scheduler.
+        self.procs.sched.thread_gone(self.tid);
         self.dtask.waits.forget(self.tid);
         // Gone, so off its CPU: thread_wait on it ends.
         let tid = self.tid;

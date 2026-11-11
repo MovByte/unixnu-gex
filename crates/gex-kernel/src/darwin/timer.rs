@@ -116,7 +116,10 @@ impl Timers {
 impl Kernel {
     /// The thread calls that are due, run; when the next one is.
     pub fn darwin_thread_calls(&mut self, m: &mut GuestMem<'_>) -> Option<Instant> {
+        // The thread-call thread is runnable while it runs them.
+        self.procs.sched.callout(true);
         let out = self.darwin_thread_calls_body(m);
+        self.procs.sched.callout(false);
         self.darwin_ipc_leave();
         // What they mapped (a workqueue thread's stack) is in force for
         // every thread now.

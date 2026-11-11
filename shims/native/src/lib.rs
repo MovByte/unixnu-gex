@@ -1204,6 +1204,16 @@ fn run_program_with(
         kernel.darwin_signals_init();
         kernel.darwin_nofile_sync();
     }
+    // The scheduler's maintenance thread (`sched_maintenance_thread`), one
+    // for every process of the table: the averages it keeps are the
+    // system's.
+    if opts.darwin && kernel.procs.sched.claim_driver() {
+        let procs = Arc::clone(&kernel.procs);
+        std::thread::Builder::new()
+            .name("gex-sched-maintenance".into())
+            .spawn(move || procs.sched.maintenance_thread())
+            .expect("the scheduler's maintenance thread");
+    }
     // Set again by `wasmprog` if this program is native wasm32.
     kernel.wasm32 = false;
     // An ejected project's replacement code has its own region. Recorded for

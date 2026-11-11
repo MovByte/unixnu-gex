@@ -492,7 +492,22 @@ impl Kernel {
     /// Thread `tid` going off its CPU (`off`), or back on: the replies
     /// waiting for it sent.
     pub(crate) fn darwin_set_offcpu(&mut self, m: &mut crate::GuestMem<'_>, tid: i32, off: bool) {
+        // Into TH_RUN or out of it: a wait at the interrupt level its
+        // call set (THREAD_UNINT for task_exception_notify's), or parked.
+        let unint = tid == self.tid && self.darwin_finish.as_ref().is_some_and(|w| w.uninterruptible());
         if let Some(t) = self.dtask.threads.map.get_mut(&tid) {
+            if t.offcpu != off || !t.sched_seen {
+                t.sched_seen = true;
+                use super::sched::RunState;
+                let state = if !off {
+                    RunState::Run
+                } else if unint {
+                    RunState::Unint
+                } else {
+                    RunState::Wait
+                };
+                self.procs.sched.set_state(self.pid, tid, state);
+            }
             t.offcpu = off;
         }
         if off {

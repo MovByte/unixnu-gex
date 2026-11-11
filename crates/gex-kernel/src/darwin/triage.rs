@@ -52,6 +52,9 @@ pub struct Triage {
     /// The next level to try: thread, task, host.
     level: u8,
     pub then: Then,
+    /// Raised by `task_exception_notify`, whose thread waits at
+    /// `THREAD_UNINT` for it.
+    unint: bool,
 }
 
 /// A delivery waiting for its handler's reply.
@@ -64,6 +67,13 @@ pub struct Pending {
     set_state: bool,
 }
 
+impl Pending {
+    /// Whether its thread waits for it at `THREAD_UNINT`.
+    pub fn uninterruptible(&self) -> bool {
+        self.t.unint
+    }
+}
+
 /// One level's delivery: done with a result, or sent and awaited.
 enum Delivered {
     Done(u64),
@@ -73,11 +83,21 @@ enum Delivered {
 impl Kernel {
     /// `exception_triage(exception, code, codeCnt)` for the calling thread.
     pub(crate) fn darwin_exception_triage(&mut self, m: &mut GuestMem<'_>, exc: usize, codes: &[i64], then: Then) -> SyscallOutcome {
+        self.darwin_triage_at(m, exc, codes, then, false)
+    }
+
+    /// `task_exception_notify(exception, code, subcode)`: the triage done
+    /// at `THREAD_UNINT` (`proc_prepareexit`'s EXC_CRASH).
+    pub(crate) fn darwin_task_exception_notify(&mut self, m: &mut GuestMem<'_>, exc: usize, codes: &[i64], then: Then) -> SyscallOutcome {
+        self.darwin_triage_at(m, exc, codes, then, true)
+    }
+
+    fn darwin_triage_at(&mut self, m: &mut GuestMem<'_>, exc: usize, codes: &[i64], then: Then, unint: bool) -> SyscallOutcome {
         let mut c = [0i64; 2];
         for (d, s) in c.iter_mut().zip(codes) {
             *d = *s;
         }
-        self.darwin_triage_from(m, Triage { exc, codes: c, count: codes.len().min(2) as u32, level: 0, then })
+        self.darwin_triage_from(m, Triage { exc, codes: c, count: codes.len().min(2) as u32, level: 0, then, unint })
     }
 
     /// The levels from `t.level` on, until one takes the exception.

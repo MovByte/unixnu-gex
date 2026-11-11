@@ -72,6 +72,7 @@ pub mod psynch;
 pub mod reason;
 pub mod rlimit;
 pub mod sandbox;
+pub mod sched;
 pub mod sema;
 pub mod select;
 pub mod shm;
