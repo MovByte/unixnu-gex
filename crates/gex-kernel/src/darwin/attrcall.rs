@@ -106,6 +106,10 @@ fn last(path: &str) -> &str {
 /// attribute code sees it.
 fn vnode(pio: &PathIo<'_>, path: &str, md: &Metadata, name: Option<&str>, want_children: bool) -> Result<Vn, Errno> {
     let mnt: &Mount = mount_of(path);
+    if mnt.fs == super::kern::Fs::Devfs {
+        super::note_unimplemented(format!("getattrlist of {path} (devfs_getattr's attributes in getattrlist)"));
+        return Err(Errno::EOPNOTSUPP);
+    }
     let st = Kernel::stat_from(md);
     let is_dir = md.file_type == FileType::Directory;
     let is_root = path == mnt.on;
@@ -206,6 +210,10 @@ fn volume_uuid(mnt: &Mount) -> [u8; 16] {
 
 /// The volume `mnt` as `getvolattrlist` has it.
 fn volume(pio: &PathIo<'_>, mnt: &Mount) -> Result<VolInfo, Errno> {
+    if mnt.fs == super::kern::Fs::Devfs {
+        super::note_unimplemented("getattrlist of devfs's volume attributes (devfs_vfs_getattr)".into());
+        return Err(Errno::EOPNOTSUPP);
+    }
     let md = pio.ns.metadata(mnt.on)?;
     let root = vnode(pio, mnt.on, &md, None, false)?;
     Ok(VolInfo {

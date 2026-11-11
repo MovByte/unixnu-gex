@@ -24,6 +24,7 @@ pub mod clist;
 pub mod commpage;
 pub mod ptmx;
 pub mod ctty;
+pub mod devfs;
 pub mod tty;
 pub mod ttydev;
 pub mod cpumon;
@@ -117,6 +118,18 @@ pub fn boot(trust_cache: Option<&[u8]>, sandbox_platform: Option<Vec<u8>>, devic
     // devfs's terminal nodes: ptmx, its replicas, tty.
     crate::vfs::devfs::set_darwin_ttys();
     mac::set_platform_profile(sandbox_platform)
+}
+
+thread_local! {
+    /// What code with no kernel to hand met that is not modelled, for the
+    /// call's end to report.
+    static NOTES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Note a gap where the kernel cannot be reached: reported (and stopped
+/// at under strict mode) when the call ends.
+pub fn note_unimplemented(what: String) {
+    NOTES.with(|n| n.borrow_mut().push(what));
 }
 
 /// A Darwin process's kernel state beyond the BSD side's: its threads and
@@ -403,6 +416,13 @@ impl crate::syscalls::Kernel {
         match &self.dtask.policy {
             Some(c) => f(&mut c.lock().unwrap_or_else(|e| e.into_inner())),
             None => f(&mut taskpolicy::TaskPolicy::default()),
+        }
+    }
+
+    /// The gaps [`note_unimplemented`] noted in this call, reported.
+    pub(crate) fn darwin_take_notes(&mut self) {
+        for what in NOTES.with(|n| std::mem::take(&mut *n.borrow_mut())) {
+            self.darwin_unimplemented(what);
         }
     }
 

@@ -591,6 +591,11 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     /// `fg_count`), for a device that is told of its close.
     fn vn_close(&self) {}
 
+    /// The Darwin devfs node this is an open of, if it is one.
+    fn darwin_devnode(&self) -> Option<&'static crate::darwin::devfs::Node> {
+        None
+    }
+
     /// A short description of this handle's state, for a diagnostic: the
     /// buffer behind a descriptor -- empty, full, which way it points -- that
     /// the fd number and path cannot show.

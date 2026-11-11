@@ -131,20 +131,85 @@ pub struct Mount {
     pub from: &'static str,
     pub fsid: u64,
     pub flags: u32,
+    pub fs: Fs,
 }
 
-/// `MNT_RDONLY`, `MNT_ROOTFS`, `MNT_DONTBROWSE`.
+/// The filesystem a mount is of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fs {
+    Apfs,
+    Devfs,
+}
+
+/// `MNT_RDONLY`, `MNT_LOCAL`, `MNT_ROOTFS`, `MNT_DONTBROWSE`,
+/// `MNT_MULTILABEL`.
 const MNT_RDONLY: u32 = 0x1;
+const MNT_LOCAL: u32 = 0x1000;
 const MNT_ROOTFS: u32 = 0x4000;
 const MNT_DONTBROWSE: u32 = 0x10_0000;
+const MNT_MULTILABEL: u32 = 0x400_0000;
 
-/// What an iOS 17 system has mounted: the system volume and the SystemOS
-/// cryptex the shared cache is in, by the filesystem id its dynamic data
-/// names.
+/// `FT_DEVFS`, devfs's `vfc_typenum`.
+pub const DEVFS_TYPENUM: u32 = 19;
+
+/// devfs's `f_fsid.val[0]` (and its nodes' `st_dev`):
+/// `VM_KERNEL_ADDRHASH` of the mount's `devfsmount`, a salted hash of a
+/// kernel address that each boot makes anew; this is this boot's.
+pub const DEVFS_FSID: u32 = 0x9a3c_51e7;
+
+/// What an iOS 17 system has mounted, in the order of the mount list: the
+/// system volume, devfs (`devfs_kernel_mount` in `bsd_init`, right after
+/// the root: MNT_DONTBROWSE, MNT_LOCAL from `devfs_mount`, MNT_MULTILABEL
+/// from its MACF `vfc_flags`), and the SystemOS cryptex the shared cache
+/// is in, by the filesystem id its dynamic data names.
 pub const MOUNTS: &[Mount] = &[
-    Mount { on: "/", from: "/dev/disk0s1s1", fsid: 0x0100_0002, flags: MNT_RDONLY | MNT_ROOTFS },
-    Mount { on: "/System/Cryptexes/OS", from: "/dev/disk3s1", fsid: super::CACHE_FS_ID, flags: MNT_RDONLY | MNT_DONTBROWSE },
+    Mount { on: "/", from: "/dev/disk0s1s1", fsid: 0x0100_0002, flags: MNT_RDONLY | MNT_ROOTFS, fs: Fs::Apfs },
+    Mount { on: "/dev", from: "devfs", fsid: DEVFS_FSID as u64, flags: MNT_LOCAL | MNT_DONTBROWSE | MNT_MULTILABEL, fs: Fs::Devfs },
+    Mount { on: "/System/Cryptexes/OS", from: "/dev/disk3s1", fsid: super::CACHE_FS_ID, flags: MNT_RDONLY | MNT_DONTBROWSE, fs: Fs::Apfs },
 ];
+
+/// A mount's `vfsstatfs` counts and type: `f_bsize`, `f_iosize`,
+/// `f_blocks`, `f_bfree`, `f_bavail`, `f_files`, `f_ffree`, its
+/// `vfs_typenum`, its name.
+struct Counts {
+    bsize: u32,
+    iosize: u32,
+    blocks: u64,
+    bfree: u64,
+    bavail: u64,
+    files: u64,
+    ffree: u64,
+    typenum: u32,
+    name: &'static [u8],
+}
+
+fn counts(mnt: &Mount) -> Counts {
+    match mnt.fs {
+        Fs::Apfs => Counts {
+            bsize: vfsstat::BSIZE,
+            iosize: vfsstat::IOSIZE,
+            blocks: vfsstat::BLOCKS,
+            bfree: vfsstat::BFREE,
+            bavail: vfsstat::BAVAIL,
+            files: vfsstat::FILES,
+            ffree: vfsstat::FFREE,
+            typenum: vfsstat::APFS_TYPENUM,
+            name: b"apfs",
+        },
+        // devfs_statfs: 512-byte blocks of its bookkeeping, nothing free.
+        Fs::Devfs => Counts {
+            bsize: 512,
+            iosize: 512,
+            blocks: super::devfs::statfs_blocks(),
+            bfree: 0,
+            bavail: 0,
+            files: super::devfs::stats().0,
+            ffree: 0,
+            typenum: DEVFS_TYPENUM,
+            name: b"devfs",
+        },
+    }
+}
 
 /// `sizeof(struct statfs64)`.
 pub const STATFS64_SIZE: usize = 2168;
@@ -173,23 +238,24 @@ pub fn mount_of(path: &str) -> &'static Mount {
         .unwrap_or(&MOUNTS[0])
 }
 
-/// One `struct statfs64` for `mnt`, as an APFS volume.
+/// One `struct statfs64` for `mnt`.
 pub fn statfs64(mnt: &Mount) -> Vec<u8> {
+    let c = counts(mnt);
     let mut b = vec![0u8; STATFS64_SIZE];
     let mut put = |o: usize, v: &[u8]| b[o..o + v.len()].copy_from_slice(v);
-    put(0, &vfsstat::BSIZE.to_le_bytes());
-    put(4, &vfsstat::IOSIZE.to_le_bytes());
-    put(8, &vfsstat::BLOCKS.to_le_bytes());
-    put(16, &vfsstat::BFREE.to_le_bytes());
-    put(24, &vfsstat::BAVAIL.to_le_bytes());
-    put(32, &vfsstat::FILES.to_le_bytes());
-    put(40, &vfsstat::FFREE.to_le_bytes());
+    put(0, &c.bsize.to_le_bytes());
+    put(4, &c.iosize.to_le_bytes());
+    put(8, &c.blocks.to_le_bytes());
+    put(16, &c.bfree.to_le_bytes());
+    put(24, &c.bavail.to_le_bytes());
+    put(32, &c.files.to_le_bytes());
+    put(40, &c.ffree.to_le_bytes());
     // The mount's device number, and the filesystem type beside it.
     put(48, &(mnt.fsid as u32).to_le_bytes());
-    put(52, &vfsstat::APFS_TYPENUM.to_le_bytes());
-    put(60, &vfsstat::APFS_TYPENUM.to_le_bytes());
+    put(52, &c.typenum.to_le_bytes());
+    put(60, &c.typenum.to_le_bytes());
     put(64, &mnt.flags.to_le_bytes());
-    put(72, b"apfs");
+    put(72, c.name);
     put(88, mnt.on.as_bytes());
     put(1112, mnt.from.as_bytes());
     b
@@ -207,24 +273,25 @@ const MNAMELEN_INO32: usize = 90;
 /// longs, the type beside the subtype, and the names cut to fit, as
 /// `strlcpy` cuts them.
 pub fn statfs_ino32(mnt: &Mount) -> [u8; STATFS_SIZE] {
+    let c = counts(mnt);
     let mut b = [0u8; STATFS_SIZE];
     let mut put = |o: usize, v: &[u8]| b[o..o + v.len()].copy_from_slice(v);
-    put(8, &u64::from(vfsstat::BSIZE).to_le_bytes());
-    put(16, &u64::from(vfsstat::IOSIZE).to_le_bytes());
-    put(24, &vfsstat::BLOCKS.to_le_bytes());
-    put(32, &vfsstat::BFREE.to_le_bytes());
-    put(40, &vfsstat::BAVAIL.to_le_bytes());
-    put(48, &vfsstat::FILES.to_le_bytes());
-    put(56, &vfsstat::FFREE.to_le_bytes());
+    put(8, &u64::from(c.bsize).to_le_bytes());
+    put(16, &u64::from(c.iosize).to_le_bytes());
+    put(24, &c.blocks.to_le_bytes());
+    put(32, &c.bfree.to_le_bytes());
+    put(40, &c.bavail.to_le_bytes());
+    put(48, &c.files.to_le_bytes());
+    put(56, &c.ffree.to_le_bytes());
     put(64, &(mnt.fsid as u32).to_le_bytes());
-    put(68, &vfsstat::APFS_TYPENUM.to_le_bytes());
-    put(78, &(vfsstat::APFS_TYPENUM as u16).to_le_bytes());
+    put(68, &c.typenum.to_le_bytes());
+    put(78, &(c.typenum as u16).to_le_bytes());
     put(80, &u64::from(mnt.flags).to_le_bytes());
     let mut name = |o: usize, size: usize, v: &[u8]| {
         let n = v.len().min(size - 1);
         b[o..o + n].copy_from_slice(&v[..n]);
     };
-    name(104, MFSNAMELEN, b"apfs");
+    name(104, MFSNAMELEN, c.name);
     name(119, MNAMELEN_INO32, mnt.on.as_bytes());
     name(209, MNAMELEN_INO32, mnt.from.as_bytes());
     b
@@ -1100,8 +1167,7 @@ impl Kernel {
 
     /// The mount `statfs64` and `statfs` find: that of the vnode the path
     /// names (`namei`, FOLLOW), or of the descriptor's for `fstatfs64` and
-    /// `fstatfs` (`file_vnode`: EINVAL for what is no vnode). devfs's has no
-    /// record here: reported.
+    /// `fstatfs` (`file_vnode`: EINVAL for what is no vnode).
     fn darwin_statfs_mount(&mut self, m: &GuestMem<'_>, path: Option<u64>, fd: u64) -> Result<&'static Mount, Errno> {
         let canon = match path {
             Some(at) => {
@@ -1120,10 +1186,6 @@ impl Kernel {
                 file.path.clone()
             }
         };
-        if canon == "/dev" || canon.starts_with("/dev/") {
-            self.darwin_unimplemented(format!("statfs of {canon} (devfs_statfs: the devfs mount has no record here)"));
-            return Err(Errno::EINVAL);
-        }
         Ok(mount_of(&canon))
     }
 

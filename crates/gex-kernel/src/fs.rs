@@ -111,6 +111,11 @@ pub struct Stat {
     pub atime_ns: u32,
     pub ctime: i64,
     pub ctime_ns: u32,
+    /// Darwin's `st_flags`.
+    pub flags: u32,
+    /// Darwin's `st_birthtimespec`, where the filesystem has one of its
+    /// own; else the modification time stands for it.
+    pub birth: Option<(i64, u32)>,
 }
 
 /// A guest `struct stat` as bytes, on the stack: every flavour fits in 144,
@@ -156,8 +161,8 @@ impl Stat {
 
     /// Darwin's `struct stat` (the 64-bit-inode one, 144 bytes): a 32-bit
     /// device, 16-bit mode and link count, then a birth time after the
-    /// three Linux has (reported as the modification time), the size,
-    /// blocks, a 32-bit block size and zeroed flags and generation.
+    /// three Linux has (the filesystem's, or the modification time), the
+    /// size, blocks, a 32-bit block size, the flags and a zero generation.
     pub fn encode_darwin(&self) -> StatBytes {
         let mut b = StatBytes::zeroed(144);
         b[0..4].copy_from_slice(&(self.dev as u32).to_le_bytes());
@@ -169,13 +174,15 @@ impl Stat {
         // st_rdev as Darwin's dev_t (major << 24 | minor).
         b[24..28].copy_from_slice(&crate::darwin::attrcall::darwin_dev(self.rdev).to_le_bytes());
         let [at, mt, ct] = self.times();
-        for (off, (t, ns)) in [32usize, 48, 64, 80].into_iter().zip([at, mt, ct, mt]) {
+        let bt = self.birth.unwrap_or(mt);
+        for (off, (t, ns)) in [32usize, 48, 64, 80].into_iter().zip([at, mt, ct, bt]) {
             b[off..off + 8].copy_from_slice(&t.to_le_bytes());
             b[off + 8..off + 16].copy_from_slice(&(ns as i64).to_le_bytes());
         }
         b[96..104].copy_from_slice(&self.size.to_le_bytes());
         b[104..112].copy_from_slice(&self.blocks.to_le_bytes());
         b[112..116].copy_from_slice(&self.blksize.to_le_bytes());
+        b[116..120].copy_from_slice(&self.flags.to_le_bytes());
         b
     }
 
@@ -199,6 +206,7 @@ impl Stat {
         b[72..80].copy_from_slice(&self.size.to_le_bytes());
         b[80..88].copy_from_slice(&self.blocks.to_le_bytes());
         b[88..92].copy_from_slice(&self.blksize.to_le_bytes());
+        b[92..96].copy_from_slice(&self.flags.to_le_bytes());
         b
     }
 
@@ -309,6 +317,8 @@ mod stat_tests {
             mtime_ns: 14,
             ctime: 15,
             ctime_ns: 16,
+            flags: 0x8000,
+            birth: None,
         };
         let (w, n) = (st.encode_darwin(), st.encode_darwin_ino32());
         assert_eq!(n.len(), 120);
@@ -320,7 +330,8 @@ mod stat_tests {
         assert_eq!(i16_at(&n, 10), i16_at(&w, 6));
         assert_eq!(n[12..24], w[16..28]);
         assert_eq!(n[24..72], w[32..80]);
-        assert_eq!(n[72..92], w[96..116]);
-        assert!(n[92..120].iter().all(|&b| b == 0));
+        assert_eq!(n[72..96], w[96..120]);
+        assert_eq!(i32_at(&n, 92), 0x8000);
+        assert!(n[96..120].iter().all(|&b| b == 0));
     }
 }

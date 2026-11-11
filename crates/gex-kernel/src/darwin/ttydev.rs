@@ -54,20 +54,25 @@ pub enum Node {
 struct Dev {
     opens: u32,
     vid: u64,
-    atime: (i64, u32),
-    mtime: (i64, u32),
-    ctime: (i64, u32),
-    access: bool,
-    update: bool,
+    times: super::devfs::DnTimes,
     ino: u64,
 }
 
 static DEVS: Mutex<Option<HashMap<u32, Dev>>> = Mutex::new(None);
-static NEXT_INO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x7474_0000);
-
-fn now() -> (i64, u32) {
-    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-    (d.as_secs() as i64, d.subsec_nanos())
+/// A node's inode number and times: a boot node's own, else a new one's.
+fn made(dev: u32) -> (u64, super::devfs::DnTimes) {
+    let minor = dev & 0x00ff_ffff;
+    let name = match dev >> 24 {
+        PTMX_MAJOR => Some("ptmx".to_string()),
+        CTTY_MAJOR => Some("tty".to_string()),
+        PTS_MAJOR => Some(bsd_name("tty", minor)),
+        PTC_MAJOR => Some(bsd_name("pty", minor)),
+        _ => None,
+    };
+    match name.and_then(|n| super::devfs::ino_of(&n)) {
+        Some(i) => (i, super::devfs::DnTimes::made_at_boot()),
+        None => (super::devfs::later_ino(), super::devfs::DnTimes::made_now()),
+    }
 }
 
 /// The record of device `dev`'s node, made with it.
@@ -75,8 +80,8 @@ fn with_dev<R>(dev: u32, f: impl FnOnce(&mut Dev) -> R) -> R {
     let mut g = DEVS.lock().unwrap_or_else(|e| e.into_inner());
     let map = g.get_or_insert_with(HashMap::new);
     let d = map.entry(dev).or_insert_with(|| {
-        let t = now();
-        Dev { opens: 0, vid: 1, atime: t, mtime: t, ctime: t, access: false, update: false, ino: NEXT_INO.fetch_add(1, Ordering::Relaxed) }
+        let (ino, times) = made(dev);
+        Dev { opens: 0, vid: 1, times, ino }
     });
     f(d)
 }
@@ -96,13 +101,11 @@ fn pts_node_made(minor: u32) {
     let mut g = DEVS.lock().unwrap_or_else(|e| e.into_inner());
     let map = g.get_or_insert_with(HashMap::new);
     let vid = map.get(&dev).map_or(1, |d| d.vid + 1);
-    let t = now();
-    map.insert(dev, Dev { opens: 0, vid, atime: t, mtime: t, ctime: t, access: false, update: false, ino: NEXT_INO.fetch_add(1, Ordering::Relaxed) });
+    let (ino, times) = made(dev);
+    map.insert(dev, Dev { opens: 0, vid, times, ino });
 }
 
-/// devfs's attributes of a terminal node (`devfs_getattr` after
-/// `devfs_update`): a read since the last look is an access now, a write a
-/// change and modification now.
+/// devfs's attributes of a terminal node (`devfs_getattr`).
 pub fn node_metadata(node: Node, dev: u32) -> Metadata {
     let mode = node_attrs(node).2;
     let ndev = match node {
@@ -110,28 +113,16 @@ pub fn node_metadata(node: Node, dev: u32) -> Metadata {
         Node::Ctty => makedev(CTTY_MAJOR, 0),
         _ => dev,
     };
-    let d = with_dev(ndev, |d| {
-        let t = now();
-        if d.access {
-            d.atime = t;
-            d.access = false;
-        }
-        if d.update {
-            d.mtime = t;
-            d.ctime = t;
-            d.update = false;
-        }
-        *d
-    });
+    let (ino, (mtime, times)) = with_dev(ndev, |d| (d.ino, d.times.getattr()));
     Metadata {
         file_type: FileType::CharDevice,
         size: 0,
         mode,
-        ino: d.ino,
-        mtime: d.mtime.0,
+        ino,
+        mtime,
         nlink: 1,
         rdev: linux_rdev(dev),
-        times: crate::vfs::Times { mtime_ns: d.mtime.1, atime: d.atime.0, atime_ns: d.atime.1, ctime: d.ctime.0, ctime_ns: d.ctime.1 },
+        times,
     }
 }
 
@@ -310,15 +301,11 @@ impl TtyDev {
         *self.procs.lock().unwrap_or_else(|e| e.into_inner()) = Some(procs);
     }
 
-    /// Mark the node's access (a read) or change (a write).
+    /// `devfsspec_read`'s access, or `devfsspec_write`'s change and
+    /// modification, of the node.
     fn mark(&self, write: bool) {
-        with_dev(node_dev(self.dev()), |d| {
-            if write {
-                d.update = true;
-            } else {
-                d.access = true;
-            }
-        });
+        use super::devfs::{UPDATE_ACCESS, UPDATE_CHANGE, UPDATE_MOD};
+        with_dev(node_dev(self.dev()), |d| d.times.consider(if write { UPDATE_CHANGE | UPDATE_MOD } else { UPDATE_ACCESS }));
     }
 
     /// What `select` sees of it (the device's `d_select`): readable,
@@ -982,6 +969,20 @@ impl Kernel {
         }
     }
 
+    /// `vn_open` of a devfs node of [`super::devfs`]'s: its owner, group
+    /// and mode checked, then the device's open, which for a device not
+    /// modelled is reported.
+    pub(crate) fn darwin_devnode_open(&mut self, fd: i32) -> Result<(), Errno> {
+        let Ok(file) = self.fds.get(fd) else { return Ok(()) };
+        let Some(n) = file.handle.darwin_devnode() else { return Ok(()) };
+        self.darwin_node_access((n.uid, n.gid, n.mode), file.readable, file.writable)?;
+        if let super::devfs::Kind::Unmodelled(what) = n.kind {
+            self.darwin_unimplemented(format!("opening /dev/{}: {what}", n.name));
+            return Err(Errno::ENXIO);
+        }
+        Ok(())
+    }
+
     /// open1's end for a terminal: one opened without O_NOCTTY by a
     /// process with no controlling terminal becomes its own if it can
     /// (TIOCSCTTY through `fo_ioctl`, whose error is ignored: a process
@@ -1049,7 +1050,7 @@ impl Kernel {
     /// `vnode_authorize` of a read and/or write of a devfs node by its
     /// owner, group and mode: root may; else the owner's bits, a member's
     /// of its group, or everyone's.
-    fn darwin_node_access(&self, (uid, gid, mode): (u32, u32, u32), read: bool, write: bool) -> Result<(), Errno> {
+    pub(crate) fn darwin_node_access(&self, (uid, gid, mode): (u32, u32, u32), read: bool, write: bool) -> Result<(), Errno> {
         let c = &self.dtask.cred;
         if c.uid == 0 {
             return Ok(());

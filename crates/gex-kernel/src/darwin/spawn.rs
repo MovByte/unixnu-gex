@@ -1019,9 +1019,9 @@ impl Kernel {
                     // open1, as an open syscall's.
                     let la = [Scratch::AT, u64::from(oflag), u64::from(mode), 0, 0, 0];
                     let got = self.darwin_open1(&mut gm, super::bsd::sys::OPEN, la, None)?;
-                    // A terminal device's own open, and open1's controlling
+                    // A device's own open, and open1's controlling
                     // terminal for an open that takes no lock.
-                    if let Err(e) = self.darwin_tty_open_now(got) {
+                    if let Err(e) = self.darwin_devnode_open(got).and_then(|()| self.darwin_tty_open_now(got)) {
                         let _ = self.darwin_close(got);
                         return Err(e);
                     }

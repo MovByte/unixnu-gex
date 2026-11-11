@@ -45,10 +45,15 @@ fn rdev_of(device: Device) -> u64 {
 #[derive(Debug)]
 struct DevHandle {
     device: Device,
+    /// A Darwin devfs node's attributes, in place of the Linux node's.
+    darwin: Option<&'static crate::darwin::devfs::Node>,
 }
 
 impl FileHandle for DevHandle {
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
+        if let Some(n) = self.darwin {
+            crate::darwin::devfs::touch(n, crate::darwin::devfs::UPDATE_ACCESS);
+        }
         match self.device {
             Device::Null => Ok(0),
             Device::Zero | Device::Full => {
@@ -66,6 +71,9 @@ impl FileHandle for DevHandle {
     }
 
     fn write_at(&self, _offset: u64, buf: &[u8]) -> SysResult {
+        if let Some(n) = self.darwin {
+            crate::darwin::devfs::touch(n, crate::darwin::devfs::UPDATE_CHANGE | crate::darwin::devfs::UPDATE_MOD);
+        }
         match self.device {
             Device::Full => Err(Errno::ENOSPC),
             _ => Ok(buf.len() as u64),
@@ -73,6 +81,9 @@ impl FileHandle for DevHandle {
     }
 
     fn metadata(&self) -> Result<Metadata, Errno> {
+        if let Some(n) = self.darwin {
+            return Ok(crate::darwin::devfs::metadata(n));
+        }
         Ok(Metadata {
             file_type: FileType::CharDevice,
             size: 0,
@@ -92,6 +103,49 @@ impl FileHandle for DevHandle {
     fn is_tty(&self) -> bool {
         self.device == Device::Tty
     }
+
+    fn darwin_devnode(&self) -> Option<&'static crate::darwin::devfs::Node> {
+        self.darwin
+    }
+}
+
+/// A Darwin devfs node whose device is not modelled: its open is the
+/// Darwin open's to report.
+#[derive(Debug)]
+struct UnmodelledDev(&'static crate::darwin::devfs::Node);
+
+impl FileHandle for UnmodelledDev {
+    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> SysResult {
+        Err(Errno::ENXIO)
+    }
+    fn write_at(&self, _offset: u64, _buf: &[u8]) -> SysResult {
+        Err(Errno::ENXIO)
+    }
+    fn metadata(&self) -> Result<Metadata, Errno> {
+        Ok(crate::darwin::devfs::metadata(self.0))
+    }
+    fn is_stream(&self) -> bool {
+        true
+    }
+    fn darwin_devnode(&self) -> Option<&'static crate::darwin::devfs::Node> {
+        Some(self.0)
+    }
+}
+
+/// A Darwin devfs node's handle.
+fn darwin_open(n: &'static crate::darwin::devfs::Node) -> Arc<dyn FileHandle> {
+    use crate::darwin::devfs::Kind;
+    let device = match n.kind {
+        Kind::Null => Device::Null,
+        Kind::Zero => Device::Zero,
+        Kind::Random => Device::Random,
+        Kind::Unmodelled(_) => return Arc::new(UnmodelledDev(n)),
+    };
+    Arc::new(DevHandle { device, darwin: Some(n) })
+}
+
+fn darwin_on() -> bool {
+    DARWIN_TTYS.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Whether a Darwin kernel runs here: devfs then has XNU's terminal nodes,
@@ -208,8 +262,18 @@ impl FileSystem for DevFs {
         if let Some(node) = darwin_tty(path) {
             return Ok(crate::darwin::ttydev::TtyDev::new(node));
         }
+        // A Darwin kernel's devfs has its own nodes, and none of the
+        // host's.
+        if darwin_on() {
+            if let Some(n) = crate::darwin::devfs::lookup(path) {
+                return Ok(darwin_open(n));
+            }
+            if !path.is_empty() {
+                return Err(Errno::ENOENT);
+            }
+        }
         if let Some(device) = Self::device_of(path) {
-            return Ok(Arc::new(DevHandle { device }));
+            return Ok(Arc::new(DevHandle { device, darwin: None }));
         }
         if let Some((_, handle)) = self.extra.iter().find(|(n, _)| n == path) {
             return Ok(Arc::clone(handle));
@@ -221,6 +285,7 @@ impl FileSystem for DevFs {
             return Ok(Arc::new(DevDir {
                 extra: self.extra.iter().map(|(n, _)| n.clone()).chain(self.per_open.iter().map(|(n, _)| n.clone())).collect(),
                 pts: self.pts.is_some(),
+                darwin: darwin_on(),
             }));
         }
         if let (Some(list), "pts") = (self.pts.as_ref(), path) {
@@ -239,7 +304,20 @@ impl FileSystem for DevFs {
 
     fn metadata(&self, path: &str) -> Result<Metadata, Errno> {
         if path.is_empty() {
+            if darwin_on() {
+                return Ok(crate::darwin::devfs::root_metadata());
+            }
             return Ok(Metadata::dir());
+        }
+        if darwin_on() {
+            if let Some(n) = crate::darwin::devfs::lookup(path) {
+                return Ok(crate::darwin::devfs::metadata(n));
+            }
+            if let Some(node) = darwin_tty(path) {
+                let dev = crate::darwin::ttydev::lookup_dev(node);
+                return Ok(crate::darwin::ttydev::node_metadata(node, dev));
+            }
+            return Err(Errno::ENOENT);
         }
         if let Some((_, open)) = self.per_open.iter().find(|(n, _)| n == path) {
             return open().metadata();
@@ -311,6 +389,11 @@ impl FileSystem for DevFs {
     }
 
     fn read_link(&self, path: &str) -> Result<String, Errno> {
+        // A Darwin devfs here has no fdesc and no links.
+        if darwin_on() {
+            self.metadata(path)?;
+            return Err(Errno::EINVAL);
+        }
         Ok(match path {
             "stdin" => "/proc/self/fd/0".to_string(),
             "stdout" => "/proc/self/fd/1".to_string(),
@@ -330,6 +413,8 @@ struct DevDir {
     extra: Vec<String>,
     /// Whether `ptmx` and `pts` exist.
     pts: bool,
+    /// Whether this is a Darwin kernel's devfs.
+    darwin: bool,
 }
 
 /// `/dev/input`: the connected game controllers (`evdev`).
@@ -385,9 +470,26 @@ impl FileHandle for DevDir {
         Err(Errno::EISDIR)
     }
     fn metadata(&self) -> Result<Metadata, Errno> {
+        if self.darwin {
+            return Ok(crate::darwin::devfs::root_metadata());
+        }
         Ok(Metadata::dir())
     }
     fn read_dir(&self) -> Result<Vec<DirEntry>, Errno> {
+        if self.darwin {
+            // devfs_readdir: ".", ".." (the root's parent is itself), then
+            // the directory's entries in the order they were made; the
+            // root's access.
+            crate::darwin::devfs::touch_root();
+            let root = crate::darwin::devfs::root_ino();
+            let mut out = vec![DirEntry { name: ".".into(), file_type: FileType::Directory, ino: root }, DirEntry { name: "..".into(), file_type: FileType::Directory, ino: root }];
+            let ttys: std::collections::HashMap<String, u64> = crate::darwin::ttydev::list().into_iter().collect();
+            for name in crate::darwin::devfs::list() {
+                let ino = crate::darwin::devfs::ino_of(&name).or_else(|| ttys.get(&name).copied()).unwrap_or(0);
+                out.push(DirEntry { name, file_type: FileType::CharDevice, ino });
+            }
+            return Ok(out);
+        }
         let mut out = vec![
             DirEntry {
                 name: ".".into(),
@@ -400,17 +502,10 @@ impl FileHandle for DevDir {
                 ino: 1,
             },
         ];
-        let darwin = DARWIN_TTYS.load(std::sync::atomic::Ordering::Acquire);
-        if darwin {
-            for (name, ino) in crate::darwin::ttydev::list() {
-                out.push(DirEntry { name, file_type: FileType::CharDevice, ino });
-            }
-        }
         for name in [
             "null", "zero", "full", "random", "urandom", "tty", "console",
         ]
         .iter()
-        .filter(|n| !(darwin && **n == "tty"))
         .map(|s| s.to_string())
         .chain(self.extra.iter().cloned())
         {

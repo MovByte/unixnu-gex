@@ -3655,6 +3655,11 @@ impl PathIo<'_> {
                 Some(p) if p.starts_with('/') && md.file_type != crate::vfs::FileType::Socket => crate::darwin::kern::mount_of(p).fsid as u32 as u64,
                 _ => 0,
             };
+            if let Some(p) = at {
+                if p.starts_with('/') && crate::darwin::kern::mount_of(p).fs == crate::darwin::kern::Fs::Devfs {
+                    crate::darwin::devfs::stat_fixup(&mut st, md, p);
+                }
+            }
             if self.stat_ino32 {
                 st.encode_darwin_ino32()
             } else {
@@ -3675,6 +3680,12 @@ impl PathIo<'_> {
         if self.darwin {
             if let Some((uid, gid)) = crate::darwin::ttydev::node_owner(md) {
                 return Stat { uid, gid, ..Kernel::stat_from(md) };
+            }
+            if let Some(n) = crate::darwin::devfs::node_of(md) {
+                if n.major.is_none() {
+                    crate::darwin::note_unimplemented(format!("st_rdev of /dev/{}: its major is the one cdevsw_add(-1) gave it at the device's boot", n.name));
+                }
+                return Stat { uid: n.uid, gid: n.gid, ..Kernel::stat_from(md) };
             }
         }
         Stat { uid: self.creds.uid(), gid: self.creds.gid(), ..Kernel::stat_from(md) }
@@ -3715,8 +3726,16 @@ impl PathIo<'_> {
         };
         crate::phase::mark(7);
         let md = md?;
-        // (a link's own device is its directory's)
-        let at = self.darwin.then(|| if flags & AT_SYMLINK_NOFOLLOW != 0 { self.ns.canonical(&crate::vfs::parent_of(&p)) } else { self.ns.canonical(&p) });
+        // (a link's own vnode is the one in its directory, not its target)
+        let at = self.darwin.then(|| {
+            if flags & AT_SYMLINK_NOFOLLOW != 0 && md.file_type == crate::vfs::FileType::Symlink {
+                let dir = self.ns.canonical(&crate::vfs::parent_of(&p));
+                let name = p.rsplit('/').next().unwrap_or("");
+                if dir == "/" { format!("/{name}") } else { format!("{dir}/{name}") }
+            } else {
+                self.ns.canonical(&p)
+            }
+        });
         m.write(buf, &self.encode_stat(&self.stat_owned(&md), &md, at.as_deref()))?;
         crate::phase::mark(9);
         Ok(0)
@@ -9879,6 +9898,7 @@ impl Kernel {
             if let Some(out) = self.darwin_guard_kill() {
                 return out;
             }
+            self.darwin_take_notes();
             if let Some(what) = self.darwin_strict_stop() {
                 eprintln!("[gex:{}] GEX_DARWIN_STRICT: stopping at pc {pc:#x}: {what}", self.pid);
                 return SyscallOutcome::Killed { signal: crate::signal::sig::SIGSYS as u32, core: false };

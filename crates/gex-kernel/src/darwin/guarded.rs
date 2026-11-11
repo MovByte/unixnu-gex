@@ -255,6 +255,12 @@ impl Kernel {
         let dflags = a[at];
         match self.darwin_open1(m, raw, a, guard) {
             Ok(fd) => {
+                // A devfs node's vn_open: its access, its device's open.
+                if let Err(e) = self.darwin_devnode_open(fd) {
+                    let _ = self.fds.close(fd);
+                    let _ = super::set_result(m, self.ctx_addr, e.as_return());
+                    return SyscallOutcome::Continue;
+                }
                 // spec_open: a terminal device's own open, which may wait.
                 if self.darwin_tty_of(fd as u64).is_some_and(|(_, d)| !d.is_open()) {
                     if let Some(out) = self.darwin_tty_open(m, fd, dflags) {
