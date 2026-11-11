@@ -2149,9 +2149,11 @@ impl Kernel {
             flags |= kf::PROC64;
             let mut ctx = Ctx { fd: a[0] as i32, ..Ctx::default() };
             if timeout != 0 && flags & kf::IMMEDIATE == 0 {
-                // kevent_legacy_get_deadline: a user64_timespec.
+                // kevent_legacy_get_deadline: a user64_timespec that
+                // timespec_is_valid takes (no more than INT32_MAX seconds,
+                // and up to a whole second of nanoseconds).
                 let (s, ns) = (m.read_u64(timeout)? as i64, m.read_u64(timeout + 8)? as i64);
-                if s < 0 || !(0..1_000_000_000).contains(&ns) {
+                if !(0..=i64::from(i32::MAX)).contains(&s) || !(0..=1_000_000_000).contains(&ns) {
                     return Err(Errno::EINVAL);
                 }
                 ctx.deadline = Some(Instant::now() + std::time::Duration::new(s as u64, ns as u32));
