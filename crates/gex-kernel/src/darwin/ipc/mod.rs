@@ -231,7 +231,8 @@ pub enum Kobject {
     ThreadInspect(i32),
     Host,
     HostPriv,
-    Clock,
+    /// A clock (`clock_list[id]`): SYSTEM_CLOCK 0, CALENDAR_CLOCK 1.
+    Clock(u8),
     Semaphore,
     Timer,
     Voucher(super::voucher::VoucherId),

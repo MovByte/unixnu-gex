@@ -184,9 +184,10 @@ impl Kernel {
         if self.creds.uid() == 0 { self.darwin_host_priv_port() } else { self.darwin_host_port() }
     }
 
-    /// The system clock's port.
-    pub(crate) fn darwin_clock_port(&mut self) -> ObjId {
-        self.ipc().global_port(Kobject::Clock)
+    /// Clock `id`'s port: the system clock (0) or the calendar (1), each
+    /// its own.
+    pub(crate) fn darwin_clock_port(&mut self, id: u8) -> ObjId {
+        self.ipc().global_port(Kobject::Clock(id))
     }
 
     /// Thread `tid`'s control port and self port (`ipc_thread_init`),

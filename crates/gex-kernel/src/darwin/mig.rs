@@ -213,8 +213,8 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         // host_get_clock_service(host, clock_id) -> clock_serv_t: the system
         // clock (SYSTEM_CLOCK) or the calendar (CALENDAR_CLOCK).
         (Kobject::Host | Kobject::HostPriv, 206) => match arg(req, 0) {
-            Some(0) | Some(1) => {
-                let p = k.darwin_clock_port();
+            Some(id @ (0 | 1)) => {
+                let p = k.darwin_clock_port(id as u8);
                 k.ipc().make_send(p);
                 Reply::port(Carried::Port(p))
             }
@@ -838,11 +838,18 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             _ => bad(),
         },
         (Kobject::Task, 5404) => Reply::err(KERN_NOT_SUPPORTED),
-        // clock_get_time(clock) -> mach_timespec_t
-        (Kobject::Clock, 1000) => {
-            let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-            let mut o = (t.as_secs() as u32).to_le_bytes().to_vec();
-            o.extend_from_slice(&(t.subsec_nanos() as i32).to_le_bytes());
+        // clock_get_time(clock) -> mach_timespec_t: the system clock's
+        // rtclock_gettime (the time since boot, clock_get_system_nanotime),
+        // the calendar's calend_gettime.
+        (Kobject::Clock(id), 1000) => {
+            let (secs, nsecs) = if *id == 0 {
+                super::mach::system_nanotime()
+            } else {
+                let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+                (t.as_secs(), t.subsec_nanos())
+            };
+            let mut o = (secs as u32).to_le_bytes().to_vec();
+            o.extend_from_slice(&(nsecs as i32).to_le_bytes());
             Reply::ok(o)
         }
         // task_info(task_name, flavor, out, &count): task_info_from_user

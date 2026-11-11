@@ -125,6 +125,16 @@ pub fn absolute_time() -> u64 {
     (uptime().as_nanos() * u128::from(TIMEBASE.1) / u128::from(TIMEBASE.0)) as u64
 }
 
+/// `clock_get_system_nanotime`: the counter in whole seconds and the
+/// nanoseconds past them (`rtclock_sec_divisor`, its ticks per second).
+pub(crate) fn system_nanotime() -> (u64, u32) {
+    let abs = absolute_time();
+    let divisor = 1_000_000_000 * u64::from(TIMEBASE.1) / u64::from(TIMEBASE.0);
+    let secs = abs / divisor;
+    let rest = abs - secs * divisor;
+    (secs, (u128::from(rest) * 1_000_000_000 / u128::from(divisor)) as u32)
+}
+
 /// `nanoseconds_to_absolutetime`.
 pub(crate) fn ns_to_abs(ns: u64) -> u64 {
     (u128::from(ns) * u128::from(TIMEBASE.1) / u128::from(TIMEBASE.0)).min(u128::from(u64::MAX)) as u64
