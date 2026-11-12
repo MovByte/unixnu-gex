@@ -422,6 +422,10 @@ impl Kernel {
             sys::OPEN | sys::OPEN_NOCANCEL | sys::OPENAT | sys::OPENAT_NOCANCEL => Some(self.darwin_open_finish(m, raw, *a, None)),
             sys::GUARDED_OPEN_NP | sys::GUARDED_OPEN_DPROTECTED_NP | sys::OPEN_DPROTECTED_NP | sys::OPENAT_DPROTECTED_NP => Some(self.darwin_open_protected(m, raw, a)),
             sys::WRITE | sys::WRITE_NOCANCEL | sys::WRITEV | sys::WRITEV_NOCANCEL if self.darwin_pipe_of(a[0]).is_some() => Some(self.darwin_pipe_write(m, raw, a)),
+            // A unix stream socket's sends and receives, over its buffers as
+            // XNU keeps them.
+            sys::WRITE | sys::WRITE_NOCANCEL | sys::WRITEV | sys::WRITEV_NOCANCEL | sys::SENDTO | sys::SENDTO_NOCANCEL | sys::SENDMSG | sys::SENDMSG_NOCANCEL if self.darwin_xnu_stream(a[0]).is_some() => Some(self.darwin_unix_send(m, raw, a)),
+            sys::READ | sys::READ_NOCANCEL | sys::READV | sys::READV_NOCANCEL | sys::RECVFROM | sys::RECVFROM_NOCANCEL | sys::RECVMSG | sys::RECVMSG_NOCANCEL if self.darwin_xnu_stream(a[0]).is_some() => Some(self.darwin_unix_recv(m, raw, a)),
             sys::READ | sys::READ_NOCANCEL | sys::READV | sys::READV_NOCANCEL | sys::WRITE | sys::WRITE_NOCANCEL | sys::WRITEV | sys::WRITEV_NOCANCEL if self.darwin_tty_of(a[0]).is_some() => Some(self.darwin_tty_rw(m, raw, a)),
             // valid_for_random_access: a terminal (VISTTY) takes no offset.
             sys::PREAD | sys::PREAD_NOCANCEL | sys::PWRITE | sys::PWRITE_NOCANCEL | sys::PREADV | sys::PREADV_NOCANCEL | sys::PWRITEV | sys::PWRITEV_NOCANCEL if self.darwin_tty_of(a[0]).is_some() => {

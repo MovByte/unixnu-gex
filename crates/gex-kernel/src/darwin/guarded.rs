@@ -186,6 +186,11 @@ impl Kernel {
     /// `sendmsg` carries, in order; those it would refuse otherwise are
     /// left for the send to.
     fn darwin_unp_internalize_guards(&mut self, m: &GuestMem<'_>, sock: i32, msg: u64) -> Result<(), Errno> {
+        // A unix stream's send internalizes its control in its own order
+        // ([`super::unixsock`]).
+        if self.darwin_xnu_stream(sock as u64).is_some() {
+            return Ok(());
+        }
         let Ok(socket) = self.fds.get(sock) else { return Ok(()) };
         let h = &socket.handle;
         if Arc::clone(h).as_unix_socket().is_none() && Arc::clone(h).as_unix_dgram().is_none() && Arc::clone(h).as_remote_unix().is_none() {

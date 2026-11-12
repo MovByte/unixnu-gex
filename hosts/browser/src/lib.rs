@@ -9083,7 +9083,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
                         }
                         Waiting::Read(Arc::clone(handle))
                     }
-                    gex_kernel::BlockOp::WriteStream { handle, .. } => {
+                    gex_kernel::BlockOp::WriteStream { handle, .. } | gex_kernel::BlockOp::WriteWait { handle, .. } => {
                         Waiting::Write(Arc::clone(handle))
                     }
                     // Both of these wait on something outside the guest, so
@@ -14595,7 +14595,7 @@ fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> 
             }
             Waiting::Read(Arc::clone(handle))
         }
-        gex_kernel::BlockOp::WriteStream { handle, .. } => Waiting::Write(Arc::clone(handle)),
+        gex_kernel::BlockOp::WriteStream { handle, .. } | gex_kernel::BlockOp::WriteWait { handle, .. } => Waiting::Write(Arc::clone(handle)),
         // As the kernel's park: re-checked on the scheduler's way round,
         // woken by the descriptors' queues (`waitq::queues_of`).
         gex_kernel::BlockOp::Poll { deadline, .. } => Waiting::Net(deadline.map(|d| turn_now() + d.as_nanos() as u64)),
@@ -15185,10 +15185,11 @@ fn finish_parked(
                 r => r,
             }
         }
-        // A Darwin pipe's parked write (its whole size and what it already
-        // wrote) is finished by the native host only: the page runs no
-        // Darwin process yet.
-        gex_kernel::BlockOp::WriteStream { xnu: Some(_), .. } => Err(Errno::ENOSYS),
+        // A Darwin pipe's or socket's parked write (its whole size and what
+        // it already wrote), and a Darwin socket's wait to send, are
+        // finished by the native host only: the page runs no Darwin process
+        // yet.
+        gex_kernel::BlockOp::WriteStream { xnu: Some(_), .. } | gex_kernel::BlockOp::WriteWait { .. } => Err(Errno::ENOSYS),
         gex_kernel::BlockOp::WriteStream { handle, buf, len, gathered, xnu: None } => {
             // One turn's worth; the scheduler brings the thread back while
             // anything is left, because the descriptor stays unwritable until

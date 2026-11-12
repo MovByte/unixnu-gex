@@ -270,6 +270,17 @@ impl Kernel {
             Kind::Socket => match com {
                 cmd::FIONBIO => Ok(()),
                 cmd::FIOASYNC if int(data) == 0 => Ok(()),
+                // The receive buffer's sb_cc, its addresses and control
+                // counted.
+                cmd::FIONREAD => {
+                    let st = file.handle.so_state().ok_or(Errno::ENOTSOCK)?;
+                    if !st.exact {
+                        self.darwin_unimplemented(format!("FIONREAD on {}, whose receive buffer is not counted as XNU counts it", file.path));
+                        return Err(Errno::EOPNOTSUPP);
+                    }
+                    data[..4].copy_from_slice(&(st.rcv as u32).to_le_bytes());
+                    Ok(())
+                }
                 cmd::SIOCGIFFLAGS | cmd::SIOCSIFFLAGS if com == cmd::SIOCGIFFLAGS || self.darwin_suser().is_ok() => self.darwin_ifflags(com, data),
                 cmd::SIOCSIFFLAGS => Err(Errno::EPERM),
                 cmd::SIOCAIFADDR => {

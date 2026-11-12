@@ -1,200 +1,470 @@
-# gex
+# unixnu-gex
 
-gex runs unmodified Linux and Windows programs in a web browser. It
-translates their machine code to WebAssembly and runs it against its own
-implementation of the Linux kernel ABI. That kernel is written in Rust and
-compiled to WebAssembly as well. A program needs no source changes and no
-rebuild, and nothing in it knows it is not on a Linux machine.
+unixnu-gex is a fork of [gex](https://github.com/HeyPuter/gex) that adds a
+Darwin personality: XNU's system call interface, ported into gex's kernel,
+so that the userland of iPadOS 17.7.11 (build 21H461), as it ships for the
+iPad7,1 (iPad Pro 12.9-inch, 2nd generation, A10X), runs on gex. It is the
+engine for [UniXNU](https://github.com/MovByte/UniXNU), to run that userland
+in a web browser.
 
-```console
-$ file hello
-hello: ELF 64-bit LSB executable, ARM aarch64, statically linked
+The Darwin work is on this repository's default branch, `darwin`. The rest
+of the tree is upstream gex.
 
-$ gexc run hello
-hello from aarch64
-```
+**Where it stands.** Darwin programs run today under gex's native host,
+`gexc`, which runs the translated program on wasmtime. The browser host
+(`hosts/browser`) does not start Darwin processes yet. See [Status](#status).
 
-The browser is the target. `gexc` also runs programs natively on wasmtime,
-for debugging and for building what a page loads ahead of time.
+## gex, upstream
 
-## What runs
+gex, by Puter Technologies, runs unmodified Linux and Windows programs in a
+web browser. It translates their machine code to WebAssembly and runs it
+against its own implementation of the Linux kernel ABI, which is written in
+Rust and compiled to WebAssembly as well. `gexc` also runs programs natively
+on wasmtime, for debugging and for building what a page loads ahead of time.
 
-- **Linux programs for AArch64, x86-64 and i386.** Static and dynamically
-  linked ELF images, with musl or glibc. gex supports threads, `fork`,
-  `exec`, signals, pipes, sockets and a full filesystem (tmpfs, host
-  passthrough, `/proc`, `/dev`). Each guest process gets its own address
-  space. The kernel's shared state is one module that every process's
-  Workers share.
-- **wasm32 Linux programs.** `toolchain/gexcc` is a C/C++ compiler for gex's
-  wasm32 Linux target. It is used like `gcc`. The debdemo repository
-  builds Debian packages with it and assembles a Debian rootfs around them.
-- **Windows programs, through Wine.** `wine` builds Wine's own
-  Unix side as wasm32 for gex, plus a ready-to-run prefix. The Windows code
-  itself is translated like any other x86 code. The build is 64-bit Wine
-  with WoW64, which runs 64-bit and 32-bit Windows programs in one prefix.
-  The older 32-bit-only Wine build is still there, marked legacy, until it
-  is removed.
-- **Graphics.** `gex-wayland` is a Wayland compositor, and `gex-xwm` the X
-  window manager that a rootless Xwayland needs. Wayland and X11 programs
-  share one desktop. Xwayland can run as native WebAssembly in the page,
-  outside any guest. A guest's OpenGL calls go through gex's own libGL and
-  libEGL (`guest/gl`) to Mesa, which is compiled to WebAssembly and draws
-  with the browser's WebGPU (`third_party/mesa`, Gallium's `gex_wgpu`).
-  Desktop GL is supported up to 4.6.
-- **In the page, or ahead of time.** The same programs run in the browser
-  page (`page/`) and natively under `gexc`. An ejected project (below) runs
-  only what was built for it ahead of time, as a static site whose
-  JavaScript library a page of your own imports.
+The Linux and Windows support is upstream's, and this README does not
+document it again. Upstream's README is the reference for the base engine:
+[the revision this branch last merged](https://github.com/HeyPuter/gex/blob/8d55896e61824a0bc534d3c9c2de1b175f1b4a8f/README.md)
+matches this tree's layout (`hosts/`, `page/`, `toolchain/`, `scripts/`,
+`wine/`); a later upstream revision may describe a newer one.
+`page/README.md` covers the page's builds.
 
-## How it works
+## The Darwin personality
 
-```
- guest ELF/PE ─▶ gex-ld ─▶ gex-xlate ─▶ gex-isa(-x86) ─▶ gex-lift(-x86) ─▶ gex-emit ─▶ wasm
-                  load      discover     decode            GIR               tier 1
-                                              │
-                                              ├─▶ gex-fjit   function JIT (GIR → wasm)
-                                              └─▶ gex-cgen   function tier (GIR → C → clang → wasm)
+A Darwin process enters the kernel with `svc #0x80` and the call number in
+x16. The number says which part of the kernel answers: a positive number is
+a BSD system call, a negative one a Mach trap, and `0x80000000` the
+machine-dependent calls (the thread's TSD pointer). A BSD call with a Linux
+counterpart is renumbered onto gex's own dispatch, its flags and structures
+translated; the rest are answered by Darwin code. Results go back as XNU
+returns them: the value in x0 with the carry flag clear, or a Darwin errno in
+x0 with the carry flag set. A Mach trap returns its `kern_return_t` in x0.
 
- page: hosts/browser (gex-kernel per process) + hosts/kernel (shared kernel) + Mesa + Xwayland
-```
+A process sees iOS's machine: 16 KiB pages, a 4 GiB `__PAGEZERO`, the
+commpage, the dyld shared cache mapped where it was linked in the shared
+region (from `0x1_8000_0000`) with its slide info applied, and the
+iPad7,1's identity in `sysctl`, the host routines and the device tree.
 
-- **Guest virtual address equals linear-memory offset.** gex is the
-  kernel, so it allocates every guest address itself, inside the guest's
-  wasm memory. A guest load is a wasm load, with no translation arithmetic.
-- **Three tiers, one ABI.** Tier 1 translates each basic block into a wasm
-  function, at load time or when a branch first reaches it. Guest JITs and
-  late-loaded libraries need no special handling. The function JIT
-  (`gex-fjit`) turns a recovered guest function into one wasm function. The
-  function tier (`gex-cgen`) does the same through C and clang, ahead of
-  time. All three tiers call each other through one function table.
-- **Discovery is never load-bearing.** Code the translator did not find
-  lands on a stub, which translates it on demand. A wrong guess costs time,
-  never a wrong branch.
-- **Ahead-of-time builds.** `gexc run --record` records what a run loaded
-  and executed. `gexc eject` turns a recording into a project that builds
-  everything ahead of time, and runs only what that build made.
-  `site/eject-site.mjs` makes the web build of an
-  ejected project into a static site. The site is a JavaScript library that
-  your own page imports.
+The kernel side is in `crates/gex-kernel/src/darwin/`, one module per
+subsystem, most naming in their header the XNU source they port:
 
-## Layout
+- **System calls.** The BSD call table, generated from XNU's
+  `syscalls.master` (`sysno.rs`); renumbering onto the canonical dispatch
+  (`bsd.rs`); the calls with no Linux counterpart (`kern.rs`); errno numbers
+  (`errno.rs`); and the calls a release kernel settles before doing any
+  work (`fixedcalls.rs`).
+- **Mach traps and IPC.** The traps (`mach.rs`); ports, port sets, rights,
+  name spaces and notifications (`ipc/`); `mach_msg` and `mach_msg2`, with
+  port rights and out-of-line data (`mach_msg.rs`); kernel object ports and
+  the MIG server for the host, task, thread, `mach_port`, `vm_map` and
+  `mach_vm`, clock, voucher and IOKit routines (`kobject.rs`, `mig.rs`);
+  exception ports and delivery to handlers (`exception.rs`, `triage.rs`);
+  semaphores (`sema.rs`), Mach timers (`mk_timer.rs`), eventlinks
+  (`eventlink.rs`), vouchers with the bank and importance attribute managers
+  (`voucher.rs`), IPC importance (`importance.rs`), and thread state
+  (`threadstate.rs`).
+- **Processes and threads.** `execve` with the Mach-O, fat and interpreter
+  activators, and the new image's stack with its `apple[]` strings
+  (`execve.rs`, `exec.rs`); `posix_spawn` with file actions, port actions
+  and attributes (`spawn.rs`); `wait4` and `waitid` (`exit.rs`);
+  libpthread's kernel side: `bsdthread_*` and `ulock` (`thread.rs`), psynch,
+  ported from libpthread's `kern_synch.c` (`psynch.rs`), and the workqueue
+  that runs libdispatch's threads (`workq.rs`); kernel waits (`wait.rs`);
+  credentials (`cred.rs`), personas (`persona.rs`), coalitions
+  (`coalition.rs`), resource limits (`rlimit.rs`), exit reasons
+  (`reason.rs`), `proc_info` (`procinfo.rs`) and `kern.proc` (`kinfo.rs`).
+- **Signals.** Dispositions, XNU's arm64 signal frame and `sigreturn`
+  (`signal.rs`), job control (`jobctl.rs`) and interval timers
+  (`itimer.rs`).
+- **Scheduling state.** Task and thread policy: app type, role, QoS and
+  priority (`taskpolicy.rs`, `threadpolicy.rs`, `priority.rs`,
+  `procpolicy.rs`); the CPU usage monitor (`cpumon.rs`); work intervals
+  (`workinterval.rs`); the scheduler's load averages and Mach factor
+  (`sched.rs`); and the kernel's thread calls, which fire timers
+  (`timer.rs`). Priorities and QoS are computed as XNU computes them;
+  running the threads is the host's job.
+- **Memory.** The task's VM map entries (`vm.rs`); `mmap`, `madvise` and
+  `mach_vm_behavior_set` (`mman.rs`); `map_with_linking_np` and the dyld
+  pager's fixups (`mwl.rs`); the commpage (`commpage.rs`); the
+  `phys_footprint` ledger (`footprint.rs`); memorystatus and the jetsam
+  bands (`memorystatus.rs`); POSIX shared memory (`shm.rs`).
+- **Files.** Name, mode and time changes and `getdirentries64`
+  (`fsops.rs`); the `getattrlist` family (`attrlist.rs`, `attrcall.rs`);
+  `clonefile` and `exchangedata` (`clonefile.rs`); extended attributes
+  (`xattr.rs`); `pathconf` (`pathconf.rs`); the file security calls
+  (`filesec.rs`); advisory locks (`lockf.rs`); guarded descriptors
+  (`guarded.rs`); file ports (`fileport.rs`); asynchronous I/O (`aio.rs`);
+  pipes (`pipe.rs`); `select` (`select.rs`); `ioctl` (`ioctl.rs`); POSIX
+  semaphores (`psem.rs`); and `/dev` as an iOS kernel makes it
+  (`devfs.rs`).
+- **kqueue.** File kqueues, the workqueue's kqueue and workloops
+  (`kevent.rs`), and their filters (`kfilt.rs`): `EVFILT_READ`, `WRITE`,
+  `VNODE`, `PROC`, `SIGNAL`, `TIMER`, `USER`, `MACHPORT`, `MEMORYSTATUS` and
+  `WORKLOOP`.
+- **Terminals.** `struct tty`, its character lists and the termios line
+  discipline (`tty.rs`, `clist.rs`); `/dev/ptmx` and its replicas, the BSD
+  ptys and `/dev/tty` (`ptmx.rs`, `ttydev.rs`); sessions and controlling
+  terminals (`ctty.rs`).
+- **Sockets.** Darwin's address structures, flags and option numbers
+  (`sockaddr.rs`); socket-level options (`sockopt.rs`); the socket layer's
+  refusals (`sockerr.rs`); Unix-domain stream sockets' sends and receives
+  with the descriptors they carry, over XNU's socket buffer accounting
+  (`unixsock.rs`, `sockbuf.rs`). As in upstream gex, an internet socket's
+  connection is carried by the host.
+- **Security.** The MAC framework's checks, with AMFI and Sandbox as its
+  policies (`mac.rs`); AMFI's decisions on code signatures, task ports, JIT
+  and executable mappings (`amfi.rs`); embedded code signatures and
+  entitlements (`codesign.rs`); trust caches (`trustcache.rs`); Sandbox's
+  compiled profiles and their evaluation (`sandbox.rs`), and AppleMatch, the
+  regular expression engine those profiles use (`applematch.rs`).
+- **IOKit.** The registry's `IODeviceTree` plane, built from the device's
+  own device tree, with the APFS volumes its file system table names
+  published as services, reached through IOKit's MIG routines (`iokit.rs`).
+- **sysctl.** The kernel's own nodes, read from the device's kernelcache
+  (`sysctl_nodes.rs`), and the values this kernel has for them
+  (`sysctl.rs`).
 
-| path | what it is |
-|------|------------|
-| `crates/gexc` | the command-line driver |
-| `crates/gex-isa`, `gex-isa-x86` | AArch64 and x86-64 decoders |
-| `crates/gex-ir` | GIR, the SSA IR translation goes through |
-| `crates/gex-lift`, `gex-lift-x86` | instruction semantics in GIR |
-| `crates/gex-f80` | exact x87 80-bit arithmetic |
-| `crates/gex-emit` | the wasm writer and tier-1 code generation |
-| `crates/gex-fjit` | the function JIT |
-| `crates/gex-cgen`, `gex-split` | the function tier, and splitting its units into hot and cold parts |
-| `crates/gex-units` | what a build ships of its function-tier units: whole, instrumented, or cut to a slot set |
-| `crates/gex-xlate` | code discovery and the translation driver |
-| `crates/gex-ld`, `gex-dylink` | ELF and PE loading; shared libraries for wasm32 programs |
-| `crates/gex-kernel` | the Linux personality: syscalls, VFS, signals, memory map, processes |
-| `crates/gex-abi`, `gex-mem`, `gex-atomic`, `gex-kmem` | the layout contract and guest-memory access |
-| `crates/gex-cache`, `gex-key` | the compiled-module cache and the content keys every host agrees on |
-| `crates/gex-wayland`, `gex-xwm`, `gex-gpu` | the compositor, the X window manager, WebGPU compositing |
-| `crates/gex-gl` | OpenGL ES passthrough for the native host |
-| `crates/gex-eject` | ejected projects, built and run ahead of time |
-| `hosts/browser` | the browser host: the kernel compiled to wasm, beside each guest |
-| `hosts/kernel` | the shared kernel module: process table, filesystem, pipes, sockets |
-| `hosts/hostwl` | the compositor for an X server that runs in the page |
-| `hosts/native` | the native host, on wasmtime |
-| `guest/` | libraries installed into the guest: GL and EGL, GLX setup, `libsteam_api` |
-| `page/` | the page: its source, runtime assets and build (`make page`) |
-| `ports/` | the Mesa, Xwayland and Tint builds the page ships |
-| `site/` | eject and demo sites built from the page, and recording a Windows program for eject |
-| `toolchain/` | gexcc, the wasm32 C/C++ compiler, its sysroots, busybox, and `pins`, the version of every fetched toolchain |
-| `wine/` | Wine for gex: dist, prefix, runner |
-| `scripts/` | generators for the GL transport and compatibility tables, source fetching, the script lint, profile and unit helpers |
-| `test/` | the runtime's tests and their runner, `test/run.mjs`, on two hosts: a headless browser page and Node |
-| `third_party/` | wasmtime (with local changes), Mesa, the Khronos GL registry and CTS |
+Outside the kernel crate:
+
+- `crates/gex-ld/src/macho.rs` loads Mach-O images. A position-independent
+  program is placed at `0x2_8000_0000`, above gex's dispatch tables and the
+  shared region; dyld goes above it.
+- `crates/gex-ld/src/dsc.rs` reads the dyld shared cache, its subcaches and
+  their slide info.
+- `crates/gex-abi/src/crypto.rs` computes the A64 cryptographic extension
+  (AES, SHA-1, SHA-256 and the polynomial multiplies), which translated code
+  calls; corecrypto uses these instructions without asking.
+- `crates/gexc/src/darwin_run.rs` is `gexc run` for a Mach-O file, and
+  `crates/gexc/src/dsc_info.rs` is `gexc dsc-info`.
+- `hosts/native/src/darwin_image.rs` loads a program and its dyld, for the
+  first program and for `execve`.
+
+## Principles
+
+- **Ported from the source.** The modules port XNU at the tag the profile
+  pins, `xnu-10063.141.1`, name the files they follow, and keep XNU's
+  structures, limits, error paths and ordering. The BSD call table is generated from
+  that tag's `syscalls.master` under the iPhoneOS RELEASE configuration
+  (`tools/darwin-gen-sysno.py`), and the sysctl nodes from the device's
+  kernelcache (`tools/darwin-sysctl-nodes.py`). psynch and the workqueue
+  follow libpthread's kernel side. AMFI, Sandbox, AppleMatch and
+  libTrustCache, which have no published source, follow the kexts in the
+  device's iOS 17.7.11 kernelcache.
+- **Measured where the source is silent.** Where behaviour belongs to the
+  filesystem rather than to XNU, the values come from a real APFS volume:
+  what a clone keeps, `pathconf`'s answers, `select` on vnodes, and the
+  attributes `getattrlist` reports.
+- **Gaps fail loudly.** Whatever a program asks for that is not implemented
+  is reported on stderr, once per kind per process:
+
+  ```
+  [gex:<pid>] Darwin: not implemented: <what>
+  ```
+
+  The call then fails with the error its path chooses: an unknown BSD call
+  is ENOSYS, a Mach trap that is not implemented is `KERN_FAILURE`, and a
+  Sandbox question the evaluator cannot answer is EPERM. A few paths go on
+  where XNU would and name in the report what they could not supply (a
+  signal frame's fault syndrome, for one). A trap number that does not
+  exist raises `EXC_SYSCALL`, as on XNU, and becomes SIGSYS. Under
+  `--strace` every occurrence is reported, not only the first.
+- **Strict mode.** With `GEX_DARWIN_STRICT=1`, the first report stops the
+  process: when the call returns, it is killed with SIGSYS, and gexc prints
+
+  ```
+  [gex:<pid>] GEX_DARWIN_STRICT: stopping at pc <pc>: <what>
+  ```
 
 ## Building
 
-`make help` lists the targets. Every one of them builds from this tree and
-the pins in it, and prints what it made on its last line.
+You need the Rust toolchain that `rust-toolchain.toml` names (it installs
+the `wasm32-unknown-unknown` target) and a C++17 compiler. The native host
+links the host's EGL and GLES (`crates/gex-gl`): on macOS that is Mesa's,
+found under Homebrew's prefix (`brew install mesa`), or under the prefix
+`GEX_MESA_PREFIX` names, which must hold `include/EGL/egl.h` and `lib/`.
 
-### Run a Linux program
-
-```console
-$ make gexc
-...
-target/release/gexc target/x86/release/gexc
-
-$ target/release/gexc run hello
-hello from aarch64
+```sh
+cargo build --release -p gexc
 ```
 
-`target/release/gexc` runs AArch64 guests, and `target/x86/release/gexc`
-runs x86-64 and i386 guests. Some other `gexc` commands:
+That builds `target/release/gexc`, for AArch64 guests, which is what Darwin
+programs are. The page, Wine and the other upstream builds are documented
+upstream (see [gex, upstream](#gex-upstream)).
 
-```console
-$ gexc run --wayland SOCKET <elf>   # with the compositor, at SOCKET
-$ gexc build <elf> -o out.wasm      # translate only
-$ gexc disasm <elf>                 # disassemble
-$ gexc ir <elf> --at 0x400abc       # the GIR for one block
-$ gexc run --strace <elf>           # syscall trace
+### The Darwin test programs
+
+The test programs are C, built with Xcode's iOS toolchain: you need macOS
+with Xcode and its iOS SDK (`xcrun -sdk iphoneos clang`), plus `codesign`
+and `lipo`.
+
+```sh
+tests/darwin/build.sh
 ```
 
-### Build the page
+They are written to `tests/darwin/bin/` (not tracked).
+`GEX_DARWIN_TARGET` sets the clang target (default `arm64-apple-ios17.0`).
+The static ones make raw system calls and need neither dyld nor the shared
+cache; they are linked at `0x280000000`, where gex places a
+position-independent program, since a static image has no fixups to slide
+it with. Every program is signed ad hoc, and some carry the entitlements in
+`tests/darwin/src/*.entitlements`.
 
-```console
-$ make page                         # the multi-process build, page/dist
-$ make serve                        # http://localhost:8088/
+## What you supply
+
+This repository ships no iPadOS files. You supply your own, extracted from
+the IPSW for the iPad7,1, iPadOS 17.7.11 (21H461): a root filesystem and a
+boot payload. The paths below are placeholders.
+
+### The root filesystem, `<ipados-root>`
+
+A directory holding the root filesystem, given to gexc with `--sysroot`;
+the guest sees its files through host passthrough. gexc reads from it:
+
+- dyld, at the path the program's `LC_LOAD_DYLINKER` names
+  (`<ipados-root>/usr/lib/dyld`);
+- the shared cache, at
+  `<ipados-root>/System/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64`,
+  with its subcaches beside it. iOS 17 keeps the shared cache in the
+  SystemOS cryptex, so the cryptex's contents go under
+  `System/Cryptexes/OS`. `GEX_DARWIN_CACHE` names another location for the
+  cache's main file.
+
+The test runner copies its programs into `<ipados-root>/var/tmp/`, so the
+directory must be writable.
+
+### The boot payload, `<ipados-boot>`
+
+A directory named by `GEX_DARWIN_BOOT`, holding what the boot loader and
+the kernelcache would give the kernel. Each file is optional, but what is
+missing has effects:
+
+| file | what it is | without it |
+|------|------------|------------|
+| `TrustCache` | the trust cache bundle the boot loader hands the kernel at `/chosen/memory-map/TrustCache`: a module count, each module's offset, then the modules, the first being the static trust cache | there are no trust caches, and AMFI runs no code |
+| `sandbox_profile.bin` | the Sandbox kext's platform profile, a compiled profile blob from the kernelcache | every Sandbox check is reported and refused (EPERM) |
+| `DeviceTree` | the flattened device tree: the payload of the IPSW's device tree image (an IM4P) for this device | the IOKit registry has no device tree, which is reported |
+
+A `TrustCache` that does not load stops the boot. `tools/darwin-trust-cache.py`
+makes the bundle from the IPSW's static trust cache (its IM4P-wrapped
+`.trustcache`, or a raw module), adding the cdhashes of any signed Mach-O
+files you name:
+
+```sh
+python3 tools/darwin-trust-cache.py -o <ipados-boot>/TrustCache \
+    --static <static-trust-cache> [your-programs...]
 ```
 
-`page/README.md` describes the two builds (`make page-sp` is the
-single-thread one), the runtime package (`make runtime`) and ejected
-programs' sites.
+`--bundle <file>` takes an existing bundle's first module instead of
+`--static`. The repository has no tool to extract `sandbox_profile.bin`
+from a kernelcache or to unwrap the device tree's IM4P.
 
-### Run a Windows program
+AMFI treats code as platform code when its cdhash is in the static trust
+cache, and requires dyld to be platform code. The other path, a CMS
+signature checked by CoreTrust and amfid, is not implemented, and an ad hoc
+signature outside the trust cache is refused, as on iOS. So a program of
+your own runs only once it is signed (ad hoc is enough) and its cdhash is
+in the bundle, as the test runner does for its programs.
 
-```console
-$ make wine
-...
-WINE64_DIST=...
-WINE64_PREFIX=...
+## Running a program
+
+`gexc run` recognises a thin 64-bit Mach-O file and runs it on the Darwin
+personality. (A fat file is taken apart by `execve` inside the guest, not
+by `gexc run`.) A dynamic program starts in dyld, read from the root, and
+needs `--sysroot`; place the program inside the root so that its own path
+resolves in the guest.
+
+```sh
+codesign -s - -f my-tool
+python3 tools/darwin-trust-cache.py -o <ipados-boot>/TrustCache \
+    --static <static-trust-cache> my-tool
+cp my-tool <ipados-root>/var/tmp/
+
+GEX_DARWIN_BOOT=<ipados-boot> target/release/gexc run \
+    --sysroot <ipados-root> <ipados-root>/var/tmp/my-tool arg1 arg2
+
+# Stop at the first thing the kernel does not implement.
+GEX_DARWIN_BOOT=<ipados-boot> GEX_DARWIN_STRICT=1 target/release/gexc run \
+    --sysroot <ipados-root> <ipados-root>/var/tmp/my-tool
 ```
 
-`wine/README.md` covers running a program on it.
+A static program (no `LC_LOAD_DYLINKER`) needs no root:
+`gexc run <program>`, with `GEX_DARWIN_BOOT` set as above.
 
-### Build a program with gexcc
+What gexc sets up:
 
-```console
-$ make gexcc
-...
-out/gexcc/bin/gexcc
-$ out/gexcc/bin/gexcc -O2 -o hello hello.c && target/x86/release/gexc run hello
+| setting | effect |
+|---|---|
+| `GEX_DARWIN_BOOT` | the boot payload (above); the system boots from it once, and an `execve` runs on the same system |
+| `GEX_DARWIN_STRICT=1` | strict mode (above) |
+| `GEX_DARWIN_CACHE` | the shared cache's main file, when it is not at the root's cryptex path |
+| environment | without `--env` or `--host-env`, `PATH=/usr/bin:/bin` and `HOME=/var/mobile` |
+| `MallocNanoZone=0` | added unless the environment sets `MallocNanoZone`: libmalloc's nano allocator claims a fixed region at `0x2_8000_0000`, where gex places programs |
+| identity | the host user's ids, or `--uid`; `/sbin/launchd` runs as root and pid 1, and any other program as a child of a pid 1 that is the kernel's own |
+| memory | always a 64-bit guest memory (`--mem32` is refused): Darwin images live above 4 GiB |
+
+The other `gexc run` options (`--strace`, `--env`, `--cwd`, `--argv0`, and
+the rest in `gexc help`) apply as they do to Linux programs. `gexc dsc-info
+<dyld_shared_cache> [--images] [--check-slide]` prints what gex reads from
+a shared cache.
+
+## Running the tests
+
+```sh
+cargo build --release -p gexc
+tests/darwin/build.sh
+
+# Every program:
+GEX_DARWIN_ROOT=<ipados-root> GEX_DARWIN_BOOT=<ipados-boot> tests/darwin/run.sh
+
+# Some, by name:
+GEX_DARWIN_ROOT=<ipados-root> GEX_DARWIN_BOOT=<ipados-boot> \
+    tests/darwin/run.sh hello dispatch xpc-anon
 ```
 
-### What the build needs
+`run.sh` runs each program under gexc and compares its output and exit
+status with what it expects, printing `PASS`, `FAIL` or `SKIP` for each; it
+exits 1 when any fails. It builds the programs first when
+`tests/darwin/bin/` is missing, and needs `python3` for the trust cache.
 
-- the Rust toolchain from `rust-toolchain.toml` (it installs the
-  `wasm32-unknown-unknown` target);
-- clang and `wasm-ld` (LLVM 22), and Node.js 22;
-- for the page: Emscripten (`emsdk`) and `wasm-tools`
-  (`cargo install wasm-tools`);
-- for Wine: the host's MinGW-w64 GCC 12 (`x86_64-w64-mingw32-gcc`, and
-  `i686-w64-mingw32-gcc` for WoW64); it is a prerequisite, not a pin;
-- for AArch64 tests: `qemu-aarch64` as the reference. The musl cross
-  toolchains are fetched by `make toolchains` at the versions in
-  `toolchain/pins`.
+| variable | effect |
+|---|---|
+| `GEXC` | the gexc to run (default `target/release/gexc`) |
+| `GEX_DARWIN_ROOT` | the root for the dynamic programs, which run from its `/var/tmp`. Without it they are skipped, or fail when named |
+| `GEX_DARWIN_BOOT` | the device's boot payload. Its trust cache, with the test programs' cdhashes added, goes to `tests/darwin/bin/boot/TrustCache`, with its `DeviceTree` and `sandbox_profile.bin` beside it, and gexc boots from there. Without it, the trust cache holds the test programs only |
 
-Fetched sources (musl, LLVM, Wine) are kept in bare mirrors under
-`~/.cache/gex` (`CACHE=`). A rerun fetches nothing it already has. The
-Makefile's header lists the settings.
+`GEX_DARWIN_STRICT=1` reaches gexc from the environment as well. The
+runner discards each program's stderr, so run a failing program directly
+under gexc to see its reports.
 
-## Tests
+The kernel's and loader's unit tests run with `cargo test -p gex-kernel`
+and `cargo test -p gex-ld`.
 
-`make test` runs the runtime's tests (`node test/run.mjs`; `test/README.md`
-gives its options, passed as `ARGS="..."`). `make check` runs each crate's
-own tests (`cargo test`). Every other test lives in the gexdev repository.
+## Repository layout
+
+The Darwin work, beside upstream's tree:
+
+| path | what it is |
+|------|------------|
+| `crates/gex-kernel/src/darwin/` | the Darwin personality, one module per subsystem; `ipc/` is Mach IPC |
+| `crates/gex-kernel/src/darwin/sysno.rs` | the BSD call numbers, generated by `tools/darwin-gen-sysno.py` |
+| `crates/gex-kernel/src/darwin/sysctl_nodes.rs` | the kernel's sysctl nodes, generated by `tools/darwin-sysctl-nodes.py` |
+| `crates/gex-kernel/src/` (the rest) | the shared kernel: the dispatch, processes, signals, pipes, sockets and VFS, extended for Darwin's needs |
+| `crates/gex-ld/src/macho.rs`, `dsc.rs` | Mach-O loading; the dyld shared cache |
+| `crates/gex-abi/src/crypto.rs` | the A64 cryptographic extension |
+| `crates/gexc/src/darwin_run.rs`, `dsc_info.rs` | `gexc run` for Mach-O; `gexc dsc-info` |
+| `hosts/native/src/darwin_image.rs` | a Darwin program's image, as exec loads it |
+| `tests/darwin/src/` | the test programs, and the entitlements some are signed with |
+| `tests/darwin/build.sh`, `run.sh` | building and running them |
+| `tools/darwin-trust-cache.py` | making a trust cache bundle |
+| `tools/darwin-gen-sysno.py` | `sysno.rs` from XNU's `syscalls.master` at a tag (fetched from Apple's open source) |
+| `tools/darwin-sysctl-nodes.py` | `sysctl_nodes.rs` from a kernelcache (a 64-bit Mach-O) |
+
+## Status
+
+### What the suite covers
+
+Each program in `tests/darwin/src/` checks one area against XNU's rules and
+prints a line `run.sh` expects. Five are static (`hello-static`,
+`bsd-carry`, `commpage`, `exclusive-pair`, `aes`); the rest run through
+dyld and libSystem from the device's shared cache.
+
+| area | programs |
+|------|----------|
+| entry, the commpage and the CPU | `hello-static`, `bsd-carry`, `commpage`, `exclusive-pair`, `aes`, `hello`, `apple`, `pages`, `pagezero` |
+| clocks and the host | `timebase`, `boottime`, `machclock`, `hoststat`, `loadavg`, `atmflag`, `sysctlnodes` |
+| threads and synchronization | `pthread`, `pshared`, `psem`, `thcwd`, `threadsuspend`, `threadstate`, `threadpolicy`, `taskthreads`, `workinterval`, `eventlink` |
+| libdispatch, CoreFoundation, XPC | `dispatch`, `dispatch-signal`, `wlqos`, `cfrunloop`, `xpc-anon` |
+| processes | `fork`, `exec`, `spawn`, `spawnfa`, `spawnports`, `setexec`, `setexecbad`, `startsusp`, `wait`, `sigchld`, `nocldwait`, `exitreason`, `procknote`, `jobctl`, `pidhold`, `tasksuspend` |
+| identity and process information | `creds`, `persona`, `killperm`, `uniqueid`, `procinfo`, `kernproc`, `fdinfo`, `fpinfo`, `ipcfd`, `coalition` |
+| policy and resources | `taskpolicy`, `priority`, `procpolicy`, `cpumon`, `rlimit`, `rlimitctl`, `cputime`, `vtimer`, `itimer`, `memlimit` |
+| signals and exceptions | `sighandler`, `sigthread`, `sigwait`, `sigio`, `procmask`, `excports`, `excdeliver`, `efault`, `protect` |
+| Mach IPC | `portrefs`, `crosstask`, `taskname`, `readports`, `extractright`, `sonce`, `rcvlarge`, `guardesc`, `circular`, `voucherx`, `importance`, `lockimp`, `watchport` |
+| memory | `mmapflags`, `madvise`, `msync`, `mlock`, `vmregion`, `vmcopy`, `vmwx`, `jit` |
+| files | `fsops`, `pathrules`, `pathconf`, `statino`, `statfsino`, `dirino`, `setattr`, `xattr`, `clone`, `renameswap`, `lockf`, `lastclose`, `guarded`, `fileport`, `filesec`, `openmode`, `vectored`, `aio`, `fixedcalls`, `ioctl`, `realdev` |
+| kqueue, poll and pipes | `kq-pipe`, `vnode`, `vnextend`, `select`, `poll`, `pipe`, `timeouts` |
+| terminals and `/dev` | `pty`, `ptyjob`, `ptyclose`, `bsdpty`, `ttyinfo`, `ttydead`, `ttydrain`, `fcntltty`, `revoke`, `devfs`, `devattr` |
+| sockets | `sockerr`, `sockevent`, `sockname`, `sockopts`, `halfclose`, `nosigpipe`, `dgrambuf`, `streambuf` |
+| code signing and IOKit | `codesig`, `amfi`, `policy`, `iokit`, `ioreg` |
+
+The suite runs single programs and the processes they create. None of it
+boots launchd or runs an app.
+
+### Known gaps
+
+What follows is grouped from the kernel's own "not implemented" reports and
+the limits its comments state. It is a summary, not the full list: the code
+is the reference (search `crates/gex-kernel/src/` for
+`darwin_unimplemented`, `note_unimplemented` and `Unported`).
+
+- **The browser.** The page runs no Darwin process yet.
+- **Code signing.** Only the static trust cache is consulted; trust caches
+  loaded at run time (by AMFI's user client, after a cryptex's manifest is
+  checked) are not. CMS signatures (CoreTrust and amfid) are not
+  implemented. AMFI's launch constraints are not implemented: an image
+  whose trust cache entry has a constraint category, or that carries its
+  own constraints, is refused (EPERM). AMFI's `__mac_syscall` calls for
+  local signing, trust cache loading and launch constraints are reported.
+- **Sandbox.** Only the platform profile is evaluated; no process has a
+  profile of its own. Filters whose facts the kernel does not have, some
+  `sandbox_check` filter types, `sandbox_check` of another process, and
+  Sandbox's `__mac_syscall` calls are reported.
+- **IOKit.** The registry holds the device tree and the APFS services
+  only; no `IOService` driver is present. `IOConnectCallMethod` on a
+  driver, `iokit_user_client_trap`, and matching dictionaries of kinds not
+  handled are reported.
+- **Mach.** The traps `clock_sleep`, `debug_control_port_for_pid` and
+  `iokit_user_client_trap`; MIG routines not in `mig.rs`, and some
+  `task_info`, `thread_info`, `host_statistics` and `task_policy_get`
+  flavors; `task_for_pid` and its read and inspect forms on another
+  process; a fault's exception (`EXC_BAD_ACCESS` and the like) sent to a
+  handler the program set, which is reported and taken as a signal instead;
+  telling an `EXC_CRASH` handler of a death outside a system call; corpses
+  (`EXC_CORPSE_NOTIFY`, and the corpse an `EXC_RESOURCE` or simulated
+  `EXC_GUARD` would make); handlers of `EXCEPTION_IDENTITY_PROTECTED`
+  behavior; hardware breakpoints, watchpoints and single step.
+- **Memory.** Purgeable memory, 4 GB chunks and other `mach_vm_allocate`
+  and `mach_vm_map` flags not handled, `MAP_TPRO`, reuse advice on a
+  region a fork left copy-on-write, the freezer, and the
+  `memorystatus_control` commands that need a memory model. A POSIX shared
+  memory object is copied into each mapping, so its mappings agree only at
+  `msync` and `munmap`, and a second mapping is reported. Memory pressure is
+  never posted: the level stays normal.
+- **Files and devices.** The filesystems keep no file owners and no access
+  control lists, so the `chown` family and ACLs are refused and reported.
+  Also reported: `mount`, `mkfifo` and `mknod`, `fsctl`, `F_PREALLOCATE`,
+  data protection classes, `fsgetpath` by object id, resource fork offsets,
+  `RENAME_SECLUDE`, and opening a device whose driver is not modelled.
+- **Sockets.** Interface `ioctl`s know only `lo0`. Out-of-band data,
+  `SO_LINGER`, `SO_DONTROUTE`, `SO_OOBINLINE`, address sharing
+  (`SO_REUSEADDR`, `SO_REUSEPORT`) when a bind is refused, keepalive probes
+  on a connection the host carries, broadcast datagrams, a socket's owner
+  (`so_pgid`), descriptors in a Unix datagram socket's control messages,
+  `EVFILT_SOCK`, `EVFILT_EXCEPT` on a socket, and socket `ioctl`s not
+  handled are reported.
+- **Processes and signals.** Darwin signals with no Linux number, `ptrace`
+  requests not handled, `wait4`'s resource usage, `settid`, cancelling a
+  thread blocked in a BSD call, process-shared psynch objects and ulocks in
+  memory another process maps, `__mac_execve` with a label, and
+  `posix_spawn` with a subsystem root path or an audit session port action.
+- **Accounting.** What needs ledgers the kernel does not keep: a
+  coalition's resource usage, the CPU monitor's actions on a violation, the
+  task-wide CPU limit, the wakeups monitor, workloop CPU limits. On a host
+  without per-thread clocks, the virtual timers, `RLIMIT_CPU`, the CPU
+  monitor, the workqueue's quantum and `getrusage`'s times are reported; on
+  one that cannot say which pages are a task's, `phys_footprint` is.
+- **Terminals.** Terminal `ioctl`s not handled, an `fcntl` that would sleep
+  in the driver, calls that would wait for a revoke to finish, and parts of
+  `revoke` itself.
+- **Other.** `EVFILT_FS`, `NOTE_WL_SYNC_IPC` on a workloop, writes to the
+  `sysctl` nodes that only have a fixed value here, the nodes this kernel
+  has no value for, and some `proc_info` flavors and `iopolicysys` types.
 
 ## Licence
 
-gex is free software under the GNU Affero General Public License, version 3
-only (`LICENSE`). Copyright (C) 2026 Puter Technologies Inc. Third-party
-code keeps its own licence; `NOTICE` lists it.
+The fork keeps upstream's licence. gex is free software under the GNU
+Affero General Public License, version 3 only (`LICENSE`), Copyright (C)
+2026 Puter Technologies Inc. Third-party code keeps its own licence;
+`NOTICE` lists it. The Darwin work is part of this repository and carries
+no other licence.
+
+iPadOS and its files are Apple's and are not part of this repository.

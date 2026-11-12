@@ -76,7 +76,7 @@ pub fn run(mut ra: RunArgs, bytes: &[u8]) -> Result<ExitCode> {
     ra.opts.jit = ra.jit;
     // Darwin images live above 4 GiB: always a 64-bit memory.
     if ra.mem64 == Some(false) {
-        bail!("--no-mem64: a Darwin program's images are above 4 GiB");
+        bail!("--mem32: a Darwin program's images are above 4 GiB");
     }
     ra.mem64 = Some(true);
     choose_mem(&mut ra, true)?;

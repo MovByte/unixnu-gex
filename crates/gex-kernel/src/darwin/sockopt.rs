@@ -34,7 +34,10 @@ pub mod so {
     pub const RCVBUF: u32 = 0x1002;
     pub const SNDLOWAT: u32 = 0x1003;
     pub const RCVLOWAT: u32 = 0x1004;
+    pub const NREAD: u32 = 0x1020;
     pub const NOSIGPIPE: u32 = 0x1022;
+    pub const NWRITE: u32 = 0x1024;
+    pub const NUMRCVPKT: u32 = 0x1112;
     pub const LINGER_SEC: u32 = 0x1080;
 }
 
@@ -46,8 +49,6 @@ const MCLBYTES: u32 = 2048;
 const HZ: i64 = 100;
 /// Marks an IPPROTO_TCP option's name apart from the socket-level ones.
 const TCP_LEVEL: u32 = 0x8000_0000;
-/// `ENOBUFS`, in the canonical numbering the errors here are carried in.
-const ENOBUFS: Errno = Errno(105);
 
 /// The options of one socket.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +85,29 @@ impl SockOpts {
             nosigpipe: false,
         }
     }
+
+    /// `sonewconn`: a connection's new socket's options from its
+    /// listener's: `so_options` but `SO_ACCEPTCONN`, the linger and
+    /// `SOF_NOSIGPIPE`, buffers of the listener's sizes and the low-water
+    /// marks `soreserve` gives a new socket.
+    pub fn inherited(head: &SockOpts, snd_hiwat: u32, rcv_hiwat: u32) -> SockOpts {
+        SockOpts {
+            options: head.options & !so::ACCEPTCONN,
+            linger: head.linger,
+            rcv_hiwat,
+            snd_hiwat,
+            rcv_lowat: 1,
+            snd_lowat: MCLBYTES.min(snd_hiwat),
+            tcp_nodelay: false,
+            nosigpipe: head.nosigpipe,
+        }
+    }
+
+    /// `soreserve`'s for a socket that has set none: buffers of the given
+    /// sizes, a receive low-water mark of 1 and a send one of MCLBYTES.
+    pub fn reserved(snd_hiwat: u32, rcv_hiwat: u32) -> SockOpts {
+        SockOpts { options: 0, linger: 0, rcv_hiwat, snd_hiwat, rcv_lowat: 1, snd_lowat: MCLBYTES.min(snd_hiwat), tcp_nodelay: false, nosigpipe: false }
+    }
 }
 
 /// `sbreserve`: a buffer's high-water mark set to `cc` (no more than
@@ -113,10 +137,25 @@ impl Kernel {
         Ok((file, st))
     }
 
-    /// The options of a socket's open file, as they are now.
+    /// The options of a socket's open file, as they are now: kept with
+    /// the socket when it keeps them, its buffers' sizes its own when it
+    /// keeps those.
     pub(crate) fn darwin_sockopts(file: &crate::file::OpenFile, st: &SoState) -> SockOpts {
-        let g = file.darwin_sockopt.lock().unwrap_or_else(|e| e.into_inner());
-        g.unwrap_or_else(|| SockOpts::attached(st))
+        let kept = file.handle.xnu_sockopts().or_else(|| *file.darwin_sockopt.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut o = kept.unwrap_or_else(|| SockOpts::attached(st));
+        if st.live_hiwat {
+            o.rcv_hiwat = st.hiwat.0 as u32;
+            o.snd_hiwat = st.hiwat.1 as u32;
+        }
+        o
+    }
+
+    /// Keep a socket's options: with the socket when it keeps them, else
+    /// with its open file.
+    fn darwin_store_sockopts(file: &crate::file::OpenFile, o: SockOpts) {
+        if !file.handle.set_xnu_sockopts(o) {
+            *file.darwin_sockopt.lock().unwrap_or_else(|e| e.into_inner()) = Some(o);
+        }
     }
 
     /// `setsockopt(s, level, name, val, valsize)` for the socket-level
@@ -126,7 +165,7 @@ impl Kernel {
         if level == IPPROTO_TCP {
             return self.darwin_tcp_option(fd, name).map(|r| r.and_then(|()| self.darwin_setsockopt_in(m, fd, name | TCP_LEVEL, val, valsize)));
         }
-        if level != SOL_SOCKET || !handled(name) {
+        if level != SOL_SOCKET || !(handled(name) || matches!(name, so::NREAD | so::NWRITE | so::NUMRCVPKT)) {
             return None;
         }
         Some(self.darwin_setsockopt_in(m, fd, name, val, valsize))
@@ -150,6 +189,8 @@ impl Kernel {
         };
         let mut o = Self::darwin_sockopts(&file, &st);
         match name {
+            // Counts to read, with no case of their own to set.
+            so::NREAD | so::NWRITE | so::NUMRCVPKT => return Err(Errno::ENOPROTOOPT),
             so::LINGER | so::LINGER_SEC => {
                 let b = copyin(8)?;
                 let (onoff, secs) = (i32::from_le_bytes(b[0..4].try_into().unwrap()), i32::from_le_bytes(b[4..8].try_into().unwrap()));
@@ -182,18 +223,20 @@ impl Kernel {
                 match name {
                     so::SNDBUF => {
                         if !sbreserve(&mut o.snd_hiwat, &mut o.snd_lowat, v) {
-                            return Err(ENOBUFS);
+                            return Err(Errno::ENOBUFS);
                         }
+                        file.handle.xnu_reserve(true, o.snd_hiwat as usize);
                     }
                     so::RCVBUF => {
                         if !sbreserve(&mut o.rcv_hiwat, &mut o.rcv_lowat, v) {
-                            return Err(ENOBUFS);
+                            return Err(Errno::ENOBUFS);
                         }
+                        file.handle.xnu_reserve(false, o.rcv_hiwat as usize);
                     }
                     so::SNDLOWAT => {
                         // A unix stream's send space is its peer's receive
                         // buffer, counted with what waits there.
-                        let hiwat = if st.unix_stream { o.snd_hiwat.saturating_add(st.snd_used as u32) } else { o.snd_hiwat };
+                        let hiwat = if st.unix_stream { o.snd_hiwat.wrapping_add(st.unp_cc as u32) } else { o.snd_hiwat };
                         o.snd_lowat = v.min(hiwat);
                     }
                     _ => {
@@ -212,7 +255,7 @@ impl Kernel {
             so::NOSIGPIPE => o.nosigpipe = i32::from_le_bytes(copyin(4)?[..4].try_into().unwrap()) != 0,
             _ => unreachable!("an option kept here"),
         }
-        *file.darwin_sockopt.lock().unwrap_or_else(|e| e.into_inner()) = Some(o);
+        Self::darwin_store_sockopts(&file, o);
         Ok(0)
     }
 
@@ -224,7 +267,7 @@ impl Kernel {
         if level == IPPROTO_TCP {
             return self.darwin_tcp_option(fd, name).map(|r| r.and_then(|()| self.darwin_getsockopt_in(m, fd, name | TCP_LEVEL, val, avalsize)));
         }
-        if level != SOL_SOCKET || !(handled(name) || name == so::ACCEPTCONN) {
+        if level != SOL_SOCKET || !(handled(name) || matches!(name, so::ACCEPTCONN | so::NREAD | so::NWRITE | so::NUMRCVPKT)) {
             return None;
         }
         Some(self.darwin_getsockopt_in(m, fd, name, val, avalsize))
@@ -242,11 +285,32 @@ impl Kernel {
             }
             // The option's own bit, not 1.
             so::DEBUG | so::KEEPALIVE | so::DONTROUTE | so::USELOOPBACK | so::BROADCAST | so::REUSEADDR | so::REUSEPORT | so::OOBINLINE => (o.options & name).to_le_bytes().to_vec(),
+            // A unix stream's adds what waits in its peer's buffer.
             so::SNDBUF => {
-                let hiwat = if st.unix_stream { o.snd_hiwat.saturating_add(st.snd_used as u32) } else { o.snd_hiwat };
+                let hiwat = if st.unix_stream { o.snd_hiwat.wrapping_add(st.unp_cc as u32) } else { o.snd_hiwat };
                 hiwat.to_le_bytes().to_vec()
             }
             so::RCVBUF => o.rcv_hiwat.to_le_bytes().to_vec(),
+            // An atomic protocol's first record's data; a stream's bytes of
+            // data.
+            so::NREAD | so::NUMRCVPKT if !st.exact => {
+                self.darwin_unimplemented(format!("getsockopt {name:#x} on {}, whose receive buffer is not counted as XNU counts it", file.path));
+                return Err(Errno::EOPNOTSUPP);
+            }
+            so::NREAD => match st.records {
+                Some((_, first)) => (first as i32).to_le_bytes().to_vec(),
+                None => ((st.rcv - st.ctl) as i32).to_le_bytes().to_vec(),
+            },
+            so::NUMRCVPKT => match st.records {
+                Some((n, _)) => (n as i32).to_le_bytes().to_vec(),
+                None => return Err(Errno::ENOPROTOOPT),
+            },
+            // The send buffer's sb_cc: a unix socket's sends wait in its
+            // peer's receive buffer, never in its own.
+            so::NWRITE => {
+                let cc = if st.unix_stream { 0 } else { st.snd_used };
+                (cc as i32).to_le_bytes().to_vec()
+            }
             so::SNDLOWAT => o.snd_lowat.to_le_bytes().to_vec(),
             so::RCVLOWAT => o.rcv_lowat.to_le_bytes().to_vec(),
             n if n == TCP_NODELAY | TCP_LEVEL => (if o.tcp_nodelay { TF_NODELAY } else { 0 }).to_le_bytes().to_vec(),
@@ -273,7 +337,7 @@ impl Kernel {
         }
         let mut o = Self::darwin_sockopts(&file, &st);
         o.nosigpipe = on;
-        *file.darwin_sockopt.lock().unwrap_or_else(|e| e.into_inner()) = Some(o);
+        Self::darwin_store_sockopts(&file, o);
         Ok(())
     }
 

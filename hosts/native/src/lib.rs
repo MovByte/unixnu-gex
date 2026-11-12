@@ -2312,6 +2312,17 @@ fn perform_block(
             }
             turn!(file_lock, seen);
         },
+        // A Darwin socket's send with no room before its first byte: only
+        // the wait, for the call to be made again by the kernel, which has
+        // the descriptor table its control's descriptors come from.
+        BlockOp::WriteWait { handle, resid, clen } => loop {
+            let seen = ready::seq();
+            service(data);
+            if handle.send_ready(resid, clen) {
+                return Ok(0);
+            }
+            turn!(write_wait, seen);
+        },
         BlockOp::AcceptWait { socket } => {
             // Only the wait: the descriptor is made by the kernel afterwards,
             // which is the one place that has a descriptor table.
@@ -2546,7 +2557,7 @@ mod blocked {
             }
         )*};
     }
-    waits!(connect, poll, write_stream, read_stream, sigsuspend, sigwait, accept, file_lock);
+    waits!(connect, poll, write_stream, write_wait, read_stream, sigsuspend, sigwait, accept, file_lock);
 
     /// A sleep's (nanosleep, a Windows program's `Sleep`).
     #[inline(never)]
