@@ -8,9 +8,9 @@
 # Without one it is skipped, or fails when it was asked for by name.
 #
 # The system boots with the device's payload (GEX_DARWIN_BOOT: its trust
-# cache bundle and the Sandbox's platform profile) with these programs'
-# cdhashes added to its static trust cache, as an owner adds their own
-# code: AMFI runs only trusted code.
+# cache bundle and the Sandbox's platform profile and profile collections)
+# with these programs' cdhashes added to its static trust cache, as an
+# owner adds their own code: AMFI runs only trusted code.
 set -u
 
 HERE=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
@@ -32,9 +32,11 @@ fi
 if [ -n "${GEX_DARWIN_BOOT:-}" ] && [ -f "$GEX_DARWIN_BOOT/DeviceTree" ]; then
     cp "$GEX_DARWIN_BOOT/DeviceTree" "$BOOT/"
 fi
-if [ -n "${GEX_DARWIN_BOOT:-}" ] && [ -f "$GEX_DARWIN_BOOT/sandbox_profile.bin" ]; then
-    cp "$GEX_DARWIN_BOOT/sandbox_profile.bin" "$BOOT/"
-fi
+for f in sandbox_profile.bin sandbox_builtin.bin sandbox_protobox.bin; do
+    if [ -n "${GEX_DARWIN_BOOT:-}" ] && [ -f "$GEX_DARWIN_BOOT/$f" ]; then
+        cp "$GEX_DARWIN_BOOT/$f" "$BOOT/"
+    fi
+done
 export GEX_DARWIN_BOOT="$BOOT"
 
 fail=0
@@ -246,6 +248,17 @@ hello from /var/tmp/gex-exec-fat with 1 argument" 0
         fi
         check_root amfi "amfi ok" 0
         ;;
+    sbxinit) check_root sbxinit "sbxinit ok" 0 ;;
+    sbxexec) check_root sbxexec "sbxexec ok" 0 ;;
+    sbxkill)
+        if [ -n "${GEX_DARWIN_ROOT:-}" ]; then
+            mkdir -p "$GEX_DARWIN_ROOT/var/tmp"
+            for c in sbxstacked sbxnotstr sbxunknown sbxexec; do
+                cp "$HERE/bin/$c" "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$c"
+            done
+        fi
+        check_root sbxkill "sbxkill ok" 0
+        ;;
     cfrunloop) check_root cfrunloop "cfrunloop 3 1" 0 ;;
     xpc-anon) check_root xpc-anon "xpc-anon 42" 0 ;;
     *)
@@ -260,7 +273,7 @@ if [ "$named" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl iokit ioreg xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit cfrunloop xpc-anon; do
+    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl iokit ioreg xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit sbxinit sbxexec sbxkill cfrunloop xpc-anon; do
         run "$p"
     done
 fi

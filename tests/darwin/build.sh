@@ -23,7 +23,7 @@ for p in hello-static bsd-carry commpage exclusive-pair aes; do
         -o "$OUT/$p" "$HERE/src/$p.c"
 done
 
-for p in hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit xpc-anon; do
+for p in hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit xpc-anon sbxinit sbxexec sbxkill; do
     cc -O2 -o "$OUT/$p" "$HERE/src/$p.c"
 done
 cc -O2 -framework CoreFoundation -o "$OUT/cfrunloop" "$HERE/src/cfrunloop.c"
@@ -32,6 +32,10 @@ cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/ioreg" "$HERE/src/ior
 # amfi's: a program in no trust cache, and one holding get-task-allow.
 cc -O2 -o "$OUT/untrusted" "$HERE/src/hello.c"
 cc -O2 -o "$OUT/gta" "$HERE/src/hello.c"
+# sbxkill's children, which their entitlements have Sandbox kill.
+for p in sbxstacked sbxnotstr sbxunknown; do
+    cc -O2 -o "$OUT/$p" "$HERE/src/sbxchild.c"
+done
 # exec's images: an arm64e slice (no pointer authentication on this CPU).
 xcrun -sdk iphoneos clang -target arm64e-apple-ios17.0 -O2 -o "$OUT/hello-arm64e" "$HERE/src/hello.c"
 # Every iOS program is signed (the linker leaves one unsigned): ad hoc,
@@ -56,6 +60,11 @@ codesign -s - -f -i com.apple.test.xnu.jitbox --entitlements "$HERE/src/jit.enti
 codesign -s - -f --entitlements "$HERE/src/workinterval.entitlements" "$OUT/workinterval" 2>/dev/null
 # atmflag sets the ATM diagnostic flag, which its entitlement allows.
 codesign -s - -f --entitlements "$HERE/src/atmflag.entitlements" "$OUT/atmflag" 2>/dev/null
+# sbxexec's seatbelt-profiles entitlement names the builtin profile its exec
+# gives it; sbxkill's children name two, a number, and an unknown name.
+for p in sbxexec sbxstacked sbxnotstr sbxunknown; do
+    codesign -s - -f --entitlements "$HERE/src/$p.entitlements" "$OUT/$p" 2>/dev/null
+done
 # The exception tests set handlers of every behavior: a platform program
 # (a hardened one) may only with the entitlement that allows it.
 for p in excports excdeliver readports; do
