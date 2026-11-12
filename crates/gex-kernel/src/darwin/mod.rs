@@ -259,6 +259,9 @@ pub struct Task {
     pub filter_msg: bool,
     /// What the exec in progress keeps for Sandbox's hook.
     pub exec_sandbox: Option<sandboxes::Pending>,
+    /// A spawned child's activation, done in its parent's call
+    /// (`Kernel::darwin_activate`): its answer, for the child's start.
+    pub activated: Option<Result<(), crate::errno::Errno>>,
 
     /// `P_LADVLOCK`: the process has taken a POSIX record lock.
     pub ladvlock: bool,

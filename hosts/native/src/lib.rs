@@ -4005,6 +4005,7 @@ fn exec_darwin(
         Err(why) => return darwin_killed(why),
     };
     note_exec(kernel.pid, &img.path, &req.argv);
+    switch_to_darwin_image(&mut kernel, &img);
     run_darwin_image(img, loaded, req.argv, req.envp, opts, xlate, kernel, proc_state, wayland)
 }
 
@@ -4028,7 +4029,32 @@ fn load_darwin_image(kernel: &Kernel, img: &gex_kernel::darwin::execve::Image) -
     Ok(loaded)
 }
 
-/// The process switched over to a loaded image and run.
+/// The process switched over to a loaded image: the other threads are
+/// gone, and the signal actions are the new image's; then what the process
+/// keeps of its task.
+fn switch_to_darwin_image(kernel: &mut Kernel, img: &gex_kernel::darwin::execve::Image) {
+    let tid = if kernel.sig_tid != 0 { kernel.sig_tid } else { kernel.tid };
+    kernel.exec_signals(tid);
+    kernel.exe_path = img.path.clone();
+    kernel.darwin_exec_switch(img.spawn.as_ref(), img.thread_id);
+}
+
+/// What `darwin_start` is told of a loaded image: its header's address,
+/// dyld, its stack size and signature.
+fn darwin_loaded<'a>(img: &'a gex_kernel::darwin::execve::Image, loaded: &'a crate::darwin_image::DarwinImage) -> gex_kernel::darwin::exec::Loaded<'a> {
+    gex_kernel::darwin::exec::Loaded {
+        mach_header: loaded.program.exe.segments.iter().map(|s| s.vaddr).min().unwrap_or(0),
+        dylinker: loaded.dylinker.as_deref().filter(|_| loaded.program.interp.is_some()),
+        stacksize: loaded.stacksize,
+        exe_path: &img.path,
+        file_start: img.arch_offset,
+        code_signature: loaded.code_signature.as_deref(),
+        signature: Some(img.load.clone()),
+        nano: img.spawn.as_ref().is_some_and(|sp| sp.flags & gex_kernel::darwin::spawn::flag::NANO_ALLOCATOR != 0),
+    }
+}
+
+/// The process, switched over to a loaded image, run.
 #[allow(clippy::too_many_arguments)]
 fn run_darwin_image(
     img: Box<gex_kernel::darwin::execve::Image>,
@@ -4041,12 +4067,6 @@ fn run_darwin_image(
     proc_state: Arc<ProcCell>,
     wayland: Option<wayland::Wayland>,
 ) -> Result<(Exit, Stats)> {
-    // The other threads are gone, and the signal actions are the new
-    // image's; then what the process keeps of its task.
-    let tid = if kernel.sig_tid != 0 { kernel.sig_tid } else { kernel.tid };
-    kernel.exec_signals(tid);
-    kernel.exe_path = img.path.clone();
-    kernel.darwin_exec_switch(img.spawn.as_ref(), img.thread_id);
     let path = img.path.clone();
     // Its string area, for the new stack (`darwin_start`).
     kernel.darwin_exec = Some(img);
@@ -4100,6 +4120,13 @@ fn start_darwin_spawn(cx: &SpawnContext, mut child: Kernel) -> std::result::Resu
             return fail(&mut child, e);
         }
     };
+    // The child switched over to its image and the image activated, its
+    // signature and labels set (exec_activate_image, process_signature),
+    // before the call returns; a policy's refusal kills the child at its
+    // start, as process_signature's SIGKILL of a spawn's child does.
+    switch_to_darwin_image(&mut child, &img);
+    child.dtask.platform = loaded.platform;
+    child.darwin_activate(&darwin_loaded(&img, &loaded));
     // exec_mach_imgact's P_EXEC and posix_spawn's NOTE_EXEC for the child,
     // before the call returns.
     procs.set_execed(pid);

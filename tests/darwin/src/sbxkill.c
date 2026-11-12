@@ -2,8 +2,9 @@
 // names two profiles (stacked profiles are not supported), holds a value
 // that is not a name, or names no builtin profile: a spawn's child dies of
 // SIGKILL. A child its entitlement gives a sandbox is seen to have one by
-// another process's sandbox_check, which has none itself, once the child
-// runs. The children are this program's siblings: its path with "sbxkill"
+// another process's sandbox_check, which has none itself, as soon as
+// posix_spawn returns: the exec's label update is done in the parent's
+// call. The children are this program's siblings: its path with "sbxkill"
 // replaced.
 
 #include <errno.h>
@@ -52,24 +53,19 @@ int main(int argc, char **argv) {
     memcpy(prefix, self, at - self);
     prefix[at - self] = 0;
     if (!killed("sbxstacked") || !killed("sbxnotstr") || !killed("sbxunknown")) return 1;
-    // A sandboxed child, which says it runs and waits on a pipe.
-    int fds[2], ready[2];
-    if (pipe(fds) != 0 || pipe(ready) != 0) return fail("pipe", errno);
+    // A sandboxed child, which waits on a pipe.
+    int fds[2];
+    if (pipe(fds) != 0) return fail("pipe", errno);
     posix_spawn_file_actions_t fa;
     posix_spawn_file_actions_init(&fa);
     posix_spawn_file_actions_adddup2(&fa, fds[0], 0);
-    posix_spawn_file_actions_adddup2(&fa, ready[1], 1);
     posix_spawn_file_actions_addclose(&fa, fds[1]);
-    posix_spawn_file_actions_addclose(&fa, ready[0]);
     char path[1100];
     char *cargv[] = {(char *)sibling("sbxexec", path, sizeof path), "wait", NULL};
     pid_t pid;
     int e = posix_spawn(&pid, path, &fa, NULL, cargv, environ);
     if (e != 0) return fail("spawn sbxexec", e);
     close(fds[0]);
-    close(ready[1]);
-    char c;
-    if (read(ready[0], &c, 1) != 1) return fail("the child's start", errno);
     int r;
     if ((r = sandbox_check(pid, NULL, 0)) != 1) return fail("the child's sandbox", r);
     if ((r = sandbox_check(pid, "forbidden-sandbox-reinit", SANDBOX_CHECK_NO_REPORT)) != 1) return fail("the child's forbidden", r);
