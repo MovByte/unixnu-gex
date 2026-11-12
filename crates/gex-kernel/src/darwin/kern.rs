@@ -929,10 +929,9 @@ impl Kernel {
         if flag & !(AT_SYMLINK_NOFOLLOW | AT_REALDEV | AT_FDONLY | AT_SYMLINK_NOFOLLOW_ANY) != 0 {
             return Err(Errno::EINVAL);
         }
-        if flag & AT_REALDEV != 0 {
-            self.darwin_unimplemented("fstatat AT_REALDEV (the filesystem's real fsid, VA_REALFSID)".into());
-            return Err(Errno::EINVAL);
-        }
+        // AT_REALDEV (VA_REALFSID): the device is the vnode's mount's
+        // f_fsid.val[0], which every stat here reports (no filesystem here
+        // gives one of its own with VA_USEFSID).
         if flag & AT_FDONLY != 0 {
             // fp_getfvp: a vnode's descriptor.
             let file = self.fds.get(a[0] as i32)?;
