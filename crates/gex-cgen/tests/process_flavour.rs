@@ -20,6 +20,8 @@ fn program(flags: u32) -> gex_ld::elf::Image {
     let seg = gex_ld::elf::Segment {
         vaddr: 0x40_0000,
         mem_size: bytes.len() as u64,
+        file_offset: 0,
+        max_prot: 7,
         bytes,
         readable: true,
         writable: false,
@@ -30,6 +32,7 @@ fn program(flags: u32) -> gex_ld::elf::Image {
         needed: Vec::new(),
         runpath: Vec::new(),
         bias: 0x40_0000,
+        page_zero: 0,
         entry: 0x40_0040,
         code: vec![(0x40_0040, 0x40_0080)],
         segments: vec![seg],

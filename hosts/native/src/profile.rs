@@ -746,6 +746,7 @@ mod tests {
             needed: Vec::new(),
             runpath: Vec::new(),
             bias: 0,
+            page_zero: 0,
             entry: base,
             code: vec![(base, base + len)],
             segments: vec![Segment {
