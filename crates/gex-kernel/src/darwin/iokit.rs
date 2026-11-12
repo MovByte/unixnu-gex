@@ -27,10 +27,15 @@ pub enum Prop {
     Str(String),
     Bool(bool),
     Strs(Vec<String>),
+    /// An `OSNumber`: its value and its size in bits.
+    Num(u64, u32),
+    Data(Vec<u8>),
+    /// An `OSSymbol` (what `setProperty(const char *, const char *)` sets).
+    Sym(String),
 }
 
 /// The classes a service belongs to, most derived first.
-fn superclasses(class: &str) -> &'static [&'static str] {
+pub fn superclasses(class: &str) -> &'static [&'static str] {
     match class {
         "AppleAPFSVolume" => &["AppleAPFSVolume", "IOMedia", "IOStorage", "IOService", "IORegistryEntry"],
         "AppleAPFSContainerScheme" => &["AppleAPFSContainerScheme", "IOPartitionScheme", "IOStorage", "IOService", "IORegistryEntry"],
@@ -39,6 +44,8 @@ fn superclasses(class: &str) -> &'static [&'static str] {
         "IOMedia" => &["IOMedia", "IOStorage", "IOService", "IORegistryEntry"],
         "IOPlatformExpertDevice" => &["IOPlatformExpertDevice", "IOService", "IORegistryEntry"],
         "IORegistryEntry" => &["IORegistryEntry"],
+        "IOUserClient" => &["IOUserClient", "IOService", "IORegistryEntry"],
+        "AppleAPFSUserClient" => &["AppleAPFSUserClient", "IOUserClient", "IOService", "IORegistryEntry"],
         _ => &[],
     }
 }
@@ -580,6 +587,21 @@ pub fn serialize_prop(p: &Prop) -> Vec<u8> {
             b.resize((b.len() + 3) & !3, 0);
         }
         Prop::Bool(v) => b.extend_from_slice(&(K_OS_SERIALIZE_END_COLLECTION | K_OS_SERIALIZE_BOOLEAN | u32::from(*v)).to_le_bytes()),
+        // The number's size in bits, then its 64-bit value.
+        Prop::Num(v, bits) => {
+            const K_OS_SERIALIZE_NUMBER: u32 = 0x0400_0000;
+            b.extend_from_slice(&(K_OS_SERIALIZE_END_COLLECTION | K_OS_SERIALIZE_NUMBER | bits).to_le_bytes());
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        Prop::Data(d) => return serialize_data(d),
+        // The symbol's characters and NUL.
+        Prop::Sym(s) => {
+            const K_OS_SERIALIZE_SYMBOL: u32 = 0x0800_0000;
+            b.extend_from_slice(&(K_OS_SERIALIZE_END_COLLECTION | K_OS_SERIALIZE_SYMBOL | (s.len() as u32 + 1)).to_le_bytes());
+            b.extend_from_slice(s.as_bytes());
+            b.push(0);
+            b.resize((b.len() + 3) & !3, 0);
+        }
         Prop::Strs(items) => {
             const K_OS_SERIALIZE_ARRAY: u32 = 0x0200_0000;
             b.extend_from_slice(&(K_OS_SERIALIZE_END_COLLECTION | K_OS_SERIALIZE_ARRAY | items.len() as u32).to_le_bytes());
@@ -592,6 +614,273 @@ pub fn serialize_prop(p: &Prop) -> Vec<u8> {
         }
     }
     b
+}
+
+/// IOReturn codes (`IOReturn.h`).
+pub mod ret {
+    pub const SUCCESS: i32 = 0;
+    pub const ERROR: i32 = 0xe00002bc_u32 as i32;
+    pub const NO_MEMORY: i32 = 0xe00002bd_u32 as i32;
+    pub const NO_RESOURCES: i32 = 0xe00002be_u32 as i32;
+    pub const IPC_ERROR: i32 = 0xe00002bf_u32 as i32;
+    pub const NO_DEVICE: i32 = 0xe00002c0_u32 as i32;
+    pub const NOT_PRIVILEGED: i32 = 0xe00002c1_u32 as i32;
+    pub const BAD_ARGUMENT: i32 = 0xe00002c2_u32 as i32;
+    pub const UNSUPPORTED: i32 = 0xe00002c7_u32 as i32;
+    pub const VM_ERROR: i32 = 0xe00002c8_u32 as i32;
+    pub const NOT_READY: i32 = 0xe00002d8_u32 as i32;
+    pub const NOT_FOUND: i32 = 0xe00002f0_u32 as i32;
+    pub const NOT_PERMITTED: i32 = 0xe00002e2_u32 as i32;
+    pub const NO_COMPLETION: i32 = 0xe00002ea_u32 as i32;
+    pub const UNDERRUN: i32 = 0xe00002e7_u32 as i32;
+}
+
+/// `kIOUCVariableStructureSize`: a dispatch count that is not checked.
+pub const VARIABLE: u32 = 0xffff_ffff;
+
+/// `sizeof(io_struct_inband_t)`.
+pub const STRUCT_INBAND_MAX: usize = 4096;
+
+/// An `IOExternalMethodDispatch`'s checks: the scalar input count, the
+/// structure input size, the scalar output count and the structure output
+/// size a selector takes, each [`VARIABLE`] or exact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dispatch {
+    pub scalar_in: u32,
+    pub struct_in: u32,
+    pub scalar_out: u32,
+    pub struct_out: u32,
+}
+
+/// `IOExternalMethodArguments` as a method sees them: the inputs, and the
+/// outputs sized to what the caller has room for (a method lowers the
+/// counts it fills less of). An out-of-line structure is its address and
+/// size in the calling task, the `IOMemoryDescriptor` over it.
+#[derive(Clone, Debug, Default)]
+pub struct MethodArgs {
+    pub selector: u32,
+    /// An asynchronous call (io_connect_async_method: `asyncReference` set),
+    /// its `asyncWakePort` (a send right the kernel holds; none for a null
+    /// port) and its reference.
+    pub is_async: bool,
+    pub wake: Option<super::ipc::ObjId>,
+    pub reference: Vec<u64>,
+    pub scalar_in: Vec<u64>,
+    pub struct_in: Vec<u8>,
+    pub ool_in: Option<(u64, u64)>,
+    pub scalar_out: Vec<u64>,
+    pub struct_out: Vec<u8>,
+    pub ool_out: Option<(u64, u64)>,
+}
+
+impl MethodArgs {
+    /// The structure input's size: the descriptor's length, else the inband
+    /// bytes'.
+    pub fn struct_in_size(&self) -> u64 {
+        self.ool_in.map_or(self.struct_in.len() as u64, |(_, n)| n)
+    }
+
+    pub fn struct_out_size(&self) -> u64 {
+        self.ool_out.map_or(self.struct_out.len() as u64, |(_, n)| n)
+    }
+}
+
+/// `IOUserClient::externalMethod`'s checks of a dispatch entry: every count
+/// that is not [`VARIABLE`] must be the caller's (kIOReturnBadArgument).
+pub fn dispatch_check(d: &Dispatch, a: &MethodArgs) -> Result<(), i32> {
+    let ok = |want: u32, got: u64| want == VARIABLE || u64::from(want) == got;
+    if !ok(d.scalar_in, a.scalar_in.len() as u64) || !ok(d.struct_in, a.struct_in_size()) || !ok(d.scalar_out, a.scalar_out.len() as u64) || !ok(d.struct_out, a.struct_out_size()) {
+        return Err(ret::BAD_ARGUMENT);
+    }
+    Ok(())
+}
+
+/// `IOUserClient::externalMethod` without a dispatch entry: the
+/// pre-Leopard method vector, which takes no out-of-line structure
+/// (kIOReturnIPCError); a client with no vector (`getTargetAndMethodForIndex`
+/// and `getAsyncTargetAndMethodForIndex` answering none) has no method
+/// (kIOReturnUnsupported).
+pub fn no_method(a: &MethodArgs) -> i32 {
+    if a.ool_in.is_some() || a.ool_out.is_some() {
+        return ret::IPC_ERROR;
+    }
+    ret::UNSUPPORTED
+}
+
+/// What kind of user client one is, and its own state.
+pub enum Kind {
+    /// AppleAPFSContainer's.
+    Apfs,
+}
+
+/// An `IOUserClient` a task opened: the service it is attached to, its
+/// class, its registry entry id, `IOUserClientCreator`, whether
+/// `IOUserClientDefaultLocking` was set on it, whether it has been closed
+/// (`closed`: io_service_close or clientDied ran clientClose), and its
+/// kind's state.
+pub struct UserClient {
+    pub service: u32,
+    pub class: &'static str,
+    pub id: u64,
+    pub creator: String,
+    pub default_locking: bool,
+    pub closed: bool,
+    pub kind: Kind,
+}
+
+/// The user clients, each behind its own lock: a call on a client holds it
+/// for the call, as IOUserClient's default locking (`ipcEnter`) does, while
+/// other clients' calls go on.
+static CLIENTS: std::sync::Mutex<Vec<Option<std::sync::Arc<std::sync::Mutex<UserClient>>>>> = std::sync::Mutex::new(Vec::new());
+
+/// The next registry entry id: the entries of the device tree have theirs
+/// in creation order (`gIORegistryLastID`), and each user client the next.
+static NEXT_CLIENT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `kIORegistryEntryIDPrefix`, the first registry entry id.
+pub const REGISTRY_ID_PREFIX: u64 = 0x1_0000_0000;
+
+/// The registry entry id of entry `i` of the tree.
+pub fn registry_id(i: u32) -> u64 {
+    REGISTRY_ID_PREFIX + u64::from(i)
+}
+
+/// A new user client of `service`, by its number.
+pub fn client_add(service: u32, class: &'static str, creator: String, default_locking: bool, kind: Kind) -> u32 {
+    let serial = NEXT_CLIENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let id = REGISTRY_ID_PREFIX + tree().len() as u64 + serial;
+    let c = UserClient { service, class, id, creator, default_locking, closed: false, kind };
+    let mut t = CLIENTS.lock().unwrap_or_else(|e| e.into_inner());
+    t.push(Some(std::sync::Arc::new(std::sync::Mutex::new(c))));
+    (t.len() - 1) as u32
+}
+
+/// The user client numbered `id`; none once it is freed.
+pub fn client(id: u32) -> Option<std::sync::Arc<std::sync::Mutex<UserClient>>> {
+    CLIENTS.lock().unwrap_or_else(|e| e.into_inner()).get(id as usize)?.clone()
+}
+
+/// The client freed: out of the table, nothing naming it any more.
+fn client_remove(id: u32) -> Option<std::sync::Arc<std::sync::Mutex<UserClient>>> {
+    CLIENTS.lock().unwrap_or_else(|e| e.into_inner()).get_mut(id as usize)?.take()
+}
+
+/// `is_io_service_open_extended` after its checks: the service's
+/// `newUserClient(owningTask, securityID, type, properties)`, and the
+/// properties the open sets on the new client: `IOUserClientCreator`
+/// (`IOCopyLogNameForPID`: "pid N, " and the process's `p_comm`), and
+/// `IOUserClientDefaultLocking` for a client of a kext that does not depend
+/// on IOSurface and set no locking property itself.
+pub fn open_user_client(k: &mut crate::syscalls::Kernel, service: u32, ty: u32) -> Result<u32, i32> {
+    let t = tree();
+    let Some(n) = t.get(service as usize) else { return Err(ret::BAD_ARGUMENT) };
+    let pid = k.pid;
+    let comm = k.darwin_public(pid).map(|(p, _)| String::from_utf8_lossy(&p.comm).into_owned()).unwrap_or_default();
+    let creator = format!("pid {pid}, {comm}");
+    let (class, kind, default_locking) = match n.class {
+        // IOService::newUserClient by the container's IOUserClientClass
+        // (its personality's), for any type; the apfs kext does not depend
+        // on IOSurface.
+        "AppleAPFSContainer" => ("AppleAPFSUserClient", Kind::Apfs, true),
+        _ => {
+            k.darwin_unimplemented(format!("newUserClient of {} (type {ty:#x})", name(t, service)));
+            return Err(ret::UNSUPPORTED);
+        }
+    };
+    Ok(client_add(service, class, creator, default_locking, kind))
+}
+
+/// The client's `clientClose`.
+pub fn client_close(_k: &mut crate::syscalls::Kernel, c: &mut UserClient) {
+    match &mut c.kind {
+        // AppleAPFSUserClient's (0xfffffff00666facc) closes what the client
+        // opened on its container and terminates it; neither has a state
+        // here, the container's opens not being modelled.
+        Kind::Apfs => {}
+    }
+}
+
+/// `clientDied`, when the connection's last send right goes
+/// (`iokit_client_died`): clientClose unless the client was closed; then
+/// the client is gone, nothing naming it any more.
+pub fn client_died(k: &mut crate::syscalls::Kernel, id: u32) {
+    let Some(cell) = client_remove(id) else { return };
+    let mut c = cell.lock().unwrap_or_else(|e| e.into_inner());
+    if !c.closed {
+        c.closed = true;
+        client_close(k, &mut c);
+    }
+}
+
+/// `getService`: none, IOUserClient's default.
+pub fn client_service(c: &UserClient) -> Option<u32> {
+    match &c.kind {
+        Kind::Apfs => None,
+    }
+}
+
+/// `clientMemoryForType`: no client here has memory of any type
+/// (IOUserClient's default, kIOReturnUnsupported).
+pub fn client_memory_for_type(_k: &mut crate::syscalls::Kernel, _c: &mut UserClient, _ty: u32) -> Result<std::convert::Infallible, i32> {
+    Err(ret::UNSUPPORTED)
+}
+
+/// `registerNotificationPort(port, type, refCon)`.
+pub fn register_notification_port(k: &mut crate::syscalls::Kernel, c: &mut UserClient, _port: Option<super::ipc::ObjId>, _ty: u32, _reference: u64) -> i32 {
+    match &mut c.kind {
+        Kind::Apfs => {
+            k.darwin_unimplemented("AppleAPFSUserClient::registerNotificationPort".to_string());
+            ret::UNSUPPORTED
+        }
+    }
+}
+
+/// `callExternalMethod`: the client's externalMethod.
+pub fn external_method(k: &mut crate::syscalls::Kernel, c: &mut UserClient, a: &mut MethodArgs) -> i32 {
+    match &mut c.kind {
+        Kind::Apfs => apfs_method(k, c.service, a),
+    }
+}
+
+/// AppleAPFSUserClient's methods: of them, selector 9, a volume's
+/// information by its index, which APFSVolumeRoleFind reads the role from
+/// (the first two bytes).
+fn apfs_method(k: &mut crate::syscalls::Kernel, _service: u32, a: &mut MethodArgs) -> i32 {
+    if a.selector == 9 && a.struct_in.len() == 8 && a.ool_in.is_none() {
+        let index = u64::from_le_bytes(a.struct_in[..8].try_into().unwrap());
+        let Some(role) = volume_role(index) else { return ret::NOT_FOUND };
+        a.struct_out.iter_mut().for_each(|b| *b = 0);
+        if a.struct_out.len() >= 2 {
+            a.struct_out[..2].copy_from_slice(&role.to_le_bytes());
+        }
+        return ret::SUCCESS;
+    }
+    k.darwin_unimplemented(format!("IOConnectCallMethod on AppleAPFSContainer: selector {}, {} scalars, {} bytes in: {:x?}", a.selector, a.scalar_in.len(), a.struct_in.len(), &a.struct_in[..a.struct_in.len().min(64)]));
+    ret::UNSUPPORTED
+}
+
+/// A property of user client `c`: what is_io_service_open_extended sets,
+/// and the client's own. `Err`: one whose value is not modelled.
+pub fn client_property(c: &UserClient, name: &str) -> Result<Option<Prop>, String> {
+    match name {
+        "IOUserClientCreator" => Ok(Some(Prop::Str(c.creator.clone()))),
+        "IOUserClientDefaultLocking" if c.default_locking => Ok(Some(Prop::Bool(true))),
+        _ => Ok(None),
+    }
+}
+
+/// `is_io_registry_entry_get_property_bytes`'s bytes of a property: an
+/// OSString's characters and NUL, an OSBoolean's "Yes" or "No", an
+/// OSData's bytes, an OSNumber's low `numberOfBytes` bytes; a collection
+/// has none (`None`: kIOReturnBadArgument).
+pub fn prop_bytes(p: &Prop) -> Option<Vec<u8>> {
+    match p {
+        Prop::Str(s) | Prop::Sym(s) => Some([s.as_bytes(), b"\0"].concat()),
+        Prop::Bool(b) => Some(if *b { b"Yes\0".to_vec() } else { b"No\0".to_vec() }),
+        Prop::Data(d) => Some(d.clone()),
+        Prop::Num(v, bits) => Some(v.to_le_bytes()[..((*bits as usize + 7) / 8).min(8)].to_vec()),
+        Prop::Strs(_) => None,
+    }
 }
 
 /// The device tree; empty when the boot payload had none.
@@ -632,6 +921,43 @@ pub fn serialize_data(value: &[u8]) -> Vec<u8> {
     b.extend_from_slice(value);
     b.resize((b.len() + 3) & !3, 0);
     b
+}
+
+impl crate::syscalls::Kernel {
+    /// `iokit_user_client_trap(userClientRef, index, p1, ...)`: a trap of
+    /// the user client the caller's name `userClientRef` sends to. A name
+    /// with bit 0 clear or bit 32 set names a DriverKit (`uext`) object,
+    /// which none is here; one that sends to no user client, or null or
+    /// dead, is kIOReturnBadArgument. A client with no trap at the index
+    /// answers kIOReturnSuccess (`trap` stays null).
+    pub(crate) fn darwin_iokit_user_client_trap(&mut self, a: &[u64; 6]) -> i32 {
+        const MACH_PORT_DEAD: u64 = 0xffff_ffff;
+        let reference = a[0];
+        if reference == 0 || reference == MACH_PORT_DEAD {
+            return ret::BAD_ARGUMENT;
+        }
+        if reference & (1 << 32) != 0 || reference & 1 == 0 {
+            return ret::BAD_ARGUMENT;
+        }
+        let ipc = self.ipc();
+        let id = match ipc.translate_send(reference as u32) {
+            Ok(p) => match ipc.port(p).kobject {
+                Some(super::ipc::Kobject::IoConnect(id)) => id,
+                _ => return ret::BAD_ARGUMENT,
+            },
+            Err(_) => return ret::BAD_ARGUMENT,
+        };
+        let Some(cell) = client(id) else { return ret::BAD_ARGUMENT };
+        let mut c = cell.lock().unwrap_or_else(|e| e.into_inner());
+        let index = a[1] as u32;
+        let r = match &mut c.kind {
+            Kind::Apfs => {
+                self.darwin_unimplemented(format!("AppleAPFSUserClient trap {index}"));
+                ret::UNSUPPORTED
+            }
+        };
+        r
+    }
 }
 
 #[cfg(test)]

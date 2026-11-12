@@ -454,6 +454,9 @@ impl Kernel {
                     self.ipc().release_send(p);
                 }
             }
+            // iokit_client_died: the user client's clientDied, and the
+            // client is gone with its connection.
+            Some(Kobject::IoConnect(id)) => super::iokit::client_died(self, id),
             Some(Kobject::WorkInterval(id)) => super::workinterval::work_interval_no_senders(id),
             Some(Kobject::Eventlink(..)) => self.darwin_eventlink_no_senders(port),
             Some(Kobject::TaskRead | Kobject::TaskInspect | Kobject::ThreadRead(_) | Kobject::ThreadInspect(_)) => self.darwin_flavor_port_no_senders(port),

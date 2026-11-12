@@ -563,9 +563,8 @@ impl Kernel {
             trap::MACH_VOUCHER_EXTRACT_ATTR_RECIPE => self.mach_voucher_extract_attr_recipe_trap(m, w(0), w(1), a[2], a[3]),
             trap::TASK_NAME_FOR_PID => self.task_name_for_pid(m, w(0), a[1] as i32, a[2]),
             trap::TASK_FOR_PID => self.task_for_pid(m, w(0), a[1] as i32, a[2]),
-            trap::CLOCK_SLEEP
-            | trap::DEBUG_CONTROL_PORT_FOR_PID
-            | trap::IOKIT_USER_CLIENT => {
+            trap::IOKIT_USER_CLIENT => self.darwin_iokit_user_client_trap(a) as u32 as u64,
+            trap::CLOCK_SLEEP | trap::DEBUG_CONTROL_PORT_FOR_PID => {
                 self.darwin_unimplemented(format!("Mach trap {t}"));
                 kr::FAILURE
             }
