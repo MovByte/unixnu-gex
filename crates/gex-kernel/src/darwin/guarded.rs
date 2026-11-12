@@ -295,6 +295,10 @@ impl Kernel {
         let symlink = self.darwin_open_links(m, at, &a)?;
         let mut la = a;
         la[at] &= !OPEN_FINISHED;
+        // openat_internal's creation mode, `cmode & ACCESSPERMS`: what the
+        // umask leaves of the access permissions, never a set-id or the
+        // sticky bit.
+        la[at + 1] &= super::fsops::ACCESSPERMS;
         let n = super::bsd::translate(raw, &mut la);
         if symlink {
             // The translated call is openat's. The name is opened, not

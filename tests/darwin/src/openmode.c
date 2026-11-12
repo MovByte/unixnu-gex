@@ -2,7 +2,9 @@
 // spawn's open action alike: both mode bits, or O_EXEC with a read or
 // write mode, are EINVAL; O_SYMLINK opens the link itself, O_NOFOLLOW_ANY
 // refuses a path through a link, and O_CLOFORK marks the descriptor (which
-// the action's dup2 to another number does not keep).
+// the action's dup2 to another number does not keep). A file O_CREAT makes
+// takes what the umask leaves of the mode's access permissions, never a
+// set-id or the sticky bit (openat_internal's cmode & ACCESSPERMS).
 
 #include <errno.h>
 #include <fcntl.h>
@@ -92,6 +94,21 @@ int main(int argc, char **argv) {
     fail |= (e = err(open(file, O_EXEC | O_WRONLY))) != EINVAL ? bad("O_EXEC | O_WRONLY", e, EINVAL) : 0;
     fail |= (e = err(openat(AT_FDCWD, file, O_RDWR | O_WRONLY | O_CREAT, 0644))) != EINVAL ? bad("openat both mode bits", e, EINVAL) : 0;
     fail |= (e = err(open(file, O_RDONLY))) ? bad("plain open", e, 0) : 0;
+
+    char made[64];
+    snprintf(made, sizeof made, "/private/var/tmp/openmode-%d.m", getpid());
+    mode_t mask = umask(022);
+    int mf = openat(AT_FDCWD, made, O_RDWR | O_CREAT | O_EXCL, 07777);
+    umask(mask);
+    if (mf < 0) {
+        fail |= bad("create with every mode bit", errno, 0);
+    } else {
+        struct stat ms;
+        fail |= fstat(mf, &ms) ? bad("fstat of the created file", errno, 0)
+              : (ms.st_mode & 07777) != 0755 ? bad("created mode", ms.st_mode & 07777, 0755) : 0;
+        close(mf);
+        unlink(made);
+    }
 
     // A spawn's open action is open1's too.
     fail |= (e = spawn_open(argv[0], "file", file, O_RDONLY)) ? bad("spawn plain", e, 0) : 0;
