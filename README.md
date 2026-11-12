@@ -40,10 +40,24 @@ translated; the rest are answered by Darwin code. Results go back as XNU
 returns them: the value in x0 with the carry flag clear, or a Darwin errno in
 x0 with the carry flag set. A Mach trap returns its `kern_return_t` in x0.
 
-A process sees iOS's machine: 16 KiB pages, a 4 GiB `__PAGEZERO`, the
-commpage, the dyld shared cache mapped where it was linked in the shared
-region (from `0x1_8000_0000`) with its slide info applied, and the
-iPad7,1's identity in `sysctl`, the host routines and the device tree.
+A process sees iOS's machine: 16 KiB pages, the address space exec lays
+out, the commpage, and the iPad7,1's identity in `sysctl`, the host
+routines and the device tree.
+
+The address space is XNU's for this device (`load_machfile`,
+`create_unix_stack`, `vm_shared_region_enter`). The map runs from the main
+image to `0x4_5800_0000` (`ARM64_MAX_OFFSET_DEVICE_LARGE`: the device has
+more than 3 GB). The main image is slid by a random 1 to 1023 16 KiB pages
+and 0, 1 or 2 32 MiB sections, its 4 GiB `__PAGEZERO` extended to it; dyld
+goes right after the main image's end, by 1 to 255 pages of its own (and
+moves itself into its copy in the shared cache); the main stack's top is
+`USRSTACK64` (`0x1_6fe0_0000`) less the main image's slide. A release
+kernel slides every image: `_POSIX_SPAWN_DISABLE_ASLR` is ignored. The
+shared region, `0x1_8000_0000` for `0x1_8000_0000`, is one read-only
+entry, with the dyld shared cache mapped in it where it was linked and its
+slide info applied. libmalloc's nano allocator, in a process exec engages
+it for (a spawn with `_POSIX_SPAWN_NANO_ALLOCATOR`, as an app's is), takes
+the 512 MiB after the shared region.
 
 The kernel side is in `crates/gex-kernel/src/darwin/`, one module per
 subsystem, most naming in their header the XNU source they port:
@@ -126,9 +140,11 @@ subsystem, most naming in their header the XNU source they port:
 
 Outside the kernel crate:
 
-- `crates/gex-ld/src/macho.rs` loads Mach-O images. A position-independent
-  program is placed at `0x2_8000_0000`, above gex's dispatch tables and the
-  shared region; dyld goes above it.
+- `crates/gex-ld/src/macho.rs` loads Mach-O images as `parse_machfile`
+  places them: a position-independent image, and dyld, moved by its slide,
+  dyld after the main image. A Darwin process's own tables (its dispatch
+  directory and page protections) are kept inside its `__PAGEZERO`
+  (`gex_abi::DARWIN_TABLES64`), so that its address space is XNU's.
 - `crates/gex-ld/src/dsc.rs` reads the dyld shared cache, its subcaches and
   their slide info.
 - `crates/gex-abi/src/crypto.rs` computes the A64 cryptographic extension
@@ -204,10 +220,10 @@ tests/darwin/build.sh
 They are written to `tests/darwin/bin/` (not tracked).
 `GEX_DARWIN_TARGET` sets the clang target (default `arm64-apple-ios17.0`).
 The static ones make raw system calls and need neither dyld nor the shared
-cache; they are linked at `0x280000000`, where gex places a
-position-independent program, since a static image has no fixups to slide
-it with. Every program is signed ad hoc, and some carry the entitlements in
-`tests/darwin/src/*.entitlements`.
+cache; they are linked at the linker's default base, after a 4 GiB
+`__PAGEZERO`, where exec loads them, since a static image has no fixups to
+slide it with. Every program is signed ad hoc, and some carry the
+entitlements in `tests/darwin/src/*.entitlements`.
 
 ## What you supply
 
@@ -298,7 +314,6 @@ What gexc sets up:
 | `GEX_DARWIN_STRICT=1` | strict mode (above) |
 | `GEX_DARWIN_CACHE` | the shared cache's main file, when it is not at the root's cryptex path |
 | environment | without `--env` or `--host-env`, `PATH=/usr/bin:/bin` and `HOME=/var/mobile` |
-| `MallocNanoZone=0` | added unless the environment sets `MallocNanoZone`: libmalloc's nano allocator claims a fixed region at `0x2_8000_0000`, where gex places programs |
 | identity | the host user's ids, or `--uid`; `/sbin/launchd` runs as root and pid 1, and any other program as a child of a pid 1 that is the kernel's own |
 | memory | always a 64-bit guest memory (`--mem32` is refused): Darwin images live above 4 GiB |
 
@@ -379,7 +394,7 @@ dyld and libSystem from the device's shared cache.
 | policy and resources | `taskpolicy`, `priority`, `procpolicy`, `cpumon`, `rlimit`, `rlimitctl`, `cputime`, `vtimer`, `itimer`, `memlimit` |
 | signals and exceptions | `sighandler`, `sigthread`, `sigwait`, `sigio`, `procmask`, `excports`, `excdeliver`, `efault`, `protect` |
 | Mach IPC | `portrefs`, `crosstask`, `taskname`, `readports`, `extractright`, `sonce`, `rcvlarge`, `guardesc`, `circular`, `voucherx`, `importance`, `lockimp`, `watchport` |
-| memory | `mmapflags`, `madvise`, `msync`, `mlock`, `vmregion`, `vmcopy`, `vmwx`, `jit` |
+| memory | `layout`, `mmapflags`, `madvise`, `msync`, `mlock`, `vmregion`, `vmcopy`, `vmwx`, `jit` |
 | files | `fsops`, `pathrules`, `pathconf`, `statino`, `statfsino`, `dirino`, `setattr`, `xattr`, `clone`, `renameswap`, `lockf`, `lastclose`, `guarded`, `fileport`, `filesec`, `openmode`, `vectored`, `aio`, `fixedcalls`, `ioctl`, `realdev` |
 | kqueue, poll and pipes | `kq-pipe`, `vnode`, `vnextend`, `select`, `poll`, `pipe`, `timeouts` |
 | terminals and `/dev` | `pty`, `ptyjob`, `ptyclose`, `bsdpty`, `ttyinfo`, `ttydead`, `ttydrain`, `fcntltty`, `revoke`, `devfs`, `devattr` |
@@ -422,6 +437,16 @@ is the reference (search `crates/gex-kernel/src/` for
   (`EXC_CORPSE_NOTIFY`, and the corpse an `EXC_RESOURCE` or simulated
   `EXC_GUARD` would make); handlers of `EXCEPTION_IDENTITY_PROTECTED`
   behavior; hardware breakpoints, watchpoints and single step.
+- **Address space.** gex's 64-bit memory is 16 GiB (V8's memory64 cap),
+  so a task's map is held only to `0x3_ffff_4000`, not XNU's
+  `0x4_5800_0000` (`0xf_c000_0000` for a jumbo map): above it are the
+  commpage's alias, to `0x4_0000_0000` (where a program reads the commpage
+  and the device has unmapped space), and the memory's end. A fixed
+  mapping that reaches past `0x3_ffff_4000`, and an anywhere one with no
+  room below it, is reported and fails; a random address (`MAP_JIT`,
+  `VM_FLAGS_RANDOM_ADDR`) is drawn below it. The shared cache is mapped at
+  a zero slide, where the device's first dyld picks a random one at each
+  boot.
 - **Memory.** Purgeable memory, 4 GB chunks and other `mach_vm_allocate`
   and `mach_vm_map` flags not handled, `MAP_TPRO`, reuse advice on a
   region a fork left copy-on-write, the freezer, and the
