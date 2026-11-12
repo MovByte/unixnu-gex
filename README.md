@@ -54,10 +54,15 @@ moves itself into its copy in the shared cache); the main stack's top is
 `USRSTACK64` (`0x1_6fe0_0000`) less the main image's slide. A release
 kernel slides every image: `_POSIX_SPAWN_DISABLE_ASLR` is ignored. The
 shared region, `0x1_8000_0000` for `0x1_8000_0000`, is one read-only
-entry, with the dyld shared cache mapped in it where it was linked and its
-slide info applied. libmalloc's nano allocator, in a process exec engages
-it for (a spawn with `_POSIX_SPAWN_NANO_ALLOCATOR`, as an app's is), takes
-the 512 MiB after the shared region.
+entry, the system's: the first dyld to find it empty (launchd's, at boot)
+maps the dyld shared cache into it with `shared_region_map_and_slide_2_np`,
+passing the cache's `maxSlide`, and the kernel slides the cache once a
+boot below it, on a 16 KiB boundary, relocating the slid mappings by their
+slide info; every task after enters it as it is. A run's region is made as
+launchd's dyld makes it, before the run's first program. libmalloc's nano
+allocator, in a process exec engages it for (a spawn with
+`_POSIX_SPAWN_NANO_ALLOCATOR`, as an app's is), takes the 512 MiB after
+the shared region.
 
 The kernel side is in `crates/gex-kernel/src/darwin/`, one module per
 subsystem, most naming in their header the XNU source they port:
@@ -472,9 +477,10 @@ is the reference (search `crates/gex-kernel/src/` for
   and the device has unmapped space), and the memory's end. A fixed
   mapping that reaches past `0x3_ffff_4000`, and an anywhere one with no
   room below it, is reported and fails; a random address (`MAP_JIT`,
-  `VM_FLAGS_RANDOM_ADDR`) is drawn below it. The shared cache is mapped at
-  a zero slide, where the device's first dyld picks a random one at each
-  boot.
+  `VM_FLAGS_RANDOM_ADDR`) is drawn below it. `shared_region_map_and_slide_2_np`
+  itself is not implemented: a run's shared region is made before its first
+  program, so `/sbin/launchd` as the first program finds it made, which is
+  reported.
 - **Memory.** Purgeable memory, 4 GB chunks and other `mach_vm_allocate`
   and `mach_vm_map` flags not handled, `MAP_TPRO`, reuse advice on a
   region a fork left copy-on-write, the freezer, and the

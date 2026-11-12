@@ -73,6 +73,7 @@ pub mod psynch;
 pub mod reason;
 pub mod rlimit;
 pub mod sandbox;
+pub mod shregion;
 pub mod sandboxes;
 pub mod sched;
 pub mod sockbuf;
@@ -451,7 +452,7 @@ impl crate::syscalls::Kernel {
     /// Something a Darwin program asked for that this kernel does not do.
     /// It is said once per kind; under strict mode the process stops with
     /// SIGSYS when the call returns ([`Self::darwin_strict_stop`]).
-    pub(crate) fn darwin_unimplemented(&mut self, what: String) {
+    pub fn darwin_unimplemented(&mut self, what: String) {
         if self.dtask.said.insert(what.clone()) || self.trace {
             eprintln!("[gex:{}] Darwin: not implemented: {what}", self.pid);
         }
