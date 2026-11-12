@@ -56,12 +56,6 @@ pub fn run(mut ra: RunArgs, bytes: &[u8]) -> Result<ExitCode> {
     if ra.opts.env.is_empty() {
         ra.opts.env = vec!["PATH=/usr/bin:/bin".into(), "HOME=/var/mobile".into()];
     }
-    // libmalloc's nano allocator claims a fixed region at 0x2_8000_0000,
-    // where gex places programs, and takes any pointer there for one of its
-    // own: off, unless asked for.
-    if !ra.opts.env.iter().any(|e| e.starts_with("MallocNanoZone=")) {
-        ra.opts.env.push("MallocNanoZone=0".into());
-    }
     ra.opts.darwin = true;
     // The boot payload: the trust caches and the Sandbox's platform
     // profile the system boots with.
