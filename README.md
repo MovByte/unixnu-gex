@@ -122,6 +122,15 @@ subsystem, most naming in their header the XNU source they port:
 - **IOKit.** The registry's `IODeviceTree` plane, built from the device's
   own device tree, with the APFS volumes its file system table names
   published as services, reached through IOKit's MIG routines (`iokit.rs`).
+- **IOSurface.** `IOSurfaceRoot` and its user client as the device's
+  IOSurface kext has them (`iosurface/`): surfaces created, looked up by id
+  and by send right, locked with their seeds, their values, use counts and
+  purgeability, and the records and graphics comm page the root shares with
+  every client. A surface's memory is the kernel's, and each task that maps
+  it has a view of it, brought up to date when the task locks the surface
+  and sent back when it unlocks; a store outside a lock is caught by the
+  page's protection and kept. libkern's binary serialization, which its
+  methods carry, is `osserialize.rs`.
 - **sysctl.** The kernel's own nodes, read from the device's kernelcache
   (`sysctl_nodes.rs`), and the values this kernel has for them
   (`sysctl.rs`).
@@ -400,7 +409,7 @@ dyld and libSystem from the device's shared cache.
 | kqueue, poll and pipes | `kq-pipe`, `vnode`, `vnextend`, `select`, `poll`, `pipe`, `timeouts` |
 | terminals and `/dev` | `pty`, `ptyjob`, `ptyclose`, `bsdpty`, `ttyinfo`, `ttydead`, `ttydrain`, `fcntltty`, `revoke`, `devfs`, `devattr` |
 | sockets | `sockerr`, `sockevent`, `sockname`, `sockopts`, `halfclose`, `nosigpipe`, `dgrambuf`, `streambuf` |
-| code signing and IOKit | `codesig`, `amfi`, `policy`, `iokit`, `ioreg` |
+| code signing and IOKit | `codesig`, `amfi`, `policy`, `iokit`, `ioreg`, `iosurface`, `iosurfacex` |
 
 The suite runs single programs and the processes they create. None of it
 boots launchd or runs an app.

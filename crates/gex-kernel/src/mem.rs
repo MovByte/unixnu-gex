@@ -453,13 +453,18 @@ pub struct Perms {
     shown: Vec<(u64, u64, u32)>,
     /// Ranges whose bytes are to be written again.
     dirty: Vec<(u64, u64)>,
+    /// Bits pages' bytes go without although their mapping allows them
+    /// ([`MemoryMap::withhold`]), by page: a kernel object's pages whose
+    /// first store it wants to see (an IOSurface view's).
+    withheld: std::collections::BTreeMap<u64, u8>,
 }
 
 impl Clone for Perms {
     /// A copy of the map is another memory's (a fork's child's), whose
-    /// table holds nothing yet: all of it is to be written.
+    /// table holds nothing yet: all of it is to be written. What a kernel
+    /// object withheld is that object's, in the memory it watches.
     fn clone(&self) -> Perms {
-        Perms { shown: self.shown.clone(), dirty: vec![(0, gex_abi::LIMIT64)] }
+        Perms { shown: self.shown.clone(), dirty: vec![(0, gex_abi::LIMIT64)], withheld: Default::default() }
     }
 }
 
@@ -528,7 +533,16 @@ impl Perms {
                         acc[i] &= byte;
                     }
                 }
-                let own: Vec<u8> = (0..n).map(|i| if covered[i] == PERM_PAGE && ps + i as u64 >= floor && ps + (i as u64) < PERM_TABLE_BYTES { acc[i] } else { 0 }).collect();
+                let own: Vec<u8> = (0..n)
+                    .map(|i| {
+                        let p = ps + i as u64;
+                        if covered[i] == PERM_PAGE && p >= floor && p < PERM_TABLE_BYTES {
+                            acc[i] & !self.withheld.get(&p).copied().unwrap_or(0)
+                        } else {
+                            0
+                        }
+                    })
+                    .collect();
                 let bytes = (0..n - 1).map(|i| own[i] | (own[i] & own[i + 1]) << perm::BOTH_SHIFT).collect();
                 (ps, bytes)
             })
@@ -772,8 +786,51 @@ impl MemoryMap {
     /// Darwin process's, before it maps anything. All of it is to be
     /// written.
     pub fn keep_perms(&mut self) {
-        self.perms = Some(Perms { shown: Vec::new(), dirty: vec![(0, gex_abi::LIMIT64)] });
+        self.perms = Some(Perms { shown: Vec::new(), dirty: vec![(0, gex_abi::LIMIT64)], withheld: Default::default() });
         self.publish();
+    }
+
+    /// Take `bits` (of [`gex_abi::perm`]'s protection bits) from the
+    /// table's bytes for the pages of `[start, end)`, whatever their
+    /// mappings allow, until [`Self::restore`]: an access they no longer
+    /// allow faults to the kernel, which may then give the bits back. The
+    /// map keeps none for a process with no table.
+    pub fn withhold(&mut self, start: u64, end: u64, bits: u8) {
+        if let Some(p) = &mut self.perms {
+            for page in (start >> gex_abi::PERM_PAGE_SHIFT)..((end + gex_abi::PERM_PAGE - 1) >> gex_abi::PERM_PAGE_SHIFT) {
+                *p.withheld.entry(page).or_insert(0) |= bits;
+            }
+            p.dirty.push((start, end));
+        }
+    }
+
+    /// Give back `bits` [`Self::withhold`] took from the pages of
+    /// `[start, end)`.
+    pub fn restore(&mut self, start: u64, end: u64, bits: u8) {
+        if let Some(p) = &mut self.perms {
+            for page in (start >> gex_abi::PERM_PAGE_SHIFT)..((end + gex_abi::PERM_PAGE - 1) >> gex_abi::PERM_PAGE_SHIFT) {
+                if let Some(b) = p.withheld.get_mut(&page) {
+                    *b &= !bits;
+                    if *b == 0 {
+                        p.withheld.remove(&page);
+                    }
+                }
+            }
+            p.dirty.push((start, end));
+        }
+    }
+
+    /// The pages [`Self::withhold`] has taken the write bit from, in order;
+    /// `None` when there are none.
+    pub fn withheld_write_pages(&self) -> Option<Vec<u64>> {
+        let p = self.perms.as_ref()?;
+        let v: Vec<u64> = p.withheld.iter().filter(|(_, &b)| b & gex_abi::perm::WRITE != 0).map(|(&k, _)| k).collect();
+        (!v.is_empty()).then_some(v)
+    }
+
+    /// The bits [`Self::withhold`] has taken from page `page`'s byte.
+    pub fn withheld(&self, page: u64) -> u8 {
+        self.perms.as_ref().and_then(|p| p.withheld.get(&page).copied()).unwrap_or(0)
     }
 
     /// What the protection table is to be written with since it last was
@@ -804,8 +861,12 @@ impl MemoryMap {
         // The log goes on (the host has still to retire the old code), but
         // not the old image's shared mappings: exec wrote them back already.
         fresh.log.shared_maps.clear();
-        // The table goes on, its old mappings' bytes to be cleared.
+        // The table goes on, its old mappings' bytes to be cleared; what
+        // kernel objects withheld went with the old image's mappings.
         fresh.perms = self.perms.take();
+        if let Some(p) = &mut fresh.perms {
+            p.withheld.clear();
+        }
         *self = fresh;
         self.publish();
     }

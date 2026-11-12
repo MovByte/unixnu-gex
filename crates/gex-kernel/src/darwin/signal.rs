@@ -910,7 +910,19 @@ impl Kernel {
     /// `handle_user_abort`: KERN_INVALID_ADDRESS where nothing is mapped,
     /// which `ux_exception` makes SIGSEGV, else KERN_PROTECTION_FAILURE,
     /// SIGBUS. The fault raised; the (Linux-numbered) signal with it.
+    ///
+    /// A store to a page whose write bit a kernel object took from the
+    /// protection table to see the store (an IOSurface view's) is noted by
+    /// it, the bit given back, and the instruction runs again: no fault,
+    /// signal 0. The access may begin on the page before.
     pub fn darwin_access_fault(&mut self, m: &mut GuestMem<'_>, pc: u64, addr: u64, write: bool) -> (Delivery, u32) {
+        if write {
+            let page = addr >> gex_abi::PERM_PAGE_SHIFT;
+            if super::iosurface::note_store(self, m, page) || super::iosurface::note_store(self, m, page + 1) {
+                self.darwin_flush_perms(m);
+                return (Delivery::Resume(pc), 0);
+            }
+        }
         let prot = if addr >= gex_abi::DARWIN_GUEST_FLOOR { self.mem.lock().vma_at(addr).map(|v| v.prot) } else { None };
         let l = match prot {
             None => crate::signal::sig::SIGSEGV,
