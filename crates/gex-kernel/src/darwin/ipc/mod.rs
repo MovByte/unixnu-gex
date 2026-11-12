@@ -360,8 +360,8 @@ pub struct Port {
     pub connection_port: bool,
     /// `ip_splabel` of a service port.
     pub splabel: Option<ServiceLabel>,
-    /// `IPC_PORT_INIT_FILTER_MESSAGE`. Only a Sandbox profile of a task's
-    /// own filters messages, and tasks have none yet.
+    /// `IPC_PORT_INIT_FILTER_MESSAGE` (`IP_BIT_FILTER_MSG`): messages a
+    /// filtered task sends it are put to its Sandbox label's filter.
     pub filter_msg: bool,
     /// `ip_sprequests`: a send-possible request is armed.
     pub sprequests: bool,
@@ -649,6 +649,8 @@ pub struct TaskLink {
     pub name_port: Mutex<Option<ObjId>>,
     /// Its code signature, for its entitlements.
     pub codesign: Option<super::codesign::CodeSign>,
+    /// Its credential's Sandbox label.
+    pub sandbox: super::sandboxes::Label,
     /// Its process's `p_csflags`, `p_idversion` and `p_textoff`.
     pub csflags: Arc<std::sync::atomic::AtomicU32>,
     pub pidversion: i32,

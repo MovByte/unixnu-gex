@@ -239,7 +239,9 @@ pub struct RunOptions {
     pub darwin_dylinker: Option<String>,
     /// The boot payload's directory (`GEX_DARWIN_BOOT`): the trust cache
     /// bundle the boot loader hands the kernel (`TrustCache`) and the
-    /// Sandbox kext's platform profile (`sandbox_profile.bin`).
+    /// Sandbox kext's platform profile (`sandbox_profile.bin`), builtin
+    /// collection (`sandbox_builtin.bin`) and protobox collection
+    /// (`sandbox_protobox.bin`).
     pub darwin_boot: Option<std::path::PathBuf>,
     /// Run ahead-of-time code only (`aot_only`): an ejected Windows
     /// program's runtime, with no tier-1 module and no run-time translator.
@@ -1268,7 +1270,7 @@ fn run_program_with(
             }
         };
         let tc = read("TrustCache")?;
-        let sandbox = read("sandbox_profile.bin")?;
+        let sandbox = gex_kernel::darwin::SandboxProfiles { platform: read("sandbox_profile.bin")?, builtin: read("sandbox_builtin.bin")?, protobox: read("sandbox_protobox.bin")? };
         let device_tree = read("DeviceTree")?;
         gex_kernel::darwin::boot(tc.as_deref(), sandbox, device_tree.as_deref()).map_err(|e| anyhow!("the boot payload: {e}"))?;
         // The run's first process: of the user it runs as.

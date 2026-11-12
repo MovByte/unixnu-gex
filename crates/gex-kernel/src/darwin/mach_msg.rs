@@ -508,6 +508,14 @@ impl Kernel {
             self.clean_header(dest, out_bits, reply, voucher);
             return Err(0x1000_0016);
         }
+        // ipc_filter_kmsg_header_from_user: a filtered task's message to a
+        // port that enforces filtering goes to the filter of the port's
+        // Sandbox label (mach_msg_fetch_filter_policy), which is not ported.
+        if self.dtask.filter_msg && self.ipc().port(dest).filter_msg {
+            self.darwin_unimplemented(format!("Sandbox's Mach message filter (message {} of a filtered task to a port that enforces filtering)", u.id));
+            self.clean_header(dest, out_bits, reply, voucher);
+            return Err(0x1000_0017);
+        }
         let mut kmsg = Kmsg { bits: out_bits, size: u.msg_size, dest, reply, voucher, voucher_raw: u.voucher, id: u.id, body, descs: Vec::new(), sender: self.darwin_sender(), aux, keep_alive: false, ppriority: 0, qos_override: 0, imp: None };
         self.kmsg_set_qos(&mut kmsg, options, u.priority);
         if u.bits & bits::COMPLEX != 0 {

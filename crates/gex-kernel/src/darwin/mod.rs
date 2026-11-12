@@ -73,6 +73,7 @@ pub mod psynch;
 pub mod reason;
 pub mod rlimit;
 pub mod sandbox;
+pub mod sandboxes;
 pub mod sched;
 pub mod sockbuf;
 pub mod unixsock;
@@ -104,13 +105,21 @@ pub mod workinterval;
 pub mod workq;
 
 
+/// The Sandbox kext's profiles, which the kernelcache carries: its platform
+/// profile, its builtin collection and its protobox collection.
+#[derive(Default)]
+pub struct SandboxProfiles {
+    pub platform: Option<Vec<u8>>,
+    pub builtin: Option<Vec<u8>>,
+    pub protobox: Option<Vec<u8>>,
+}
+
 /// The boot: the boot loader's payload as the kernel takes it, the trust
 /// cache bundle (`/chosen/memory-map/TrustCache`), whose first module is
 /// the static trust cache (`load_static_trust_cache`; one that does not
 /// load is the kernel's panic), without which there are no trust caches;
-/// and the Sandbox kext's platform profile, which the kernelcache
-/// carries. Once per system.
-pub fn boot(trust_cache: Option<&[u8]>, sandbox_platform: Option<Vec<u8>>, device_tree: Option<&[u8]>) -> Result<(), String> {
+/// and the Sandbox kext's profiles. Once per system.
+pub fn boot(trust_cache: Option<&[u8]>, sandbox: SandboxProfiles, device_tree: Option<&[u8]>) -> Result<(), String> {
     if let Some(t) = device_tree {
         iokit::set_tree(t)?;
     }
@@ -121,7 +130,8 @@ pub fn boot(trust_cache: Option<&[u8]>, sandbox_platform: Option<Vec<u8>>, devic
     trustcache::set_static(m);
     // devfs's terminal nodes: ptmx, its replicas, tty.
     crate::vfs::devfs::set_darwin_ttys();
-    mac::set_platform_profile(sandbox_platform)
+    mac::set_platform_profile(sandbox.platform)?;
+    sandboxes::set_collections(sandbox.builtin, sandbox.protobox)
 }
 
 thread_local! {
@@ -243,6 +253,14 @@ pub struct Task {
     /// The process's credential (`p_ucred`'s POSIX part) and `P_SUGID`.
     pub cred: cred::Cred,
     pub sugid: bool,
+    /// The credential's Sandbox label: its sandbox, which the task's link
+    /// shows other processes.
+    pub sandbox: sandboxes::Label,
+    /// `TFRO_FILTER_MSG`: the task's Mach messages are filtered.
+    pub filter_msg: bool,
+    /// What the exec in progress keeps for Sandbox's hook.
+    pub exec_sandbox: Option<sandboxes::Pending>,
+
     /// `P_LADVLOCK`: the process has taken a POSIX record lock.
     pub ladvlock: bool,
     /// Threads whose lock requests another thread or process woke.
@@ -368,7 +386,7 @@ impl crate::syscalls::Kernel {
                 let pending = old.as_ref().map(|l| std::mem::take(&mut *l.mailbox.lock().unwrap_or_else(|e| e.into_inner()))).unwrap_or_default();
                 let name_port = old.and_then(|l| l.name_port.lock().unwrap_or_else(|e| e.into_inner()).take());
                 let ring = !pending.is_empty();
-                let link = std::sync::Arc::new(ipc::TaskLink { mailbox: std::sync::Mutex::new(pending), bell, pid: self.pid, name_port: std::sync::Mutex::new(name_port), codesign: self.dtask.codesign.clone(), csflags: std::sync::Arc::clone(&self.dtask.csflags), pidversion: self.dtask.pidversion, textoff: self.dtask.textoff, uniqueid: self.dtask.uniqueid, policy });
+                let link = std::sync::Arc::new(ipc::TaskLink { mailbox: std::sync::Mutex::new(pending), bell, pid: self.pid, name_port: std::sync::Mutex::new(name_port), codesign: self.dtask.codesign.clone(), sandbox: std::sync::Arc::clone(&self.dtask.sandbox), csflags: std::sync::Arc::clone(&self.dtask.csflags), pidversion: self.dtask.pidversion, textoff: self.dtask.textoff, uniqueid: self.dtask.uniqueid, policy });
                 ipc.links.insert(ipc.task, std::sync::Arc::clone(&link));
                 if ring {
                     link.bell.ring();

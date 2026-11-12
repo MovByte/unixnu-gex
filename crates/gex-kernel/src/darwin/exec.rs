@@ -467,11 +467,29 @@ impl Kernel {
             }
             return Err(Errno::EPERM);
         }
+        // Then Sandbox's label update, of the script's vnode for a script;
+        // its kill is the exec's error, EPERM (mac_error_select of AMFI's
+        // none and its 1).
+        let pending = self.dtask.exec_sandbox.take().unwrap_or_default();
+        let vnode = self.vfs.canonical(&self.vfs.absolute(pending.script.as_deref().unwrap_or(l.exe_path)));
+        if let Err(super::sandboxes::Kill(why)) = self.darwin_sb_label_update_execve(&super::sandboxes::Exec { path: &vnode, spawnattrs: pending.spawnattrs.as_deref(), marked: pending.marked }) {
+            if self.trace {
+                eprintln!("[gex:{}] Sandbox: hook..execve() killing {}[pid={}, uid={}]: {why}", self.pid, vnode, self.pid, self.creds.uid());
+            }
+            return Err(Errno::EPERM);
+        }
         self.darwin_launch_constraints()?;
         self.darwin_publish();
         // The image's entitlements that raise its default memory limit.
         self.darwin_jetsam_entitlements();
         self.darwin_vm_policies();
+        // mpo_proc_notify_exec_complete.
+        if let Err(why) = self.darwin_sb_exec_complete() {
+            if self.trace {
+                eprintln!("[gex:{}] Sandbox: killing {}: {why}", self.pid, l.exe_path);
+            }
+            return Err(Errno::EPERM);
+        }
         // task_set_main_thread_qos, for an exec's, a spawn's and the first
         // image's main thread alike.
         let q = self.darwin_main_thread_qos();

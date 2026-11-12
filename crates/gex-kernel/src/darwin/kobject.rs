@@ -181,11 +181,20 @@ impl Kernel {
     }
 
     /// The task's host port (`itk_host`), as `set_security_token` sets it
-    /// with each change of identity: the host privilege port for root,
-    /// the host port for anyone else. No MAC policy here takes it from
-    /// root (`mac_system_check_host_priv`).
+    /// with each change of identity: the host privilege port for root
+    /// unless a MAC policy takes it (`mac_system_check_host_priv`:
+    /// Sandbox's mach-priv-host-port, quietly; the platform profile allows
+    /// it), the host port for anyone else. The answer is the one the
+    /// credential's last token got: its sandbox changes only with a new
+    /// token (an exec) or by `sandbox_init`, which revokes the port on the
+    /// same question.
     pub(crate) fn darwin_itk_host(&mut self) -> ObjId {
-        if self.creds.uid() == 0 { self.darwin_host_priv_port() } else { self.darwin_host_port() }
+        let a = super::mac::SbArgs { quiet: true, ..Default::default() };
+        if self.creds.uid() == 0 && self.darwin_sb_evaluate(super::mac::op::MACH_PRIV_HOST_PORT, &a) == 0 {
+            self.darwin_host_priv_port()
+        } else {
+            self.darwin_host_port()
+        }
     }
 
     /// Clock `id`'s port: the system clock (0) or the calendar (1), each

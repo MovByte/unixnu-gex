@@ -115,8 +115,10 @@ subsystem, most naming in their header the XNU source they port:
   policies (`mac.rs`); AMFI's decisions on code signatures, task ports, JIT
   and executable mappings (`amfi.rs`); embedded code signatures and
   entitlements (`codesign.rs`); trust caches (`trustcache.rs`); Sandbox's
-  compiled profiles and their evaluation (`sandbox.rs`), and AppleMatch, the
-  regular expression engine those profiles use (`applematch.rs`).
+  compiled profiles and their evaluation (`sandbox.rs`), the sandboxes a
+  process gets from its exec or `sandbox_init` (`sandboxes.rs`), and
+  AppleMatch, the regular expression engine those profiles use
+  (`applematch.rs`).
 - **IOKit.** The registry's `IODeviceTree` plane, built from the device's
   own device tree, with the APFS volumes its file system table names
   published as services, reached through IOKit's MIG routines (`iokit.rs`).
@@ -242,6 +244,8 @@ missing has effects:
 |------|------------|------------|
 | `TrustCache` | the trust cache bundle the boot loader hands the kernel at `/chosen/memory-map/TrustCache`: a module count, each module's offset, then the modules, the first being the static trust cache | there are no trust caches, and AMFI runs no code |
 | `sandbox_profile.bin` | the Sandbox kext's platform profile, a compiled profile blob from the kernelcache | every Sandbox check is reported and refused (EPERM) |
+| `sandbox_builtin.bin` | the Sandbox kext's builtin profile collection (its named profiles), a compiled collection blob from the kernelcache | a process that would get a builtin profile is reported and its exec killed (or its `sandbox_init` refused, EPERM) |
+| `sandbox_protobox.bin` | the Sandbox kext's protobox profile collection (profiles named by executable path), a compiled collection blob from the kernelcache | every exec is reported and killed, since its protobox profile cannot be looked up |
 | `DeviceTree` | the flattened device tree: the payload of the IPSW's device tree image (an IM4P) for this device | the IOKit registry has no device tree, which is reported |
 
 A `TrustCache` that does not load stops the boot. `tools/darwin-trust-cache.py`
@@ -255,8 +259,20 @@ python3 tools/darwin-trust-cache.py -o <ipados-boot>/TrustCache \
 ```
 
 `--bundle <file>` takes an existing bundle's first module instead of
-`--static`. The repository has no tool to extract `sandbox_profile.bin`
-from a kernelcache or to unwrap the device tree's IM4P.
+`--static`. `tools/darwin-sandbox-blobs.py` writes the three Sandbox blobs
+from a decompressed kernelcache (a prelinked one or a fileset), finding them
+where the Sandbox kext's `policy_init` loads them and checking each as the
+kext's loader does, with each file's SHA-256:
+
+```sh
+python3 tools/darwin-sandbox-blobs.py <kernelcache> <ipados-boot>
+```
+
+In 21H461's iPad7,1 kernelcache the platform profile is 0x22111 bytes at
+0xfffffff0056ca320, the builtin collection 0xd6d7b bytes at
+0xfffffff0056ecab0 and the protobox collection 0x75bd1 bytes at
+0xfffffff0057c3840. The repository has no tool to unwrap the device tree's
+IM4P.
 
 AMFI treats code as platform code when its cdhash is in the static trust
 cache, and requires dyld to be platform code. The other path, a CMS
@@ -330,7 +346,7 @@ exits 1 when any fails. It builds the programs first when
 |---|---|
 | `GEXC` | the gexc to run (default `target/release/gexc`) |
 | `GEX_DARWIN_ROOT` | the root for the dynamic programs, which run from its `/var/tmp`. Without it they are skipped, or fail when named |
-| `GEX_DARWIN_BOOT` | the device's boot payload. Its trust cache, with the test programs' cdhashes added, goes to `tests/darwin/bin/boot/TrustCache`, with its `DeviceTree` and `sandbox_profile.bin` beside it, and gexc boots from there. Without it, the trust cache holds the test programs only |
+| `GEX_DARWIN_BOOT` | the device's boot payload. Its trust cache, with the test programs' cdhashes added, goes to `tests/darwin/bin/boot/TrustCache`, with its `DeviceTree` and Sandbox blobs beside it, and gexc boots from there. Without it, the trust cache holds the test programs only |
 
 `GEX_DARWIN_STRICT=1` reaches gexc from the environment as well. The
 runner discards each program's stderr, so run a failing program directly
@@ -404,10 +420,22 @@ is the reference (search `crates/gex-kernel/src/` for
   whose trust cache entry has a constraint category, or that carries its
   own constraints, is refused (EPERM). AMFI's `__mac_syscall` calls for
   local signing, trust cache loading and launch constraints are reported.
-- **Sandbox.** Only the platform profile is evaluated; no process has a
-  profile of its own. Filters whose facts the kernel does not have, some
-  `sandbox_check` filter types, `sandbox_check` of another process, and
-  Sandbox's `__mac_syscall` calls are reported.
+- **Sandbox.** A process gets its sandbox as the kext gives it: at exec
+  from its `seatbelt-profiles` entitlement, its spawn's Sandbox attributes,
+  the platform profile's choice for apps, or its executable's protobox
+  profile; or by `sandbox_init` with a builtin profile. The platform
+  profile, then the process's, decide the checks that are wired, an exec's
+  process-exec* and process-exec-interpreter among them; Sandbox's other
+  hooks (the other vnode checks among them) are not called. Not ported,
+  and reported where the kext would act: the
+  profiles of the `com.apple.private.sandbox.profile` entitlements,
+  containers and containermanagerd's upcall, the extensions of the
+  `com.apple.security.exception.*` entitlements, matching an extension
+  filter against an object, Mach message filtering, a profile's own system
+  call masks (nor are the platform profile's masks applied), filters whose
+  facts the kernel does not have, some `sandbox_check` filter types,
+  `sandbox_check` of another process's operation, and Sandbox's other
+  `__mac_syscall` calls.
 - **IOKit.** The registry holds the device tree and the APFS services
   only; no `IOService` driver is present. `IOConnectCallMethod` on a
   driver, `iokit_user_client_trap`, and matching dictionaries of kinds not
