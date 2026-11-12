@@ -34,6 +34,7 @@ pub fn run(mut ra: RunArgs, bytes: &[u8]) -> Result<ExitCode> {
     ra.opts.darwin_code_signature = img.code_signature;
     ra.opts.darwin_stacksize = img.stacksize;
     ra.opts.darwin_user_stack = img.user_stack;
+    ra.opts.darwin_thread_stack = img.thread_stack;
     ra.opts.darwin_dylinker = img.dylinker;
     ra.opts.darwin_dyld_infos = img.dyld_infos;
     ra.opts.darwin_dyld_infos_size = img.dyld_infos_size;

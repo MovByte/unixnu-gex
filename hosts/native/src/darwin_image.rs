@@ -26,6 +26,9 @@ pub struct DarwinImage {
     /// The main thread's stack top (`load_result.user_stack`): `USRSTACK64`
     /// less the executable's slide.
     pub user_stack: u64,
+    /// The stack pointer an `LC_UNIXTHREAD` names (`load_threadstack`'s
+    /// custom stack): 0 for none.
+    pub thread_stack: u64,
 }
 
 /// Load the Mach-O executable `bytes` (one slice), with its dyld read by
@@ -40,6 +43,10 @@ pub fn load(bytes: &[u8], name: &str, read: &dyn Fn(&str) -> Result<Vec<u8>>) ->
     let code_signature = m.code_signature.and_then(|(o, n)| bytes.get(o as usize..(o as usize).checked_add(n as usize)?)).map(<[u8]>::to_vec);
     let stacksize = match &m.entry {
         Some(gex_ld::macho::Entry::Main { stacksize, .. }) => *stacksize,
+        _ => 0,
+    };
+    let thread_stack = match &m.entry {
+        Some(gex_ld::macho::Entry::Thread { sp, .. }) => *sp,
         _ => 0,
     };
     let (mut dyld_infos, mut dyld_infos_size) = (0, 0);
@@ -69,5 +76,6 @@ pub fn load(bytes: &[u8], name: &str, read: &dyn Fn(&str) -> Result<Vec<u8>>) ->
         dyld_infos,
         dyld_infos_size,
         user_stack,
+        thread_stack,
     })
 }

@@ -238,6 +238,8 @@ pub struct RunOptions {
     /// The main thread's stack top (`load_result.user_stack`), which the
     /// executable's slide moved down from `USRSTACK64`.
     pub darwin_user_stack: u64,
+    /// The stack pointer the executable's `LC_UNIXTHREAD` names, 0 for none.
+    pub darwin_thread_stack: u64,
     /// `LC_LOAD_DYLINKER`'s path, as the guest names it.
     pub darwin_dylinker: Option<String>,
     /// The boot payload's directory (`GEX_DARWIN_BOOT`): the trust cache
@@ -264,6 +266,7 @@ impl Default for RunOptions {
             darwin_code_signature: None,
             darwin_stacksize: 0,
             darwin_user_stack: 0,
+            darwin_thread_stack: 0,
             darwin_dylinker: None,
             darwin_boot: None,
             args: Vec::new(),
@@ -4064,6 +4067,7 @@ fn run_darwin_image(
         darwin_code_signature: loaded.code_signature,
         darwin_stacksize: loaded.stacksize,
         darwin_user_stack: loaded.user_stack,
+        darwin_thread_stack: loaded.thread_stack,
         darwin_dylinker: loaded.dylinker,
         darwin_dyld_infos: loaded.dyld_infos,
         darwin_dyld_infos_size: loaded.dyld_infos_size,
@@ -4968,6 +4972,13 @@ fn place_image(
 
     if opts.darwin {
         store.data_mut().with_kernel(|k| k.dtask.map_min = image.page_zero);
+    }
+    // load_threadstack: an LC_UNIXTHREAD that names a stack (a static
+    // program's, which only a DEVELOPMENT kernel runs) has it as its own,
+    // with nothing allocated; the default stack is made instead.
+    if opts.darwin && opts.darwin_thread_stack != 0 {
+        let sp = opts.darwin_thread_stack;
+        store.data_mut().with_kernel(|k| k.darwin_unimplemented(format!("an LC_UNIXTHREAD that names its stack ({sp:#x}, load_threadstack's custom stack): the default stack is made instead")));
     }
 
     // A Darwin program's shared region, which every task enters at exec
