@@ -373,6 +373,16 @@ impl Entries {
         out
     }
 
+    /// The submap entries (the shared region's) that meet `[start, end)`,
+    /// clipped to it.
+    pub fn submaps(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
+        if start >= end {
+            return Vec::new();
+        }
+        let first = self.ranges.range(..=start).next_back().filter(|(_, e)| e.end > start).map_or(start, |(&s, _)| s);
+        self.ranges.range(first..end).filter(|(_, e)| e.attrs.kind == kind::SUBMAP && e.end > start).map(|(&s, e)| (s.max(start), e.end.min(end))).collect()
+    }
+
     /// `vm_map_lookup_entry` then `vme_next`: the entry at `addr`, or the
     /// first past it.
     pub fn at_or_after(&self, addr: u64) -> Option<EntryInfo> {
