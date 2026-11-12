@@ -426,13 +426,14 @@ is the reference (search `crates/gex-kernel/src/` for
   profile; or by `sandbox_init` with a builtin profile. The platform
   profile, then the process's, decide the checks that are wired, an exec's
   process-exec* and process-exec-interpreter among them; Sandbox's other
-  hooks (the other vnode checks among them) are not called. Not ported,
-  and reported where the kext would act: the
+  hooks (the other vnode checks among them) are not called. A process's
+  Unix calls, Mach traps and kernel MIG routines are filtered by the masks
+  its sandbox (or, with none, the platform profile) gives it, as XNU
+  filters them. Not ported, and reported where the kext would act: the
   profiles of the `com.apple.private.sandbox.profile` entitlements,
   containers and containermanagerd's upcall, the extensions of the
   `com.apple.security.exception.*` entitlements, matching an extension
-  filter against an object, Mach message filtering, a profile's own system
-  call masks (nor are the platform profile's masks applied), filters whose
+  filter against an object, Mach message filtering, filters whose
   facts the kernel does not have, some `sandbox_check` filter types,
   `sandbox_check` of another process's operation, and Sandbox's other
   `__mac_syscall` calls.

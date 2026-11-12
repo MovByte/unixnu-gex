@@ -13,7 +13,9 @@
 //! Only the hooks below are wired, process-exec* and
 //! process-exec-interpreter among them; Sandbox's others (the other vnode
 //! checks among them: file-read*, file-write*, ...) are not called, for the
-//! platform profile's rules as for a sandbox's.
+//! platform profile's rules as for a sandbox's. The call filters ask of the
+//! Unix calls, Mach traps and kernel MIG routines a process's masks do not
+//! let through (syscall-unix, syscall-mach, syscall-mig).
 
 use std::sync::Arc;
 
@@ -60,6 +62,9 @@ pub mod op {
     pub const PROCESS_INFO_CODESIGNATURE: usize = 124;
     pub const PROCESS_LEGACY_CODESIGNING_STATUS_SET: usize = 142;
     pub const SIGNAL: usize = 146;
+    pub const SYSCALL_UNIX: usize = 152;
+    pub const SYSCALL_MACH: usize = 153;
+    pub const SYSCALL_MIG: usize = 154;
     pub const SYSCTL_READ: usize = 156;
     pub const SYSCTL_WRITE: usize = 157;
     pub const SYSTEM_FSCTL: usize = 164;
@@ -424,17 +429,32 @@ impl Facts for KernelFacts<'_> {
 /// The Sandbox's platform profile, as the boot loaded it.
 static PLATFORM: std::sync::OnceLock<Option<(Vec<u8>, sandbox::Profile)>> = std::sync::OnceLock::new();
 
-/// Load the Sandbox's platform profile (the kext's own blob), once.
+/// The platform profile's masks (`0x...6f8e540`): what a process with no
+/// sandbox is filtered by, and what a sandbox's are and-ed with.
+static PLATFORM_MASKS: std::sync::OnceLock<[Option<sandbox::FilterMask>; 4]> = std::sync::OnceLock::new();
+
+/// Load the Sandbox's platform profile (the kext's own blob), once, with
+/// its masks (its loader's, for a profile that stacks nothing); a mask
+/// that does not load fails the boot, as it panics the kernel.
 pub fn set_platform_profile(blob: Option<Vec<u8>>) -> Result<(), String> {
-    let p = match blob {
+    let (p, masks) = match blob {
         Some(b) => {
             let p = sandbox::single(&b).map_err(|e| format!("the sandbox platform profile: {e:?}"))?;
-            Some((b, p))
+            let m = super::sandboxes::profile_masks(&b, &p, false).map_err(|e| format!("failed to initialize platform sandbox: {e}"))?;
+            (Some((b, p)), m.map(|m| m.mask))
         }
-        None => None,
+        // No platform profile: no masks (each check is refused instead).
+        None => (None, Default::default()),
     };
     let _ = PLATFORM.set(p);
+    let _ = PLATFORM_MASKS.set(masks);
     Ok(())
+}
+
+/// The platform profile's masks: of the Unix calls, Mach traps, kernel MIG
+/// routines and fcntl commands.
+pub fn platform_masks() -> [Option<sandbox::FilterMask>; 4] {
+    PLATFORM_MASKS.get().cloned().unwrap_or_default()
 }
 
 impl Kernel {
@@ -623,6 +643,79 @@ impl Kernel {
         }
         let a = SbArgs { kind: sandbox::kind::HOST_SPECIAL_PORT, number: id as u32 & 0xffff, ..Default::default() };
         self.darwin_sb_evaluate(op::MACH_HOST_SPECIAL_PORT_SET, &a)
+    }
+
+    /// `unix_syscall`'s filter: call `code` (`SYS_invalid` past the table)
+    /// is asked of the MAC policies when the process's mask does not let it
+    /// through, and their error skips it.
+    pub(crate) fn darwin_syscall_filter(&mut self, code: u64) -> Result<(), crate::errno::Errno> {
+        let Some(mask) = &self.dtask.syscall_mask else { return Ok(()) };
+        if sandbox::mask_allows(mask, code as usize) {
+            return Ok(());
+        }
+        match self.darwin_mac_check_syscall_unix(code as u32) {
+            0 => Ok(()),
+            e => Err(super::errno::errno_of(e as i32)),
+        }
+    }
+
+    /// `mac_proc_check_syscall_unix` (Sandbox's hook, slot 124:
+    /// syscall-unix of the call's number; AMFI has none). Calls 1, 328, 520
+    /// and 521 (exit, pthread_kill and the two that end a process with a
+    /// payload) set the argument block's flag 8, which shapes only the
+    /// violation's report (`0x...a0b778`).
+    pub(crate) fn darwin_mac_check_syscall_unix(&mut self, code: u32) -> u32 {
+        let a = SbArgs { kind: sandbox::kind::SYSCALL_UNIX, number: code, ..Default::default() };
+        self.darwin_sb_evaluate(op::SYSCALL_UNIX, &a)
+    }
+
+    /// `mach_syscall`'s filter, for trap `call` (`-x16`, one of the table's
+    /// traps): asked of Sandbox's callback when the task's mask does not let
+    /// it through; a refusal is the trap's result.
+    pub(crate) fn darwin_mach_trap_filter(&mut self, call: usize) -> Option<u64> {
+        let mask = self.dtask.mach_trap_mask.clone()?;
+        if sandbox::mask_allows(&mask, call) {
+            return None;
+        }
+        match self.darwin_sb_mach_trap_evaluate(call as u32) {
+            0 => None,
+            kr => Some(kr),
+        }
+    }
+
+    /// Sandbox's Mach trap filter callback (`0x...a01994`, which it
+    /// registers with `proc_set_syscall_filter_callbacks`): syscall-mach of
+    /// the trap's number, KERN_DENIED for a refusal.
+    fn darwin_sb_mach_trap_evaluate(&mut self, call: u32) -> u64 {
+        const KERN_DENIED: u64 = 53;
+        let a = SbArgs { kind: sandbox::kind::SYSCALL_MACH, number: call, ..Default::default() };
+        if self.darwin_sb_evaluate(op::SYSCALL_MACH, &a) == 0 { 0 } else { KERN_DENIED }
+    }
+
+    /// `ipc_kobject_server`'s filter, for a request of message id `id`: a
+    /// routine Sandbox indexed that the task's mask does not let through
+    /// is asked of Sandbox's callback; a refusal is the reply's error.
+    pub(crate) fn darwin_kobj_filter(&mut self, id: u32) -> Option<i32> {
+        let idx = super::sandboxes::kobj_index(id)?;
+        let mask = self.dtask.kobj_mask.clone()?;
+        if sandbox::mask_allows(&mask, idx) {
+            return None;
+        }
+        match self.darwin_sb_kobj_msg_evaluate(idx as u32) {
+            0 => None,
+            kr => Some(kr),
+        }
+    }
+
+    /// Sandbox's kernel MIG filter callback (`0x...a01ab0`): syscall-mig of
+    /// the routine's index (the block holds its message id too, `+0xdc`),
+    /// KERN_DENIED for a refusal. The exception raises' indexes (54 to 56,
+    /// mach_exception_raise and its _state and _state_identity forms) set
+    /// the block's flag 8, which shapes only the report.
+    fn darwin_sb_kobj_msg_evaluate(&mut self, idx: u32) -> i32 {
+        const KERN_DENIED: i32 = 53;
+        let a = SbArgs { kind: sandbox::kind::SYSCALL_MIG, number: idx, ..Default::default() };
+        if self.darwin_sb_evaluate(op::SYSCALL_MIG, &a) == 0 { 0 } else { KERN_DENIED }
     }
 
     pub(crate) fn darwin_mac_check_fork(&mut self) -> u32 {

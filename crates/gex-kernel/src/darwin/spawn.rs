@@ -302,6 +302,11 @@ impl Kernel {
             cred: t.cred.clone(),
             sandbox: std::sync::Arc::new(std::sync::Mutex::new(super::sandboxes::of(&t.sandbox))),
             filter_msg: t.filter_msg,
+            // forkproc: the parent's Unix call mask; task_create_internal:
+            // its task's Mach trap and kernel MIG masks.
+            syscall_mask: t.syscall_mask.clone(),
+            mach_trap_mask: t.mach_trap_mask.clone(),
+            kobj_mask: t.kobj_mask.clone(),
             sugid: t.sugid,
             csflags: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(t.csflags.load(std::sync::atomic::Ordering::Acquire) & !super::amfi::cs::KILLED)),
             // forkproc: the parent's persona.

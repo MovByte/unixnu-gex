@@ -568,8 +568,12 @@ impl Kernel {
             sandbox: old.sandbox,
             exec_sandbox: old.exec_sandbox,
             // task_create_internal: the new task has the old one's message
-            // filtering, until the label update sets it.
+            // filtering and Mach trap and kernel MIG masks, and the process
+            // keeps its Unix call mask, until the label update sets them.
             filter_msg: old.filter_msg,
+            syscall_mask: old.syscall_mask,
+            mach_trap_mask: old.mach_trap_mask,
+            kobj_mask: old.kobj_mask,
             // Until the image's policies make it (`vm_map_set_max_addr`).
             map_max: spawn.map_or(0, |s| s.max_addr),
             crash_behavior: spawn.map_or(0, |s| s.crash_behavior),

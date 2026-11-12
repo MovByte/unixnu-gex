@@ -11401,6 +11401,15 @@ impl Kernel {
             raw = if raw as u32 as u64 == crate::darwin::PLATFORM {
                 raw
             } else {
+                // unix_syscall's MAC filter, before the call's entry is
+                // taken: an error skips the call.
+                if let Err(e) = self.darwin_syscall_filter(crate::darwin::bsd_syscode(m, self.ctx_addr, raw)) {
+                    if self.trace {
+                        eprintln!("[gex:{}] pc=0x{pc:x} darwin syscall {} refused by its filter", self.pid, crate::darwin::bsd_syscode(m, self.ctx_addr, raw));
+                    }
+                    let _ = crate::darwin::set_result(m, self.ctx_addr, e.as_return());
+                    return SyscallOutcome::Continue;
+                }
                 match crate::darwin::bsd_call(m, self.ctx_addr, raw) {
                     crate::darwin::Bsd::Call { nr, first } => {
                         if first != 0 {

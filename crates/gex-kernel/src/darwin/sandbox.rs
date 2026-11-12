@@ -237,6 +237,8 @@ pub mod kind {
     pub const POSIX_IPC: u32 = 6;
     pub const HOST_SPECIAL_PORT: u32 = 7;
     pub const SYSCALL_UNIX: u32 = 0x14;
+    pub const SYSCALL_MACH: u32 = 0x16;
+    pub const SYSCALL_MIG: u32 = 0x17;
     pub const MAC_SYSCALL: u32 = 0x19;
 }
 
@@ -312,8 +314,9 @@ pub trait Facts {
     fn os_release_type(&self) -> Vec<u8>;
     fn developer_mode(&self) -> bool;
     /// The operation's numbers: the host special port (kind 7), the reboot
-    /// flags, the Unix syscall number (kind 0x14), the MAC syscall's call
-    /// number (kind 0x19).
+    /// flags, the call number (`+0xd8`: a Unix call's, kind 0x14; a Mach
+    /// trap's, kind 0x16; a kernel MIG routine's index, kind 0x17), the MAC
+    /// syscall's call number (kind 0x19).
     fn host_special_port(&self) -> u16;
     fn reboot_flags(&self) -> u16;
     fn syscall_number(&self) -> u32;
@@ -452,35 +455,130 @@ pub fn string(b: &[u8], p: &Profile, index: u16) -> Option<Vec<u8>> {
     string_at(b, p, p.nodes_end + usize::from(index) * NODE)
 }
 
-/// What a profile's syscall operation (syscall-unix, syscall-mach,
-/// syscall-mig, system-fcntl) makes of the mask a sandbox filters those
-/// calls by (`0x...a09308`, the loader's): `present` unless the
-/// operation's first node is a terminal that allows with no flags and no
-/// modifiers (a call is then never asked about); `defer` when that
-/// terminal allows with flag 10 alone (the protobox profile decides); and
-/// `undecided` when the first node is the bitmap filter of a profile that
-/// stacks a protobox profile, whose deferral the loader works out further
-/// (`0x...a095d4`), which is not followed here.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Mask {
-    pub present: bool,
-    pub defer: bool,
-    pub undecided: bool,
+/// A filter mask's size in bytes: Sandbox's zone of masks (`0x...9f75e0`)
+/// holds the largest of the kernel's three counts in bits (no fewer than
+/// 112), rounded up to whole bytes: this kernel's `nsysent` (556), against
+/// `mach_trap_count` (128) and `mach_kobj_count` (372: the 340 routines of
+/// its 17 MIG subsystems, and 32 to spare).
+pub const MASK_BYTES: usize = 70;
+
+/// A filter mask (`proc_set_syscall_filter_mask`'s): bit `n` set lets call
+/// `n` through unasked; a clear one has the MAC policies asked.
+pub type FilterMask = std::sync::Arc<[u8; MASK_BYTES]>;
+
+/// `bitstr_test`: whether `mask` lets call `n` through.
+pub fn mask_allows(mask: &[u8; MASK_BYTES], n: usize) -> bool {
+    mask.get(n / 8).is_some_and(|b| b & (1 << (n % 8)) != 0)
 }
 
-/// The mask operation `op` of profile `p` leaves; for a filter, `ty` is the
-/// filter type of the call's number (65, 75, 76 and 78).
-pub fn syscall_mask(b: &[u8], p: &Profile, op: usize, ty: u8, stacks_protobox: bool) -> Mask {
-    let Some(idx) = (op < OPERATIONS).then(|| u16_at(b, p.ops + 2 * op)).flatten() else { return Mask { present: true, ..Mask::default() } };
+/// What a profile's call operation (syscall-unix, syscall-mach,
+/// syscall-mig, system-fcntl) makes of the mask its process's calls are
+/// filtered by (`0x...a09308`, the profile loader's). `mask` is none when
+/// the operation's first node is a terminal that allows with no flags and
+/// no modifiers (no call is asked about); the bitmap that node names when
+/// it is the bitmap form of the call's number filter (its type with bit 7),
+/// past which the mask is clear; else all clear (every call asked). `defer`
+/// is that the operation defers to a stacked protobox profile: its first
+/// node is a terminal that allows with flag 10 alone, or, for a profile
+/// that stacks one, every way on from the bitmap's no-match edge does
+/// ([`defers`]).
+#[derive(Clone, Debug, Default)]
+pub struct ProfileMask {
+    pub mask: Option<FilterMask>,
+    pub defer: bool,
+}
+
+/// The loader's mask of operation `op` of profile `p`, whose calls' number
+/// filter is `ty` (65, 75, 76 or 78); EINVAL for a profile cut short. A
+/// bitmap longer than a mask panics the kext's loader; here it is refused.
+pub fn profile_mask(b: &[u8], p: &Profile, op: usize, ty: u8, stacks_protobox: bool) -> Result<ProfileMask, &'static str> {
+    const TRUNCATED: &str = "truncated";
+    let idx = (op < OPERATIONS).then(|| u16_at(b, p.ops + 2 * op)).flatten().ok_or(TRUNCATED)?;
     let at = p.nodes + usize::from(idx) * NODE;
-    let Some(n) = b.get(at..at + NODE) else { return Mask { present: true, ..Mask::default() } };
+    let n = b.get(at..at + NODE).ok_or(TRUNCATED)?;
+    let mut defer = false;
+    let mut bits: &[u8] = &[];
     match n[0] {
         1 => {
             let word = u32::from(n[1]) | u32::from(n[2]) << 8 | u32::from(n[3]) << 16;
-            Mask { present: word != 0 || n[4] != 0, defer: word == 0x400 && n[4] == 0, undecided: false }
+            if word == 0 && n[4] == 0 {
+                return Ok(ProfileMask::default());
+            }
+            defer = word == 0x400 && n[4] == 0;
         }
-        0 if n[1] == ty | 0x80 && stacks_protobox => Mask { present: true, defer: false, undecided: true },
-        _ => Mask { present: true, ..Mask::default() },
+        0 if n[1] == ty | 0x80 => {
+            // The bitmap the filter's argument names: an integer object
+            // (kind 1, its size, its bytes); another kind masks nothing.
+            let r = p.nodes_end + usize::from(u16::from_le_bytes([n[2], n[3]])) * NODE;
+            let kind = *b.get(r).ok_or(TRUNCATED)?;
+            let size = usize::from(u16_at(b, r + 2).ok_or(TRUNCATED)?);
+            if kind == 1 {
+                bits = b.get(r + 4..r + 4 + size).ok_or("bad integer object size")?;
+            }
+            if stacks_protobox {
+                defer = defers(b, p, at + 6)?;
+            }
+        }
+        _ => {}
+    }
+    if bits.len() > MASK_BYTES {
+        return Err("mask size exceeds maximum");
+    }
+    let mut m = [0u8; MASK_BYTES];
+    m[..bits.len()].copy_from_slice(bits);
+    Ok(ProfileMask { mask: Some(std::sync::Arc::new(m)), defer })
+}
+
+/// `0x...a095d4`: whether the calls a bitmap filter does not match all
+/// defer, every way on from its no-match edge (at `edge`) ending in a
+/// terminal that allows with no flags or flag 10 alone and no modifiers
+/// (or a node of neither kind). The walk follows each filter's match edge
+/// and keeps its no-match edge for later, at most 15 of them; one more, or
+/// a terminal of other flags, ends it with no deferral.
+fn defers(b: &[u8], p: &Profile, edge: usize) -> Result<bool, &'static str> {
+    const TRUNCATED: &str = "truncated";
+    // An edge's node, which must lie past the edge.
+    let target = |at: usize| -> Result<(u16, usize), &'static str> {
+        let i = u16_at(b, at).ok_or(TRUNCATED)?;
+        let n = p.nodes + usize::from(i) * NODE;
+        if n <= at || n >= b.len() {
+            return Err(TRUNCATED);
+        }
+        Ok((i, n))
+    };
+    let mut pending: Vec<u16> = Vec::with_capacity(15);
+    let (_, mut node) = target(edge)?;
+    loop {
+        match b[node] {
+            0 => {
+                let (other, _) = target(node + 6)?;
+                if !pending.contains(&other) {
+                    if pending.len() == 15 {
+                        return Ok(false);
+                    }
+                    pending.push(other);
+                }
+                node = target(node + 4)?.1;
+                continue;
+            }
+            1 => {
+                let word = b.get(node + 1..node + 4).ok_or(TRUNCATED)?;
+                let word = u32::from(word[0]) | u32::from(word[1]) << 8 | u32::from(word[2]) << 16;
+                if word & !0x400 != 0 || *b.get(node + 4).ok_or(TRUNCATED)? != 0 {
+                    return Ok(false);
+                }
+            }
+            _ => {}
+        }
+        match pending.pop() {
+            None => return Ok(true),
+            Some(i) => {
+                node = p.nodes + usize::from(i) * NODE;
+                if node >= b.len() {
+                    return Err(TRUNCATED);
+                }
+            }
+        }
     }
 }
 
@@ -965,6 +1063,10 @@ fn filter(b: &[u8], p: &Profile, ty: u8, flag: bool, arg: u16, facts: &mut dyn F
         // host-special-port, syscall-number, mac-syscall-number.
         47 => k == kind::HOST_SPECIAL_PORT && int_match(b, p, flag, arg, u64::from(facts.host_special_port()))?,
         65 => k == kind::SYSCALL_UNIX && int_match(b, p, flag, arg, u64::from(facts.syscall_number()))?,
+        // A Mach trap's number; a kernel MIG routine's index (the one
+        // Sandbox gave its message id at boot).
+        75 => k == kind::SYSCALL_MACH && int_match(b, p, flag, arg, u64::from(facts.syscall_number()))?,
+        76 => k == kind::SYSCALL_MIG && int_match(b, p, flag, arg, u64::from(facts.syscall_number()))?,
         82 => k == kind::MAC_SYSCALL && int_match(b, p, flag, arg, u64::from(facts.mac_call()))?,
         // reboot-flags: every flag the argument names.
         54 => arg & !facts.reboot_flags() == 0,
@@ -1373,6 +1475,46 @@ mod tests {
         for (s, want) in [(&b"/Applications"[..], true), (b"/Applications/X.app", true), (b"/ApplicationsX", false), (b"/Appl", false)] {
             assert_eq!(literal(&b, &p, 8, s, &mut Flags(0)), Ok(want), "{}", String::from_utf8_lossy(s));
         }
+    }
+
+    #[test]
+    fn a_profiles_masks_are_its_loaders() {
+        // A terminal that allows with nothing: no mask; with flag 10 alone:
+        // all clear, deferring; with other flags: all clear.
+        let none = |n: [u8; 8]| {
+            let b = blob(0, &[n]);
+            let p = single(&b).unwrap();
+            profile_mask(&b, &p, 152, 65, false).unwrap()
+        };
+        assert!(none(allow()).mask.is_none());
+        let m = none([1, 0, 4, 0, 0, 0, 0, 0]);
+        assert!(m.defer && m.mask.is_some_and(|m| m.iter().all(|&x| x == 0)));
+        let m = none(deny());
+        assert!(!m.defer && m.mask.is_some_and(|m| m.iter().all(|&x| x == 0)));
+        // syscall-unix's bitmap filter (65 with bit 7) names an integer
+        // object of two bytes: its bits are the mask's, the rest clear.
+        let mut b = blob(0, &[[0, 65 | 0x80, 0, 0, 1, 0, 2, 0], allow(), deny()]);
+        b.extend_from_slice(&[1, 0, 2, 0, 0xdf, 0x07, 0, 0]);
+        let p = single(&b).unwrap();
+        let m = profile_mask(&b, &p, 152, 65, false).unwrap();
+        let mask = m.mask.unwrap();
+        assert_eq!((0..16).filter(|&n| mask_allows(&mask, n)).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4, 6, 7, 8, 9, 10]);
+        assert!(!m.defer);
+        // Another operation's filter is no bitmap of its own: all clear.
+        assert!(profile_mask(&b, &p, 153, 75, false).unwrap().mask.is_some_and(|m| m.iter().all(|&x| x == 0)));
+        // Stacking a protobox profile, the bitmap's no-match edge decides:
+        // a denial does not defer; an allow with flag 10 alone does.
+        assert!(!profile_mask(&b, &p, 152, 65, true).unwrap().defer);
+        let mut b = blob(0, &[[0, 65 | 0x80, 0, 0, 1, 0, 2, 0], allow(), [1, 0, 4, 0, 0, 0, 0, 0]]);
+        b.extend_from_slice(&[1, 0, 2, 0, 0xdf, 0x07, 0, 0]);
+        let p = single(&b).unwrap();
+        assert!(profile_mask(&b, &p, 152, 65, true).unwrap().defer);
+        // A bitmap longer than a mask is refused.
+        let mut b = blob(0, &[[0, 65 | 0x80, 0, 0, 1, 0, 2, 0], allow(), deny()]);
+        b.extend_from_slice(&[1, 0, 71, 0]);
+        b.extend_from_slice(&[0xff; 71]);
+        let p = single(&b).unwrap();
+        assert!(profile_mask(&b, &p, 152, 65, false).is_err());
     }
 
     #[test]
