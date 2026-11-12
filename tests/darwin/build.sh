@@ -39,13 +39,24 @@ done
 # exec's images: an arm64e slice (no pointer authentication on this CPU).
 xcrun -sdk iphoneos clang -target arm64e-apple-ios17.0 -O2 -o "$OUT/hello-arm64e" "$HERE/src/hello.c"
 # Every iOS program is signed (the linker leaves one unsigned): ad hoc,
-# for the run's trust cache to hold. memlimit sets its own memory limit,
-# which memorystatus allows an entitled task.
+# for the run's trust cache to hold. Those the suite runs from /private/var
+# hold com.apple.private.security.no-container (default.entitlements, and
+# every other entitlements file here but the sbx ones): the platform
+# profile's process-exec* refuses a caller without it (or no-sandbox) the
+# exec of a file under /private/var, as on a device, and these programs
+# exec copies of themselves and files they write there. The static programs
+# run from this directory and exec nothing. sbxexec's entitlements and
+# sbxkill's children's are what those tests are about, so they hold only
+# theirs.
 for f in "$OUT"/*; do
-    if [ -f "$f" ]; then
-        codesign -s - -f "$f" 2>/dev/null
-    fi
+    [ -f "$f" ] || continue
+    case "$(basename "$f")" in
+    hello-static | bsd-carry | commpage | exclusive-pair | aes) codesign -s - -f "$f" 2>/dev/null ;;
+    *) codesign -s - -f --entitlements "$HERE/src/default.entitlements" "$f" 2>/dev/null ;;
+    esac
 done
+# memlimit sets its own memory limit, which memorystatus allows an entitled
+# task.
 codesign -s - -f --entitlements "$HERE/src/memlimit.entitlements" "$OUT/memlimit" 2>/dev/null
 codesign -s - -f --entitlements "$HERE/src/gta.entitlements" "$OUT/gta" 2>/dev/null
 # persona manages personas, which takes the persona manager's entitlement.
