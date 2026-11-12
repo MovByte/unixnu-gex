@@ -34,6 +34,7 @@ pub mod so {
     pub const RCVBUF: u32 = 0x1002;
     pub const SNDLOWAT: u32 = 0x1003;
     pub const RCVLOWAT: u32 = 0x1004;
+    pub const NOSIGPIPE: u32 = 0x1022;
     pub const LINGER_SEC: u32 = 0x1080;
 }
 
@@ -62,6 +63,8 @@ pub struct SockOpts {
     pub snd_lowat: u32,
     /// A TCP socket's `TF_NODELAY`.
     pub tcp_nodelay: bool,
+    /// `so_flags`' `SOF_NOSIGPIPE`: a send's EPIPE raises no SIGPIPE.
+    pub nosigpipe: bool,
 }
 
 impl SockOpts {
@@ -78,6 +81,7 @@ impl SockOpts {
             rcv_lowat: 1,
             snd_lowat: (st.snd_lowat as u32).min(snd_hiwat),
             tcp_nodelay: false,
+            nosigpipe: false,
         }
     }
 }
@@ -205,6 +209,7 @@ impl Kernel {
                 }
             }
             n if n == TCP_NODELAY | TCP_LEVEL => o.tcp_nodelay = i32::from_le_bytes(copyin(4)?[..4].try_into().unwrap()) != 0,
+            so::NOSIGPIPE => o.nosigpipe = i32::from_le_bytes(copyin(4)?[..4].try_into().unwrap()) != 0,
             _ => unreachable!("an option kept here"),
         }
         *file.darwin_sockopt.lock().unwrap_or_else(|e| e.into_inner()) = Some(o);
@@ -245,6 +250,8 @@ impl Kernel {
             so::SNDLOWAT => o.snd_lowat.to_le_bytes().to_vec(),
             so::RCVLOWAT => o.rcv_lowat.to_le_bytes().to_vec(),
             n if n == TCP_NODELAY | TCP_LEVEL => (if o.tcp_nodelay { TF_NODELAY } else { 0 }).to_le_bytes().to_vec(),
+            // so_flags & SOF_NOSIGPIPE, which is 1.
+            so::NOSIGPIPE => i32::from(o.nosigpipe).to_le_bytes().to_vec(),
             _ => return Err(Errno::ENOPROTOOPT),
         };
         // sooptcopyout: as much as there is room for, and that much said.
@@ -254,6 +261,25 @@ impl Kernel {
         }
         m.write_u32(avalsize, n as u32)?;
         Ok(0)
+    }
+
+    /// `sock_setsockopt(so, SOL_SOCKET, SO_NOSIGPIPE, &on)` from the kernel
+    /// (`F_SETNOSIGPIPE` on a socket): sosetoptlock's check of a socket
+    /// shut down both ways, then the flag.
+    pub(crate) fn darwin_so_set_nosigpipe(&mut self, fd: i32, on: bool) -> Result<(), Errno> {
+        let (file, st) = self.darwin_socket_opts(fd)?;
+        if st.cantrcv && st.cantsend {
+            return Err(Errno::EINVAL);
+        }
+        let mut o = Self::darwin_sockopts(&file, &st);
+        o.nosigpipe = on;
+        *file.darwin_sockopt.lock().unwrap_or_else(|e| e.into_inner()) = Some(o);
+        Ok(())
+    }
+
+    /// Whether `fd` is a socket with `SOF_NOSIGPIPE`.
+    pub(crate) fn darwin_so_nosigpipe(&self, fd: i32) -> bool {
+        self.darwin_socket_opts(fd).is_ok_and(|(file, st)| Self::darwin_sockopts(&file, &st).nosigpipe)
     }
 
     /// Whether a connect of `fd` to the address at `addr` would carry
@@ -316,7 +342,7 @@ pub(crate) fn is_broadcast(m: &GuestMem<'_>, addr: u64, len: u64) -> bool {
 fn handled(name: u32) -> bool {
     matches!(
         name,
-        so::DEBUG | so::KEEPALIVE | so::DONTROUTE | so::USELOOPBACK | so::BROADCAST | so::REUSEADDR | so::REUSEPORT | so::OOBINLINE | so::LINGER | so::LINGER_SEC | so::SNDBUF | so::RCVBUF | so::SNDLOWAT | so::RCVLOWAT
+        so::DEBUG | so::KEEPALIVE | so::DONTROUTE | so::USELOOPBACK | so::BROADCAST | so::REUSEADDR | so::REUSEPORT | so::OOBINLINE | so::LINGER | so::LINGER_SEC | so::SNDBUF | so::RCVBUF | so::SNDLOWAT | so::RCVLOWAT | so::NOSIGPIPE
     )
 }
 

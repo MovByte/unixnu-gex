@@ -837,9 +837,14 @@ impl Kernel {
             // FG_NOSIGPIPE on the open file; a socket's is its SO_NOSIGPIPE.
             f::SETNOSIGPIPE | f::GETNOSIGPIPE => match self.fds.get(fd as i32) {
                 Err(e) => neg(e),
+                // sock_setsockopt and sock_getsockopt of SO_NOSIGPIPE, the
+                // argument cut to an int.
                 Ok(file) if file.handle.metadata().is_ok_and(|md| md.file_type == crate::vfs::FileType::Socket) => {
-                    self.darwin_unimplemented("F_SETNOSIGPIPE and F_GETNOSIGPIPE on a socket (SO_NOSIGPIPE)".into());
-                    neg(Errno::EINVAL)
+                    if a[1] == f::SETNOSIGPIPE {
+                        res(self.darwin_so_set_nosigpipe(fd as i32, a[2] as i32 != 0).map(|()| 0))
+                    } else {
+                        u64::from(self.darwin_so_nosigpipe(fd as i32))
+                    }
                 }
                 Ok(file) => {
                     use std::sync::atomic::Ordering::AcqRel;

@@ -946,6 +946,15 @@ fn raises_sigpipe(n: u64, a: &[u64; 6]) -> bool {
     }
 }
 
+impl Kernel {
+    /// Whether an `EPIPE` from syscall `n` raises SIGPIPE ([`raises_sigpipe`]):
+    /// on Darwin not for a socket with `SOF_NOSIGPIPE` (`soo_write`,
+    /// `sendit`).
+    fn epipe_signals(&self, n: u64, a: &[u64; 6]) -> bool {
+        raises_sigpipe(n, a) && !(self.darwin && self.darwin_so_nosigpipe(a[0] as i32))
+    }
+}
+
 /// Read a `struct timeval` -- seconds then microseconds -- as nanoseconds.
 fn read_timeval(m: &GuestMem<'_>, at: u64) -> Result<u128, Errno> {
     let secs = m.read_u64(at)?;
@@ -10331,7 +10340,7 @@ impl Kernel {
                     eprintln!("[gex:{}.{}] {} blocking", self.pid, self.tid, syscall_name(n));
                 }
             }
-            self.write_blocked = matches!(op, BlockOp::WriteStream { .. });
+            self.write_blocked = matches!(op, BlockOp::WriteStream { .. }) && self.epipe_signals(n, &a);
             return SyscallOutcome::Blocking(op);
         }
 
@@ -10384,7 +10393,7 @@ impl Kernel {
         // pipe (two readers of one pipe).
         if let Ok(Err(Errno::EAGAIN)) = &outcome {
             if let Some(op) = self.eagain_park(m, n, a) {
-                self.write_blocked = matches!(op, BlockOp::WriteStream { .. });
+                self.write_blocked = matches!(op, BlockOp::WriteStream { .. }) && self.epipe_signals(n, &a);
                 return SyscallOutcome::Blocking(op);
             }
             if self.darwin && self.fd_io().send_unparked(n, &a) {
@@ -10392,7 +10401,7 @@ impl Kernel {
             }
         }
         if let Ok(Err(Errno::EPIPE)) = &outcome {
-            if raises_sigpipe(n, &a) {
+            if self.epipe_signals(n, &a) {
                 self.signals.raise_from(
                     crate::signal::sig::SIGPIPE,
                     // Linux sends it as the writer itself sending it (SI_USER).
