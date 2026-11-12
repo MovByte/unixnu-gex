@@ -33,6 +33,78 @@ pub const SYSREG_CMPXCHG16B: i32 = -102;
 /// `GEX_TRACE_INSNS` (`gex_lift_x86::sysreg::TRACE`): the value is the pc.
 pub const SYSREG_TRACE: i32 = -103;
 
+/// A far transfer (`gex_lift_x86::sysreg::FAR`): the value is `offset |
+/// selector << 32`. See [`serve_far`].
+pub const SYSREG_FAR: i32 = -104;
+/// A far transfer the block goes on from in wasm
+/// (`gex_lift_x86::sysreg::FAR_IN_PLACE`): served as [`SYSREG_FAR`], then
+/// the block reads [`SYSREG_FAR_NEXT`] for the address it dispatches.
+pub const SYSREG_FAR_IN_PLACE: i32 = -105;
+/// What a block dispatches after [`SYSREG_FAR_IN_PLACE`]
+/// (`gex_lift_x86::sysreg::FAR_NEXT`): the target, or [`FAR_PAD`] when the
+/// transfer changed the thread's mode.
+pub const SYSREG_FAR_NEXT: i32 = -106;
+/// The address a block dispatches after a far transfer that changed the
+/// thread's mode: its module's directory is the old mode's, and no
+/// directory has an entry for page 0, so the dispatch misses, and the miss
+/// path goes on at the target through the new mode's directory.
+pub const FAR_PAD: u64 = 0x10;
+
+/// A far `jmp`/`call`/`ret` or `iret` to `selector:offset`: a user code
+/// selector (64-bit 0x33, 32-bit 0x23 or 0x1b) becomes the thread's
+/// `ctx::CS`, and the translated code goes on at the offset in that mode.
+/// Any other selector is the #GP Windows reports as an access violation:
+/// `Err` with the selector, and the context is left as it was.
+pub fn serve_far(m: &mut GuestMem<'_>, ctx_addr: u64, v: u64) -> Result<(), u16> {
+    let sel = (v >> 32) as u16;
+    match sel as u32 {
+        ctx::CS_LONG | ctx::CS_COMPAT | 0x1b => {
+            let _ = m.write_u32(ctx_addr + ctx::CS as u64, sel as u32);
+            Ok(())
+        }
+        _ => Err(sel),
+    }
+}
+
+/// The pointer of the stack a WoW64 thread's 64-bit code runs on (where
+/// Wine's call-outs are made, and which a longjmp or an exception unwinds),
+/// for the thread at `ctx_addr`; `alt` says it runs code of the process's
+/// other mode, `wow64` that the process runs any.
+///
+/// Outside a WoW64 process that is RSP. In 32-bit code it is R14, where the
+/// WoW64 CPU keeps it while the 32-bit stack is in RSP. Its transitions
+/// switch the two a few instructions away from the far transfer, so for
+/// those instructions 64-bit code runs on the 32-bit stack (`syscall_32to64`
+/// before its `movq %r14,%rsp`): an RSP off the 64-bit stack the TEB (GS)
+/// names, with R14 on it, is that, and R14 is the answer there too.
+pub fn wow64_live_sp(m: &GuestMem<'_>, ctx_addr: u64, alt: bool, wow64: bool) -> u64 {
+    let reg = |r: u8| m.read_u64(ctx_addr + ctx::x(r) as u64).unwrap_or(0);
+    let (rsp, r14) = (reg(4), reg(14));
+    if alt {
+        return r14;
+    }
+    if !wow64 {
+        return rsp;
+    }
+    // NT_TIB: StackBase at 8, StackLimit at 16.
+    let teb = m.read_u64(ctx_addr + ctx::GS_BASE as u64).unwrap_or(0);
+    let (Ok(base), Ok(limit)) = (m.read_u64(teb + 8), m.read_u64(teb + 16)) else { return rsp };
+    let on = |sp: u64| limit < base && sp >= limit && sp <= base;
+    if !on(rsp) && on(r14) { r14 } else { rsp }
+}
+
+/// [`wow64_live_sp`] for a call-out made in `callout_alt` mode, whose
+/// caller's frame is on that mode's stack: one made from 32-bit code (a
+/// native 32-bit module's guest call, `ctx::CS` 0x23 at the call) waits on
+/// ESP, which says nothing while the thread runs 64-bit code (a syscall
+/// under it): `None` then, and the check waits for the thread's return.
+pub fn callout_live_sp(m: &GuestMem<'_>, ctx_addr: u64, alt: bool, wow64: bool, callout_alt: bool) -> Option<u64> {
+    if !callout_alt {
+        return Some(wow64_live_sp(m, ctx_addr, alt, wow64));
+    }
+    alt.then(|| m.read_u64(ctx_addr + ctx::x(4) as u64).unwrap_or(0) & 0xffff_ffff)
+}
+
 /// The operations [`SYSREG_X87`] carries (`gex_lift_x86::x87op`; the two
 /// must agree): an operation code in the low byte, operand fields above it.
 pub mod x87op {
@@ -75,6 +147,7 @@ pub mod x87op {
     pub const MEM_I16: u64 = 3;
     pub const MEM_I32: u64 = 4;
     pub const MEM_I64: u64 = 5;
+    pub const MEM_BCD: u64 = 6;
     pub const TRUNC: u64 = 1 << 19;
     pub const QUIET: u64 = 1 << 20;
     pub const TO_EFLAGS: u64 = 1 << 21;
@@ -162,6 +235,7 @@ pub mod raw {
     pub const FDATASYNC: u64 = 75;
     pub const TRUNCATE: u64 = 76;
     pub const FTRUNCATE: u64 = 77;
+    pub const FADVISE64: u64 = 221;
     pub const GETDENTS: u64 = 78;
     pub const GETCWD: u64 = 79;
     pub const CHDIR: u64 = 80;
@@ -188,6 +262,11 @@ pub mod raw {
     pub const GETUID: u64 = 102;
     pub const GETGID: u64 = 104;
     pub const SETUID: u64 = 105;
+    pub const SETFSUID: u64 = 122;
+    pub const SETFSGID: u64 = 123;
+    pub const CAPGET: u64 = 125;
+    pub const CAPSET: u64 = 126;
+    pub const CHROOT: u64 = 161;
     pub const SETGID: u64 = 106;
     pub const GETEUID: u64 = 107;
     pub const GETEGID: u64 = 108;
@@ -217,6 +296,8 @@ pub mod raw {
     pub const ARCH_PRCTL: u64 = 158;
     pub const SETRLIMIT: u64 = 160;
     pub const SYNC: u64 = 162;
+    pub const SYNC_FILE_RANGE: u64 = 277;
+    pub const SYNCFS: u64 = 306;
     pub const MOUNT: u64 = 165;
     pub const UMOUNT2: u64 = 166;
     pub const REBOOT: u64 = 169;
@@ -444,6 +525,7 @@ pub fn translate(
         x::FSYNC => nr::FSYNC,
         x::FDATASYNC => nr::FDATASYNC,
         x::FTRUNCATE => nr::FTRUNCATE,
+        x::TRUNCATE => nr::TRUNCATE,
         x::GETCWD => nr::GETCWD,
         x::CHDIR => nr::CHDIR,
         x::FCHDIR => nr::FCHDIR,
@@ -510,6 +592,11 @@ pub fn translate(
         x::GETUID => nr::GETUID,
         x::GETGID => nr::GETGID,
         x::SETUID => nr::SETUID,
+        x::SETFSUID => nr::SETFSUID,
+        x::SETFSGID => nr::SETFSGID,
+        x::CAPGET => nr::CAPGET,
+        x::CAPSET => nr::CAPSET,
+        x::CHROOT => nr::CHROOT,
         x::SETGID => nr::SETGID,
         x::GETEUID => nr::GETEUID,
         x::GETEGID => nr::GETEGID,
@@ -541,6 +628,8 @@ pub fn translate(
         x::PRCTL => nr::PRCTL,
         x::ARCH_PRCTL => nr::ARCH_PRCTL,
         x::SYNC => nr::SYNC,
+        x::SYNCFS => nr::SYNCFS,
+        x::SYNC_FILE_RANGE => nr::SYNC_FILE_RANGE,
         x::MOUNT => nr::MOUNT,
         x::UMOUNT2 => nr::UMOUNT2,
         x::REBOOT => nr::REBOOT,
@@ -630,8 +719,12 @@ pub fn translate(
         151 => nr::MLOCKALL,
         152 => nr::MUNLOCKALL,
         325 => nr::MLOCK2,
-        // Advisory: fadvise64, readahead, sync_file_range, sched_setaffinity.
-        221 | 187 | 277 | 203 => nr::NOOP_OK,
+        // fadvise64 is the canonical one: gex's own advice (`vfs::FADV_GEX_IMAGE`,
+        // which 64-bit Wine's ntdll gives before an image mapping) and
+        // WILLNEED fetch a lazy file's parts.
+        x::FADVISE64 => nr::FADVISE64,
+        // Advisory: readahead, sched_setaffinity.
+        187 | 203 => nr::NOOP_OK,
         _ => UNKNOWN,
     }
 }
@@ -880,7 +973,7 @@ fn x87_mem(op: u64) -> Option<f80::Mem> {
         x87op::MEM_I16 => f80::Mem::I16,
         x87op::MEM_I32 => f80::Mem::I32,
         x87op::MEM_I64 => f80::Mem::I64,
-        _ => return None, // MEM_F80: the raw register format
+        _ => return None, // MEM_F80: the raw register format (MEM_BCD is served apart)
     })
 }
 
@@ -981,6 +1074,27 @@ pub fn serve_x87(m: &mut GuestMem<'_>, ctx_addr: u64, op: u64) {
                 _ => F80::INDEFINITE,
             };
             x.set_st(0, r);
+        }
+        x87op::FLD if (op >> x87op::MEM_SHIFT) & 7 == x87op::MEM_BCD => {
+            let t = x.tmp();
+            let mut raw = [0u8; 10];
+            raw[..8].copy_from_slice(&t.sig.to_le_bytes());
+            raw[8..].copy_from_slice(&t.se.to_le_bytes());
+            let v = f80::load_bcd(&mut env, raw);
+            x.push(&mut env, v);
+        }
+        x87op::FST if (op >> x87op::MEM_SHIFT) & 7 == x87op::MEM_BCD => {
+            let raw = match x.operand(&mut env, 0) {
+                Some(v) => f80::store_bcd(&mut env, v),
+                None => {
+                    env.c1 = false;
+                    f80::BCD_INDEFINITE
+                }
+            };
+            x.set_tmp(F80 {
+                sig: u64::from_le_bytes(raw[..8].try_into().unwrap()),
+                se: u16::from_le_bytes([raw[8], raw[9]]),
+            });
         }
         x87op::FLD => {
             let v = match x87_mem(op) {
@@ -1184,6 +1298,55 @@ mod tests {
         assert_eq!(run(&[-12.0], x87op::FXTRACT).0, vec![-1.5, 3.0]);
         assert_eq!(run(&[0.0], x87op::FXTRACT).0, vec![0.0, f64::NEG_INFINITY]);
         assert_eq!(run(&[f64::MIN_POSITIVE / 4.0], x87op::FXTRACT).0, vec![1.0, -1024.0]);
+    }
+
+    #[test]
+    fn x87_packed_bcd_goes_through_the_operand_slot() {
+        let bcd = x87op::MEM_BCD << x87op::MEM_SHIFT;
+        // fbstp's conversion: -1234.5 rounds to even, to -1234.
+        let mut buf = vec![0u8; 0x4000];
+        stack(&mut buf, &[-1234.5]);
+        let mut m = GuestMem::new(&mut buf);
+        serve_x87(&mut m, CTX, x87op::FST | bcd);
+        let t = m.read(CTX + ctx::X87_TMP as u64, 10).unwrap().to_vec();
+        assert_eq!(t, [0x34, 0x12, 0, 0, 0, 0, 0, 0, 0, 0x80]);
+        // fbld pushes it back.
+        serve_x87(&mut m, CTX, x87op::FLD | bcd);
+        let top = m.read_u32(CTX + ctx::X87_TOP as u64).unwrap() & 7;
+        let a = CTX + ctx::X87 as u64 + top as u64 * 16;
+        let v = crate::f80::F80 {
+            sig: m.read_u64(a).unwrap(),
+            se: u16::from_le_bytes(m.read(a + 8, 2).unwrap().try_into().unwrap()),
+        };
+        assert_eq!(crate::f80::to_f64(v), -1234.0);
+    }
+
+    #[test]
+    fn call_outs_wait_on_the_stack_of_the_mode_they_were_made_in() {
+        // A WoW64 thread: TEB at 0x2000, its 64-bit stack 0x10000..0x20000,
+        // the 32-bit stack around 0x8000 (R14 keeps the 64-bit one).
+        let mut buf = vec![0u8; 0x4000];
+        let mut m = GuestMem::new(&mut buf);
+        m.write_u64(CTX + ctx::GS_BASE as u64, 0x2000).unwrap();
+        m.write_u64(0x2008, 0x20000).unwrap();
+        m.write_u64(0x2010, 0x10000).unwrap();
+        let regs = |m: &mut GuestMem<'_>, rsp: u64, r14: u64| {
+            m.write_u64(CTX + ctx::x(4) as u64, rsp).unwrap();
+            m.write_u64(CTX + ctx::x(14) as u64, r14).unwrap();
+        };
+        // In 32-bit code: a 64-bit call-out waits on R14, a 32-bit one on ESP.
+        regs(&mut m, 0xffff_ffff_0000_8000, 0x18000);
+        assert_eq!(callout_live_sp(&m, CTX, true, true, false), Some(0x18000));
+        assert_eq!(callout_live_sp(&m, CTX, true, true, true), Some(0x8000));
+        // In 64-bit code (a syscall under a 32-bit call-out): RSP for a
+        // 64-bit call-out; a 32-bit one waits.
+        regs(&mut m, 0x17000, 0x18000);
+        assert_eq!(callout_live_sp(&m, CTX, false, true, false), Some(0x17000));
+        assert_eq!(callout_live_sp(&m, CTX, false, true, true), None);
+        // 64-bit code still on the 32-bit stack (before syscall_32to64's
+        // switch): R14.
+        regs(&mut m, 0x8000, 0x18000);
+        assert_eq!(callout_live_sp(&m, CTX, false, true, false), Some(0x18000));
     }
 
     #[test]

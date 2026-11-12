@@ -5,10 +5,10 @@
 // loads the 24 once, phase 2 four times over. Between the two, each further
 // load may cost under 4096 dispatch slots (the runtime's exit lines, under
 // `log: 'debug'`) and under 18 MiB of the run's peak RSS
-// (each load currently keeps about 13 MiB), and under 0.5 MiB of the
-// kernel's memory (known to fail: about 2.3 MiB): an unloaded image's
-// translations must go with it.
-import { bootWine, exitStats } from '../lib/wine.mjs';
+// (each load currently keeps about 8 MiB), and under 0.5 MiB of the
+// kernel's memory: an unloaded image's translations must go with it, and
+// one loaded again is served from the store, not lifted and stored again.
+import { bootWine, exitStats, exitLineOf } from '../lib/wine.mjs';
 import { expect } from '../fixtures/wine/bigdll.mjs';
 
 export const meta = { hosts: ['browser', 'node'], arches: ['x86'], images: ['wine64', 'win-progs'], timeout: 1800, alone: true };
@@ -27,6 +27,7 @@ export default async function (t) {
   // This phase's process (Node) or the page's renderer: its Workers are its
   // threads. The browser's is unknown when other jobs' renderers run too.
   const rss = await t.peakRss();
+  t.check(`${name}: dllcycle's exit line`, await exitLineOf(t, /dllcycle\.exe/), 'none in 60 s');
   await w.sys.shutdown();
   const stats = await exitStats(t);
   const left = Math.min(...stats.map((s) => s.slotsLeftK).filter((n) => n >= 0));
@@ -51,6 +52,5 @@ export default async function (t) {
   // only grows: the same 24 images again should add next to nothing.
   const store = (kernel - t.state.kernel) / further;
   t.record('kernel MiB per further load', Number(store.toFixed(2)));
-  t.known(`kernel memory per further load: ${store.toFixed(2)} MiB (${t.state.kernel} -> ${kernel} MiB), want under 0.5`, store < 0.5, store.toFixed(2),
-    'the module store grows on every reload of the same image: KC');
+  t.check(`kernel memory per further load: ${store.toFixed(2)} MiB (${t.state.kernel} -> ${kernel} MiB), want under 0.5`, store < 0.5, store.toFixed(2));
 }

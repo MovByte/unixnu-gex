@@ -194,6 +194,9 @@ pub struct FuncBody {
     fold: bool,
     /// With `fold`: every local instruction, as (offset, local, length).
     local_log: Vec<(u32, u32, u8)>,
+    /// Control constructs open at the end of `code`, the function's own
+    /// body not counted.
+    open: u32,
 }
 
 impl FuncBody {
@@ -206,7 +209,34 @@ impl FuncBody {
             last_set: None,
             fold: false,
             local_log: Vec::new(),
+            open: 0,
         }
+    }
+
+    /// Control constructs open here: a `br` of this depth targets the
+    /// label of a block [`Self::prepend_block`] puts around the body later.
+    pub fn open(&self) -> u32 {
+        self.open
+    }
+
+    /// Put a void `block` in front of everything emitted so far, its labels
+    /// one deeper and the recorded offsets moved with the code. It is closed
+    /// by an [`Self::end`] like any other.
+    pub fn prepend_block(&mut self) {
+        let head = [op::BLOCK, 0x40];
+        let n = head.len();
+        self.code.splice(0..0, head);
+        for r in self.relocs.iter_mut() {
+            *r += n as u32;
+        }
+        for l in self.local_log.iter_mut() {
+            l.0 += n as u32;
+        }
+        if let Some((at, _, end)) = self.last_set.as_mut() {
+            *at += n;
+            *end += n;
+        }
+        self.open += 1;
     }
 
     /// Declare a new local and return its index.
@@ -372,6 +402,11 @@ impl FuncBody {
         }
     }
 
+    /// The two addresses on the stack added.
+    pub fn addr_add(&mut self) {
+        self.byte(if gex_abi::mem64() { 0x7c } else { 0x6a }); // i64.add / i32.add
+    }
+
     /// `& k`.
     pub fn addr_and_const(&mut self, k: i64) {
         if gex_abi::mem64() {
@@ -474,24 +509,28 @@ impl FuncBody {
 
     pub fn end(&mut self) {
         self.byte(op::END);
+        self.open = self.open.wrapping_sub(1);
     }
 
     /// `if` with a single result value.
     pub fn if_result(&mut self, ty: ValType) {
         self.byte(op::IF);
         self.byte(ty.byte());
+        self.open += 1;
     }
 
     /// `if` with no result.
     pub fn if_void(&mut self) {
         self.byte(op::IF);
         self.byte(0x40);
+        self.open += 1;
     }
 
     /// `block` with no result.
     pub fn block_void(&mut self) {
         self.byte(op::BLOCK);
         self.byte(0x40);
+        self.open += 1;
     }
 
     /// `br_table`: branch to `targets[i]` for index `i`, or to `default`.
@@ -508,6 +547,7 @@ impl FuncBody {
     pub fn loop_void(&mut self) {
         self.byte(op::LOOP);
         self.byte(0x40);
+        self.open += 1;
     }
 
     /// Unconditional branch to the label `depth` levels out.
@@ -1221,9 +1261,11 @@ impl Module {
     }
 
     /// Define a global (none are imported), returning its index.
+    /// A defined global: its index follows the imported ones'.
     pub fn add_global(&mut self, ty: ValType, mutable: bool, init: i64) -> u32 {
+        let imported = self.imports.iter().filter(|i| matches!(i.kind, ImportKind::Global { .. })).count() as u32;
         self.globals.push((ty, mutable, init));
-        self.globals.len() as u32 - 1
+        imported + self.globals.len() as u32 - 1
     }
 
     pub fn set_start(&mut self, func: u32) {

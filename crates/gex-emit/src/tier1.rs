@@ -204,10 +204,18 @@ pub struct Context<'a> {
     pub page_bases: Option<&'a HashMap<u64, u32>>,
     /// `TranslatedModule::module_id` of the module being built.
     pub module_id: u64,
+    /// The global holding it instead, set by the host at instantiation
+    /// (`crate::module::with_module_id_global`): the bytes then do not
+    /// depend on which id the module was given.
+    pub module_id_global: Option<u32>,
     /// The module's imported dense base (`crate::dense::GLOBAL`), when it
     /// has one: `PAGE_STALE` passes its value, where this module's dense
     /// blocks really are in the process running it.
     pub dense_global: Option<u32>,
+    /// The module's imported other directory ([`gex_abi::imports::ALT_DIR`])
+    /// when its code is in the process's other mode: every directory lookup
+    /// reads that one.
+    pub alt_dir: Option<u32>,
     /// Every address some block of `gir` branches back to (a successor at or
     /// below the branching block's start). A region needs a back edge to its
     /// entry, so a block not in here grows none and the walk is skipped.
@@ -339,9 +347,9 @@ fn page_check_ballast() -> usize {
 
 /// The pages `[start, end)` touches that the module numbered, with their
 /// entries.
-fn checked_pages(bases: &HashMap<u64, u32>, start: u64, end: u64) -> Vec<(u64, u32)> {
-    let first = start / gex_abi::DISPATCH_PAGE;
-    let last = end.max(start + 1).saturating_sub(1) / gex_abi::DISPATCH_PAGE;
+fn checked_pages(bases: &HashMap<u64, u32>, start: u64, end: u64, alt: bool) -> Vec<(u64, u32)> {
+    let first = gex_abi::page_key(start, alt);
+    let last = gex_abi::page_key(end.max(start + 1).saturating_sub(1), alt);
     (first..=last).filter_map(|p| bases.get(&p).map(|&b| (p, b))).collect()
 }
 
@@ -548,12 +556,12 @@ pub fn compile_with_relocs(block: &Block, cx: &Context<'_>) -> (Vec<u8>, Vec<u32
         e.emit_target_check(block.start);
     }
     if let Some(bases) = cx.page_bases.filter(|_| page_check()) {
-        let mut pages = checked_pages(bases, block.start, block.end);
+        let mut pages = checked_pages(bases, block.start, block.end, cx.alt_dir.is_some());
         // A region carries its members: their pages too.
         if let Some(region) = &region {
             for a in region.iter() {
                 if let Some(b) = cx.gir.get(a) {
-                    pages.extend(checked_pages(bases, b.start, b.end));
+                    pages.extend(checked_pages(bases, b.start, b.end, cx.alt_dir.is_some()));
                 }
             }
         }
@@ -587,6 +595,7 @@ pub fn compile_with_relocs(block: &Block, cx: &Context<'_>) -> (Vec<u8>, Vec<u32
     }
     run_one(&mut e, block, region);
     strip_tees(&mut e);
+    e.close_kuser_fault();
     e.f.finish_with_relocs()
 }
 
@@ -606,12 +615,12 @@ pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
         e.emit_target_check(block.start);
     }
     if let Some(bases) = cx.page_bases.filter(|_| page_check()) {
-        let mut pages = checked_pages(bases, block.start, block.end);
+        let mut pages = checked_pages(bases, block.start, block.end, cx.alt_dir.is_some());
         // A region carries its members: their pages too.
         if let Some(region) = &region {
             for a in region.iter() {
                 if let Some(b) = cx.gir.get(a) {
-                    pages.extend(checked_pages(bases, b.start, b.end));
+                    pages.extend(checked_pages(bases, b.start, b.end, cx.alt_dir.is_some()));
                 }
             }
         }
@@ -645,6 +654,7 @@ pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
     }
     run_one(&mut e, block, region);
     strip_tees(&mut e);
+    e.close_kuser_fault();
     e.f.finish()
 }
 
@@ -759,6 +769,14 @@ struct Emitter<'a> {
     /// (returning 0: the caller goes on at the context's PC); 0 when the
     /// host never returns from a fault.
     resumable_pc: u64,
+    /// Function mode, with `resumable_pc`: where the statement being
+    /// emitted carries on when it is a fault the host may deliver in place
+    /// (`int3`'s or `ud2`'s `HostCall`): the next instruction's pc.
+    fault_next: Option<u64>,
+    /// Function mode, with `resumable_pc`: the pc of the instruction the
+    /// statement being emitted is of, where a fault it raises in place is
+    /// (with the registers written back there).
+    stmt_pc: Option<u64>,
     /// Function mode: the local the next `def` leaves its value in (a
     /// register's, when a `WriteReg` of the value follows at once). Taken
     /// by `def`'s common tail; left set by a definition that has no local.
@@ -771,6 +789,9 @@ struct Emitter<'a> {
     value_fp: Vec<Option<bool>>,
     free_f32: Vec<u32>,
     free_f64: Vec<u32>,
+    /// A bounds guard branched to the shared KUSER fault: the body still
+    /// needs [`Self::close_kuser_fault`].
+    kuser_fault: bool,
 }
 
 /// What a region member needs to know to branch to its neighbours.
@@ -832,11 +853,14 @@ impl<'a> Emitter<'a> {
             region_writes: Default::default(),
             func_regs: None,
             resumable_pc: 0,
+            fault_next: None,
+            stmt_pc: None,
             def_into: None,
             fp_result: false,
             value_fp: Vec::new(),
             free_f32: Vec::new(),
             free_f64: Vec::new(),
+            kuser_fault: false,
         }
     }
 
@@ -1553,7 +1577,7 @@ impl<'a> Emitter<'a> {
         // A byte's page's protection. The first byte's index is in the
         // table when the static offset is under a page (the address was
         // wrapped into the memory, and the byte past the table reads 0,
-        // `HIGH_TABLES_END` padding it); else, and for the last byte, the
+        // `DARWIN_TABLES_END` padding it); else, and for the last byte, the
         // index is held to the table's end.
         let small = (0..PERM_PAGE as i64).contains(&offset);
         let byte = |e: &mut Self, past: u32, clamp: bool| {
@@ -1884,10 +1908,10 @@ impl<'a> Emitter<'a> {
         let t = self.scratch_i64;
         // 32-bit Wine with KUSER_SHARED_DATA folded: an address at or above the old
         // page is a pointer the translator could not fold. A branch to the
-        // host's named fault (`BRK_KUSER_UNFOLDED`: an access violation),
-        // where the select would steer to a bare trap. The context holds
-        // what the block last wrote back, at its start's pc, as natively for
-        // an out-of-bounds access.
+        // host's named fault (`BRK_KUSER_UNFOLDED`: an access violation at
+        // that address), where the select would steer to a bare trap. The
+        // context holds what the block last wrote back, at its start's pc, as
+        // natively for an out-of-bounds access.
         if gex_abi::kuser_fold() {
             if floor == 0 {
                 self.f.local_tee(t);
@@ -1897,18 +1921,18 @@ impl<'a> Emitter<'a> {
                 self.guard_range(floor);
             }
             self.f.byte(code::I64_GE_U);
-            self.f.if_void();
-            self.store_pc(self.block_start);
-            self.f.local_get(self.ctx_local);
-            self.f.i64_const(self.block_start as i64);
-            self.f.local_get(t);
-            self.f.i64_const(32);
-            self.f.byte(code::I64_SHL);
-            self.f.byte(code::I64_OR);
-            self.f.i32_const(gex_abi::imports::BRK_KUSER_UNFOLDED);
-            self.f.call(self.cx.breakpoint);
-            self.f.unreachable();
-            self.f.end();
+            if self.func_regs.is_some() {
+                // The function JIT's bodies have results and their own exits:
+                // the fault stays in place.
+                self.f.if_void();
+                self.kuser_fault_call();
+                self.f.end();
+            } else {
+                // One fault per body (`close_kuser_fault`), `t` still the
+                // address there.
+                self.f.br_if(self.f.open());
+                self.kuser_fault = true;
+            }
             self.f.local_get(t);
             self.f.byte(code::I32_WRAP_I64);
             return;
@@ -1920,6 +1944,84 @@ impl<'a> Emitter<'a> {
         self.guard_range(floor);
         self.f.byte(code::I64_LT_U);
         self.f.select();
+    }
+
+    /// `BRK_KUSER_UNFOLDED` for the address in the scratch local, at the
+    /// block's start (the host writes that pc back); it does not return.
+    /// In function mode with resumable faults, the registers written back
+    /// first, at the faulting instruction's pc, and
+    /// `BRK_KUSER_UNFOLDED_RESUMABLE`: the host delivers the access
+    /// violation in place and returns, and the function leaves for the
+    /// context's PC.
+    fn kuser_fault_call(&mut self) {
+        let resumable = self.func_regs.is_some() && self.resumable_pc != 0;
+        let pc = if resumable { self.stmt_pc.unwrap_or(self.block_start) } else { self.block_start };
+        if resumable {
+            self.flush_conditional();
+        }
+        let t = self.scratch_i64;
+        self.f.local_get(self.ctx_local);
+        self.f.i64_const(pc as i64);
+        self.f.local_get(t);
+        self.f.i64_const(32);
+        self.f.byte(code::I64_SHL);
+        self.f.byte(code::I64_OR);
+        self.f.i32_const(if resumable { gex_abi::imports::BRK_KUSER_UNFOLDED_RESUMABLE } else { gex_abi::imports::BRK_KUSER_UNFOLDED });
+        self.f.call(self.cx.breakpoint);
+        if resumable {
+            self.f.i32_const(0);
+            self.f.ret();
+        } else {
+            self.f.unreachable();
+        }
+    }
+
+    /// Function mode: `int3`'s or `ud2`'s host call as a fault the host may
+    /// deliver in place (`resumable_pc` on its pc), as gex-cgen's units make
+    /// it. The registers and PC (the next instruction, `next`) are written
+    /// back first, so a host that returns without delivering anything (a
+    /// trace point) carries on; any other PC is a handler's target, which the
+    /// function leaves for (returning 0). Delivered by trapping out instead,
+    /// such a fault unwinds every wasm frame down to the nearest run loop:
+    /// those of the native code that called the function too, a native
+    /// `__TRY` whose handler then catches the exception among them.
+    fn resumable_fault(&mut self, func: HostFunc, args: &[Value], next: u64) {
+        self.flush();
+        self.store_pc(next);
+        self.f.local_get(self.ctx_local);
+        self.push(args[0]);
+        self.f.i64_const(self.resumable_pc as i64);
+        self.f.byte(code::I64_OR);
+        self.push(args[1]);
+        self.f.call(self.import_index(func));
+        self.invalidate();
+        self.ctx_base();
+        self.f.load(0x29, 3, ctx::PC as u32);
+        self.f.i64_const(next as i64);
+        self.f.byte(code::I64_NE);
+        self.f.if_void();
+        self.f.i32_const(0);
+        self.f.ret();
+        self.f.end();
+    }
+
+    /// The fault the body's KUSER guards branch to: the body becomes
+    /// `block block <body> br 1 end <fault> end`, so it runs as before and
+    /// a guard at any depth reaches the fault with one `br_if`. The body is
+    /// a block function's (no results), complete.
+    fn close_kuser_fault(&mut self) {
+        if !std::mem::take(&mut self.kuser_fault) {
+            return;
+        }
+        let before = self.f.code.len();
+        debug_assert_eq!(self.f.open(), 0);
+        self.f.prepend_block();
+        self.f.prepend_block();
+        self.f.br(1);
+        self.f.end();
+        self.kuser_fault_call();
+        self.f.end();
+        GUARD_BYTES.fetch_add(self.f.code.len() - before, Ordering::Relaxed);
     }
 
     // -- statements --------------------------------------------------------
@@ -1950,6 +2052,11 @@ impl<'a> Emitter<'a> {
                     let opcode = store_op(ty, *sz);
                     self.f.store(opcode, natural_align(*sz), static_off);
                 }
+            }
+            Stmt::HostCall { func: func @ (HostFunc::Breakpoint | HostFunc::Illegal), args }
+                if self.resumable_pc != 0 && self.fault_next.is_some() && args.len() == 2 =>
+            {
+                self.resumable_fault(*func, args, self.fault_next.unwrap());
             }
             Stmt::HostCall { func, args } => {
                 self.host_call(*func, args, None, block);
@@ -5370,13 +5477,30 @@ impl<'a> Emitter<'a> {
         self.f.byte(0xa7); // i32.wrap_i64
         self.f.i32_const(4);
         self.f.byte(0x6c); // i32.mul
-        self.f.addr_i32();
-        self.f.load64(0x28, 2, gex_abi::dispatch_dir());
+        self.load_dir_entry();
         self.f.i32_const(0);
         self.f.local_get(self.scratch_page);
         self.f.i64_const(gex_abi::dispatch_max_pages() as i64);
         self.f.byte(code::I64_LT_U);
         self.f.select();
+    }
+
+    /// The directory entry at the byte offset (an `i32`, page * 4) on the
+    /// stack: in the process's directory, or for a module of code in its
+    /// other mode the other one.
+    fn load_dir_entry(&mut self) {
+        match self.cx.alt_dir {
+            Some(g) => {
+                self.f.addr_i32();
+                self.f.global_get(g);
+                self.f.addr_add();
+                self.f.load64(0x28, 2, 0);
+            }
+            None => {
+                self.f.addr_i32();
+                self.f.load64(0x28, 2, gex_abi::dispatch_dir());
+            }
+        }
     }
 
     /// Drop the table index from an entry on the stack, leaving the base slot.
@@ -5508,9 +5632,18 @@ impl<'a> Emitter<'a> {
         if pages.is_empty() {
             return;
         }
-        for (k, (page, base)) in pages.iter().enumerate() {
-            self.f.addr_const(gex_abi::dispatch_dir() + page * 4);
-            self.f.load(0x28, 2, 0); // i32.load
+        for (k, (key, base)) in pages.iter().enumerate() {
+            let (page, _) = gex_abi::key_page(*key);
+            match self.cx.alt_dir {
+                Some(_) => {
+                    self.f.i32_const((page * 4) as i32);
+                    self.load_dir_entry();
+                }
+                None => {
+                    self.f.addr_const(gex_abi::dispatch_dir() + page * 4);
+                    self.f.load(0x28, 2, 0); // i32.load
+                }
+            }
             self.f.i32_const(*base as i32);
             self.f.byte(0x47); // i32.ne
             if k > 0 {
@@ -5533,11 +5666,18 @@ impl<'a> Emitter<'a> {
             // The argument: this module's dense base (high half, read at run
             // time: where its blocks are in the process running it, unique
             // there by construction) and its id (low half). The id is
-            // compiled in and code outlives its process (units adopted from
+            // compiled in (natively, a global set at instantiation) and code
+            // outlives its process (units adopted from
             // another, modules restored from the translation cache), so ids
             // repeat; it only decides whether to translate again, never
             // whether to resume from JavaScript (`gex_cache_op`).
-            self.f.i64_const((self.cx.module_id & 0xffff_ffff) as i64);
+            match self.cx.module_id_global {
+                Some(g) => {
+                    self.f.global_get(g);
+                    self.f.byte(0xad); // i64.extend_i32_u
+                }
+                None => self.f.i64_const((self.cx.module_id & 0xffff_ffff) as i64),
+            }
             if let Some(g) = self.cx.dense_global {
                 self.f.global_get(g);
                 self.f.byte(0xad); // i64.extend_i32_u

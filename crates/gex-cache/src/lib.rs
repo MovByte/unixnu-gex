@@ -25,16 +25,203 @@ use wasmtime::{Engine, Module};
 /// batch keys on which blocks it held and almost never recurs.
 const DEFAULT_BUDGET: u64 = 4 << 30;
 
-/// Sweeping means listing the directory and statting every entry (a
-/// shared cache holds hundreds of thousands), so it is not done on every
-/// store: the first store of a process sweeps, and later ones only when the
-/// size the last sweep found plus what this process stored since reaches the
-/// budget, or every this many stores (other processes store too).
-const STORES_BETWEEN_SWEEPS: u64 = 4096;
-static STORES: AtomicU64 = AtomicU64::new(0);
-/// The cache's size as of the last sweep plus this process's stores since,
-/// or `u64::MAX` before the first sweep.
-static ESTIMATE: AtomicU64 = AtomicU64::new(u64::MAX);
+/// The cache's running size lives in this file in the cache directory, so a
+/// store need not list the directory (a shared cache holds hundreds of
+/// thousands of entries, seconds to list and stat): each store adds its bytes,
+/// each eviction subtracts what it removed, and only a sweep walks. Its text is
+/// "<bytes> <unix seconds a walk last set them> <unix seconds a walk last
+/// started>", each right-aligned in 20 columns, rewritten in place under a
+/// lock.
+const LEDGER: &str = "size";
+
+/// The oldest entries the last walk left, as "<key> <bytes>" lines, oldest
+/// last: what a store that takes the cache over budget evicts at once, with
+/// no walk. Read and written only under the ledger's lock.
+const VICTIMS: &str = "victims";
+
+/// How many entries a walk leaves in [`VICTIMS`].
+const VICTIMS_MAX: usize = 1024;
+
+/// The most entries one store evicts from [`VICTIMS`].
+const VICTIM_BATCH: usize = 64;
+
+/// Held (non-blocking) by the one sweep running against a cache directory.
+const SWEEP_LOCK: &str = "sweep.lock";
+
+/// How long a ledger is trusted before a sweep re-walks the directory to
+/// correct it: other gex builds share the directory and may store without
+/// adding, and two processes storing one key both add it.
+const RESYNC_AFTER: u64 = 3600;
+
+/// How long after a walk started another may start, unless the cache is over
+/// budget. A walk takes seconds and dies with its process, and a test run
+/// starts thousands of short processes: without this, each would start a
+/// walk of the whole directory and leave it unfinished.
+const WALK_RETRY: u64 = 600;
+
+/// Entries an eviction removes between ledger updates, so a process that
+/// exits mid-eviction leaves a ledger that matches what it removed.
+const EVICT_BATCH: usize = 256;
+
+/// The directories this process has a sweep running against.
+static SWEEPING: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Ledger {
+    bytes: u64,
+    /// When a walk last set `bytes`; 0 for never (a ledger stores started).
+    walked: u64,
+    /// When a walk last started; 0 for never.
+    started: u64,
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Update the ledger under its lock with `f` (given `None` when it is absent
+/// or unreadable) and return what was written. `None` when the ledger cannot
+/// be opened or locked.
+fn ledger_update(dir: &Path, f: impl FnOnce(Option<Ledger>) -> Ledger) -> Option<Ledger> {
+    use std::io::{Read, Seek, Write};
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(LEDGER))
+        .ok()?;
+    file.lock().ok()?;
+    let mut text = String::new();
+    let old = file.read_to_string(&mut text).ok().and_then(|_| {
+        let mut it = text.split_ascii_whitespace().map(str::parse::<u64>);
+        match (it.next(), it.next(), it.next(), it.next()) {
+            (Some(Ok(bytes)), Some(Ok(walked)), Some(Ok(started)), None) => Some(Ledger { bytes, walked, started }),
+            _ => None,
+        }
+    });
+    let new = f(old);
+    // One length always, written over the old in one write: a process may
+    // exit with its sweep thread in here, and a ledger truncated and not yet
+    // rewritten would read as absent (untrusted, no walk started), so the
+    // next store would start a walk of its own.
+    let line = format!("{:>20} {:>20} {:>20}\n", new.bytes, new.walked, new.started);
+    let _ = file.seek(std::io::SeekFrom::Start(0));
+    let _ = file.write_all(line.as_bytes());
+    // (a ledger from before was shorter)
+    if text.len() > line.len() {
+        let _ = file.set_len(line.len() as u64);
+    }
+    Some(new)
+}
+
+/// Record `delta` bytes stored (positive) or removed (negative). An absent or
+/// unreadable ledger starts from the delta, marked never walked.
+fn ledger_add(dir: &Path, delta: i64) -> Option<Ledger> {
+    ledger_update(dir, |old| {
+        let old = old.unwrap_or_default();
+        Ledger { bytes: old.bytes.saturating_add_signed(delta), ..old }
+    })
+}
+
+/// Evict up to `want` bytes from the oldest of the last walk's [`VICTIMS`]
+/// (at most [`VICTIM_BATCH`] entries), skipping any read since that walk
+/// (`walked`). Called under the ledger's lock. Returns the bytes removed.
+fn evict_victims(dir: &Path, want: u64, walked: u64) -> u64 {
+    let path = dir.join(VICTIMS);
+    let Ok(text) = std::fs::read_to_string(&path) else { return 0 };
+    let mut lines: Vec<&str> = text.lines().collect();
+    let mut removed = 0u64;
+    let mut n = 0;
+    while removed < want && n < VICTIM_BATCH {
+        let Some(line) = lines.pop() else { break };
+        n += 1;
+        let Some((key, size)) = line.split_once(' ') else { continue };
+        let meta_path = dir.join(format!("{key}.meta"));
+        // In whole seconds, as `walked` is: an entry the walk saw has an
+        // mtime no later than the second the walk ended in.
+        let read_since = std::fs::metadata(&meta_path)
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t.duration_since(std::time::UNIX_EPOCH).is_ok_and(|d| d.as_secs() > walked));
+        if read_since {
+            continue;
+        }
+        let gone = std::fs::remove_file(dir.join(format!("{key}.cwasm"))).is_ok();
+        let _ = std::fs::remove_file(&meta_path);
+        if gone {
+            removed += size.parse::<u64>().unwrap_or(0);
+        }
+    }
+    if lines.is_empty() {
+        let _ = std::fs::remove_file(&path);
+    } else {
+        let mut rest = lines.join("\n");
+        rest.push('\n');
+        let _ = std::fs::write(&path, rest);
+    }
+    removed
+}
+
+/// After a store of `added` bytes: account for it; if that takes the cache
+/// over budget, evict as much from the last walk's oldest entries at once;
+/// and start a sweep on a thread of its own (the store's caller is a guest
+/// waiting on its code) when the cache is still over budget, or when the
+/// ledger is untrusted and no walk has started for [`WALK_RETRY`]. At most one
+/// sweep runs per directory, in a process and across processes. Returns the
+/// sweep's thread, for tests.
+fn account_store(dir: &Path, added: u64, budget: u64) -> Option<std::thread::JoinHandle<()>> {
+    let now = now_secs();
+    let mut start = false;
+    ledger_update(dir, |old| {
+        let mut l = old.unwrap_or_default();
+        l.bytes = l.bytes.saturating_add(added);
+        if l.bytes > budget {
+            l.bytes = l.bytes.saturating_sub(evict_victims(dir, added, l.walked));
+        }
+        let stale = old.is_none() || l.walked == 0 || now.saturating_sub(l.walked) > RESYNC_AFTER;
+        if l.bytes > budget || (stale && now.saturating_sub(l.started) >= WALK_RETRY) {
+            start = true;
+            l.started = now;
+        }
+        l
+    })?;
+    if !start {
+        return None;
+    }
+    let done = |dir: &Path| {
+        if let Ok(mut s) = SWEEPING.lock() {
+            s.retain(|d| d != dir);
+        }
+    };
+    {
+        let mut s = SWEEPING.lock().ok()?;
+        if s.iter().any(|d| d == dir) {
+            return None;
+        }
+        s.push(dir.to_path_buf());
+    }
+    let owned = dir.to_path_buf();
+    let spawned = std::thread::Builder::new().name("gex-cache-sweep".into()).spawn(move || {
+        sweep(&owned, budget);
+        done(&owned);
+    });
+    spawned.inspect_err(|_| done(dir)).ok()
+}
+
+/// Walk and evict, unless another process is sweeping this directory.
+/// Returns the size left, or `None` when another sweep holds the directory.
+fn sweep(dir: &Path, budget: u64) -> Option<u64> {
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(SWEEP_LOCK))
+        .ok()?;
+    lock.try_lock().ok()?;
+    Some(evict(dir, budget))
+}
 
 fn budget() -> u64 {
     std::env::var("GEX_CACHE_MAX_BYTES")
@@ -46,16 +233,23 @@ fn budget() -> u64 {
 /// Delete least-recently-used entries until the cache is under budget.
 ///
 /// "Least recently used" is the metadata file's mtime, which
-/// [`load_or_compile`] refreshes on a hit. Evicts down to 80% of budget, not
-/// exactly to it, so a full cache does not sweep on every store. Returns the
-/// size left.
+/// [`load_or_compile`] refreshes on a hit (to the hour, [`REFRESH_AFTER`]).
+/// Evicts down to 80% of budget whenever the cache is above that, not only
+/// once it is over budget: a sweep that left it just under budget let the
+/// next store's estimate cross it again, so every store swept the whole
+/// directory. Sets the ledger to what the walk found (plus what other
+/// processes stored meanwhile) and subtracts each batch it removes. Returns
+/// the size left.
 fn evict(dir: &Path, budget: u64) -> u64 {
+    // What the ledger said before the walk: stores made during it (by any
+    // process) are what it says after, less this.
+    let before = ledger_update(dir, |old| old.unwrap_or_default()).map_or(0, |l| l.bytes);
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
     // (mtime, key, bytes) for each entry, sized as module plus metadata.
     let mut items: Vec<(std::time::SystemTime, String, u64)> = Vec::new();
-    let mut total = 0u64;
+    let mut walked = 0u64;
     for e in entries.flatten() {
         let path = e.path();
         if path.extension().and_then(|x| x.to_str()) != Some("cwasm") {
@@ -71,21 +265,51 @@ fn evict(dir: &Path, budget: u64) -> u64 {
         let when = meta
             .and_then(|m| m.modified())
             .unwrap_or(std::time::UNIX_EPOCH);
-        total += wasm_len + meta_len;
+        walked += wasm_len + meta_len;
         items.push((when, key, wasm_len + meta_len));
     }
-    if total <= budget {
+    let target = budget / 5 * 4;
+    items.sort_by_key(|(when, _, _)| *when);
+    // What this walk will evict: the oldest entries down to the target.
+    let mut cut = 0;
+    let mut kept = walked;
+    while kept > target && cut < items.len() {
+        kept -= items[cut].2;
+        cut += 1;
+    }
+    let mut total = ledger_update(dir, |old| {
+        // The next oldest, for stores to evict between walks.
+        let mut victims = String::new();
+        for (_, key, size) in items[cut..].iter().take(VICTIMS_MAX).rev() {
+            victims.push_str(&format!("{key} {size}\n"));
+        }
+        let _ = std::fs::write(dir.join(VICTIMS), victims);
+        let old = old.unwrap_or_default();
+        Ledger {
+            bytes: walked.saturating_add(old.bytes.saturating_sub(before)),
+            walked: now_secs(),
+            started: old.started,
+        }
+    })
+    .map_or(walked, |l| l.bytes);
+    if total <= target {
         return total;
     }
-    items.sort_by_key(|(when, _, _)| *when);
-    let target = budget / 5 * 4;
-    for (_, key, size) in items {
-        if total <= target {
+    let mut items = items.into_iter();
+    while total > target {
+        let mut removed = 0u64;
+        for (_, key, size) in items.by_ref().take(EVICT_BATCH) {
+            let _ = std::fs::remove_file(dir.join(format!("{key}.cwasm")));
+            let _ = std::fs::remove_file(dir.join(format!("{key}.meta")));
+            removed += size;
+            if total.saturating_sub(removed) <= target {
+                break;
+            }
+        }
+        if removed == 0 {
             break;
         }
-        let _ = std::fs::remove_file(dir.join(format!("{key}.cwasm")));
-        let _ = std::fs::remove_file(dir.join(format!("{key}.meta")));
-        total = total.saturating_sub(size);
+        total = ledger_add(dir, -(removed as i64)).map_or(total.saturating_sub(removed), |l| l.bytes);
     }
     total
 }
@@ -175,32 +399,6 @@ pub fn cache_dir() -> Option<PathBuf> {
 /// memory has, named by the sha256 of the image.
 pub fn mem64_dir() -> Option<PathBuf> {
     Some(gex_cache_root()?.join("mem64"))
-}
-
-fn mem64_record(image: &[u8]) -> Option<PathBuf> {
-    let mut h = sha256::Sha256::new();
-    h.update(image);
-    Some(mem64_dir()?.join(sha256::hex(&h.finish())))
-}
-
-/// Whether an earlier run of `image` ran out of a wasm32 memory's address
-/// space, so this one should start with a 64-bit memory.
-pub fn mem64_recorded(image: &[u8]) -> bool {
-    mem64_record(image).and_then(|p| std::fs::read(p).ok()).is_some_and(|b| b.starts_with(MEM64_RECORD_V))
-}
-
-/// The first line of a record: one an earlier gex wrote without it may have
-/// been learned from another image the run exec'd, and is not taken.
-const MEM64_RECORD_V: &[u8] = b"v 2\n";
-
-/// Record that `image` (at `path`, for the record's reader) ran out of
-/// address space asking for `short` bytes. Returns where it was written.
-pub fn record_mem64(image: &[u8], path: &str, short: u64) -> Option<PathBuf> {
-    let p = mem64_record(image)?;
-    std::fs::create_dir_all(p.parent()?).ok()?;
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    std::fs::write(&p, format!("v 2\nimage {path}\nshort {short}\nwhen {now}\n")).ok()?;
-    Some(p)
 }
 
 /// Where entry-point profiles live.
@@ -293,11 +491,7 @@ pub fn load_or_compile(
         // failure path below simply rebuilds.
         match unsafe { Module::deserialize(engine, &bytes) } {
             Ok(module) => {
-                // Rewriting the metadata refreshes its mtime, which eviction
-                // sorts by. Via `store`, not `fs::write`: this runs on every
-                // hit, and `fs::write` truncates before it fills, so a
-                // concurrent reader could see an empty file.
-                store(dir, &meta_path, &metadata);
+                refresh(&meta_path);
                 return Ok(Loaded {
                     module,
                     metadata,
@@ -309,6 +503,7 @@ pub fn load_or_compile(
                 // again. Failing to remove it is not worth reporting.
                 let _ = std::fs::remove_file(&path);
                 let _ = std::fs::remove_file(&meta_path);
+                ledger_add(dir, -((bytes.len() + metadata.len()) as i64));
             }
         }
     }
@@ -320,24 +515,35 @@ pub fn load_or_compile(
         // what publishes the entry.
         store(dir, &meta_path, &metadata);
         store(dir, &path, &serialized);
-        // Not on every store: the sweep lists the whole directory, and with a
-        // quarter of a million entries that is not free (a quarter of a
-        // translation-bound program's start, sweeping every 64th store).
-        let added = (metadata.len() + serialized.len()) as u64;
-        let n = STORES.fetch_add(1, Ordering::Relaxed);
-        let est = ESTIMATE.load(Ordering::Relaxed);
-        let budget = budget();
-        if est == u64::MAX || est.saturating_add(added) > budget || n % STORES_BETWEEN_SWEEPS == 0 {
-            ESTIMATE.store(evict(dir, budget), Ordering::Relaxed);
-        } else {
-            ESTIMATE.fetch_add(added, Ordering::Relaxed);
-        }
+        account_store(dir, (metadata.len() + serialized.len()) as u64, budget());
     }
     Ok(Loaded {
         module,
         metadata,
         hit: false,
     })
+}
+
+/// How stale a hit's metadata mtime may be before the hit refreshes it.
+/// Eviction needs no finer order than this, and a refresh is a write to the
+/// cache's filesystem: a Wine child starts with some seventy hits, and when
+/// each one rewrote its metadata file (a new file renamed over the old), a
+/// busy disk's journal held every start for seconds.
+const REFRESH_AFTER: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Mark a hit's entry as recently read for [`evict`]: its metadata file's
+/// mtime set to now, in place (its bytes untouched, so a concurrent reader
+/// never sees it partial), and only when older than [`REFRESH_AFTER`].
+fn refresh(meta_path: &Path) {
+    let Ok(f) = std::fs::File::open(meta_path) else { return };
+    let now = std::time::SystemTime::now();
+    let fresh = f
+        .metadata()
+        .and_then(|m| m.modified())
+        .is_ok_and(|t| now.duration_since(t).is_ok_and(|age| age < REFRESH_AFTER));
+    if !fresh {
+        let _ = f.set_modified(now);
+    }
 }
 
 /// A compiled module kept at `path` (no eviction: for large, long-lived
@@ -511,37 +717,46 @@ fn compile_uncached(engine: &Engine, wasm: &[u8]) -> Result<Module> {
 }
 
 /// [`compile`], keeping what it compiles: a native wasm32 program (a
-/// gexcc build) is a whole module compiled at every exec, seconds for a
-/// large one, so its compiled form goes in the cache by content
-/// (`cache_dir()/wasm32`). A cached module from another engine
-/// configuration or wasmtime version fails to deserialize and is
-/// recompiled over.
+/// gexcc build) and the libraries it links are whole modules compiled at
+/// every exec, seconds for a large one, so their compiled forms go in the
+/// shared cache as [`load_or_compile_module`]'s do (under the cache's
+/// budget: they once went to `cache_dir()/wasm32`, which nothing evicted).
 pub fn compile_cached(engine: &Engine, wasm: &[u8]) -> Result<Module> {
-    if precompiled_dir().is_some() {
-        return compile(engine, wasm);
-    }
-    let Some(dir) = cache_dir().map(|d| d.join("wasm32")) else {
+    load_or_compile_module(engine, wasm)
+}
+
+/// A whole module loaded as it is (Wine's native PE modules and their core,
+/// a library provider), compiled once and kept in the shared cache
+/// ([`cache_dir`], under its budget and eviction, stored by temp file and
+/// rename) by its content and the engine's configuration
+/// ([`module_key`]): never beside the module's file, which may be another
+/// install's, read through a link. With [`precompiled_dir`] set (an ejected
+/// project), or without a compiler, as [`compile`].
+pub fn load_or_compile_module(engine: &Engine, wasm: &[u8]) -> Result<Module> {
+    let (Some(dir), Some(key)) = (cache_dir().filter(|_| precompiled_dir().is_none()), module_key(engine, wasm)) else {
         return compile(engine, wasm);
     };
-    let name = content_name(wasm);
-    // And in memory for the host process: under 32-bit Wine every child
-    // execs the same 5.7 MB loader.
-    memo(engine, wasm.len(), || format!("cc:{name}"), || {
-        let path = dir.join(&name);
-        if let Ok(bytes) = std::fs::read(&path) {
-            // SAFETY: written below by this runtime with an engine of the same
-            // kind; `deserialize` checks the engine configuration and version.
-            if let Ok(m) = unsafe { Module::deserialize(engine, &bytes) } {
-                return Ok(m);
-            }
-        }
-        let m = compile_here(engine, wasm)?;
-        #[cfg(feature = "compile")]
-        if let Ok(bytes) = m.serialize() {
-            store(&dir, &path, &bytes);
-        }
-        Ok(m)
+    memo(engine, wasm.len(), || format!("mod:{key}"), || {
+        Ok(load_or_compile(engine, &dir, &key, || Ok((wasm.to_vec(), Vec::new())))?.module)
     })
+}
+
+/// [`load_or_compile_module`]'s key: the module's bytes and the engine's
+/// precompile compatibility (what `deserialize` checks), so engines of two
+/// configurations (a 64-bit memory's, a wasm32 one's) keep an entry each
+/// rather than recompiling over each other's. None without a compiler.
+#[cfg(feature = "compile")]
+pub fn module_key(engine: &Engine, wasm: &[u8]) -> Option<String> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    engine.precompile_compatibility_hash().hash(&mut h);
+    let e = h.finish().to_le_bytes();
+    Some(key_memo("module", [wasm, &e[..]]))
+}
+
+#[cfg(not(feature = "compile"))]
+pub fn module_key(_engine: &Engine, _wasm: &[u8]) -> Option<String> {
+    None
 }
 
 #[cfg(feature = "compile")]
@@ -660,6 +875,66 @@ mod tests {
     }
 
     use super::*;
+
+    /// A hit writes nothing to the cache unless its entry's mtime is stale,
+    /// and then only the mtime: the same file (no new one renamed over it),
+    /// its bytes untouched.
+    #[test]
+    fn a_hit_refreshes_a_stale_mtime_in_place_and_leaves_a_fresh_one() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("gex-meta-refresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("k.meta");
+        std::fs::write(&path, b"meta").unwrap();
+        let ino = std::fs::metadata(&path).unwrap().ino();
+        let set = |ago: u64| {
+            let t = std::time::SystemTime::now() - std::time::Duration::from_secs(ago);
+            std::fs::File::open(&path).unwrap().set_modified(t).unwrap();
+            t
+        };
+        let mtime = || std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let recent = set(600);
+        refresh(&path);
+        assert_eq!(mtime(), recent, "a mtime newer than REFRESH_AFTER is left");
+
+        let stale = set(2 * 3600);
+        refresh(&path);
+        let after = mtime();
+        assert!(after > stale + std::time::Duration::from_secs(3600), "a stale mtime is refreshed");
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), ino, "in place, not a new file");
+        assert_eq!(std::fs::read(&path).unwrap(), b"meta");
+        assert!(std::fs::read_dir(&dir).unwrap().count() == 1, "no temporary file left");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With the mtime refreshed at most once an hour, an entry read all the
+    /// time still sorts as recent: its mtime is within the hour, and entries
+    /// not read for longer go before it.
+    #[test]
+    fn eviction_keeps_an_entry_read_all_the_time() {
+        let dir = std::env::temp_dir().join(format!("gex-evict-hour-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = std::time::SystemTime::now();
+        // Read 59 minutes ago and refreshed then, read since (no refresh);
+        // last read 2 h and 3 h ago.
+        for (k, ago) in [("busy", 59 * 60), ("old", 2 * 3600), ("older", 3 * 3600)] {
+            std::fs::write(dir.join(format!("{k}.cwasm")), [0u8; 1000]).unwrap();
+            let meta = dir.join(format!("{k}.meta"));
+            std::fs::write(&meta, b"m").unwrap();
+            std::fs::File::open(&meta).unwrap().set_modified(now - std::time::Duration::from_secs(ago)).unwrap();
+        }
+        refresh(&dir.join("busy.meta"));
+        // Over budget; eviction goes down to 80% of it, room for one entry
+        // (1001 bytes): two must go.
+        let left = evict(&dir, 1300);
+        let kept: Vec<bool> = ["busy", "old", "older"].iter().map(|k| dir.join(format!("{k}.cwasm")).exists()).collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(kept, [true, false, false], "the busy entry is kept, the two idle ones evicted");
+        assert_eq!(left, 1001);
+    }
 
     #[test]
     fn the_key_covers_every_field() {
@@ -817,6 +1092,138 @@ mod budget_tests {
         assert!(left.contains(&"k0".to_string()), "dropped a recent read: {left:?}");
         assert!(left.contains(&"k9".to_string()), "dropped the newest: {left:?}");
         assert!(!left.contains(&"k1".to_string()), "kept the oldest unread: {left:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sweep that finds the cache under budget but above 80% of it still
+    /// takes it down to 80%, so the stores after it do not sweep again.
+    #[test]
+    fn a_sweep_near_the_budget_leaves_room() {
+        let dir = std::env::temp_dir().join(format!("gex-cache-near-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..10 {
+            std::fs::write(dir.join(format!("k{i}.cwasm")), vec![0u8; 1024]).unwrap();
+            std::fs::write(dir.join(format!("k{i}.meta")), b"m").unwrap();
+        }
+        // 10 entries of 1025 bytes against a budget of 10.5 of them: under it.
+        let budget = 10 * 1025 + 512;
+        let left = evict(&dir, budget);
+        assert!(left <= budget / 5 * 4, "left {left} bytes, more than 80% of {budget}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn entry(dir: &Path, i: usize) {
+        std::fs::write(dir.join(format!("k{i}.cwasm")), vec![0u8; 1024]).unwrap();
+        std::fs::write(dir.join(format!("k{i}.meta")), b"m").unwrap();
+    }
+
+    fn on_disk(dir: &Path) -> u64 {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| matches!(e.path().extension().and_then(|x| x.to_str()), Some("cwasm" | "meta")))
+            .map(|e| e.metadata().unwrap().len())
+            .sum()
+    }
+
+    /// Stores keep the ledger without listing the directory; a sweep
+    /// corrects it to what is there; a store that takes the cache over
+    /// budget evicts its own bytes' worth of the oldest entries at once,
+    /// without a walk.
+    #[test]
+    fn the_ledger_follows_stores_and_eviction() {
+        let dir = std::env::temp_dir().join(format!("gex-cache-ledger-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let budget = 8 * 1025;
+        let read = |dir: &Path| ledger_update(dir, |old| old.unwrap()).unwrap();
+
+        // No ledger yet: the first store starts one, never walked, and so
+        // starts a sweep, which finds what is really there.
+        for i in 0..4 {
+            entry(&dir, i);
+            std::thread::sleep(std::time::Duration::from_millis(12));
+        }
+        account_store(&dir, 1025, budget).expect("a sweep").join().unwrap();
+        let l = read(&dir);
+        assert_eq!(l.bytes, 4 * 1025);
+        assert_ne!(l.walked, 0);
+        assert_ne!(l.started, 0);
+
+        // Stores up to the budget only add.
+        for i in 4..8 {
+            entry(&dir, i);
+            assert!(account_store(&dir, 1025, budget).is_none(), "swept under budget");
+        }
+        assert_eq!(read(&dir).bytes, 8 * 1025);
+
+        // One more crosses it: the oldest entry goes at once, and no walk.
+        entry(&dir, 8);
+        assert!(account_store(&dir, 1025, budget).is_none(), "walked with victims to hand");
+        assert!(!dir.join("k0.cwasm").exists(), "the oldest was kept");
+        assert!(dir.join("k1.cwasm").exists(), "evicted more than the store added");
+        assert_eq!(read(&dir).bytes, on_disk(&dir));
+        assert!(read(&dir).bytes <= budget);
+
+        // A ledger that cannot be trusted is corrected by a walk, which
+        // also takes the cache to 80%.
+        ledger_update(&dir, |old| Ledger { bytes: 1, walked: 1, ..old.unwrap() });
+        let left = sweep(&dir, budget).unwrap();
+        assert_eq!(left, on_disk(&dir));
+        assert!(left <= budget / 5 * 4, "{left} bytes left");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Short processes in a row (a test run's) start at most one walk among
+    /// them, though each exits with its walk unfinished and the ledger still
+    /// untrusted.
+    #[test]
+    fn short_processes_start_one_walk() {
+        let dir = std::env::temp_dir().join(format!("gex-cache-short-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..4 {
+            entry(&dir, i);
+        }
+        let exe = std::env::current_exe().unwrap();
+        let mut walks = 0;
+        for _ in 0..20 {
+            let out = std::process::Command::new(&exe)
+                .args(["--ignored", "--exact", "budget_tests::a_short_process_stores", "--nocapture", "--test-threads=1"])
+                .env("GEX_CACHE_SHORT_DIR", &dir)
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(text.contains("stored"), "child did not run: {text}");
+            walks += text.matches("walk started").count();
+        }
+        assert_eq!(walks, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One short process for [`short_processes_start_one_walk`]: a store,
+    /// then exit at once, killing any walk it started.
+    #[test]
+    #[ignore]
+    fn a_short_process_stores() {
+        let Some(dir) = std::env::var_os("GEX_CACHE_SHORT_DIR") else { return };
+        let walk = account_store(Path::new(&dir), 1, u64::MAX).is_some();
+        println!("stored{}", if walk { ", walk started" } else { "" });
+        std::process::exit(0);
+    }
+
+    /// A sweep running in one process keeps another from starting one.
+    #[test]
+    fn one_sweep_at_a_time_per_directory() {
+        let dir = std::env::temp_dir().join(format!("gex-cache-onesweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let held = std::fs::File::create(dir.join(SWEEP_LOCK)).unwrap();
+        held.lock().unwrap();
+        assert_eq!(sweep(&dir, 1 << 20), None);
+        held.unlock().unwrap();
+        assert_eq!(sweep(&dir, 1 << 20), Some(0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

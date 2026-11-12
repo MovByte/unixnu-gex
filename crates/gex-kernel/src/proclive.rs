@@ -36,6 +36,10 @@ struct Live {
     exe: String,
     argv: Vec<String>,
     envp: Vec<String>,
+    /// Its ids and capabilities, read when `status` is.
+    creds: Arc<crate::syscalls::Creds>,
+    /// The host's clock (`Kernel::clock`): uptime, and `btime`.
+    clock: crate::syscalls::ClockFn,
 }
 
 /// One process's `/proc` source: empty until the process is first
@@ -145,11 +149,49 @@ impl ProcSource for KernelProcSource {
         let canon = l.vfs.upgrade().map_or_else(|| path.clone(), |v| v.get().canonical(&path));
         Some(crate::pty::link_name(&canon))
     }
-    fn stat(&self, tid: i32, threads: usize) -> String {
+    fn fd_info(&self, fd: i32) -> Option<String> {
+        let fds = self.0.get()?.fds.upgrade()?;
+        let f = fds.get(fd).ok()?;
+        let cloexec = if fds.cloexec(fd).unwrap_or(false) { crate::fs::oflags::O_CLOEXEC } else { 0 };
+        let ino = f.handle.metadata().map_or(0, |m| m.ino);
+        let mut out = format!("pos:\t{}\nflags:\t0{:o}\nmnt_id:\t0\nino:\t{ino}\n", f.offset(), f.flags() | cloexec);
+        if let Some(pid) = f.handle.pidfd() {
+            out.push_str(&format!("Pid:\t{pid}\nNSpid:\t{pid}\n"));
+        }
+        Some(out)
+    }
+    fn stat(&self, tid: i32, threads: usize, task: Option<&crate::proc::TaskUsage>) -> String {
         let Some(l) = self.0.get() else { return String::new() };
         let (ppid, pgid, sid) = relations(&l);
         let tty = tty_of(l.ptys, sid);
-        crate::vfs::procfs::stat_line(tid, &comm(&l.exe), 'R', ppid, pgid, sid, tty, threads)
+        let mut u = usage(&l);
+        let name = match task {
+            Some(t) => {
+                (u.cpu_ns, u.child_cpu_ns) = (t.cpu_ns, 0);
+                t.own_name().unwrap_or_else(|| comm(&l.exe))
+            }
+            None => comm(&l.exe),
+        };
+        crate::vfs::procfs::stat_line(tid, &name, 'R', ppid, pgid, sid, tty, threads, &u)
+    }
+    fn usage(&self) -> crate::proc::Usage {
+        self.0.get().map(|l| usage(&l)).unwrap_or_default()
+    }
+    fn system(&self) -> Option<crate::vfs::procfs::System> {
+        let l = self.0.get()?;
+        let uptime_ns = crate::syscalls::clock_ns(l.clock, 1);
+        let all = l.procs.entries();
+        Some(crate::vfs::procfs::System {
+            uptime_ns,
+            cpu_ns: l.procs.cpu_total(),
+            load: l.procs.loadavg(uptime_ns),
+            rss: all.iter().map(|e| e.usage.rss).sum(),
+            procs: all.len(),
+            last_pid: all.iter().map(|e| e.pid).max().unwrap_or(l.pid),
+        })
+    }
+    fn wall_secs(&self) -> u64 {
+        self.0.get().map_or(0, |l| crate::syscalls::clock_ns(l.clock, 0) / 1_000_000_000)
     }
     fn others(&self) -> Vec<crate::proc::ProcEntry> {
         self.0.get().map(|l| l.procs.entries()).unwrap_or_default()
@@ -166,22 +208,35 @@ impl ProcSource for KernelProcSource {
     fn task_owner(&self, id: i32) -> Option<i32> {
         self.0.get()?.procs.task_owner(id)
     }
-    fn status(&self, tid: i32, threads: usize) -> String {
+    fn status(&self, tid: i32, threads: usize, task: Option<&crate::proc::TaskUsage>) -> String {
         let Some(l) = self.0.get() else { return String::new() };
         let (ppid, _, _) = relations(&l);
         // (no peak is kept: the peaks are the current sizes)
         let (size, rss, anon) = l.mm.lock().vm_counters();
         let (size, rss, anon) = (size >> 10, rss >> 10, anon >> 10);
+        let (uid, gid, caps) = crate::vfs::procfs::status_ids(&l.creds.save());
         format!(
-            "Name:\t{}\nState:\tR (running)\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\n\
+            "Name:\t{}\nState:\tR (running)\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\n{uid}{gid}\
              VmPeak:\t{size:8} kB\nVmSize:\t{size:8} kB\nVmHWM:\t{rss:8} kB\nVmRSS:\t{rss:8} kB\n\
-             RssAnon:\t{anon:8} kB\nVmSwap:\t       0 kB\nThreads:\t{threads}\n",
-            l.exe.rsplit('/').next().unwrap_or("gex"),
+             RssAnon:\t{anon:8} kB\nVmSwap:\t       0 kB\nThreads:\t{threads}\n{caps}",
+            task.and_then(|t| t.own_name()).unwrap_or_else(|| l.exe.rsplit('/').next().unwrap_or("gex").to_string()),
             l.pid,
             tid,
             ppid
         )
     }
+}
+
+/// What this process has used: its processor time and memory now, and the
+/// rest (its start, its children's time) as the process table has them.
+fn usage(l: &Live) -> crate::proc::Usage {
+    let mut u = l.procs.entries().into_iter().find(|e| e.pid == l.pid).map(|e| e.usage).unwrap_or_default();
+    if let Some(ns) = crate::proc::cpu_clock(false) {
+        u.cpu_ns = ns;
+    }
+    let (size, rss, _) = l.mm.lock().vm_counters();
+    (u.vsize, u.rss) = (size, rss);
+    u
 }
 
 /// Parent, group and session, as the process table has them now.
@@ -224,7 +279,11 @@ impl Kernel {
                 && o.ptys.is_some() == self.ptys.is_some()
                 && o.argv == self.argv
                 && o.envp == self.envp
+                && Arc::ptr_eq(&o.creds, &self.creds)
         });
+        // The ids as they are now, for the other processes' `status` (an
+        // exec's capabilities, a fork child's own).
+        self.procs.set_creds(self.pid, &self.creds.save());
         if same {
             return;
         }
@@ -239,7 +298,14 @@ impl Kernel {
             exe: self.exe_path.clone(),
             argv: self.argv.clone(),
             envp: self.envp.clone(),
+            creds: Arc::clone(&self.creds),
+            clock: self.clock,
         };
+        // A program's publication (an exec arms its own, as it chooses the
+        // new program's memory: `Kernel::exec_flavour`).
+        if old.as_ref().is_none_or(|o| o.pid != live.pid || o.exe != live.exe) {
+            self.outgrow_arm(&self.exe_path, false);
+        }
         if old.as_ref().is_none_or(|o| o.exe != live.exe || o.argv != live.argv || o.pid != live.pid) {
             let name = live.exe.rsplit('/').next().unwrap_or("gex");
             let mut info = name.as_bytes().to_vec();
@@ -309,6 +375,25 @@ mod tests {
         let gone = k.fds.insert(crate::file::OpenFile::new(h, "/nowhere/x".into(), 0, true, false), false).unwrap() as i32;
         assert_eq!(src.fd_link(gone).as_deref(), Some("/nowhere/x"));
         assert_eq!(src.fd_link(999), None);
+    }
+
+    /// `/proc/self/fdinfo/N` as Linux writes it: position and flags (with
+    /// `O_CLOEXEC`), and a process descriptor's `Pid:` -- where polkit finds
+    /// the process a pidfd it opened names.
+    #[test]
+    fn fdinfo_shows_a_pidfds_process() {
+        let mut k = Kernel::new(0x1000, 0x10000, "/bin/a".into());
+        k.vfs.mount("/", Arc::new(TmpFs::new()));
+        let src = KernelProcSource::new();
+        k.publish_proc(&src.0);
+        let p = k.fds.insert(crate::pidfd::open_file(k.pid, &k.procs, false), true).unwrap() as i32;
+        assert_eq!(src.fd_info(p).unwrap(), format!("pos:\t0\nflags:\t02000002\nmnt_id:\t0\nino:\t0\nPid:\t{0}\nNSpid:\t{0}\n", k.pid));
+        let h = k.vfs.open("/f", crate::fs::oflags::O_CREAT | crate::fs::oflags::O_RDWR, 0o644).unwrap();
+        let f = k.fds.insert(crate::file::OpenFile::new(h, "/f".into(), crate::fs::oflags::O_RDWR, true, true), false).unwrap() as i32;
+        let info = src.fd_info(f).unwrap();
+        assert!(info.starts_with("pos:\t0\nflags:\t02\n"), "{info}");
+        assert!(!info.contains("Pid:"));
+        assert_eq!(src.fd_info(999), None);
     }
 
     /// A process that mounts its own `/proc` (as every gex process does)

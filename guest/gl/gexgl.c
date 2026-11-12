@@ -80,6 +80,10 @@ struct header {
 };
 
 static int gl_fd = -1;
+/* The host context's state (context_create, host_realize, below). */
+static int host_context_made;
+static int host_deferred;
+static void host_realize(void);
 static struct header *ring;
 static uint8_t *cmds;   /* the command area, just past the header */
 static uint8_t *replies;
@@ -347,7 +351,7 @@ static int fbq_invalidates(uint32_t opcode) {
 #include "gexgl-shadow.inc"
 
 /* Hand everything recorded so far to the host without waiting for it to
-   run: GEX_GL_SUBMIT_ASYNC (shims/native/src/gl.rs, shims/browser/src/gl.rs)
+   run: GEX_GL_SUBMIT_ASYNC (hosts/native/src/gl.rs, hosts/browser/src/gl.rs)
    copies the batch and returns, and the next submit of either kind waits for
    it. For a batch with nothing to answer -- a frame's last, when nothing is
    paced on its reply. In the page a synchronous submit is a round trip to
@@ -462,6 +466,8 @@ static void pv_divisor(unsigned index, unsigned divisor);
    room for them, or NULL if the batch is full -- in which case it is flushed
    and the caller tries again. */
 static uint32_t *begin(uint32_t opcode, size_t arg_words, size_t tail_bytes) {
+    if (host_deferred && !host_context_made && opcode != GEXGL_CONTEXT_CREATE)
+        host_realize();
     if (!ring && ring_open() != 0) {
         return NULL;
     }
@@ -777,7 +783,7 @@ static void mirror_drop(struct buffer_object_state *object) {
 }
 
 /* Called first by every command that may change a buffer's contents other
-   than glBufferData/glBufferSubData (tools/gl_buffer_writers.py). */
+   than glBufferData/glBufferSubData (scripts/gl/gl_buffer_writers.py). */
 static void buffer_contents_unknown(void) {
     for (struct buffer_object_state *o = buffer_objects; o; o = o->next) {
         if (o->map) o->host_wrote = 1;
@@ -1245,7 +1251,7 @@ static void persistent_settle(void) {
     if (persistent_tracing()) persistent_trace(hashed, sent);
 }
 
-/* glMemoryBarrier's (gl44-generated.inc, via tools/gl_buffer_writers.py). */
+/* glMemoryBarrier's (gl44-generated.inc, via scripts/gl/gl_buffer_writers.py). */
 static void persistent_barrier(unsigned barriers) {
     persistent_publish((barriers & 0x00004000u) != 0, /* CLIENT_MAPPED_BUFFER_BARRIER_BIT */
                        PUBLISH_BARRIER);
@@ -3085,6 +3091,16 @@ static unsigned egl_api = 0x30A0; /* EGL_OPENGL_ES_API */
 static int host_context_made;
 /* How many contexts the application believes it has. */
 static int egl_contexts_live;
+/* A context asked for whose host context is not made yet. The host's is made
+   (host_realize) at the first command that needs it -- a GL call, a surface,
+   a make-current with a drawable -- not at eglCreateContext: Wine's display
+   driver creates contexts, makes them current with no surface and reads their
+   strings while the first process starts, for every page visit, and the
+   host's first context is what starts the page's Mesa. */
+static int host_deferred;
+static void host_realize(void);
+/* The current draw surface (eglMakeCurrent, below). */
+static void *egl_current_draw;
 
 /* Defined below, next to the list it builds. */
 static const char *gexgl_extension_string(void);
@@ -3097,6 +3113,20 @@ const unsigned char *glGetString(unsigned name) {
        reports 3.30 -- and an application that believes it writes
        `#version 440` shaders that cannot compile. glxinfo prints it next to
        the real GL version, which is where the disagreement showed. */
+    /* A context no surface has been current with, whose host context is not
+       made: what a driver's probe reads (Wine's GPU list names the device from
+       these). Said without the host, and not kept: the first context that
+       draws asks the host as before. The version has no x.y.z after its last
+       space, so a probe that parses one leaves it unknown rather than wrong. */
+    if (!host_context_made && host_deferred && !egl_current_draw) {
+        switch (name) {
+        case 0x1F00u: return (const unsigned char *)"Mesa";
+        case 0x1F01u: return (const unsigned char *)"gex WebGPU";
+        case 0x1F02u: return (const unsigned char *)(egl_api == 0x30A2u ? "4.6 Mesa" : "OpenGL ES 3.2 Mesa");
+        case 0x1F03u: return (const unsigned char *)"";
+        default: host_realize(); break;
+        }
+    }
     if (name == 0x1F03u) { /* GL_EXTENSIONS */
         return (const unsigned char *)gexgl_extension_string();
     }
@@ -3509,7 +3539,7 @@ static uint64_t readback_chunk(void) {
 }
 
 /* Uploads larger than one command can carry, the generated commands' part
-   (tools/gen_gl44_transport.py calls these first; each returns 1 when it
+   (scripts/gl/gen_gl44_transport.py calls these first; each returns 1 when it
    sent the upload itself, as smaller commands of the same kind). */
 void glTexSubImage3D(unsigned target, int level, int xoffset, int yoffset, int zoffset,
                      int width, int height, int depth, unsigned format, unsigned type,
@@ -3656,13 +3686,13 @@ static int split_glCompressedTexImage3D(unsigned target, int level, unsigned int
 }
 
 /* Registry-derived, pointer-free OpenGL 4.4 entry points.  This include is
-   regenerated by tools/gen_gl44_transport.py and uses the same batch helpers
+   regenerated by scripts/gl/gen_gl44_transport.py and uses the same batch helpers
    as the hand-written pointer/object-aware commands above. */
 #include "gl44-generated.inc"
 
 /* ------------------------------------------- the registry's other commands */
 
-/* Every other registry command with a wire plan (tools/gen_gl_compat.py,
+/* Every other registry command with a wire plan (scripts/gl/gen_gl_compat.py,
    guest/gl/gexgl-plan.h) is one call to this, its arguments as 64-bit words
    (floats and doubles as their bits, pointers as addresses): the plan says
    how each goes on the wire and how many elements an array holds. A command
@@ -3940,10 +3970,15 @@ void *eglGetDisplay(void *native) {
     return (void *)1;
 }
 
+/* EGL_PLATFORM_XCB_EXT's screen, from EGL_PLATFORM_XCB_SCREEN_EXT. */
+static int egl_native_xcb_screen;
+
 void *eglGetPlatformDisplay(unsigned platform, void *native, const intptr_t *attrs) {
-    (void)attrs;
     egl_native_display = native;
     egl_native_platform = platform;
+    egl_native_xcb_screen = 0;
+    for (const intptr_t *a = attrs; a && a[0] != 0x3038 /* EGL_NONE */; a += 2)
+        if (a[0] == 0x31DE /* EGL_PLATFORM_XCB_SCREEN_EXT */) egl_native_xcb_screen = (int)a[1];
     return (void *)1;
 }
 
@@ -3976,6 +4011,99 @@ static void *gexgl_x11_client_display(void) {
     return gexgl_x11_symbol_source() ? egl_native_display : NULL;
 }
 
+/* The same three questions for an XCB client (EGL_PLATFORM_XCB_EXT), which
+ * hands over an `xcb_connection_t *` and need not have Xlib at all: x11rb,
+ * and so wgpu under gpui, talks to the server through libxcb alone. The
+ * platform is explicit, so the pointer is known to be a connection; libxcb is
+ * found with RTLD_NOLOAD for the reason given above.
+ *
+ * libxcb's structures are the X protocol's wire layout, which does not change,
+ * so the few fields needed are declared here rather than taken from headers
+ * the guest's toolchain may not have. A request that fails comes back as an
+ * error rather than a call to an error handler, so nothing here can end the
+ * process. */
+struct gexgl_xcb_geometry_reply {
+    uint8_t response_type, depth;
+    uint16_t sequence;
+    uint32_t length, root;
+    int16_t x, y;
+    uint16_t width, height, border_width;
+};
+struct gexgl_xcb_tree_reply {
+    uint8_t response_type, pad0;
+    uint16_t sequence;
+    uint32_t length, root, parent;
+    uint16_t children_len;
+};
+struct gexgl_xcb_screen {
+    uint32_t root, default_colormap, white_pixel, black_pixel, input_masks;
+    uint16_t width, height, mm_width, mm_height, min_maps, max_maps;
+    uint32_t root_visual;
+};
+struct gexgl_xcb_cookie {
+    unsigned sequence;
+};
+struct gexgl_xcb_screen_iterator {
+    struct gexgl_xcb_screen *data;
+    int rem, index;
+};
+
+static void *gexgl_xcb_client_connection(void **xcb) {
+    if (!egl_native_display || egl_native_platform != 0x31DCu) return NULL;
+    *xcb = dlopen("libxcb.so.1", RTLD_LAZY | RTLD_NOLOAD);
+    return *xcb ? egl_native_display : NULL;
+}
+
+/* Returns 1 with the size if `win` is a window on the client's connection. */
+static int gexgl_xcb_window_size(void *c, void *xcb, uint32_t win, int *width, int *height) {
+    struct gexgl_xcb_cookie (*get)(void *, uint32_t) = dlsym(xcb, "xcb_get_geometry");
+    struct gexgl_xcb_geometry_reply *(*reply)(void *, struct gexgl_xcb_cookie, void **) =
+        dlsym(xcb, "xcb_get_geometry_reply");
+    if (!get || !reply) return 0;
+    void *error = NULL;
+    struct gexgl_xcb_geometry_reply *r = reply(c, get(c, win), &error);
+    free(error);
+    if (!r) return 0;
+    const int ok = r->width && r->height;
+    if (ok) {
+        *width = r->width;
+        *height = r->height;
+    }
+    free(r);
+    return ok;
+}
+
+static uint32_t gexgl_xcb_toplevel(void *c, void *xcb, uint32_t win) {
+    struct gexgl_xcb_cookie (*query)(void *, uint32_t) = dlsym(xcb, "xcb_query_tree");
+    struct gexgl_xcb_tree_reply *(*reply)(void *, struct gexgl_xcb_cookie, void **) =
+        dlsym(xcb, "xcb_query_tree_reply");
+    if (!query || !reply) return win;
+    for (int depth = 0; depth < 32; depth++) {
+        void *error = NULL;
+        struct gexgl_xcb_tree_reply *r = reply(c, query(c, win), &error);
+        free(error);
+        if (!r) break;
+        const uint32_t parent = r->parent, root = r->root;
+        free(r);
+        if (!parent || parent == root) break;
+        win = parent;
+    }
+    return win;
+}
+
+static int gexgl_xcb_default_visual(void *c, void *xcb) {
+    const void *(*get_setup)(void *) = dlsym(xcb, "xcb_get_setup");
+    struct gexgl_xcb_screen_iterator (*roots)(const void *) =
+        dlsym(xcb, "xcb_setup_roots_iterator");
+    void (*next)(struct gexgl_xcb_screen_iterator *) = dlsym(xcb, "xcb_screen_next");
+    if (!get_setup || !roots || !next) return 0;
+    const void *setup = get_setup(c);
+    if (!setup) return 0;
+    struct gexgl_xcb_screen_iterator it = roots(setup);
+    for (int i = 0; i < egl_native_xcb_screen && it.rem; i++) next(&it);
+    return it.rem && it.data ? (int)it.data->root_visual : 0;
+}
+
 /* The X visual an EGL config corresponds to.
  *
  * EGL on X11 has to answer EGL_NATIVE_VISUAL_ID with a visual the X server
@@ -4000,6 +4128,8 @@ static int egl_native_visual_id = -1;
 static int gexgl_x11_default_visual(void) {
     if (egl_native_visual_id >= 0) return egl_native_visual_id;
     egl_native_visual_id = 0;
+    void *xcb = NULL, *connection = gexgl_xcb_client_connection(&xcb);
+    if (connection) return egl_native_visual_id = gexgl_xcb_default_visual(connection, xcb);
     void *xlib = gexgl_x11_symbol_source();
     if (!xlib) return 0;
     void *(*open_display)(const char *) = dlsym(xlib, "XOpenDisplay");
@@ -4036,8 +4166,16 @@ static void context_create(void) {
         if (host_context_made) egl_contexts_live++;
         return;
     }
-    host_context_made = 1;
+    /* Counted now, made at the first command that needs it (host_realize),
+       with the attributes of the last context asked for by then. */
     egl_contexts_live++;
+    host_deferred = 1;
+}
+
+static void host_realize(void) {
+    if (host_context_made || !host_deferred || !ring) return;
+    host_context_made = 1;
+    host_deferred = 0;
     shadow_context_made();
     uint32_t *p = begin(GEXGL_CONTEXT_CREATE, 4, 0);
     if (!p) return;
@@ -4073,10 +4211,21 @@ static void context_create(void) {
     }
 }
 
+/* eglGetError's answer: the last failure's code, EGL_SUCCESS once read. A
+   failing call must leave one, or a caller that asks why (khronos-egl's
+   Err(get_error().unwrap())) has nothing to report. */
+static int egl_error = 0x3000; /* EGL_SUCCESS */
+static unsigned egl_fail(int error) { egl_error = error; return EGL_FALSE; }
+static void *egl_fail_null(int error) { egl_error = error; return NULL; }
+#define EGL_NOT_INITIALIZED 0x3001
+#define EGL_BAD_NATIVE_PIXMAP 0x300A
+#define EGL_BAD_PARAMETER 0x300C
+#define EGL_BAD_SURFACE 0x300D
+
 unsigned eglInitialize(void *dpy, int *major, int *minor) {
     (void)dpy;
     if (ring_open() != 0) {
-        return EGL_FALSE;
+        return egl_fail(EGL_NOT_INITIALIZED);
     }
     /* EGL 1.5. The GL context itself is created later, from
        eglCreateContext, once eglBindAPI has said what it is for. */
@@ -4089,7 +4238,7 @@ unsigned eglInitialize(void *dpy, int *major, int *minor) {
 unsigned eglTerminate(void *dpy) { (void)dpy; return EGL_TRUE; }
 unsigned eglBindAPI(unsigned api) {
     if (api != 0x30A0u && api != 0x30A2u) /* EGL_OPENGL_ES_API / EGL_OPENGL_API */
-        return EGL_FALSE;
+        return egl_fail(EGL_BAD_PARAMETER);
     /* Only recorded here. The context is created from eglCreateContext, and
        the version strings are whatever the host answers for it -- selecting an
        identity here would be asserting a version rather than reporting one. */
@@ -4113,7 +4262,7 @@ unsigned eglGetConfigs(void *dpy, void **configs, int size, int *num) {
 
 unsigned eglGetConfigAttrib(void *dpy, void *config, int attr, int *value) {
     (void)dpy; (void)config;
-    if (!value) return EGL_FALSE;
+    if (!value) return egl_fail(EGL_BAD_PARAMETER);
     switch (attr) {
     case 0x3024: /* EGL_RED_SIZE */ *value = 8; break;
     case 0x3023: /* EGL_GREEN_SIZE */ *value = 8; break;
@@ -4179,6 +4328,9 @@ static int gexgl_x11_window_size(void *win, int *width, int *height) {
        gets BadWindow for a window that certainly exists -- measured, not
        supposed. Requests on one connection are ordered, so the client's own
        sees it. */
+    void *xcb = NULL, *connection = gexgl_xcb_client_connection(&xcb);
+    if (connection)
+        return gexgl_xcb_window_size(connection, xcb, (uint32_t)(uintptr_t)win, width, height);
     void *display = gexgl_x11_client_display();
     void *xlib = gexgl_x11_symbol_source();
     if (!display || !xlib) return 0;
@@ -4216,6 +4368,8 @@ static unsigned long gexgl_x11_toplevel(void *win) {
     void *display = gexgl_x11_client_display();
     void *xlib = gexgl_x11_symbol_source();
     unsigned long w = (unsigned long)(uintptr_t)win;
+    void *xcb = NULL, *connection = gexgl_xcb_client_connection(&xcb);
+    if (connection) return gexgl_xcb_toplevel(connection, xcb, (uint32_t)w);
     if (!display || !xlib) return w;
     int (*query_tree)(void *, unsigned long, unsigned long *, unsigned long *,
                       unsigned long **, unsigned *) = dlsym(xlib, "XQueryTree");
@@ -4519,6 +4673,24 @@ unsigned eglDestroySurface(void *dpy, void *surface) {
        process has gone. */
     CMD1(GEXGL_SURFACE_DETACH, s->handle);
     flush();
+    /* A Wayland surface's compositor is told too, unless another EGL surface
+       still draws for the same wl_surface: from here the client may attach
+       buffers of its own to it, and ids are reused -- a surface made later
+       with this id must not inherit this one's size and host frames. (A Qt
+       dialog came up 1 pixel high: its wl_surface had the id of a GL probe
+       window's, which had been drawn on the host at 133x1.) */
+    if (s->kind == GEXGL_SURFACE_WAYLAND) {
+        int shared = 0;
+        for (unsigned i = 0; i < GEXGL_MAX_SURFACES; i++)
+            if (&egl_surfaces[i] != s && egl_surfaces[i].handle &&
+                egl_surfaces[i].kind == GEXGL_SURFACE_WAYLAND &&
+                egl_surfaces[i].id == s->id)
+                shared = 1;
+        if (!shared) {
+            unsigned args[4] = { GEXGL_SURFACE_WAYLAND, s->id, 0, 0 };
+            ioctl(gl_fd, GEXGL_SURFACE, args);
+        }
+    }
     if (egl_surface == s) egl_surface = NULL;
     *s = (struct gexgl_egl_surface){ .kind = -1 };
     return EGL_TRUE;
@@ -4564,6 +4736,8 @@ unsigned eglDestroyContext(void *dpy, void *ctx) {
     (void)dpy; (void)ctx;
     if (!host_context_made || egl_contexts_live > 1) {
         if (egl_contexts_live) egl_contexts_live--;
+        /* The last of them gone before any drew: the host never made one. */
+        if (!egl_contexts_live) host_deferred = 0;
         return EGL_TRUE;
     }
     egl_contexts_live = 0;
@@ -4580,7 +4754,7 @@ unsigned eglDestroyContext(void *dpy, void *ctx) {
 unsigned eglMakeCurrent(void *dpy, void *draw, void *read, void *ctx) {
     fbq_forget();
     fbq_known = 0;
-    if (!egl_ready) return EGL_FALSE;
+    if (!egl_ready) return egl_fail(EGL_NOT_INITIALIZED);
     /* A safety net for callers that reach a current context without going
        through this library's eglCreateContext. The latch inside makes it a
        no-op once the host context exists. */
@@ -4588,7 +4762,9 @@ unsigned eglMakeCurrent(void *dpy, void *draw, void *read, void *ctx) {
        counting every make-current as a new context kept the host context
        alive after its last eglDestroyContext (SDL's throwaway GLX context
        then stood in for the one it really wanted). */
-    if (ctx && !host_context_made) context_create();
+    if (ctx && !host_context_made && !host_deferred) context_create();
+    /* Drawing into a surface: the host's context is needed now. */
+    if (ctx && draw) host_realize();
     egl_current_display = ctx ? dpy : NULL;
     egl_current_context = ctx;
     egl_current_draw = ctx ? draw : NULL;
@@ -4693,7 +4869,7 @@ unsigned eglSwapInterval(void *dpy, int interval) {
     egl_swap_interval = interval < 0 ? 0 : interval;
     return EGL_TRUE;
 }
-int eglGetError(void) { return 0x3000; /* EGL_SUCCESS */ }
+int eglGetError(void) { int e = egl_error; egl_error = 0x3000; return e; }
 
 void *eglGetCurrentDisplay(void) { return egl_current_display; }
 void *eglGetCurrentContext(void) { return egl_current_context; }
@@ -4704,7 +4880,7 @@ unsigned eglQueryAPI(void) { return egl_api; }
 
 unsigned eglQueryContext(void *dpy, void *ctx, int attr, int *value) {
     (void)dpy; (void)ctx;
-    if (!value) return EGL_FALSE;
+    if (!value) return egl_fail(EGL_BAD_PARAMETER);
     switch (attr) {
     case 0x3097: *value = (int)egl_api; break;       /* EGL_CONTEXT_CLIENT_TYPE */
     case 0x3098: *value = egl_context_major; break; /* EGL_CONTEXT_CLIENT_VERSION */
@@ -4717,7 +4893,7 @@ unsigned eglQueryContext(void *dpy, void *ctx, int attr, int *value) {
 
 unsigned eglQuerySurface(void *dpy, void *surface, int attr, int *value) {
     (void)dpy; (void)surface;
-    if (!value) return EGL_FALSE;
+    if (!value) return egl_fail(EGL_BAD_PARAMETER);
     switch (attr) {
     case 0x3057: *value = egl_surface_width; break;  /* EGL_WIDTH */
     case 0x3056: *value = egl_surface_height; break; /* EGL_HEIGHT */
@@ -4739,51 +4915,54 @@ unsigned eglSurfaceAttrib(void *dpy, void *surface, int attr, int value) {
     (void)dpy; (void)surface; (void)attr; (void)value; return EGL_TRUE;
 }
 unsigned eglBindTexImage(void *dpy, void *surface, int buffer) {
-    (void)dpy; (void)surface; (void)buffer; return EGL_FALSE;
+    (void)dpy; (void)surface; (void)buffer; return egl_fail(EGL_BAD_SURFACE);
 }
 unsigned eglReleaseTexImage(void *dpy, void *surface, int buffer) {
-    (void)dpy; (void)surface; (void)buffer; return EGL_FALSE;
+    (void)dpy; (void)surface; (void)buffer; return egl_fail(EGL_BAD_SURFACE);
 }
 unsigned eglCopyBuffers(void *dpy, void *surface, void *pixmap) {
-    (void)dpy; (void)surface; (void)pixmap; return EGL_FALSE;
+    (void)dpy; (void)surface; (void)pixmap; return egl_fail(EGL_BAD_NATIVE_PIXMAP);
 }
 void *eglCreatePixmapSurface(void *dpy, void *config, void *pixmap, const int *attrs) {
-    (void)dpy; (void)config; (void)pixmap; (void)attrs; return NULL;
+    (void)dpy; (void)config; (void)pixmap; (void)attrs; return egl_fail_null(EGL_BAD_NATIVE_PIXMAP);
 }
 void *eglCreatePlatformWindowSurface(void *dpy, void *config, void *window,
                                      const intptr_t *attrs) {
     (void)attrs;
+    /* EGL_EXT_platform_xcb's window is a pointer to the xcb_window_t. */
+    if (egl_native_platform == 0x31DCu && window)
+        window = (void *)(uintptr_t)*(const uint32_t *)window;
     return eglCreateWindowSurface(dpy, config, window, NULL);
 }
 void *eglCreatePlatformPixmapSurface(void *dpy, void *config, void *pixmap,
                                      const intptr_t *attrs) {
-    (void)dpy; (void)config; (void)pixmap; (void)attrs; return NULL;
+    (void)dpy; (void)config; (void)pixmap; (void)attrs; return egl_fail_null(EGL_BAD_NATIVE_PIXMAP);
 }
 void *eglCreatePbufferFromClientBuffer(void *dpy, unsigned type, void *buffer,
                                        void *config, const int *attrs) {
-    (void)dpy; (void)type; (void)buffer; (void)config; (void)attrs; return NULL;
+    (void)dpy; (void)type; (void)buffer; (void)config; (void)attrs; return egl_fail_null(EGL_BAD_PARAMETER);
 }
 void *eglCreateImage(void *dpy, void *ctx, unsigned target, void *buffer,
                      const intptr_t *attrs) {
-    (void)dpy; (void)ctx; (void)target; (void)buffer; (void)attrs; return NULL;
+    (void)dpy; (void)ctx; (void)target; (void)buffer; (void)attrs; return egl_fail_null(EGL_BAD_PARAMETER);
 }
 unsigned eglDestroyImage(void *dpy, void *image) {
-    (void)dpy; (void)image; return EGL_FALSE;
+    (void)dpy; (void)image; return egl_fail(EGL_BAD_PARAMETER);
 }
 void *eglCreateSync(void *dpy, unsigned type, const intptr_t *attrs) {
-    (void)dpy; (void)type; (void)attrs; return NULL;
+    (void)dpy; (void)type; (void)attrs; return egl_fail_null(EGL_BAD_PARAMETER);
 }
 unsigned eglDestroySync(void *dpy, void *sync) {
-    (void)dpy; (void)sync; return EGL_FALSE;
+    (void)dpy; (void)sync; return egl_fail(EGL_BAD_PARAMETER);
 }
 int eglClientWaitSync(void *dpy, void *sync, int flags, uint64_t timeout) {
     (void)dpy; (void)sync; (void)flags; (void)timeout; return 0x30F5; /* EGL_TIMEOUT_EXPIRED */
 }
 unsigned eglGetSyncAttrib(void *dpy, void *sync, int attr, intptr_t *value) {
-    (void)dpy; (void)sync; (void)attr; (void)value; return EGL_FALSE;
+    (void)dpy; (void)sync; (void)attr; (void)value; return egl_fail(EGL_BAD_PARAMETER);
 }
 unsigned eglWaitSync(void *dpy, void *sync, int flags) {
-    (void)dpy; (void)sync; (void)flags; return EGL_FALSE;
+    (void)dpy; (void)sync; (void)flags; return egl_fail(EGL_BAD_PARAMETER);
 }
 
 const char *eglQueryString(void *dpy, int name) {
@@ -4807,7 +4986,8 @@ const char *eglQueryString(void *dpy, int name) {
                      "EGL_KHR_no_config_context"
                    : "EGL_EXT_client_extensions EGL_EXT_platform_base "
                      "EGL_KHR_client_get_all_proc_addresses "
-                     "EGL_EXT_platform_wayland EGL_KHR_platform_wayland";
+                     "EGL_EXT_platform_wayland EGL_KHR_platform_wayland "
+                     "EGL_EXT_platform_xcb";
     case 0x308D: return "OpenGL OpenGL_ES"; /* EGL_CLIENT_APIS */
     default: return "";
     }
@@ -4839,7 +5019,7 @@ void *eglGetProcAddress(const char *name) {
 
 /* Fixed function: the compatibility-profile calls a pre-shader program makes.
  *
- * Not generated, because tools/gen_gl44_manifest.py builds its command list
+ * Not generated, because scripts/gl/gen_gl44_manifest.py builds its command list
  * from glcorearb.h and the core-profile header omits every one of these by
  * definition. Twenty of them is what glxgears needs and it needs nothing
  * else, so they are written out rather than the manifest machinery being
@@ -4980,6 +5160,6 @@ unsigned glGenLists(int range) {
  */
 #include "gexgl-glx.inc"
 
-/* Registry command aliases; see tools/gen_gl_extensions.py. Last, so every
+/* Registry command aliases; see scripts/gl/gen_gl_extensions.py. Last, so every
    alias target above is already declared. */
 #include "gl-aliases-generated.inc"

@@ -60,13 +60,18 @@ pub fn image_key(image: &gex_ld::Image) -> String {
     gex_key::unit_key(image, FORMAT, &unit_inputs(), UNIT_ABI_VERSION, RECOVERY_INPUTS)
 }
 
+/// [`image_key`] of an image whose `gex_key::image_identity` is `identity`.
+pub fn image_key_of(identity: &str) -> String {
+    gex_key::unit_key_of(identity, FORMAT, &unit_inputs(), UNIT_ABI_VERSION, RECOVERY_INPUTS)
+}
+
 /// Everything [`image_key`] takes besides the image (the format, the unit
 /// and recovery inputs, the flavour), hashed, and the export providers'
 /// fingerprints, which an image with providers adds to its key (`-p...`):
 /// two gexc builds give every image the same key exactly when they print
 /// the same id. `gexc cgen-image --inputs` prints it, for a cache of frozen
 /// units that must be rebuilt when a gex change moves the keys
-/// (tools/units-for.sh). Without the providers' part, a provider's change
+/// (scripts/units-for.sh). Without the providers' part, a provider's change
 /// moved its images' keys and kept the id, and a cached set gave those
 /// images no unit.
 pub fn inputs_id() -> String {
@@ -114,6 +119,140 @@ fn unit_inputs() -> String {
         format!("{base}:mem64")
     } else {
         base
+    }
+}
+
+/// The `gexc cgen-image` switches that build a unit of this process's key
+/// flavour (the parts of [`unit_inputs`] a switch sets): what a "build it
+/// with" line must name, or the unit it builds has another key and is never
+/// used. GEX_CGEN_GUARD=1 (the guarded flavour) is an environment setting,
+/// not a switch: see [`unguarded`].
+pub fn flavour_switches() -> Vec<String> {
+    let mut f = Vec::new();
+    if gex_abi::kuser_fold() && gex_abi::kuser_fold_entry() {
+        f.push("--wine64-compact".to_string());
+    } else if gex_abi::kuser_fold() {
+        f.push("--wine32-kuser".to_string());
+    }
+    if gex_abi::mem64() {
+        f.push("--mem64".to_string());
+    }
+    if max_insns() != DEFAULT_MAX_INSNS {
+        f.push("--max-insns".to_string());
+        f.push(max_insns().to_string());
+    }
+    f
+}
+
+/// Apply one of [`flavour_switches`]' switches that takes no value, as gexc
+/// does: false for any other.
+pub fn set_flavour_switch(switch: &str) -> bool {
+    match switch {
+        "--mem64" => gex_abi::set_mem_flavor(gex_abi::MemFlavor::M64),
+        // 32-bit Wine's KUSER_SHARED_DATA fold.
+        "--wine32-kuser" => gex_abi::set_kuser_fold(true),
+        // 64-bit Wine's compact space: the fold and the entry page after it.
+        "--wine64-compact" => {
+            gex_abi::set_kuser_fold(true);
+            gex_abi::set_kuser_fold_entry(true);
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// The GEXWASM header's flags (offset 36 of the header 0x40 bytes before a
+/// native wasm32 program's entry): what the program's process is, before it
+/// runs. Natively and in the page alike (the page reads them from the
+/// placed image). 0 for a program without the header.
+pub mod program_flags {
+    pub const MAGIC: &[u8; 8] = b"GEXWASM\0";
+    /// The program runs i386 code (32-bit Wine).
+    pub const GUEST_I386: u32 = 1;
+    /// The program runs x86-64 code (64-bit native Wine).
+    pub const GUEST_X86_64: u32 = 2;
+    /// This i386 Wine maps KUSER_SHARED_DATA at `gex_abi::WINE32_KUSER`.
+    pub const KUSER_WINE32: u32 = 4;
+
+    /// The flags of `exe` (an ELF container's loaded image).
+    pub fn of(exe: &gex_ld::elf::Image) -> u32 {
+        let at = exe.entry.wrapping_sub(0x40);
+        exe.segments
+            .iter()
+            .find(|s| at >= s.vaddr && at + 40 <= s.vaddr + s.bytes.len() as u64)
+            .map(|s| {
+                let o = (at - s.vaddr) as usize;
+                if &s.bytes[o..o + 8] != MAGIC {
+                    return 0;
+                }
+                u32::from_le_bytes(s.bytes[o + 36..o + 40].try_into().unwrap())
+            })
+            .unwrap_or(0)
+    }
+}
+
+/// What decides a new process's unit flavour, all known before any image is
+/// placed: so a test (or a site's build) can ask for the switches a process
+/// will name (`gexc cgen-flavour`) without running it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProcessFlavour {
+    /// In the page (the browser shim); natively otherwise.
+    pub page: bool,
+    /// The program's [`program_flags`].
+    pub flags: u32,
+    /// The process has a 64-bit memory.
+    pub mem64: bool,
+    /// The page was asked for 32-bit Wine's 2 GiB split (`?winesplit=1`).
+    pub split: bool,
+    /// The install's x86_64-windows/ntdll.dll is the native PE core's
+    /// skeleton (which asks gex where KUSER_SHARED_DATA is).
+    pub native_ntdll: bool,
+}
+
+/// Whether `pe` is a native Wine DLL's skeleton (its code a wasm module,
+/// named by a `.wasmref` section).
+pub fn is_skeleton(pe: &gex_ld::pe::PeImage) -> bool {
+    pe.sections.iter().any(|s| s.name == ".wasmref")
+}
+
+/// [`ProcessFlavour::native_ntdll`] for an install's loader file: the
+/// x86_64-windows/ntdll.dll beside its x86_64-unix directory a skeleton.
+pub fn loader_has_native_ntdll(loader: &str) -> bool {
+    let Some((dir, _)) = loader.rsplit_once("/x86_64-unix/") else { return false };
+    std::fs::read(format!("{dir}/x86_64-windows/ntdll.dll"))
+        .ok()
+        .and_then(|b| gex_ld::pe::parse(&b).ok().map(|pe| is_skeleton(&pe)))
+        .unwrap_or(false)
+}
+
+impl ProcessFlavour {
+    /// 64-bit Wine in the compact space: a page process of x86-64 Wine in a
+    /// wasm32 memory with the native ntdll, unless the split was asked for.
+    /// Natively there is no compact space. (A process that inherits a space,
+    /// a fork or an exec in the same memory, keeps its parent's.)
+    pub fn compact64(&self) -> bool {
+        self.page && self.flags & program_flags::GUEST_X86_64 != 0 && !self.mem64 && !self.split && self.native_ntdll
+    }
+
+    /// 32-bit Wine's KUSER_SHARED_DATA fold: an i386 Wine that maps the page
+    /// at `gex_abi::WINE32_KUSER`; the compact space folds it too.
+    pub fn kuser_fold(&self) -> bool {
+        self.compact64()
+            || self.flags & program_flags::GUEST_I386 != 0 && self.flags & program_flags::KUSER_WINE32 != 0
+    }
+
+    /// Set this process's flavour (before its first unit key), as the shims
+    /// do when the process starts; [`flavour_switches`] then names it.
+    pub fn apply(&self) {
+        if self.mem64 {
+            gex_abi::set_mem_flavor(gex_abi::MemFlavor::M64);
+        }
+        if self.kuser_fold() {
+            gex_abi::set_kuser_fold(true);
+        }
+        if self.compact64() {
+            gex_abi::set_kuser_fold_entry(true);
+        }
     }
 }
 
@@ -1066,8 +1205,9 @@ mod fingerprint_tests {
         // Not values: modules, types, functions of the host side.
         // NULL_GUARD: embedded only with the null guard on, whose units'
         // key names it (`unit_inputs`), so the fingerprint of every other
-        // build stays as it was.
-        let ignore = ["ctx", "imports", "exports", "cache_op", "IMPORT_MODULE", "dispatch_entry_table", "dispatch_index", "NULL_GUARD"];
+        // build stays as it was. MemFlavor: the host's memory flavour type
+        // (a flavour's switches), not a value a unit embeds.
+        let ignore = ["ctx", "imports", "exports", "cache_op", "IMPORT_MODULE", "dispatch_entry_table", "dispatch_index", "NULL_GUARD", "MemFlavor"];
         let mut missing = Vec::new();
         for (file, text) in sources {
             for prefix in ["ctx::", "gex_abi::"] {

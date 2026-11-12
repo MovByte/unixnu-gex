@@ -1,0 +1,15 @@
+// Wine's environment as a page starts it, past what the build and the caller
+// gave.
+
+/** A prefix this visit does not keep (`kept`: the filesystem is not one a
+ *  load keeps): `WINEGEX_NO_REGSAVE=1` into `env`, so the wineserver saves
+ *  no registry every 30 s. Each save held the server, and every request
+ *  waiting on it, for tens of ms (an audio underrun) for files nothing reads
+ *  again. A kept root's prefix is saved as before. Nothing without a
+ *  WINEPREFIX, or when the caller set the knob. */
+export function noRegSave(env, kept) {
+  const prefix = env.find((e) => e.startsWith('WINEPREFIX='));
+  if (!prefix || env.some((e) => e.startsWith('WINEGEX_NO_REGSAVE='))) return env;
+  if (!kept) env.push('WINEGEX_NO_REGSAVE=1');
+  return env;
+}

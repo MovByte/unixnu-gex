@@ -42,6 +42,7 @@ pub mod nr {
     pub const SENDFILE: u64 = 71;
     pub const COPY_FILE_RANGE: u64 = 285;
     pub const SPLICE: u64 = 76;
+    pub const TRUNCATE: u64 = 45;
     pub const FTRUNCATE: u64 = 46;
     pub const FACCESSAT: u64 = 48;
     pub const CHDIR: u64 = 49;
@@ -79,6 +80,8 @@ pub mod nr {
     pub const FSTAT: u64 = 80;
     pub const FSYNC: u64 = 82;
     pub const FDATASYNC: u64 = 83;
+    pub const SYNC_FILE_RANGE: u64 = 84;
+    pub const SYNCFS: u64 = 267;
     pub const EXIT: u64 = 93;
     pub const EXIT_GROUP: u64 = 94;
     pub const SET_TID_ADDRESS: u64 = 96;
@@ -135,6 +138,11 @@ pub mod nr {
     pub const GETRESUID: u64 = 148;
     pub const SETRESGID: u64 = 149;
     pub const GETRESGID: u64 = 150;
+    pub const SETFSUID: u64 = 151;
+    pub const SETFSGID: u64 = 152;
+    pub const CAPGET: u64 = 90;
+    pub const CAPSET: u64 = 91;
+    pub const CHROOT: u64 = 51;
     pub const TIMES: u64 = 153;
     pub const SETPGID: u64 = 154;
     pub const GETPGID: u64 = 155;
@@ -448,6 +456,13 @@ pub enum BlockOp {
         /// reports (`None`: ends only).
         jobs: Option<JobWait>,
     },
+    /// `fcntl(F_SETLKW)`, `F_OFD_SETLKW` or a blocking `flock` with the
+    /// lock held in the way: until `locks` would grant `req`
+    /// ([`unix::FileLocks::would_grant`]; every release notifies its
+    /// `queue_id`). The host then makes the request (natively,
+    /// [`unix::FileLocks::apply`]) or the call again (the page), parking
+    /// again if another got there first.
+    FileLock { locks: Arc<unix::FileLocks>, req: crate::locks::LockReq },
 }
 
 /// What a Darwin `wait4` or `waitid` reports of a child (kern_exit.c).
@@ -567,7 +582,8 @@ impl BlockOp {
             // `connect` is not in signal(7)'s list: an interrupted connect
             // goes on in the background and says `EINTR`.
             BlockOp::Connect { .. } => Restart::Never,
-            BlockOp::ReadStream { .. } | BlockOp::WriteStream { .. } | BlockOp::AcceptWait { .. } | BlockOp::WriteWait { .. } | BlockOp::WaitChild { .. } => {
+            // signal(7) lists `flock` and `F_SETLKW` with the reads and writes.
+            BlockOp::ReadStream { .. } | BlockOp::WriteStream { .. } | BlockOp::AcceptWait { .. } | BlockOp::WriteWait { .. } | BlockOp::WaitChild { .. } | BlockOp::FileLock { .. } => {
                 Restart::SaRestart
             }
         }
@@ -634,6 +650,10 @@ pub struct Kernel {
     /// `user.gex.mem64` attribute (the learned record). The shim takes it
     /// when it places the exec.
     pub exec_mem64: Option<bool>,
+    /// The Windows program the running image is Wine's loader for (the
+    /// exec's `WINEGEX_IMAGE`, or the DOS path Wine was started on by
+    /// hand): where its memory flavour is recorded ([`outgrow_ending`]).
+    pub exec_image: Option<String>,
     /// The argument and environment vectors, for `/proc/self/cmdline`.
     pub argv: Vec<String>,
     pub envp: Vec<String>,
@@ -650,9 +670,10 @@ pub struct Kernel {
     pub futexes: Arc<FutexTable>,
     /// Syscalls seen but not implemented, for ENOSYS telemetry.
     pub unimplemented: Vec<u64>,
-    /// Next free register-context slot. Slot 0 is the initial thread's.
-    /// Shared with the free path (`Free::slots`), which makes threads there.
-    pub next_ctx_slot: Arc<std::sync::atomic::AtomicU32>,
+    /// The register-context slots ([`CtxSlots`]). Slot 0 is the initial
+    /// thread's. Shared with the free path (`Free::slots`), which makes
+    /// threads there.
+    pub next_ctx_slot: Arc<CtxSlots>,
     /// Threads that have been created and not yet exited, including this one.
     /// Shared with the free path (`Free::live`), which ends a thread there.
     pub live_threads: Arc<std::sync::atomic::AtomicU32>,
@@ -707,6 +728,10 @@ pub struct Kernel {
     /// An `rt_sigtimedwait` that waited (`BlockOp::SigWait`): its arguments,
     /// to take the signal with once one of its set is pending.
     pub retry_sigwait: Option<[u64; 6]>,
+    /// A lock request on this descriptor parked (`BlockOp::FileLock`): once
+    /// the host has granted it, the file's shared mappings are brought up
+    /// to date ([`sync_shared_file`]), as the call itself does.
+    pub retry_lock: Option<i32>,
     /// A 32-bit (i386) process: its code runs in compatibility mode, it
     /// enters with `int 0x80`, and its numbering and structures are the i386
     /// ones (see `crate::i386`). Set at exec from the image's class,
@@ -945,6 +970,222 @@ pub const ITIMER_PROF: usize = 2;
 /// gets [`system_clock`].
 pub type ClockFn = fn() -> (u64, u32);
 
+/// A host's part in moving a program that outgrew its lowered memory to a
+/// 64-bit one ([`note_short`], [`outgrow_ending`]).
+pub struct OutgrowHost {
+    /// Whether this host can run a program in a 64-bit memory.
+    pub reachable: fn() -> bool,
+    /// A debug-level line (off by default), without the host's prefix.
+    pub debug: fn(&str),
+    /// A line at the default level, without the host's prefix.
+    pub say: fn(&str),
+}
+
+static OUTGROW_HOST: std::sync::OnceLock<OutgrowHost> = std::sync::OnceLock::new();
+
+/// Set the host's [`OutgrowHost`], once. Without it nothing is recorded.
+pub fn set_outgrow_host(h: OutgrowHost) {
+    let _ = OUTGROW_HOST.set(h);
+}
+
+/// The smallest reservation [`Kernel::note_short`] records: 64-bit Wine
+/// probes its user space's top with a 1 MiB one in every process.
+const OUTGROW_MIN: u64 = 4 << 20;
+
+/// The largest one a 64-bit memory could hold: its high arena above the
+/// memory64 tables.
+const OUTGROW_MAX: u64 = gex_abi::LIMIT64 - gex_abi::HIGH_TABLES_END;
+
+/// How soon after falling short an abnormal end counts as caused by it
+/// ([`outgrow_ending`]): 60 s. A program that cannot do without the
+/// reservation fails within moments (its allocator's error, a null
+/// pointer used), but may first show an error dialog someone has to
+/// dismiss. A wrong guess costs a program only a 64-bit memory it did not
+/// need; one that carries on past this was not stopped by it.
+pub const OUTGROW_WINDOW_NS: u64 = 60_000_000_000;
+
+/// A process's record for moving it to a 64-bit memory
+/// ([`Kernel::outgrow_arm`], [`note_short`], [`outgrow_ending`]).
+struct Outgrow {
+    pid: i32,
+    /// Where the record goes: the Windows program, or the program.
+    image: Option<String>,
+    /// It asked to keep the lowered memory (GEX_MEM64=0, a `0` record).
+    stay32: bool,
+    /// Its namespace, which [`outgrow_ending`] sets the record through
+    /// without the kernel (a host ends a process with it held).
+    ns: Arc<crate::vfs::VfsView>,
+    clock: ClockFn,
+    /// The largest reservation that did not fit, and when (ns).
+    short: Option<(u64, u64)>,
+    /// The last one that did not fit (0: none yet).
+    last: u64,
+    /// gex is ending it for asking again ([`note_short`]); `end` until the
+    /// call that asked has taken it.
+    ended: bool,
+    end: bool,
+    /// gex's own memory for it ran out in the lowered memory
+    /// ([`note_runtime_short`]): it ends for that, whatever its status.
+    runtime: bool,
+}
+
+static OUTGROW: crate::sync::Mutex<Vec<Outgrow>> = crate::sync::Mutex::new(Vec::new());
+
+fn raw_ns(clock: ClockFn) -> u64 {
+    let (secs, nanos) = clock();
+    secs.saturating_mul(1_000_000_000).saturating_add(nanos as u64)
+}
+
+/// The Windows program Wine's loader (`path`) was started on by hand
+/// (`wine C:\\app.exe`, not by CreateProcess, which says it in
+/// WINEGEX_IMAGE): its first argument (`argv[1]`), a DOS path, found
+/// through the prefix's dosdevices. `None` for any other program.
+pub fn wine_program(path: &str, argv: &[String], envp: &[String]) -> Option<String> {
+    let wine = path.rsplit('/').next().is_some_and(|n| n == "wine" || n == "wine.m64");
+    let a = argv.get(1).filter(|a| wine && a.len() > 3 && a.as_bytes()[1] == b':' && a.as_bytes()[2] == b'\\')?;
+    let pfx = envp.iter().find_map(|e| e.strip_prefix("WINEPREFIX="))?;
+    Some(format!("{pfx}/dosdevices/{}:/{}", a[..1].to_ascii_lowercase(), a[3..].replace('\\', "/")))
+}
+
+/// A reservation of `len` bytes process `pid` asked for found no room in
+/// its lowered memory (an `mmap` the kernel refused for want of address
+/// space, or 64-bit Wine's [`crate::proc::PR_GEX_SHORT`]). Only recorded,
+/// with when (the largest since its exec): the call still fails, as many
+/// programs try a large reservation and then a smaller one. If the process
+/// then ends abnormally soon after ([`outgrow_ending`]), its image is
+/// recorded for a 64-bit memory. Nothing is recorded for a small ask, a
+/// 32-bit guest (`compat`, `wasm32`), one already in a 64-bit memory or
+/// asked to stay out of one, an ask a 64-bit memory could not hold either,
+/// or a host that cannot run the 64-bit flavour.
+///
+/// The first refusal is the program's to handle: an allocator that can
+/// take a failure asks for less next (and one refused again may ask for
+/// less still). Asking again for at least what was last refused is a
+/// program that cannot go on without it, retrying as some allocators do
+/// for ever: true, and the caller ends the process (SIGKILL, raised now),
+/// which [`outgrow_ending`] records as ended for want of room.
+pub fn note_short(pid: i32, len: u64, compat: bool, wasm32: bool) -> bool {
+    // (the host is asked when the process ends: a page Worker's first
+    // calls can come before its host has set itself up)
+    if len < OUTGROW_MIN || len > OUTGROW_MAX || gex_abi::mem64() || compat || wasm32 {
+        return false;
+    }
+    let mut all = OUTGROW.lock();
+    let Some(o) = all.iter_mut().find(|o| o.pid == pid && !o.stay32) else { return false };
+    if o.short.is_none_or(|(had, _)| len > had) {
+        o.short = Some((len, raw_ns(o.clock)));
+    }
+    let again = o.last != 0 && len >= o.last;
+    o.last = len;
+    let end = again && !o.ended;
+    o.ended |= end;
+    drop(all);
+    if let Some(host) = OUTGROW_HOST.get() {
+        (host.debug)(&format!("pid {pid}: a reservation of {len:#x} bytes did not fit its 32-bit memory\n"));
+    }
+    end
+}
+
+/// Whether a [`crate::proc::PR_GEX_SHORT`] process `pid` just made says to
+/// end it ([`note_short`]), for its caller: `prctl` is answered where no
+/// signal can be raised.
+pub fn outgrow_take_end(pid: i32) -> bool {
+    OUTGROW.lock().iter_mut().find(|o| o.pid == pid).is_some_and(|o| std::mem::take(&mut o.end))
+}
+
+/// gex's own memory for process `pid` (the runtime's heap, a Worker's
+/// stack) could not grow by `len` bytes in its lowered memory, and the
+/// process cannot go on: recorded as a reservation that did not fit, which
+/// ends it whatever its status ([`outgrow_ending`]). Whether it was
+/// recorded: false for a process with no record (a 32-bit guest, one in a
+/// 64-bit memory or asked to stay out of one), or with the record's lock
+/// held where it ran out. Takes no other lock.
+pub fn note_runtime_short(pid: i32, len: u64, wasm32: bool) -> bool {
+    if gex_abi::mem64() || wasm32 {
+        return false;
+    }
+    let Some(mut all) = OUTGROW.try_lock() else { return false };
+    let Some(o) = all.iter_mut().find(|o| o.pid == pid && !o.stay32) else { return false };
+    let len = len.clamp(OUTGROW_MIN, OUTGROW_MAX);
+    if o.short.is_none_or(|(had, _)| len > had) {
+        o.short = Some((len, raw_ns(o.clock)));
+    }
+    o.runtime = true;
+    true
+}
+
+/// Whether [`note_runtime_short`] would record process `pid`, and its host
+/// can move it to a 64-bit memory. No lock but the record's, tried.
+pub fn outgrow_armed(pid: i32, wasm32: bool) -> bool {
+    if gex_abi::mem64() || wasm32 || !OUTGROW_HOST.get().is_some_and(|h| (h.reachable)()) {
+        return false;
+    }
+    OUTGROW.try_lock().is_some_and(|all| all.iter().any(|o| o.pid == pid && !o.stay32))
+}
+
+/// Process `pid` is ending with wait status `status`. One that fell short
+/// of address space ([`Kernel::note_short`]) and ends abnormally (a signal
+/// that dumps core, or a nonzero exit) within [`OUTGROW_WINDOW_NS`] of it
+/// has its image recorded for a 64-bit memory (`user.gex.mem64` = `1`,
+/// which [`Kernel::exec_flavour`] and gexc read at its next start), and its
+/// crash notice says so, or that the record could not be made. A process
+/// that carried on, or exited 0, keeps its memory. Hosts call this as the
+/// process ends, before its descriptors close and before `procs` hears of
+/// it: whatever sees it gone may start it again at once (a Windows parent
+/// learns of a child's end from wineserver, at the close of the child's
+/// connection), and that start must find the record. A second call for
+/// the same process finds nothing.
+pub fn outgrow_ending(pid: i32, status: i32, procs: &crate::proc::ProcTable) {
+    let Some(host) = OUTGROW_HOST.get() else { return };
+    let rec = {
+        let mut all = OUTGROW.lock();
+        let Some(i) = all.iter().position(|o| o.pid == pid) else { return };
+        all.swap_remove(i)
+    };
+    let Some((len, at)) = rec.short else { return };
+    let sig = (status & 0x7f) as u32;
+    let abnormal = rec.ended
+        || rec.runtime
+        || match sig {
+            0 => (status >> 8) & 0xff != 0,
+            0x7f => false,
+            s => matches!(s, 3 | 4 | 5 | 6 | 7 | 8 | 11 | 24 | 25 | 31),
+        };
+    if rec.ended {
+        let why = format!("\0ended by gex: it asked again for {:#x} bytes, which its 32-bit memory has no room for", rec.last);
+        procs.set_crash_unless_said(pid, why.as_bytes());
+    }
+    if !abnormal || raw_ns(rec.clock).saturating_sub(at) > OUTGROW_WINDOW_NS || !(host.reachable)() {
+        return;
+    }
+    let set = match &rec.image {
+        Some(p) => rec.ns.get().xattr(p, true, crate::vfs::XattrOp::Set { name: "user.gex.mem64", value: b"1", flags: 0 }).map(|_| ()),
+        None => Err(Errno::ENOENT),
+    };
+    let line = match set {
+        Ok(()) => {
+            let why = if rec.runtime {
+                format!("gex's own memory for it could not grow by {len:#x} bytes")
+            } else {
+                format!("a reservation of {len:#x} bytes did not fit")
+            };
+            (host.say)(&format!("{} needs 64-bit memory ({why}); it gets it from its next start\n", rec.image.as_deref().unwrap_or("")));
+            "needs 64-bit memory; it will get it the next time it starts".to_string()
+        }
+        Err(e) => {
+            let why = match e {
+                Errno::EROFS => "its file is on a read-only filesystem".to_string(),
+                Errno::EOPNOTSUPP => "its filesystem keeps no extended attributes".to_string(),
+                Errno::EACCES | Errno::EPERM => "its file may not be changed".to_string(),
+                Errno::ENOENT if rec.image.is_none() => "which program it is is not known".to_string(),
+                e => format!("error {}", e.0),
+            };
+            format!("needs 64-bit memory, which could not be recorded for its next start ({why}): start it with GEX_MEM64=1")
+        }
+    };
+    procs.add_crash_line(pid, &line);
+}
+
 /// Whether an `EPIPE` from syscall `n` also raises SIGPIPE, as Linux does
 /// for a write to a pipe or stream socket with no reader -- except a `send`
 /// with `MSG_NOSIGNAL`. (A shell pipeline's `yes | head` ends with the
@@ -1115,6 +1356,23 @@ fn monotonic_from((secs, nanos): (u64, u32)) -> (u64, u32) {
     (ns / 1_000_000_000, (ns % 1_000_000_000) as u32)
 }
 
+/// `getrusage`'s `who`: the process (`RUSAGE_SELF`, 0), its reaped
+/// children (`RUSAGE_CHILDREN`, -1) or the calling thread (`RUSAGE_THREAD`,
+/// 1); the time each has used, from `self_ns`, `child_ns` and `thread_ns`.
+fn rusage_ns(who: u64, self_ns: impl FnOnce() -> u128, child_ns: impl FnOnce() -> u128, thread_ns: impl FnOnce() -> u128) -> Result<u128, Errno> {
+    match who as u32 as i32 {
+        0 => Ok(self_ns()),
+        -1 => Ok(child_ns()),
+        1 => Ok(thread_ns()),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+/// The time `pid`'s reaped children used, as the process table keeps it.
+pub fn child_cpu_of(procs: &ProcTable, pid: i32) -> u128 {
+    procs.entries().into_iter().find(|e| e.pid == pid).map_or(0, |e| e.usage.child_cpu_ns as u128)
+}
+
 /// A call's answer as the word its result register holds: the value, or
 /// the negated errno.
 fn result_word(r: SysResult) -> u64 {
@@ -1127,15 +1385,18 @@ fn result_word(r: SysResult) -> u64 {
 /// `times`: four `clock_t` -- user, system, and the same for reaped
 /// children -- counted in the hundredths of a second that `USER_HZ` means
 /// on Linux, and a return value on the same scale; `cpu_ns` the processor
-/// time used. i386's are 32-bit.
-fn times_answer(m: &mut GuestMem<'_>, compat: bool, cpu_ns: u128, buf: u64) -> SysResult {
+/// time used, `child_ns` its reaped children's. i386's are 32-bit.
+fn times_answer(m: &mut GuestMem<'_>, compat: bool, cpu_ns: u128, child_ns: u128, buf: u64) -> SysResult {
     let ticks = (cpu_ns / 10_000_000) as u64;
+    let child = (child_ns / 10_000_000) as u64;
     if buf != 0 && compat {
         m.zero(buf, 16)?;
         m.write_u32(buf, ticks as u32)?;
+        m.write_u32(buf + 8, child as u32)?;
     } else if buf != 0 {
         m.zero(buf, 32)?;
         m.write_u64(buf, ticks)?;
+        m.write_u64(buf + 16, child)?;
     }
     Ok(if compat { ticks as u32 as u64 } else { ticks })
 }
@@ -1172,7 +1433,8 @@ fn time_answer(m: &mut GuestMem<'_>, compat: bool, clock: ClockFn, tloc: u64) ->
 /// numbers here never takes its kernel for them. `compat` is
 /// [`Kernel::compat`] (the i386 numbering, number in
 /// `eax`, 32-bit layouts); `started` the process's start, which the
-/// processor-time clocks count from. The result goes where [`set_result`]
+/// processor-time clocks count from; `children` the time its reaped children
+/// used (`times`, `getrusage(RUSAGE_CHILDREN)`). The result goes where [`set_result`]
 /// puts it. Signal delivery, which the kernel does at every syscall
 /// boundary, is the host's to arrange (the page's safepoints).
 pub fn clock_call(
@@ -1181,6 +1443,7 @@ pub fn clock_call(
     compat: bool,
     clock: ClockFn,
     started: u128,
+    children: &dyn Fn() -> u128,
 ) -> bool {
     let (raw, a0, a1) = if compat {
         let r = |slot: usize| m.read_u64(ctx_addr + slot as u64).unwrap_or(!0) & 0xffff_ffff;
@@ -1200,7 +1463,8 @@ pub fn clock_call(
         Res(u64, bool),
         // (buffer, 32-bit timeval)
         Tod(u64, bool),
-        Rusage(u64),
+        // (who, buffer)
+        Rusage(u64, u64),
         // (buffer): `times`, in the ABI's `clock_t`.
         Times(u64),
         // (where to store it, or 0): `time`, x86-64's and i386's.
@@ -1215,7 +1479,7 @@ pub fn clock_call(
             x::CLOCK_GETRES => Call::Res(a1, true),
             x::CLOCK_GETRES_TIME64 => Call::Res(a1, false),
             x::GETTIMEOFDAY => Call::Tod(a0, true),
-            x::GETRUSAGE => Call::Rusage(a1),
+            x::GETRUSAGE => Call::Rusage(a0, a1),
             x::TIMES => Call::Times(a0),
             x::TIME => Call::Time(a0),
             x::SCHED_YIELD => Call::Yield,
@@ -1228,7 +1492,7 @@ pub fn clock_call(
             228 => Call::Clock(a0, a1, false),
             229 => Call::Res(a1, false),
             96 => Call::Tod(a0, false),
-            98 => Call::Rusage(a1),
+            98 => Call::Rusage(a0, a1),
             100 => Call::Times(a0),
             201 => Call::Time(a0),
             24 => Call::Yield,
@@ -1239,17 +1503,22 @@ pub fn clock_call(
             nr::CLOCK_GETTIME => Call::Clock(a0, a1, false),
             nr::CLOCK_GETRES => Call::Res(a1, false),
             nr::GETTIMEOFDAY => Call::Tod(a0, false),
-            nr::GETRUSAGE => Call::Rusage(a1),
+            nr::GETRUSAGE => Call::Rusage(a0, a1),
             nr::TIMES => Call::Times(a0),
             nr::SCHED_YIELD => Call::Yield,
             _ => return false,
         }
     };
     // Before the host has said when the process started (0): no time used.
-    let cpu = || {
+    // A host that measures processor time says it (`crate::proc::set_cpu_clock`).
+    let cpu_of = |thread: bool| {
+        if let Some(ns) = crate::proc::cpu_clock(thread) {
+            return ns as u128;
+        }
         let (s, n) = clock();
         if started == 0 { 0 } else { (s as u128 * 1_000_000_000 + n as u128).saturating_sub(started) }
     };
+    let cpu = || cpu_of(false);
     let pair = |m: &mut GuestMem<'_>, at: u64, hi: u64, lo: u64, w32: bool| {
         if w32 {
             m.write_u32(at, hi as u32).and_then(|_| m.write_u32(at + 4, lo as u32))
@@ -1262,7 +1531,7 @@ pub fn clock_call(
             // As `sys_clock_gettime`, which a null buffer faults in.
             let (secs, nanos) = match clk {
                 2 | 3 => {
-                    let t = cpu();
+                    let t = cpu_of(clk == 3);
                     ((t / 1_000_000_000) as u64, (t % 1_000_000_000) as u32)
                 }
                 c if is_monotonic_clock(c) => monotonic_from(clock()),
@@ -1279,21 +1548,26 @@ pub fn clock_call(
                 pair(m, buf, secs, (nanos / 1000) as u64, w32).is_ok()
             }
         }
-        Call::Rusage(buf) => {
-            if buf == 0 {
-                true
-            } else {
-                let ns = cpu();
+        Call::Rusage(who, buf) => match rusage_ns(who, cpu, &children, || cpu_of(true)) {
+            Err(e) => {
+                if gex_abi::X86 {
+                    let _ = m.write_u64(ctx_addr + ctx::LAST_SYSCALL as u64, raw);
+                }
+                let _ = set_result(m, ctx_addr, e.as_return());
+                return true;
+            }
+            Ok(_) if buf == 0 => true,
+            Ok(ns) => {
                 let (s, us) = ((ns / 1_000_000_000) as u64, (ns % 1_000_000_000 / 1000) as u64);
                 let size = if compat { 72 } else { 144 };
                 m.zero(buf, size).is_ok() && pair(m, buf, s, us, compat).is_ok()
             }
-        }
+        },
         // A pure yield: the caller's Worker is its own OS thread, and the
         // browser schedules those without being asked.
         Call::Yield => true,
         Call::Times(buf) => {
-            let r = times_answer(m, compat, cpu(), buf);
+            let r = times_answer(m, compat, cpu(), children(), buf);
             if gex_abi::X86 {
                 let _ = m.write_u64(ctx_addr + ctx::LAST_SYSCALL as u64, raw);
             }
@@ -1332,6 +1606,10 @@ pub struct FdIo<'a> {
     /// A Darwin process: its socket addresses and message structures are
     /// Darwin's.
     pub darwin: bool,
+    /// A wasm32 program ([`Kernel::wasm32`]): i386's numbering, its own
+    /// layouts where they differ (a `struct flock`'s 64-bit offsets are
+    /// 8-aligned).
+    pub wasm32: bool,
     /// The process's namespace, for a descriptor rebuilt from its name
     /// (`SCM_RIGHTS` from another process), and its pid.
     pub ns: &'a crate::vfs::Namespace,
@@ -1501,7 +1779,8 @@ impl FdIo<'_> {
         let name = String::from_utf8_lossy(&raw).into_owned();
         let memfd = Arc::new(unix::MemFd::new(&name));
         let handle: Arc<dyn crate::vfs::FileHandle> = memfd;
-        let file = OpenFile::new(handle, format!("/memfd:{name}"), 0, true, true);
+        // read-write, as F_GETFL says (and as a fork's child rebuilds it)
+        let file = OpenFile::new(handle, format!("/memfd:{name}"), crate::fs::oflags::O_RDWR, true, true);
         self.fds.insert(file, flags & MFD_CLOEXEC != 0)
     }
     /// `fallocate`. Only mode zero, which is "make sure these bytes exist".
@@ -1771,11 +2050,19 @@ impl FdIo<'_> {
     /// `ftruncate`.
     pub fn ftruncate(&self, m: &mut GuestMem<'_>, fd: i32, len: u64) -> SysResult {
         let f = self.fds.get(fd)?;
+        self.truncate_file(m, &f, len)
+    }
+
+    /// `ftruncate` or `truncate` on `f`: the file `len` bytes long.
+    pub fn truncate_file(&self, m: &mut GuestMem<'_>, f: &OpenFile, len: u64) -> SysResult {
+        if (len as i64) < 0 {
+            return Err(Errno::EINVAL);
+        }
         f.handle.truncate(len)?;
         // A shared mapping's bytes past the new end are no longer the file's:
         // zero, as the file now reads there once it grows again.
         if any_shared(self.shared) {
-            for (at, _, k) in shared_spans(self.shared, &f, len, u64::MAX - len) {
+            for (at, _, k) in shared_spans(self.shared, f, len, u64::MAX - len) {
                 let _ = m.zero(at, k as usize);
             }
         }
@@ -1803,12 +2090,8 @@ impl FdIo<'_> {
         };
         // Watching something that is not open is an error, and a program that
         // gets silence instead waits for a readiness that cannot arrive.
-        let source = if op != unix::epoll_op::DEL {
-            self.fds.get(fd)?.handle.wait_queue()
-        } else {
-            0
-        };
-        set.ctl_queue(op, fd, events, data, source)
+        let file = if op != unix::epoll_op::DEL { Some(self.fds.get(fd)?) } else { self.fds.get(fd).ok() };
+        set.ctl_file(op, fd, events, data, file.as_ref().map(|f| (&f.handle, f.writable)))
     }
 
     /// A `readv`'s vectors when there is more than one with room in it,
@@ -1897,7 +2180,8 @@ impl FdIo<'_> {
             }
             nr::READV => {
                 let file = self.fds.get(a[0] as i32).ok()?;
-                if !file.would_block() {
+                // (a terminal's polling read answers 0 instead: `polling_read`)
+                if !file.would_block() || file.handle.empty_read_returns() {
                     return None;
                 }
                 let (buf, len) = self.first_iovec(m, a)?;
@@ -1912,7 +2196,7 @@ impl FdIo<'_> {
             }
             nr::READ => {
                 let file = self.fds.get(a[0] as i32).ok()?;
-                if !file.would_block() {
+                if !file.would_block() || file.handle.empty_read_returns() {
                     return None;
                 }
                 Some(BlockOp::ReadStream {
@@ -1926,10 +2210,21 @@ impl FdIo<'_> {
         }
     }
 
+    /// Whether `fd` is a blocking descriptor of a terminal whose empty reads
+    /// return 0 ([`crate::vfs::FileHandle::empty_read_returns`]).
+    fn polling_read(&self, fd: u64) -> bool {
+        self.fds.get(fd as i32).is_ok_and(|f| {
+            f.flags() & crate::fs::oflags::O_NONBLOCK == 0 && f.handle.empty_read_returns()
+        })
+    }
+
     /// The park for a `read`/`readv` or `write`/`writev` that returned
     /// `EAGAIN` on a stream descriptor that should block.
     fn eagain_park(&self, m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> Option<BlockOp> {
         const MSG_NOSIGNAL: u64 = 0x4000;
+        if n == nr::FCNTL || n == nr::FLOCK {
+            return self.lock_park(m, n, a);
+        }
         let file = self.fds.get(a[0] as i32).ok()?;
         let (buf, len) = match n {
             nr::READ | nr::WRITE => (a[1], a[2]),
@@ -2162,6 +2457,31 @@ impl FdIo<'_> {
         Ok(cmsg_len)
     }
 
+    /// The `SCM_CREDENTIALS` message a socket with `SO_PASSCRED` gets with
+    /// what it reads: the sender's `struct ucred`, here the far end's as
+    /// the two were joined (`SO_PEERCRED`'s: a process that changes its ids
+    /// after connecting is still reported as it was). A peer not known is
+    /// Linux's overflow ids, as for a sender in no namespace of the
+    /// reader's. The bytes written: none when there is no room.
+    fn write_scm_creds(&self, m: &mut GuestMem<'_>, control: u64, len: u64, peer: Option<unix::Cred>) -> Result<u64, Errno> {
+        const SOL_SOCKET: u32 = 1;
+        const SCM_CREDENTIALS: u32 = 2;
+        let (hdr, w) = (self.cmsg_hdr(), self.msg_word());
+        let cmsg_len = hdr + 12;
+        let used = self.cmsg_align(cmsg_len);
+        if control == 0 || used > len {
+            return Ok(0);
+        }
+        let c = peer.unwrap_or(unix::Cred { pid: 0, uid: 65534, gid: 65534 });
+        self.msg_wr(m, control, 0, cmsg_len)?;
+        m.write_u32(control + w, SOL_SOCKET)?;
+        m.write_u32(control + w + 4, SCM_CREDENTIALS)?;
+        m.write_u32(control + hdr, c.pid as u32)?;
+        m.write_u32(control + hdr + 4, c.uid)?;
+        m.write_u32(control + hdr + 8, c.gid)?;
+        Ok(used)
+    }
+
     /// `sendmsg`, which is how glibc writes to a socket, and the only way to
     /// pass a descriptor to another process.
     pub fn sendmsg(&self, m: &GuestMem<'_>, fd: i32, msg: u64) -> SysResult {
@@ -2335,7 +2655,8 @@ impl FdIo<'_> {
         if name != 0 {
             m.write_u32(msg + if self.compat { 4 } else { 8 }, 0)?;
         }
-        let written = self.write_scm_rights(m, control, controllen, files)?;
+        let creds = if sock.passcred() { self.write_scm_creds(m, control, controllen, sock.peer_cred())? } else { 0 };
+        let written = creds + self.write_scm_rights(m, control + creds, controllen - creds, files)?;
         self.hdr_wr(m, msg, 5, written)?;
         m.write_u32(msg + self.msg_flags_at(), 0)?;
         Ok(n)
@@ -2446,9 +2767,13 @@ impl FdIo<'_> {
             }
         }
         let given = !received.is_empty();
+        let creds = match &unix_sock {
+            Some(s) if s.passcred() => self.write_scm_creds(m, control, controllen, s.peer_cred())?,
+            _ => 0,
+        };
         // Each keeps its in-flight hold until it is in this table.
         let files = received.iter().map(|f| Arc::clone(f.file())).collect();
-        let written = self.write_scm_rights(m, control, controllen, files)?;
+        let written = creds + self.write_scm_rights(m, control + creds, controllen - creds, files)?;
         drop(received);
         self.hdr_wr(m, msg, 5, written)?;
         // msg_flags (int): MSG_CTRUNC when descriptors were closed for want
@@ -2647,24 +2972,55 @@ impl FdIo<'_> {
         )
     }
 
-    /// A set's registrations as the list the poll path understands.
+    /// A set's registrations as the list the poll path understands, each
+    /// asking the open file it is of ([`unix::EpollSet::owner`]), which
+    /// its number may no longer name. A watch whose file is closed is gone.
     fn epoll_pollfds(&self, set: &Arc<unix::EpollSet>) -> Vec<PollFd> {
         set.watches()
             .iter()
             .filter_map(|w| {
-                let file = self.fds.get(w.fd).ok()?;
-                set.rechain(w.fd, file.handle.wait_queue());
+                let (handle, writable) = match set.owner(w.fd) {
+                    Some(Some(owned)) => owned,
+                    Some(None) => {
+                        set.forget(w.fd);
+                        return None;
+                    }
+                    None => {
+                        let file = self.fds.get(w.fd).ok()?;
+                        set.note_file(w.fd, &file.handle, file.writable);
+                        (Arc::clone(&file.handle), file.writable)
+                    }
+                };
+                set.rechain(w.fd, handle.wait_queue());
                 Some(PollFd {
                     addr: 0,
                     fd: w.fd,
                     events: (w.events & 0xffff) as u16,
-                    handle: Some(Arc::clone(&file.handle)),
-                    writable: file.writable,
+                    handle: Some(handle),
+                    writable,
                     epoll: Some(Arc::clone(set)),
                     edge: w.events & unix::epoll_flag::ET != 0,
                 })
             })
             .collect()
+    }
+
+    /// Every epoll set among `fds` (and the sets they watch, `depth` deep)
+    /// learns its watched descriptors' open files from this process's
+    /// table ([`unix::EpollSet::note_file`]) before it is asked whether it
+    /// is readable: a set polled before any wait on it (a fork's copy, one
+    /// only ever polled) knows them by its first poll, and a watch whose
+    /// descriptor is not open here reports nothing, as Linux drops it.
+    fn note_epoll_sets(&self, fds: &[PollFd], depth: u32) {
+        if depth == 0 {
+            return;
+        }
+        for p in fds {
+            if let Some(set) = p.handle.as_ref().and_then(|h| Arc::clone(h).as_epoll()) {
+                let inner = self.epoll_pollfds(&set);
+                self.note_epoll_sets(&inner, depth - 1);
+            }
+        }
     }
 
     /// The poll family's question (`ppoll`, `pselect6`, `epoll_pwait`,
@@ -2692,6 +3048,7 @@ impl FdIo<'_> {
                 let set = self.epoll_of(a[0] as i32)?;
                 let generation = set.generation();
                 let fds = self.epoll_pollfds(&set);
+                self.note_epoll_sets(&fds, 4);
                 // `epoll_pwait` takes milliseconds, negative for ever;
                 // `epoll_pwait2` a `timespec`.
                 let wait = if n == nr::EPOLL_PWAIT2 {
@@ -2713,12 +3070,20 @@ impl FdIo<'_> {
                 };
                 Ok((fds, report, wait))
             }
-            nr::PPOLL => Ok((self.collect_pollfds(m, a[0], a[1]).ok_or(Errno::EFAULT)?, PollReport::Poll, timespec(a[2])?)),
-            nr::PSELECT6 => Ok((
-                self.collect_selectfds(m, a[0] as u32, a[1], a[2], a[3])?,
-                PollReport::Select { nfds: a[0] as u32, readfds: a[1], writefds: a[2], exceptfds: a[3] },
-                timespec(a[4])?,
-            )),
+            nr::PPOLL => {
+                let fds = self.collect_pollfds(m, a[0], a[1]).ok_or(Errno::EFAULT)?;
+                self.note_epoll_sets(&fds, 4);
+                Ok((fds, PollReport::Poll, timespec(a[2])?))
+            }
+            nr::PSELECT6 => {
+                let fds = self.collect_selectfds(m, a[0] as u32, a[1], a[2], a[3])?;
+                self.note_epoll_sets(&fds, 4);
+                Ok((
+                    fds,
+                    PollReport::Select { nfds: a[0] as u32, readfds: a[1], writefds: a[2], exceptfds: a[3] },
+                    timespec(a[4])?,
+                ))
+            }
             _ => Err(Errno::ENOSYS),
         }
     }
@@ -2760,13 +3125,27 @@ impl FdIo<'_> {
             nr::PREAD64 => io_pread(fds, m, a[0] as i32, a[1], a[2], a[3], self.shared),
             nr::PWRITE64 => io_pwrite(fds, m, a[0] as i32, a[1], a[2], a[3], self.shared),
             nr::LSEEK => fds.get(a[0] as i32).and_then(|f| f.seek(a[1] as i64, a[2] as u32)),
-            nr::CLOSE => self.close(a[0] as i32),
-            nr::CLOSE_RANGE => self.close_range(a[0], a[1], a[2]),
+            nr::CLOSE => {
+                self.closing_writes(m, a[0], a[0]);
+                self.close(a[0] as i32)
+            }
+            nr::CLOSE_RANGE => {
+                self.closing_writes(m, a[0], a[1]);
+                self.close_range(a[0], a[1], a[2])
+            }
             nr::DUP => self.dup(a[0] as i32),
-            nr::DUP2 => self.dup2(a[0] as i32, a[1] as i32),
-            nr::DUP3 => self.dup3(a[0] as i32, a[1] as i32, a[2]),
+            nr::DUP2 => {
+                if a[0] != a[1] {
+                    self.closing_writes(m, a[1], a[1]);
+                }
+                self.dup2(a[0] as i32, a[1] as i32)
+            }
+            nr::DUP3 => {
+                self.closing_writes(m, a[1], a[1]);
+                self.dup3(a[0] as i32, a[1] as i32, a[2])
+            }
             nr::FCNTL => self.fcntl_call(m, a[0] as i32, a[1], a[2]),
-            nr::FLOCK => self.flock(a[0] as i32, a[1]),
+            nr::FLOCK => self.flock(m, a[0] as i32, a[1]),
             _ => return None,
         })
     }
@@ -3325,6 +3704,11 @@ impl PathIo<'_> {
     /// open runs. The pair lives in the global kernel (`self.ptys`); with none
     /// there is no pty support and `/dev/ptmx` falls through to `ENOENT`.
     pub fn open_pty(&self, p: &str, flags: u64) -> Option<SysResult> {
+        // A Darwin process's terminals are XNU's: its devfs's `ptmx`,
+        // `ttysNNN` and `tty` ([`crate::darwin::ttydev`]), never these.
+        if self.darwin {
+            return None;
+        }
         let r = self.ptys?;
         // `/dev/tty` is the caller's *controlling terminal*. Inside a terminal
         // emulator that is a pty in the global kernel, not the page's own
@@ -3438,10 +3822,10 @@ impl PathIo<'_> {
             let (tmp, h) = loop {
                 let n = self.tmpfiles.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let tmp = format!("{}/.gex-tmpfile-{}-{}", p.trim_end_matches('/'), self.pid, n);
-                match self.ns.open(
+                match self.ns.open_mode(
                     &tmp,
                     oflags::O_RDWR | oflags::O_CREAT | oflags::O_EXCL,
-                    if mode == 0 { 0o600 } else { mode },
+                    mode & 0o7777 & !self.fs.umask(),
                 ) {
                     Err(Errno::EEXIST) if tries < 256 => tries += 1,
                     r => break (tmp, r?),
@@ -3474,10 +3858,9 @@ impl PathIo<'_> {
                 return Err(Errno::ELOOP);
             }
             // A directory opens for reading only: each filesystem's `open`
-            // says `EISDIR`, without a lookup of its own here. What it
-            // creates has the mode under the process's umask.
-            let mode = if flags & oflags::O_CREAT != 0 { mode & !self.fs.umask() } else { mode };
-            let h = self.ns.open(&p, flags, mode)?;
+            // says `EISDIR`, without a lookup of its own here.
+            // O_CREAT's mode, less the umask, as Linux makes the file.
+            let h = self.ns.open_mode(&p, flags, mode & 0o7777 & !self.fs.umask())?;
             // O_DIRECTORY on what is not one: ENOTDIR (mv's and find's test
             // of whether a name is a directory)
             if flags & oflags::O_DIRECTORY != 0 && h.metadata()?.file_type != FileType::Directory {
@@ -3784,7 +4167,7 @@ impl PathIo<'_> {
         let p = self.at_path(m, dirfd, path)?;
         // A root guest (`--uid 0`) may read and write anything; execute
         // still needs an execute bit, which the host checks.
-        let mode = if self.creds.uid() == 0 { mode & 1 } else { mode & 7 };
+        let mode = if self.creds.ruid() == 0 { mode & 1 } else { mode & 7 };
         self.ns.access(&p, mode).map(|_| 0)
     }
 
@@ -4196,6 +4579,9 @@ impl PathIo<'_> {
     /// published view, its one writer; the kernel's copy follows at its
     /// next call ([`crate::vfs::Vfs::refresh`]).
     pub fn mount_call(&self, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> SysResult {
+        if n == nr::CHROOT {
+            return self.chroot(m, a[0]);
+        }
         if n == nr::UMOUNT2 {
             let target = self.at_path(m, AT_FDCWD, a[0])?;
             return if self.view.unmount(&target) { Ok(0) } else { Err(Errno::EINVAL) };
@@ -4241,6 +4627,43 @@ impl PathIo<'_> {
             }
             _ => Err(Errno::ENODEV),
         }
+    }
+
+    /// `chroot(path)`: the namespace's root, as published, now `path`
+    /// ([`crate::vfs::Namespace::chroot`]), for every thread of the process
+    /// (Linux's is the calling thread's fs_struct, which its threads
+    /// share); the caller's directory moved with it. Needs
+    /// `CAP_SYS_CHROOT`, as on Linux.
+    fn chroot(&self, m: &GuestMem<'_>, path: u64) -> SysResult {
+        const CAP_SYS_CHROOT: u64 = 1 << 18;
+        let p = self.at_path(m, AT_FDCWD, path)?;
+        let dir = self.ns.canonical(&p);
+        if self.ns.metadata(&dir)?.file_type != FileType::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+        if self.creds.caps()[0] & CAP_SYS_CHROOT == 0 {
+            return Err(Errno::EPERM);
+        }
+        self.view.chroot(&dir)?;
+        let cwd = self.fs.get();
+        let inside = cwd.len() > dir.len() && cwd.starts_with(&dir) && (dir == "/" || cwd.as_bytes()[dir.len()] == b'/');
+        if dir != "/" {
+            let new = if inside { cwd[dir.len()..].to_string() } else { "/".to_string() };
+            self.fs.set(new, None);
+        }
+        Ok(0)
+    }
+
+    /// What `truncate(path, length)` truncates: the file `path` names (its
+    /// links followed), opened for writing as `ftruncate`'s descriptor
+    /// would be. A directory is `EISDIR`.
+    pub fn truncate_target(&self, m: &GuestMem<'_>, path: u64) -> Result<Arc<OpenFile>, Errno> {
+        let p = self.at_path(m, AT_FDCWD, path)?;
+        if self.ns.metadata(&p)?.file_type == FileType::Directory {
+            return Err(Errno::EISDIR);
+        }
+        let h = self.ns.open(&p, oflags::O_WRONLY, 0)?;
+        Ok(OpenFile::new(h, p, oflags::O_WRONLY, false, true))
     }
 
     pub fn at_path(&self, m: &GuestMem<'_>, dirfd: i32, path: u64) -> Result<String, Errno> {
@@ -4399,7 +4822,9 @@ impl MapIo<'_> {
                 }
                 r.map(|_| 0)
             }
-            nr::MSYNC => self.flush_shared(m, a[0], a[1]).map(|_| 0),
+            // MS_INVALIDATE (2): and what other processes wrote back since
+            // read in ([`sync_shared_file`]).
+            nr::MSYNC => self.flush_shared(m, a[0], a[1]).and_then(|_| if a[2] & 2 != 0 { self.refresh_shared(m, a[0], a[1]) } else { Ok(()) }).map(|_| 0),
             nr::MREMAP => self.mremap(m, a),
             nr::MPROTECT => self.mprotect(m, a),
             nr::MADVISE => self.madvise(m, a[0], a[1], a[2] as u32),
@@ -4417,6 +4842,12 @@ impl MapIo<'_> {
         // detour), which x86 needs no cache flush to see.
         if (a[2] as u32) & crate::mem::prot::EXEC == 0 || (a[2] as u32) & crate::mem::prot::WRITE != 0 {
             self.retire_code_why(a[0], a[1], "mprotect", a[2] as u32);
+            if (a[2] as u32) & crate::mem::prot::EXEC != 0 {
+                let (start, end) = (crate::mem::page_align_down(a[0]), crate::mem::page_align_up(a[0].saturating_add(a[1])));
+                if end > start {
+                    self.mem.lock().log.writable_code.push((start, end));
+                }
+            }
         }
         let mut mm = self.mem.lock();
         let r = mm.protect(a[0], a[1], (a[2] & 0x7) as u32).map(|_| 0);
@@ -4454,27 +4885,88 @@ impl MapIo<'_> {
     pub fn mremap(&self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
         const MREMAP_MAYMOVE: u64 = 1;
         let (addr, old_len, new_len, flags) = (a[0], a[1], a[2], a[3]);
+        // Whole pages, as Linux moves and keeps them: an old length short
+        // of a page (sqlite passes its file's size) still has the page.
+        let (old_al, new_al) = (crate::mem::page_align_up(old_len), crate::mem::page_align_up(new_len));
+        if addr.is_multiple_of(crate::mem::PAGE_SIZE) && old_len != 0 && new_len != 0 {
+            if let Some(r) = self.mremap_shared(m, addr, old_al, new_al, flags & MREMAP_MAYMOVE != 0) {
+                return r;
+            }
+        }
         // The map's lock held through the copy: the old range is free in
         // the map once it has moved, and another thread's mapping there
         // must not land before its bytes are out.
         let mut mm = self.mem.lock();
         let (dst, moved) = mm.mremap(addr, old_len, new_len, flags & MREMAP_MAYMOVE != 0)?;
         if moved {
-            let keep = old_len.min(new_len) as usize;
+            let keep = old_al.min(new_al) as usize;
             let bytes = m.read(addr, keep)?.to_vec();
             m.write(dst, &bytes)?;
             // The grown tail at the new location is fresh anonymous memory,
             // which Linux exposes as zero -- but `dst` may be a reused hole
             // holding stale bytes, and only `keep` of them were overwritten.
-            if new_len > old_len {
-                m.zero_dirty(dst + keep as u64, (new_len - keep as u64) as usize)?;
+            if new_al > old_al {
+                m.zero_dirty(dst + keep as u64, (new_al - keep as u64) as usize)?;
             }
-        } else if new_len > old_len {
+        } else if new_al > old_al {
             // Growing in place must expose zeroes, not whatever the guest
             // left behind the last time this range was mapped.
-            m.zero_dirty(addr + old_len, (new_len - old_len) as usize)?;
+            m.zero_dirty(addr + old_al, (new_al - old_al) as usize)?;
         }
         Ok(dst)
+    }
+
+    /// `mremap` of a shared file mapping (`[addr, addr + old_len)`, page
+    /// lengths), or `None` when the range is none of one. The pages are the
+    /// file's, so it is written back, moved in the map, and read again from
+    /// the file at its new place and length; its entry follows it, so the
+    /// process's `write`s to the file land there and not at the old address
+    /// (by then anything's: sqlite grows its mapping of a database this
+    /// way, and its writes went into whatever malloc put there next).
+    /// One mapping's whole range only: a part of one, or one of several
+    /// holders of the same pages, cannot move without the others (`ENOMEM`,
+    /// on which a caller maps afresh, as sqlite does).
+    fn mremap_shared(&self, m: &mut GuestMem<'_>, addr: u64, old_len: u64, new_len: u64, may_move: bool) -> Option<SysResult> {
+        let end = addr.saturating_add(old_len);
+        let file = {
+            let mm = self.mem.lock();
+            let s = mm.log.shared_maps.iter().find(|s| s.start < end && addr < s.start + s.len)?;
+            if s.start != addr || s.len != old_len || s.holders != [(addr, old_len)] {
+                return Some(Err(Errno::ENOMEM));
+            }
+            Arc::clone(&s.file)
+        };
+        if let Err(e) = self.flush_shared(m, addr, old_len) {
+            return Some(Err(e));
+        }
+        let pages: Arc<[std::sync::atomic::AtomicU64]> =
+            (0..new_len / crate::mem::PAGE_SIZE).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+        let (dst, offset) = {
+            let mut mm = self.mem.lock();
+            let (dst, _) = match mm.mremap(addr, old_len, new_len, may_move) {
+                Ok(r) => r,
+                Err(e) => return Some(Err(e)),
+            };
+            // In the list before the read: a `write` from now on lands in
+            // the new pages, and the read after it sees the file with it.
+            match mm.log.shared_maps.moved(addr, dst, new_len, Arc::clone(&pages)) {
+                Some(offset) => (dst, offset),
+                None => return Some(Ok(dst)),
+            }
+        };
+        let read = match m.read_mut(dst, new_len as usize) {
+            Ok(buf) => file.pread(offset, buf).unwrap_or(0) as u64,
+            Err(e) => return Some(Err(e)),
+        };
+        if let Err(e) = m.zero_dirty(dst + read, (new_len - read) as usize) {
+            return Some(Err(e));
+        }
+        if let Ok(bytes) = m.read(dst, new_len as usize) {
+            for (h, p) in pages.iter().zip(bytes.chunks(crate::mem::PAGE_SIZE as usize)) {
+                h.store(page_hash(p), std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        Some(Ok(dst))
     }
 
     /// The pinned base for a path a closure build named, if there is one.
@@ -4704,6 +5196,7 @@ impl MapIo<'_> {
                 });
             }
             if shared {
+                let path_of_map = file.path.clone();
                 let changes = if before != 0 && file.handle.changes() == before { before } else { 0 };
                 let kept = if changes != 0 { self.mem.lock().log.shared_maps.recall(&file, offset, len_aligned, changes) } else { None };
                 let pages = match kept {
@@ -4718,6 +5211,7 @@ impl MapIo<'_> {
                     holders: vec![(start, len_aligned)],
                     pages,
                     changes: Arc::new(std::sync::atomic::AtomicU64::new(changes)),
+                    seen: Arc::new(std::sync::atomic::AtomicU64::new(crate::locks::written(&path_of_map))),
                 });
             }
             return Ok(start);
@@ -4793,6 +5287,20 @@ impl MapIo<'_> {
         let _ = self.flush_shared(m, 0, u64::MAX);
     }
 
+    /// `msync(MS_INVALIDATE)`: the shared mappings over `[addr, addr + len)`
+    /// given what their files hold now where another process wrote back.
+    pub fn refresh_shared(&self, m: &mut GuestMem<'_>, addr: u64, len: u64) -> Result<(), Errno> {
+        let (lo, hi) = (addr, addr.saturating_add(len));
+        let maps: Vec<SharedMap> = {
+            let mm = self.mem.lock();
+            mm.log.shared_maps.iter().filter(|map| map.start.max(lo) < (map.start + map.len).min(hi)).cloned().collect()
+        };
+        for map in maps {
+            refresh(m, &map, true, None, false)?;
+        }
+        Ok(())
+    }
+
     /// Write a shared mapping's bytes back to the file behind it.
     pub fn flush_shared(&self, m: &GuestMem<'_>, addr: u64, len: u64) -> Result<(), Errno> {
         let (lo, hi) = (addr, addr.saturating_add(len));
@@ -4805,75 +5313,7 @@ impl MapIo<'_> {
             mm.log.shared_maps.iter().filter(|map| map.start.max(lo) < (map.start + map.len).min(hi)).cloned().collect()
         };
         for map in maps {
-            // A mapping of a descriptor opened read-only has nothing to
-            // write back (Linux refuses it PROT_WRITE): its stores are
-            // the process's own, as Wine's relocations of an image view
-            // are. Writing them was EBADF, and failed the next mmap.
-            if !map.file.writable {
-                continue;
-            }
-            let from = map.start.max(lo);
-            let to = (map.start + map.len).min(hi);
-            // Only what the file holds: a shared mapping's page past the
-            // end of the file is not the file's (Linux never extends it).
-            let known = map.changes.load(std::sync::atomic::Ordering::Acquire);
-            let (size, at_start) = match map.file.handle.metadata_changes() {
-                Ok((md, c)) => (md.size, if known != 0 { c } else { 0 }),
-                Err(_) => (u64::MAX, 0),
-            };
-            let to = to.min(map.start + size.saturating_sub(map.offset));
-            // Whether `pages` stay the file's at a count (`SharedMap::changes`):
-            // only if nothing else changed the file since they were (the count
-            // has not moved), and after the writes below only if those were
-            // the only changes and every page written had its hash kept.
-            use std::sync::atomic::Ordering::AcqRel;
-            let mut writes = 0u64;
-            let mut exact = known != 0 && at_start == known;
-            // Only the pages that changed since the file last had them, in
-            // runs: another process's writes to the other pages stand.
-            const P: u64 = crate::mem::PAGE_SIZE;
-            let mut run: Option<u64> = None;
-            let mut page = (from - map.start) / P;
-            loop {
-                let ps = (map.start + page * P).max(from);
-                let changed = ps < to && {
-                    let pe = (map.start + (page + 1) * P).min(to);
-                    let whole = map.start + page * P;
-                    let h = page_hash(m.read(whole, (P as usize).min((map.start + map.len - whole) as usize))?);
-                    let slot = map.pages.get(page as usize);
-                    let was = slot.map(|s| s.load(std::sync::atomic::Ordering::Relaxed));
-                    // A partial range writes back only its part, so the page's
-                    // hash is the file's only when the whole page went.
-                    if was != Some(h) {
-                        if ps == whole && pe == (whole + P).min(map.start + map.len) {
-                            if let Some(s) = slot {
-                                s.store(h, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        } else {
-                            exact = false;
-                        }
-                    }
-                    was != Some(h)
-                };
-                match (changed, run) {
-                    (true, None) => run = Some(ps),
-                    (false, Some(rs)) => {
-                        let at = map.offset + (rs - map.start);
-                        map.file.pwrite(at, m.read(rs, (ps.min(to) - rs) as usize)?)?;
-                        writes += 1;
-                        run = None;
-                    }
-                    _ => {}
-                }
-                if ps >= to {
-                    break;
-                }
-                page += 1;
-            }
-            if known != 0 {
-                let now = if exact && writes > 0 { map.file.handle.changes() } else { at_start };
-                let _ = map.changes.compare_exchange(known, if exact && now == at_start + writes { now } else { 0 }, AcqRel, std::sync::atomic::Ordering::Relaxed);
-            }
+            write_back(m, &map, lo, hi)?;
         }
         Ok(())
     }
@@ -5069,11 +5509,25 @@ impl NetIo<'_> {
                     io.put_inet(m, ip, port, a[1], a[2], Rule::Sock)
                 }
             },
-            // Nothing here has an option worth setting -- no timeouts, no
-            // buffer sizes that mean anything -- and refusing makes libraries
-            // treat the socket as broken.
-            // agreed to without effect, on a descriptor that exists
-            nr::SETSOCKOPT => io.fds.get(fd).map(|_| 0),
+            // `SO_PASSCRED` on a unix socket (`SCM_CREDENTIALS` on each
+            // `recvmsg`, [`FdIo::write_scm_creds`]). Nothing else here has an
+            // option worth setting -- no timeouts, no buffer sizes that mean
+            // anything -- and refusing makes libraries treat the socket as
+            // broken: agreed to without effect, on a descriptor that exists.
+            nr::SETSOCKOPT => {
+                const SOL_SOCKET: u64 = 1;
+                const SO_PASSCRED: u64 = 16;
+                io.fds.get(fd)?;
+                if a[1] == SOL_SOCKET && a[2] == SO_PASSCRED && a[3] != 0 && a[4] >= 4 {
+                    let on = m.read_u32(a[3])? != 0;
+                    if let Ok(s) = io.unix_of(fd) {
+                        s.set_passcred(on);
+                    } else if let Ok(s) = io.remote_unix_of(fd) {
+                        s.set_passcred(on);
+                    }
+                }
+                Ok(0)
+            }
             nr::GETSOCKOPT => getsockopt(io, m, fd, a[1], a[2], a[3], a[4]),
             // A unix socket's directions close as asked, local or in the
             // global kernel; the proxied network's as it can; anything else
@@ -5248,7 +5702,8 @@ impl NetIo<'_> {
         const SOCK_STREAM: u64 = 1;
         if let (Some(r), SOCK_STREAM) = (self.unix_remote, ty & 0xf) {
             let mut ids = [0u8; 8];
-            let rc = (r.pair)(ids.as_mut_ptr() as crate::PAddr);
+            let me = io.cred();
+            let rc = (r.pair)(ids.as_mut_ptr() as crate::PAddr, me.pid, me.uid, me.gid);
             if rc < 0 {
                 return Err(Errno(-rc));
             }
@@ -5304,7 +5759,10 @@ impl NetIo<'_> {
         if let Ok(d) = io.dgram_of(fd) {
             let path = io.unix_path(m, addr, len)?;
             let path = if path.starts_with('\0') { path } else { crate::vfs::normalize(&path, cwd) };
-            d.bind(&path)?;
+            // Named in the table every process shares as the namespace the
+            // process started with names it (a `chroot`'s root in front).
+            let name = io.ns.outer_path(&path).into_owned();
+            d.bind(&name)?;
             if io.darwin {
                 // SOCK_MAXADDRLEN bounds it.
                 d.set_xnu_name_len(len.min(255) as usize);
@@ -5319,6 +5777,9 @@ impl NetIo<'_> {
         // A filesystem socket resolves against the guest's root the way any
         // other path does; an abstract one has no filesystem existence.
         let path = if path.starts_with('\0') { path } else { crate::vfs::normalize(&path, cwd) };
+        // Named in the table every process shares as the namespace the
+        // process started with names it (a `chroot`'s root in front).
+        let name = io.ns.outer_path(&path).into_owned();
         // In the global kernel when there is one, because the client that
         // will connect is another process -- and with a Worker per process
         // that is another memory, where a name bound here means nothing.
@@ -5327,7 +5788,8 @@ impl NetIo<'_> {
         // and `listen` is local to itself, and what the far end can see is
         // only whether the name answers.
         if let Some(r) = self.unix_remote {
-            let id = (r.bind)(path.as_ptr() as crate::PAddr, path.len() as u32);
+            let me = io.cred();
+            let id = (r.bind)(name.as_ptr() as crate::PAddr, name.len() as u32, me.pid, me.uid, me.gid);
             if id < 0 {
                 return Err(Errno(-id));
             }
@@ -5340,9 +5802,9 @@ impl NetIo<'_> {
             }
             return Ok(0);
         }
-        sock.bind(&path)?;
-        if let Err(e) = self.socket_names.bind(&path, sock.clone()) {
-            sock.unbind_failed(&path);
+        sock.bind(&name)?;
+        if let Err(e) = self.socket_names.bind(&name, sock.clone()) {
+            sock.unbind_failed(&name);
             return Err(e);
         }
         // And a node in the filesystem, so the name can be seen as well as
@@ -5363,17 +5825,24 @@ impl NetIo<'_> {
         if let Ok(d) = io.dgram_of(fd) {
             let path = io.unix_path(m, addr, len)?;
             let path = if path.starts_with('\0') { path } else { crate::vfs::normalize(&path, cwd) };
-            return d.connect(&path);
+            // Named in the table every process shares as the namespace the
+            // process started with names it (a `chroot`'s root in front).
+            let name = io.ns.outer_path(&path).into_owned();
+            return d.connect(&name);
         }
         let sock = io.unix_of(fd)?;
         let path = io.unix_path(m, addr, len)?;
         let path = if path.starts_with('\0') { path } else { crate::vfs::normalize(&path, cwd) };
+        // Named in the table every process shares as the namespace the
+        // process started with names it (a `chroot`'s root in front).
+        let name = io.ns.outer_path(&path).into_owned();
         // The global kernel first, because that is where a name another
         // process bound will be. A host-bound name -- the virtio-gpu socket --
         // is in *this* process's table and never in the kernel's, so the
         // local path is still tried when the kernel does not know the name.
         if let Some(r) = self.unix_remote {
-            let id = (r.connect)(path.as_ptr() as crate::PAddr, path.len() as u32);
+            let me = io.cred();
+            let id = (r.connect)(name.as_ptr() as crate::PAddr, name.len() as u32, me.pid, me.uid, me.gid, 0, 0);
             if id >= 0 {
                 let flags = io.fds.get(fd)?.flags();
                 let cloexec = io.fds.cloexec(fd).unwrap_or(false);
@@ -5386,10 +5855,10 @@ impl NetIo<'_> {
         // then the system-wide table, which is where a guest server (an X
         // server's socket) lives.
         sock.set_cred(io.cred());
-        if let Ok(r) = self.host_names.connect(&sock, &path) {
+        if let Ok(r) = self.host_names.connect(&sock, &name) {
             return Ok(r);
         }
-        let r = self.socket_names.connect(&sock, &path);
+        let r = self.socket_names.connect(&sock, &name);
         if io.darwin && r == Err(Errno::ECONNREFUSED) {
             return Err(Self::unix_connect_lookup(io, &path));
         }
@@ -5426,6 +5895,10 @@ fn install_unix(io: &FdIo<'_>, sock: Arc<unix::UnixSocket>, flags: u64, cloexec:
 /// starts as an ordinary local socket and is swapped when its name is
 /// known.
 fn install_remote_unix(io: &FdIo<'_>, fd: i32, sock: Arc<unix::RemoteUnix>, flags: u64, cloexec: bool) -> Result<(), Errno> {
+    // An option set on the local socket it replaces.
+    if io.unix_of(fd).is_ok_and(|s| s.passcred()) {
+        sock.set_passcred(true);
+    }
     let handle: Arc<dyn crate::vfs::FileHandle> = sock;
     let file = OpenFile::new(handle, "socket".to_string(), flags, true, true);
     io.fds.install(fd, file, cloexec)?;
@@ -5641,10 +6114,10 @@ fn getsockopt(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, level: u64, name: u6
     // every ABI), as it was when the two were joined. Every byte is written:
     // dbus-daemon reads the struct off its stack uninitialised and compares
     // the uid with the one a client claims, so a struct left as the caller
-    // had it refused every wasm32 client's authentication. A peer this
-    // kernel did not see made (in the global kernel, or a host's end) has
-    // no pid to give (0) and this process's user and group, the only ones
-    // there are.
+    // had it refused every wasm32 client's authentication. A socket in the
+    // global kernel asks it (`unix::Remote::peer_cred`). A peer neither
+    // kernel saw made (a host's end) has no pid to give (0) and this
+    // process's user and group, the only ones there are.
     const SO_PEERCRED: u64 = 17;
     if level == SOL_SOCKET && name == SO_PEERCRED {
         let me = io.cred();
@@ -5652,6 +6125,7 @@ fn getsockopt(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, level: u64, name: u6
             .unix_of(fd)
             .ok()
             .and_then(|s| s.peer_cred())
+            .or_else(|| io.remote_unix_of(fd).ok().and_then(|s| s.peer_cred()))
             .unwrap_or(unix::Cred { pid: 0, uid: me.uid, gid: me.gid });
         let mut bytes = [0u8; 12];
         bytes[0..4].copy_from_slice(&peer.pid.to_le_bytes());
@@ -5679,8 +6153,13 @@ fn getsockopt(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, level: u64, name: u6
     let (v, len): (u64, u64) = match (level, name) {
         // SO_DEBUG, SO_REUSEADDR, SO_DONTROUTE, SO_BROADCAST, SO_KEEPALIVE,
         // SO_OOBINLINE, SO_NO_CHECK, SO_PRIORITY, SO_REUSEPORT,
-        // SO_PASSCRED, SO_TIMESTAMP, SO_PASSSEC, SO_MARK
-        (SOL_SOCKET, 1 | 2 | 5 | 6 | 9 | 10 | 11 | 12 | 15 | 16 | 29 | 34 | 36) => (0, 4),
+        // SO_TIMESTAMP, SO_PASSSEC, SO_MARK
+        (SOL_SOCKET, 1 | 2 | 5 | 6 | 9 | 10 | 11 | 12 | 15 | 29 | 34 | 36) => (0, 4),
+        // SO_PASSCRED, as set
+        (SOL_SOCKET, 16) => {
+            let on = io.unix_of(fd).map(|s| s.passcred()).or_else(|_| io.remote_unix_of(fd).map(|s| s.passcred())).unwrap_or(false);
+            (on as u64, 4)
+        }
         // SO_SNDBUF, SO_RCVBUF: Linux's defaults, as it reports them
         (SOL_SOCKET, 7) => (212_992, 4),
         (SOL_SOCKET, 8) => (212_992, 4),
@@ -5795,9 +6274,8 @@ pub struct Free<'a> {
     pub procs: &'a Arc<ProcTable>,
     /// The process's live thread count (`Kernel::live_threads`), for `exit`.
     pub live: &'a std::sync::atomic::AtomicU32,
-    /// Its next free register-context slot (`Kernel::next_ctx_slot`), for
-    /// `clone`.
-    pub slots: &'a std::sync::atomic::AtomicU32,
+    /// Its register-context slots (`Kernel::next_ctx_slot`), for `clone`.
+    pub slots: &'a CtxSlots,
     /// The terminal (`Kernel::tty`, the same one for the process's life),
     /// for `ioctl`.
     pub tty: &'a crate::tty::TtyRef,
@@ -6041,7 +6519,7 @@ pub fn process_vm(procs: &ProcTable, m: &mut GuestMem<'_>, compat: bool, write: 
 pub fn is_fd_misc(n: u64) -> bool {
     matches!(
         n,
-        nr::EPOLL_CTL | nr::PIPE2 | nr::FTRUNCATE | nr::FADVISE64 | nr::STATFS | nr::FSTATFS | nr::GETPRIORITY | nr::SETPRIORITY | nr::SYSINFO | nr::PRLIMIT64
+        nr::EPOLL_CTL | nr::PIPE2 | nr::FTRUNCATE | nr::TRUNCATE | nr::FADVISE64 | nr::STATFS | nr::FSTATFS | nr::GETPRIORITY | nr::SETPRIORITY | nr::SYSINFO | nr::PRLIMIT64
             | nr::PROCESS_VM_READV | nr::PROCESS_VM_WRITEV
     )
 }
@@ -6061,6 +6539,8 @@ pub fn is_quiet(n: u64, compat: bool) -> bool {
         nr::UNAME
             | nr::PRCTL
             | nr::SYNC
+            | nr::SYNCFS
+            | nr::SYNC_FILE_RANGE
             | nr::FSYNC
             | nr::FDATASYNC
             | nr::SET_ROBUST_LIST
@@ -6131,46 +6611,315 @@ pub fn fd_object_call(io: &FdIo<'_>, clock: ClockFn, m: &mut GuestMem<'_>, n: u6
     }
 }
 
-/// A process's user and group ids. Its threads share one (a `setuid` on
-/// any is every thread's, as Linux's process-wide set), a fork copies it,
-/// and an `exec` keeps it. Read at each use (the owner a stat reports, the
-/// sender a signal names, `getuid`), so a change is seen by every thread's
-/// next call, with or without a kernel lock. Each set call changes one
-/// word, so two atomics are the whole of it.
+/// A process's user and group ids, real, effective and saved, and its
+/// capability sets. Its threads share one (a `setuid` on any is every
+/// thread's, as Linux's process-wide set), a fork copies it, and an `exec`
+/// keeps the ids ([`Creds::exec`] recomputes the capabilities). Read at each
+/// use (the owner a stat reports, the sender a signal names, `getuid`), so
+/// a change is seen by every thread's next call, with or without a kernel
+/// lock. A set call stores word by word: two threads setting at once may
+/// interleave, which no program relies on.
+///
+/// The filesystem ids are the effective ones (no `setfsuid`), and there
+/// are no file capabilities, no ambient set and no bounding set narrower
+/// than every capability.
 #[derive(Debug)]
 pub struct Creds {
-    uid: std::sync::atomic::AtomicU32,
-    gid: std::sync::atomic::AtomicU32,
+    /// Real, effective, saved.
+    uid: [std::sync::atomic::AtomicU32; 3],
+    gid: [std::sync::atomic::AtomicU32; 3],
+    /// Effective, permitted, inheritable.
+    caps: [std::sync::atomic::AtomicU64; 3],
+    /// `PR_SET_KEEPCAPS`: a uid change away from root keeps the permitted
+    /// set (it clears at exec).
+    keep_caps: std::sync::atomic::AtomicBool,
 }
 
+/// Every capability Linux 6.x has (`CAP_LAST_CAP` 40): root's sets.
+pub const CAPS_ALL: u64 = (1 << 41) - 1;
+const CAP_SETPCAP: u64 = 1 << 8;
+
+const RE: usize = 0;
+const EF: usize = 1;
+const SV: usize = 2;
+
 impl Creds {
+    fn blank(uid: u32, gid: u32) -> Creds {
+        Creds {
+            uid: [uid.into(), uid.into(), uid.into()],
+            gid: [gid.into(), gid.into(), gid.into()],
+            caps: [0.into(), 0.into(), 0.into()],
+            keep_caps: false.into(),
+        }
+    }
+
     pub fn new(uid: u32, gid: u32) -> Arc<Creds> {
-        Arc::new(Creds { uid: uid.into(), gid: gid.into() })
+        let c = Creds::blank(uid, gid);
+        c.exec();
+        Arc::new(c)
     }
 
+    /// A fork's copy, every id and set as they are.
+    pub fn fork(&self) -> Arc<Creds> {
+        let c = Creds::blank(0, 0);
+        c.restore(&self.save());
+        Arc::new(c)
+    }
+
+    fn ld32(a: &std::sync::atomic::AtomicU32) -> u32 {
+        a.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn st32(a: &std::sync::atomic::AtomicU32, v: u32) {
+        a.store(v, std::sync::atomic::Ordering::Release)
+    }
+
+    /// The effective uid: what permission, ownership and peer credentials
+    /// go by.
     pub fn uid(&self) -> u32 {
-        self.uid.load(std::sync::atomic::Ordering::Acquire)
+        Self::ld32(&self.uid[EF])
     }
 
+    /// The effective gid.
     pub fn gid(&self) -> u32 {
-        self.gid.load(std::sync::atomic::Ordering::Acquire)
+        Self::ld32(&self.gid[EF])
     }
 
-    /// Become `uid` (a host's identity, or the guest's `setuid`).
+    /// The real uid: `getuid`, and the sender a signal names.
+    pub fn ruid(&self) -> u32 {
+        Self::ld32(&self.uid[RE])
+    }
+
+    pub fn rgid(&self) -> u32 {
+        Self::ld32(&self.gid[RE])
+    }
+
+    /// Real, effective and saved uids.
+    pub fn uids(&self) -> [u32; 3] {
+        [self.ruid(), self.uid(), Self::ld32(&self.uid[SV])]
+    }
+
+    pub fn gids(&self) -> [u32; 3] {
+        [self.rgid(), self.gid(), Self::ld32(&self.gid[SV])]
+    }
+
+    /// Effective, permitted and inheritable capabilities.
+    pub fn caps(&self) -> [u64; 3] {
+        self.caps.each_ref().map(|c| c.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    fn set_caps(&self, v: [u64; 3]) {
+        for (c, v) in self.caps.iter().zip(v) {
+            c.store(v, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Become `uid`, real, effective and saved (a host's identity), with
+    /// root's capabilities if it is root and none if not.
     pub fn set_uid(&self, uid: u32) {
-        self.uid.store(uid, std::sync::atomic::Ordering::Release);
+        for a in &self.uid {
+            Self::st32(a, uid);
+        }
+        self.exec();
     }
 
     pub fn set_gid(&self, gid: u32) {
-        self.gid.store(gid, std::sync::atomic::Ordering::Release);
+        for a in &self.gid {
+            Self::st32(a, gid);
+        }
     }
+
+    /// The ids and sets as bytes, for a process another memory goes on in
+    /// (the browser's fork and exec): 6 `u32`s, 3 `u64`s and a flag byte.
+    pub fn save(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(Self::SAVED);
+        for id in self.uids().into_iter().chain(self.gids()) {
+            v.extend_from_slice(&id.to_le_bytes());
+        }
+        for c in self.caps() {
+            v.extend_from_slice(&c.to_le_bytes());
+        }
+        v.push(self.keep_caps.load(std::sync::atomic::Ordering::Acquire) as u8);
+        v
+    }
+
+    /// The length of [`Creds::save`]'s bytes.
+    pub const SAVED: usize = 6 * 4 + 3 * 8 + 1;
+
+    /// [`Creds::save`]'s bytes back; anything else changes nothing.
+    pub fn restore(&self, b: &[u8]) {
+        if b.len() != Self::SAVED {
+            return;
+        }
+        let w = |i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
+        for i in 0..3 {
+            Self::st32(&self.uid[i], w(i));
+            Self::st32(&self.gid[i], w(3 + i));
+        }
+        let c = |i: usize| u64::from_le_bytes(b[24 + i * 8..32 + i * 8].try_into().unwrap());
+        self.set_caps([c(0), c(1), c(2)]);
+        self.keep_caps.store(b[48] != 0, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The capabilities an `execve` leaves, as Linux computes them for a
+    /// file with none of its own: everything for a program run by root
+    /// (real or effective), effective only when the effective uid is;
+    /// nothing otherwise. The inheritable set stays; `PR_SET_KEEPCAPS`
+    /// clears.
+    pub fn exec(&self) {
+        let [r, e, _] = self.uids();
+        let [_, _, inh] = self.caps();
+        let permitted = if r == 0 || e == 0 { CAPS_ALL } else { 0 };
+        let effective = if e == 0 { permitted } else { 0 };
+        self.set_caps([effective, permitted, inh]);
+        self.keep_caps.store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// `prctl(PR_GET_KEEPCAPS)` / `PR_SET_KEEPCAPS`.
+    pub fn keep_caps(&self) -> bool {
+        self.keep_caps.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn set_keep_caps(&self, on: bool) {
+        self.keep_caps.store(on, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The capability changes a uid change makes (Linux's
+    /// `cap_emulate_setxuid`): leaving root altogether (no id 0 left)
+    /// drops the permitted and effective sets, unless `PR_SET_KEEPCAPS`
+    /// keeps the permitted; an effective uid leaving 0 drops the effective
+    /// set, and one becoming 0 takes the permitted set as effective.
+    fn after_uid_change(&self, old: [u32; 3]) {
+        let new = self.uids();
+        let [mut eff, mut perm, inh] = self.caps();
+        if old.contains(&0) && !new.contains(&0) {
+            if !self.keep_caps() {
+                perm = 0;
+            }
+            eff = 0;
+        }
+        if old[1] == 0 && new[1] != 0 {
+            eff = 0;
+        }
+        if old[1] != 0 && new[1] == 0 {
+            eff = perm;
+        }
+        // A process that was not root at all and is now (every change is
+        // granted, [`cred_call`]): root's sets, as a set-user-ID-root
+        // program's exec would have given it.
+        if !old.contains(&0) && new[1] == 0 {
+            (eff, perm) = (CAPS_ALL, CAPS_ALL);
+        }
+        self.set_caps([eff, perm, inh]);
+    }
+
+    /// `setresuid`/`setresgid` and the calls made of it: each id `None`
+    /// to keep.
+    fn set_res(ids: &[std::sync::atomic::AtomicU32; 3], want: [Option<u32>; 3]) {
+        for (a, v) in ids.iter().zip(want) {
+            if let Some(v) = v {
+                Self::st32(a, v);
+            }
+        }
+    }
+
+    /// `setuid(id)` (`gid`: `setgid`), as root's: every id.
+    fn setid(&self, gid: bool, id: u32) {
+        Self::set_res(if gid { &self.gid } else { &self.uid }, [Some(id); 3]);
+    }
+
+    /// `setreuid(r, e)` (`gid`: `setregid`). When the real id is set, or
+    /// the effective one set to other than the old real, the saved id
+    /// becomes the new effective.
+    fn setreid(&self, gid: bool, r: Option<u32>, e: Option<u32>) {
+        let ids = if gid { &self.gid } else { &self.uid };
+        let (or, oe) = (Self::ld32(&ids[RE]), Self::ld32(&ids[EF]));
+        let saved = (r.is_some() || e.is_some_and(|e| e != or)).then_some(e.unwrap_or(oe));
+        Self::set_res(ids, [r, e, saved]);
+    }
+
+    /// `capget`'s answer for this process.
+    pub fn capget(&self) -> [u64; 3] {
+        self.caps()
+    }
+
+    /// `capset`: the inheritable set within the old inheritable and
+    /// permitted (any, with CAP_SETPCAP), the permitted within the old
+    /// permitted, the effective within the new permitted; `EPERM` else.
+    pub fn capset(&self, eff: u64, perm: u64, inh: u64) -> Result<(), Errno> {
+        let [ceff, cperm, cinh] = self.caps();
+        let inh_room = if ceff & CAP_SETPCAP != 0 { CAPS_ALL } else { cinh | cperm };
+        if inh & !inh_room != 0 || perm & !cperm != 0 || eff & !perm != 0 {
+            return Err(Errno::EPERM);
+        }
+        self.set_caps([eff, perm, inh]);
+        Ok(())
+    }
+}
+
+/// `capget`/`capset`'s header versions: 1 has one 32-bit data struct, 2
+/// and 3 two.
+const CAP_V1: u32 = 0x1998_0330;
+const CAP_V2: u32 = 0x2007_1026;
+const CAP_V3: u32 = 0x2008_0522;
+
+/// `capget(hdr, data)` and `capset(hdr, data)` on this process's sets
+/// ([`Creds`]). Another live process's sets are not kept where this
+/// process can read them, so `capget` of one answers as Linux does for a
+/// process run by root, every capability; `capset` of one is `EPERM`, as
+/// on Linux.
+fn cap_call(creds: &Creds, procs: &ProcTable, pid: i32, m: &mut GuestMem<'_>, set: bool, a: [u64; 6]) -> SysResult {
+    let (hdr, data) = (a[0], a[1]);
+    let version = m.read_u32(hdr)?;
+    let target = m.read_u32(hdr + 4)? as i32;
+    let words = match version {
+        CAP_V1 => 1,
+        CAP_V2 | CAP_V3 => 2,
+        _ => {
+            // The version this kernel prefers, written back for libcap to
+            // ask again with; a probe with no data is not an error.
+            m.write_u32(hdr, CAP_V3)?;
+            return if data == 0 && !set { Ok(0) } else { Err(Errno::EINVAL) };
+        }
+    };
+    if target < 0 {
+        return Err(Errno::EINVAL);
+    }
+    let me = target == 0 || target == pid;
+    if set {
+        if !me {
+            return Err(Errno::EPERM);
+        }
+        let mut v = [0u64; 3];
+        for w in 0..words {
+            for (i, s) in v.iter_mut().enumerate() {
+                *s |= u64::from(m.read_u32(data + w * 12 + i as u64 * 4)?) << (32 * w);
+            }
+        }
+        return creds.capset(v[0], v[1], v[2]).map(|_| 0);
+    }
+    let sets = if me {
+        creds.capget()
+    } else if procs.task_owner(target).is_some() {
+        [CAPS_ALL, CAPS_ALL, 0]
+    } else {
+        return Err(Errno::ESRCH);
+    };
+    if data != 0 {
+        for w in 0..words {
+            for (i, s) in sets.iter().enumerate() {
+                m.write_u32(data + w * 12 + i as u64 * 4, (s >> (32 * w)) as u32)?;
+            }
+        }
+    }
+    Ok(0)
 }
 
 /// The credential, session and process group calls: `get[e]uid`,
 /// `mount` and `umount2`: the namespace's mount table, which its
 /// published view ([`crate::vfs::VfsView`]) writes. Canonical.
 pub fn is_mount(n: u64) -> bool {
-    matches!(n, nr::MOUNT | nr::UMOUNT2)
+    matches!(n, nr::MOUNT | nr::UMOUNT2 | nr::CHROOT)
 }
 
 /// The calls on the calling thread's own state alone:
@@ -6303,8 +7052,8 @@ pub struct ThreadMaker<'a> {
     pub procs: &'a ProcTable,
     pub pid: i32,
     pub compat: bool,
-    /// The next free register-context slot (`Kernel::next_ctx_slot`).
-    pub slots: &'a std::sync::atomic::AtomicU32,
+    /// The register-context slots (`Kernel::next_ctx_slot`).
+    pub slots: &'a CtxSlots,
     /// The live thread count (`Kernel::live_threads`).
     pub live: &'a std::sync::atomic::AtomicU32,
     pub thread_fs: &'a ThreadFs,
@@ -6313,6 +7062,81 @@ pub struct ThreadMaker<'a> {
     pub blocked: u64,
     /// The creator's fs_struct.
     pub fs: &'a Arc<FsCwd>,
+}
+
+/// A process's register-context slots, in the reserved region below the
+/// guest's own memory ([`ctx_addr`]): numbered upwards from `next`, and
+/// the slots of threads that have ended, which the host gives back once
+/// nothing of the thread runs ([`Self::give`]). Without that a process
+/// could make only as many threads in its whole life as there are slots.
+#[derive(Debug, Default)]
+pub struct CtxSlots {
+    next: std::sync::atomic::AtomicU32,
+    free: std::sync::Mutex<Vec<u32>>,
+}
+
+impl CtxSlots {
+    /// Slots from `next` up, none given back.
+    pub fn new(next: u32) -> Self {
+        Self { next: std::sync::atomic::AtomicU32::new(next), free: Default::default() }
+    }
+
+    /// A fork's child's: the same, its address space a copy.
+    pub fn fork(&self) -> Self {
+        Self { next: std::sync::atomic::AtomicU32::new(self.load()), free: std::sync::Mutex::new(self.free_list().clone()) }
+    }
+
+    fn free_list(&self) -> std::sync::MutexGuard<'_, Vec<u32>> {
+        self.free.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A slot for a new thread: the one given back last, else the next
+    /// number, or `None` when that would end past [`gex_abi::CTX_LIMIT`].
+    pub fn take(&self) -> Option<u32> {
+        use std::sync::atomic::Ordering;
+        if let Some(slot) = self.free_list().pop() {
+            return Some(slot);
+        }
+        // Claimed with one atomic add; one past the limit is never handed out.
+        let slot = self.next.fetch_add(1, Ordering::AcqRel);
+        if ctx_addr(slot) + ctx::SIZE as u64 > gex_abi::CTX_LIMIT {
+            self.next.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(slot)
+    }
+
+    /// The slot of the context at `ctx`, whose thread has ended and whose
+    /// host runs nothing of it any more, for the next thread.
+    pub fn give(&self, ctx: u64) {
+        let stride = (ctx::SIZE as u64 + 63) & !63;
+        let Some(off) = ctx.checked_sub(ctx_addr(0)) else { return };
+        let slot = (off / stride) as u32;
+        if off % stride == 0 && slot != 0 && slot < self.load() {
+            self.free_list().push(slot);
+        }
+    }
+
+    /// The next number a slot would take.
+    pub fn load(&self) -> u32 {
+        self.next.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Number from `next` up again, none given back: a new program's
+    /// (`execve`).
+    pub fn reset(&self, next: u32) {
+        let mut free = self.free_list();
+        free.clear();
+        self.next.store(next, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Number from `next` up at least, none at or below it given back:
+    /// a process running on a context there.
+    pub fn at_least(&self, next: u32) {
+        let mut free = self.free_list();
+        free.retain(|&s| s >= next);
+        self.next.fetch_max(next, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 /// What the host runs a process's threads on, when it has only so many (the
@@ -6367,14 +7191,10 @@ impl ThreadMaker<'_> {
         }
         // Contexts live in the reserved region below the guest's own memory;
         // running out of slots is a hard limit, not something to paper over.
-        // A slot is claimed with one atomic add; one past the limit is
-        // never handed out.
-        let slot = self.slots.fetch_add(1, Ordering::AcqRel);
-        let child = ctx_addr(slot);
-        if child + ctx::SIZE as u64 > gex_abi::CTX_LIMIT {
-            self.slots.fetch_sub(1, Ordering::AcqRel);
+        let Some(slot) = self.slots.take() else {
             return Err(Errno::EAGAIN);
-        }
+        };
+        let child = ctx_addr(slot);
         // Numbered with the processes (`ProcTable::new_tid`).
         let tid = self.procs.new_tid(self.pid);
         {
@@ -6529,6 +7349,10 @@ pub fn is_cred(n: u64) -> bool {
             | nr::SETRESGID
             | nr::GETRESUID
             | nr::GETRESGID
+            | nr::SETFSUID
+            | nr::SETFSGID
+            | nr::CAPGET
+            | nr::CAPSET
             | nr::SETSID
             | nr::GETSID
             | nr::GETPGID
@@ -6539,36 +7363,67 @@ pub fn is_cred(n: u64) -> bool {
 /// A call [`is_cred`] admits, made, for the kernel's arms and
 /// [`free_call`] alike, as process `pid`.
 ///
-/// There is no privilege model here: the guest is the whole system, so a
-/// request to become another user is recorded and granted. Refusing would
-/// be the less honest answer, since nothing gex does is protected by the
-/// uid in the first place. Real, effective and saved ids are one value, so
-/// the `setre*`/`setres*` forms set the effective one and the `getres*`
-/// forms report it three times; all ones means "leave alone".
+/// There is no privilege check on the id changes: the guest is the whole
+/// system, and there are no set-user-ID programs (a file's owner is the
+/// process's own), so a request to become another user is recorded and
+/// granted, as root's would be. Refusing would be the less honest answer,
+/// since nothing gex does is protected by the uid in the first place. The
+/// real, effective and saved ids are each kept, set as Linux sets them for
+/// root, and the capability sets follow a uid change as Linux's do
+/// ([`Creds::after_uid_change`]): what peer credentials, `getuid` and
+/// `geteuid` report is what Linux's would. All ones means "leave alone".
 pub fn cred_call(creds: &Creds, procs: &ProcTable, pid: i32, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> SysResult {
-    let set = |want: u64, apply: &dyn Fn(u32)| {
-        if want as u32 != u32::MAX {
-            apply(want as u32);
-        }
-        Ok(0)
-    };
-    let getres = |m: &mut GuestMem<'_>, id: u32| {
-        for slot in [a[0], a[1], a[2]] {
+    let r = cred_change(creds, procs, pid, m, n, a);
+    // A change the other processes' `/proc/<pid>/status` shows.
+    if r.is_ok() && !matches!(n, nr::GETUID | nr::GETEUID | nr::GETGID | nr::GETEGID | nr::GETRESUID | nr::GETRESGID | nr::CAPGET | nr::SETFSUID | nr::SETFSGID | nr::SETSID | nr::GETSID | nr::GETPGID | nr::SETPGID) {
+        procs.set_creds(pid, &creds.save());
+    }
+    r
+}
+
+fn cred_change(creds: &Creds, procs: &ProcTable, pid: i32, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> SysResult {
+    // -1 keeps an id (the 16-bit calls' 0xffff arrives as -1 too,
+    // `i386::canonical`).
+    let id = |v: u64| (v as u32 != u32::MAX).then_some(v as u32);
+    let getres = |m: &mut GuestMem<'_>, ids: [u32; 3]| {
+        for (slot, id) in [a[0], a[1], a[2]].into_iter().zip(ids) {
             if slot != 0 {
                 m.write_u32(slot, id)?;
             }
         }
         Ok(0)
     };
+    let uid_change = |f: &dyn Fn()| {
+        let old = creds.uids();
+        f();
+        creds.after_uid_change(old);
+        Ok(0)
+    };
     match n {
-        nr::GETUID | nr::GETEUID => Ok(creds.uid() as u64),
-        nr::GETGID | nr::GETEGID => Ok(creds.gid() as u64),
-        nr::SETUID => set(a[0], &|v| creds.set_uid(v)),
-        nr::SETGID => set(a[0], &|v| creds.set_gid(v)),
-        nr::SETREUID | nr::SETRESUID => set(a[1], &|v| creds.set_uid(v)),
-        nr::SETREGID | nr::SETRESGID => set(a[1], &|v| creds.set_gid(v)),
-        nr::GETRESUID => getres(m, creds.uid()),
-        nr::GETRESGID => getres(m, creds.gid()),
+        nr::GETUID => Ok(creds.ruid() as u64),
+        nr::GETEUID => Ok(creds.uid() as u64),
+        nr::GETGID => Ok(creds.rgid() as u64),
+        nr::GETEGID => Ok(creds.gid() as u64),
+        nr::SETUID => match id(a[0]) {
+            Some(v) => uid_change(&|| creds.setid(false, v)),
+            None => Err(Errno::EINVAL),
+        },
+        nr::SETGID => match id(a[0]) {
+            Some(v) => Ok(creds.setid(true, v)).map(|_| 0),
+            None => Err(Errno::EINVAL),
+        },
+        nr::SETREUID => uid_change(&|| creds.setreid(false, id(a[0]), id(a[1]))),
+        nr::SETREGID => Ok(creds.setreid(true, id(a[0]), id(a[1]))).map(|_| 0),
+        nr::SETRESUID => uid_change(&|| Creds::set_res(&creds.uid, [id(a[0]), id(a[1]), id(a[2])])),
+        nr::SETRESGID => Ok(Creds::set_res(&creds.gid, [id(a[0]), id(a[1]), id(a[2])])).map(|_| 0),
+        nr::GETRESUID => getres(m, creds.uids()),
+        nr::GETRESGID => getres(m, creds.gids()),
+        // The filesystem ids are the effective ones: the old one back, and
+        // nothing changed (Linux answers the old one whatever it does).
+        nr::SETFSUID => Ok(creds.uid() as u64),
+        nr::SETFSGID => Ok(creds.gid() as u64),
+        nr::CAPGET => cap_call(creds, procs, pid, m, false, a),
+        nr::CAPSET => cap_call(creds, procs, pid, m, true, a),
         nr::SETSID => procs.setsid(pid).map(|s| s as u64),
         nr::GETSID => procs.sid(pid, a[0] as i32).map(|s| s as u64),
         nr::GETPGID => procs.pgid(pid, a[0] as i32).map(|g| g as u64),
@@ -6716,6 +7571,14 @@ pub struct KillTo<'a> {
 /// waiting elsewhere wakes them after (a signal for one is raised on its
 /// own pending word, which it sees when it looks).
 pub fn kill_call(to: &KillTo<'_>, n: u64, a: [u64; 6]) -> SysResult {
+    {
+        let (pid, tid, signo) = match n {
+            nr::KILL => (a[0] as i32, 0, a[1] as u32),
+            nr::TKILL => (to.pid, a[0] as i32, a[1] as u32),
+            _ => (a[0] as i32, a[1] as i32, a[2] as u32),
+        };
+        to.signals.process().note_send(to.tid, pid, tid, signo);
+    }
     if n == nr::KILL {
         // `kill` addresses a process, which may be any process on the
         // system. It goes through the table, which leaves the signal
@@ -6730,7 +7593,7 @@ pub fn kill_call(to: &KillTo<'_>, n: u64, a: [u64; 6]) -> SysResult {
         // group entirely. Whether or not anything is still in the inbox:
         // another thread's collect may have taken it and not yet raised it,
         // and collecting waits for that one (`ProcSig::collect`).
-        to.signals.process().collect(to.procs, to.pid, to.creds.uid());
+        to.signals.process().collect(to.procs, to.pid, to.creds.ruid());
         return Ok(0);
     }
     // `tkill(tid, sig)` and `tgkill(tgid, tid, sig)`: a thread-directed
@@ -6761,7 +7624,7 @@ pub fn kill_call(to: &KillTo<'_>, n: u64, a: [u64; 6]) -> SysResult {
         return Err(Errno::ESRCH);
     }
     if signo > 0 {
-        let source = crate::signal::Source { code: crate::signal::SI_TKILL, pid: to.pid, uid: to.creds.uid() };
+        let source = crate::signal::Source { code: crate::signal::SI_TKILL, pid: to.pid, uid: to.creds.ruid() };
         match target {
             Some(t) => t.raise_from(signo, source),
             None => to.signals.raise_from(signo, source),
@@ -6772,21 +7635,82 @@ pub fn kill_call(to: &KillTo<'_>, n: u64, a: [u64; 6]) -> SysResult {
 
 /// A call [`is_quiet`] admits, made: the kernel's arms and [`free_call`]
 /// both answer them here. `ctx_addr` is the calling thread's context.
-pub fn quiet_call(io: &FdIo<'_>, procs: &ProcTable, m: &mut GuestMem<'_>, ctx_addr: u64, n: u64, a: [u64; 6]) -> SysResult {
+pub fn quiet_call(io: &FdIo<'_>, procs: &ProcTable, tid: i32, m: &mut GuestMem<'_>, ctx_addr: u64, n: u64, a: [u64; 6]) -> SysResult {
     match n {
         nr::UNAME => uname(m, io.compat, a[0]),
-        // Names, death signals and dumpability: all things a process may
-        // set about itself that change nothing observable here.
-        nr::PRCTL => Ok(0),
-        // Nothing here is written back to a device, so there is nothing
-        // to flush -- but an init script's last act is usually to call it.
-        nr::SYNC => Ok(0),
-        // `fdatasync` like `fsync`: everything is already durable (the VFS
-        // is in memory), so validating the fd and returning success is the
-        // honest answer. Missing it made sqlite's journal sync return
-        // ENOSYS, which sqlite reports as SQLITE_IOERR ("disk I/O error")
-        // and refuses to write any file-backed database.
-        nr::FSYNC | nr::FDATASYNC => io.fds.get(a[0] as i32).map(|_| 0),
+        // The capability options ([`Creds`]): `PR_GET_KEEPCAPS` and
+        // `PR_SET_KEEPCAPS`, and the bounding set, every capability (a
+        // drop is not kept; `PR_CAPBSET_READ` of one past the last is
+        // `EINVAL`, which libcap counts them by). Names, death signals,
+        // dumpability and the rest: all things a process may set about
+        // itself that change nothing observable here. A thread's name
+        // (`PR_SET_NAME`, `PR_GET_NAME`: what `pthread_setname_np` and
+        // `_getname_np` make) is the table's, for `/proc/<pid>/task/<tid>/comm`.
+        nr::PRCTL => match a[0] {
+            15 => {
+                // at most 15 bytes, cut there when no NUL comes sooner
+                let name = match m.read_cstr(a[1], 16) {
+                    Err(Errno::ENAMETOOLONG) => m.read(a[1], 15)?.to_vec(),
+                    r => r?,
+                };
+                procs.set_task_name(tid, &name);
+                Ok(0)
+            }
+            16 => {
+                let e = procs.entries().into_iter().find(|e| e.pid == io.pid);
+                let name = e.map_or_else(|| "gex".to_string(), |e| e.task_comm(tid));
+                let mut out = [0u8; 16];
+                let b = name.as_bytes();
+                out[..b.len().min(15)].copy_from_slice(&b[..b.len().min(15)]);
+                m.write(a[1], &out)?;
+                Ok(0)
+            }
+            7 => Ok(io.creds.keep_caps() as u64),
+            8 if a[1] <= 1 => {
+                io.creds.set_keep_caps(a[1] == 1);
+                Ok(0)
+            }
+            8 => Err(Errno::EINVAL),
+            23 if a[1] <= 40 => Ok(1),
+            23 => Err(Errno::EINVAL),
+            // gex's own: the process has crashed, and says how (the report
+            // its exit makes, `ProcTable::set_crash`).
+            crate::proc::PR_GEX_CRASH => {
+                let note = m.read(a[1], (a[2] as usize).min(1024))?.to_vec();
+                procs.set_crash(io.pid, &note);
+                Ok(0)
+            }
+            // A reservation the lowered memory had no room for, as 64-bit
+            // Wine says it (it never asks for a mapping it found no gap for).
+            crate::proc::PR_GEX_SHORT => {
+                if note_short(io.pid, a[1], io.compat, false) {
+                    if let Some(o) = OUTGROW.lock().iter_mut().find(|o| o.pid == io.pid) {
+                        o.end = true;
+                    }
+                }
+                Ok(0)
+            }
+            _ => Ok(0),
+        },
+        // Everything written made durable: the block store's dirty blocks
+        // written out and the store flushed (vfs::sync_all); with the files
+        // in memory, nothing. MAP_SHARED pages still in a process's memory
+        // reach the file at msync and munmap, not here.
+        nr::SYNC => crate::vfs::sync_all().map(|_| 0),
+        // One filesystem: the fd's is the root's (a mount's provider keeps
+        // its own, and flushes nothing here).
+        nr::SYNCFS => {
+            io.fds.get(a[0] as i32)?;
+            crate::vfs::sync_all().map(|_| 0)
+        }
+        // A range of the file written out: the file's data, as fdatasync.
+        nr::SYNC_FILE_RANGE => io.fds.get(a[0] as i32)?.handle.sync(true).map(|_| 0),
+        // `fsync` and `fdatasync`: the file's own (FileHandle::sync); a file
+        // in memory has nothing to flush, so it is the fd's validation alone.
+        // (Without them sqlite's journal sync was ENOSYS, which it reports
+        // as SQLITE_IOERR and refuses to write a file-backed database.)
+        // The file's size and names with it: a generation of the kept root.
+        nr::FSYNC | nr::FDATASYNC => io.fds.get(a[0] as i32)?.handle.sync(false).map(|_| 0),
         nr::SET_ROBUST_LIST | nr::GET_ROBUST_LIST => Ok(0),
         // Restartable sequences are an optimisation the guest can live
         // without, and both libcs treat ENOSYS as "not available".
@@ -6973,6 +7897,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::EPOLL_CTL => nr::EPOLL_CTL,
             x::PIPE | x::PIPE2 => nr::PIPE2,
             x::FTRUNCATE | x::FTRUNCATE64 => nr::FTRUNCATE,
+            x::TRUNCATE | x::TRUNCATE64 => nr::TRUNCATE,
             x::FADVISE64 | x::FADVISE64_64 => nr::FADVISE64,
             x::STATFS64 => nr::STATFS,
             x::FSTATFS64 => nr::FSTATFS,
@@ -7074,6 +7999,8 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::EPOLL_CTL => nr::EPOLL_CTL,
             x::PIPE | x::PIPE2 => nr::PIPE2,
             x::FTRUNCATE => nr::FTRUNCATE,
+            x::TRUNCATE => nr::TRUNCATE,
+            x::FADVISE64 => nr::FADVISE64,
             x::STATFS => nr::STATFS,
             x::FSTATFS => nr::FSTATFS,
             x::GETPRIORITY => nr::GETPRIORITY,
@@ -7146,6 +8073,26 @@ pub struct FreeCall {
 /// the 32-bit ABI's `pread64`, `pwrite64`,
 /// `_llseek`, `fcntl64`, `mmap2` and old `mmap` too, translated as the full
 /// call translates them.
+/// `TIOCGPTPEER` (Linux 4.13): the slave of the pty master `fd`, opened
+/// with the flags in `arg` and without its name, as openpty implementations
+/// try first (rustix's falls back to the name only on ENOSYS or EPERM).
+/// `None` for any other request, or a descriptor that is not a master. The
+/// slave of a master still locked (`TIOCSPTLCK`) is refused, as its name is.
+/// The full call and the free path both answer it here.
+pub fn pty_peer_ioctl(fds: &FdTable, path: &PathIo<'_>, fd: i32, req: u64, arg: u64) -> Option<SysResult> {
+    const TIOCGPTPEER: u64 = 0x5441;
+    if req & 0xffff_ffff != TIOCGPTPEER {
+        return None;
+    }
+    let ptn = match fds.get(fd) {
+        Ok(f) => f.handle.pty_peer()?,
+        Err(e) => return Some(Err(e)),
+    };
+    // Linux takes the access mode and these, and ignores any other bit.
+    let allowed = 0o3 | oflags::O_NOCTTY | oflags::O_NONBLOCK | oflags::O_CLOEXEC;
+    Some(path.open_pty(&format!("/dev/pts/{ptn}"), arg & allowed).unwrap_or(Err(Errno::EIO)))
+}
+
 pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeCall> {
     free_class_of(m, call_regs(m, ctx_addr, compat), compat)
 }
@@ -7289,6 +8236,9 @@ impl FreeCall {
 /// is due at a syscall's end.
 pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall) -> FreeOutcome {
     let FreeCall { n, raw, mut a } = call;
+    if let Some(v) = f.io.shared {
+        v.catch_up(m);
+    }
     let compat = f.io.compat;
     // The poll family in the canonical form: `poll`, `select` and
     // `epoll_wait` as their `p` forms, and a 32-bit ABI's times and
@@ -7328,7 +8278,8 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
     }
     if n == CLOCK_OR_ID {
         let ids = Idents { pid: f.pid as u32, ppid: 0, tid: f.futex.tid };
-        if !clock_call(m, ctx_addr, compat, f.futex.clock, f.started) && !ident_call(m, ctx_addr, compat, &ids, f.creds) {
+        let children = || child_cpu_of(f.procs, f.pid);
+        if !clock_call(m, ctx_addr, compat, f.futex.clock, f.started, &children) && !ident_call(m, ctx_addr, compat, &ids, f.creds) {
             let _ = set_result(m, ctx_addr, Errno::ENOSYS.as_return());
         }
         let d = if f.signals.has_pending() {
@@ -7359,14 +8310,24 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
         }
         r
     } else if n == nr::IOCTL {
-        let r = f.io.ioctl(m, f.procs, f.tty, a[0] as i32, a[1], a[2]);
+        let r = match pty_peer_ioctl(f.io.fds, &f.path, a[0] as i32, a[1], a[2]) {
+            Some(r) => r,
+            None => f.io.ioctl(m, f.procs, f.tty, a[0] as i32, a[1], a[2]),
+        };
         // A terminal's request may have signalled this process's own group
         // (`TIOCSIG`, `TIOCSWINSZ`): in now, to be delivered at the call's
         // end as the full call's are.
-        f.signals.process().collect(f.procs, f.pid, f.creds.uid());
+        f.signals.process().collect(f.procs, f.pid, f.creds.ruid());
         r
     } else if is_mapping(n) {
         let Some(r) = f.map.call(m, n, a) else { unreachable!("free_class admitted a call MapIo does not make") };
+        // A mapping the lowered memory had no room for.
+        if r == Err(Errno::ENOMEM) && matches!(n, nr::MMAP | nr::MREMAP) {
+            let len = f.map.mem.lock().take_short();
+            if len != 0 && note_short(f.pid, len, compat, f.wasm32) {
+                f.signals.raise(crate::signal::sig::SIGKILL);
+            }
+        }
         r
     } else if is_own_state(n) {
         let now = || {
@@ -7386,7 +8347,11 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
         let Some(r) = f.path.call(m, n, a) else { unreachable!("free_class admitted a call PathIo does not make") };
         r
     } else if is_quiet(n, compat) {
-        quiet_call(&f.io, f.procs, m, ctx_addr, n, a)
+        let r = quiet_call(&f.io, f.procs, f.futex.tid as i32, m, ctx_addr, n, a);
+        if n == nr::PRCTL && a[0] == crate::proc::PR_GEX_SHORT && outgrow_take_end(f.pid) {
+            f.signals.raise(crate::signal::sig::SIGKILL);
+        }
+        r
     } else if is_cred(n) {
         cred_call(f.creds, f.procs, f.pid, m, n, a)
     } else if is_mount(n) {
@@ -7498,12 +8463,13 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
             nr::EPOLL_CTL => f.io.epoll_ctl(m, a[0] as i32, a[1], a[2] as i32, a[3]),
             nr::PIPE2 => f.io.pipe2(m, a[0], a[1]),
             nr::FTRUNCATE => f.io.ftruncate(m, a[0] as i32, a[1]),
+            nr::TRUNCATE => f.path.truncate_target(m, a[0]).and_then(|t| f.io.truncate_file(m, &t, a[1])),
             nr::FADVISE64 => f.io.fadvise(a[0] as i32, a[1], a[2], a[3]),
             nr::STATFS | nr::FSTATFS => statfs(m, compat, a[1]),
             // As the kernel's arms: nice 0, and a change taken and ignored.
             nr::GETPRIORITY => Ok(20),
             nr::SETPRIORITY => Ok(0),
-            nr::SYSINFO => sysinfo(m, compat, a[0]),
+            nr::SYSINFO => sysinfo(m, compat, a[0], f.procs, f.futex.clock),
             nr::PROCESS_VM_READV | nr::PROCESS_VM_WRITEV => process_vm(f.procs, m, compat, n == nr::PROCESS_VM_WRITEV, a),
             _ => prlimit(f.rlimits, f.io.fds, f.creds.uid(), m, a[1], a[2], a[3]),
         }
@@ -7563,6 +8529,8 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
         let Some(r) = f.io.call(m, n, a) else { unreachable!("free_class admitted a call FdIo does not make") };
         // Lost the room or the bytes to another Worker since the check:
         // park, as the full call does.
+        // (a terminal's polling read: 0, as the full call answers)
+        let r = if r == Err(Errno::EAGAIN) && matches!(n, nr::READ | nr::READV) && f.io.polling_read(a[0]) { Ok(0) } else { r };
         if r == Err(Errno::EAGAIN) {
             if let Some(op) = f.io.eagain_park(m, n, a) {
                 return FreeOutcome::Blocking(op, None);
@@ -7572,7 +8540,7 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
     };
     if r == Err(Errno::EPIPE) && raises_sigpipe(n, &a) {
         // Linux sends it as the writer itself sending it (SI_USER).
-        f.signals.raise_from(signal::sig::SIGPIPE, signal::Source { code: signal::SI_USER, pid: f.pid, uid: f.creds.uid() });
+        f.signals.raise_from(signal::sig::SIGPIPE, signal::Source { code: signal::SI_USER, pid: f.pid, uid: f.creds.ruid() });
     }
     // `_llseek` answers through memory (`i386::Post`).
     let ret = match r {
@@ -7602,7 +8570,10 @@ pub fn clock_nanos_at(clock: ClockFn, started: u128, clk: u64) -> u128 {
         secs as u128 * 1_000_000_000 + nanos as u128
     };
     match clk {
-        CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => wall().saturating_sub(started),
+        CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => match crate::proc::cpu_clock(clk == CLOCK_THREAD_CPUTIME_ID) {
+            Some(ns) => ns as u128,
+            None => wall().saturating_sub(started),
+        },
         c if is_monotonic_clock(c) => {
             let (secs, nanos) = monotonic_from(clock());
             secs as u128 * 1_000_000_000 + nanos as u128
@@ -7854,10 +8825,10 @@ pub fn futex_call(cx: &FutexCx<'_>, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysRes
             // of the count and its store (`FutexTable::pi_lock`).
             let mut pi = cx.table.pi_lock();
             loop {
-                let v = gex_atomic::load_u32(m.bytes, uaddr).ok_or(Errno::EFAULT)?;
+                let v = gex_atomic::load_u32(m.word_mut(uaddr).ok_or(Errno::EFAULT)?, 0).ok_or(Errno::EFAULT)?;
                 match v & futex::pi::TID_MASK {
                     0 => {
-                        if gex_atomic::cas_u32(m.bytes, uaddr, v, tid | (v & futex::pi::WAITERS))
+                        if gex_atomic::cas_u32(m.word_mut(uaddr).ok_or(Errno::EFAULT)?, 0, v, tid | (v & futex::pi::WAITERS))
                             .ok_or(Errno::EFAULT)?
                             .is_ok()
                         {
@@ -7868,7 +8839,7 @@ pub fn futex_call(cx: &FutexCx<'_>, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysRes
                     // A compare-and-swap even when the bit is already on:
                     // it checks the word is still the one just read.
                     _ => {
-                        if gex_atomic::cas_u32(m.bytes, uaddr, v, v | futex::pi::WAITERS)
+                        if gex_atomic::cas_u32(m.word_mut(uaddr).ok_or(Errno::EFAULT)?, 0, v, v | futex::pi::WAITERS)
                             .ok_or(Errno::EFAULT)?
                             .is_ok()
                         {
@@ -7893,11 +8864,11 @@ pub fn futex_call(cx: &FutexCx<'_>, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysRes
             let pi = cx.table.pi_lock();
             let rest = if pi.waiters(uaddr) { futex::pi::WAITERS } else { 0 };
             loop {
-                let v = gex_atomic::load_u32(m.bytes, uaddr).ok_or(Errno::EFAULT)?;
+                let v = gex_atomic::load_u32(m.word_mut(uaddr).ok_or(Errno::EFAULT)?, 0).ok_or(Errno::EFAULT)?;
                 if v & futex::pi::TID_MASK != tid {
                     return Err(Errno::EPERM);
                 }
-                if gex_atomic::cas_u32(m.bytes, uaddr, v, rest).ok_or(Errno::EFAULT)?.is_ok() {
+                if gex_atomic::cas_u32(m.word_mut(uaddr).ok_or(Errno::EFAULT)?, 0, v, rest).ok_or(Errno::EFAULT)?.is_ok() {
                     break;
                 }
             }
@@ -7908,11 +8879,11 @@ pub fn futex_call(cx: &FutexCx<'_>, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysRes
         futex::op::TRYLOCK_PI => {
             let tid = cx.tid;
             loop {
-                let v = gex_atomic::load_u32(m.bytes, uaddr).ok_or(Errno::EFAULT)?;
+                let v = gex_atomic::load_u32(m.word_mut(uaddr).ok_or(Errno::EFAULT)?, 0).ok_or(Errno::EFAULT)?;
                 match v & futex::pi::TID_MASK {
                     0 => {
                         let new = tid | (v & futex::pi::WAITERS);
-                        if gex_atomic::cas_u32(m.bytes, uaddr, v, new).ok_or(Errno::EFAULT)?.is_ok() {
+                        if gex_atomic::cas_u32(m.word_mut(uaddr).ok_or(Errno::EFAULT)?, 0, v, new).ok_or(Errno::EFAULT)?.is_ok() {
                             return Ok(0);
                         }
                     }
@@ -7979,6 +8950,205 @@ pub fn futex_call(cx: &FutexCx<'_>, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysRes
 // The bodies of `read`, `write`, `pread64`, `pwrite64`, `readv` and `writev`:
 // they need the descriptor table and nothing else of the kernel, so the full
 // call and any caller holding only the table run the same code.
+
+/// Write a shared mapping's changed pages over guest `[lo, hi)` back to its
+/// file ([`MapIo::flush_shared`]).
+fn write_back(m: &GuestMem<'_>, map: &SharedMap, lo: u64, hi: u64) -> Result<(), Errno> {
+    // A mapping of a descriptor opened read-only has nothing to
+    // write back (Linux refuses it PROT_WRITE): its stores are
+    // the process's own, as Wine's relocations of an image view
+    // are. Writing them was EBADF, and failed the next mmap.
+    if !map.file.writable {
+        return Ok(());
+    }
+    let from = map.start.max(lo);
+    let to = (map.start + map.len).min(hi);
+    // The pages' hashes first, and nothing more when none changed: a lock
+    // given up over an untouched mapping costs no call to the file.
+    const P: u64 = crate::mem::PAGE_SIZE;
+    let first = (from.max(map.start) - map.start) / P;
+    let mut hashes = Vec::new();
+    let mut any = false;
+    while (map.start + (first + hashes.len() as u64) * P).max(from) < to {
+        let page = first + hashes.len() as u64;
+        let whole = map.start + page * P;
+        let h = page_hash(m.read(whole, (P as usize).min((map.start + map.len - whole) as usize))?);
+        any |= map.pages.get(page as usize).map(|s| s.load(std::sync::atomic::Ordering::Relaxed)) != Some(h);
+        hashes.push(h);
+    }
+    if !any {
+        return Ok(());
+    }
+    // Only what the file holds: a shared mapping's page past the
+    // end of the file is not the file's (Linux never extends it).
+    let known = map.changes.load(std::sync::atomic::Ordering::Acquire);
+    let (size, at_start) = match map.file.handle.metadata_changes() {
+        Ok((md, c)) => (md.size, if known != 0 { c } else { 0 }),
+        Err(_) => (u64::MAX, 0),
+    };
+    let to = to.min(map.start + size.saturating_sub(map.offset));
+    // Whether `pages` stay the file's at a count (`SharedMap::changes`):
+    // only if nothing else changed the file since they were (the count
+    // has not moved), and after the writes below only if those were
+    // the only changes and every page written had its hash kept.
+    use std::sync::atomic::Ordering::AcqRel;
+    let mut writes = 0u64;
+    let mut exact = known != 0 && at_start == known;
+    // Only the pages that changed since the file last had them, in
+    // runs: another process's writes to the other pages stand.
+    let mut run: Option<u64> = None;
+    let mut page = first;
+    loop {
+        let ps = (map.start + page * P).max(from);
+        let changed = ps < to && {
+            let pe = (map.start + (page + 1) * P).min(to);
+            let whole = map.start + page * P;
+            let h = hashes[(page - first) as usize];
+            let slot = map.pages.get(page as usize);
+            let was = slot.map(|s| s.load(std::sync::atomic::Ordering::Relaxed));
+            // A partial range writes back only its part, so the page's
+            // hash is the file's only when the whole page went.
+            if was != Some(h) {
+                if ps == whole && pe == (whole + P).min(map.start + map.len) {
+                    if let Some(s) = slot {
+                        s.store(h, std::sync::atomic::Ordering::Relaxed);
+                    }
+                } else {
+                    exact = false;
+                }
+            }
+            was != Some(h)
+        };
+        match (changed, run) {
+            (true, None) => run = Some(ps),
+            (false, Some(rs)) => {
+                let at = map.offset + (rs - map.start);
+                map.file.pwrite(at, m.read(rs, (ps.min(to) - rs) as usize)?)?;
+                writes += 1;
+                run = None;
+            }
+            _ => {}
+        }
+        if ps >= to {
+            break;
+        }
+        page += 1;
+    }
+    if known != 0 {
+        let now = if exact && writes > 0 { map.file.handle.changes() } else { at_start };
+        let _ = map.changes.compare_exchange(known, if exact && now == at_start + writes { now } else { 0 }, AcqRel, std::sync::atomic::Ordering::Relaxed);
+    }
+    // Other processes' mappings of the file see that it changed; this one's
+    // stays up to date with it unless somebody else wrote back meanwhile.
+    if writes > 0 {
+        let was = map.seen.load(std::sync::atomic::Ordering::Acquire);
+        let now = crate::locks::note_written(&map.file.path);
+        if now == was + 1 {
+            map.seen.store(now, std::sync::atomic::Ordering::Release);
+        }
+    }
+    Ok(())
+}
+
+/// What `map`'s file now holds where its pages differ from what they were
+/// last read or written back as (another process wrote them back), into
+/// the mapping: a page whose hash still matches is left as it is, this
+/// process's own stores in it included. Nothing to read when the file's
+/// change count is still the one the pages were the file's at.
+///
+/// `keep_own`: a page this process changed since it last synced it is left
+/// as it is (and the mapping is not marked up to date, so the next lock
+/// brings it in): for a refresh at a point that is no synchronisation of
+/// the program's ([`SharedMapView::catch_up`]).
+fn refresh(m: &mut GuestMem<'_>, map: &SharedMap, force: bool, seen: Option<u64>, keep_own: bool) -> Result<(), Errno> {
+    use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+    // The count the lock call brought, when it did: unchanged, nothing to ask.
+    // Without one, the count alone (no call where the filesystem keeps it
+    // here), or for a filesystem that keeps none the write generation.
+    if !force {
+        let c = seen.unwrap_or_else(|| map.file.handle.changes());
+        if if c != 0 { map.changes.load(Acquire) == c } else { map.seen.load(Acquire) == crate::locks::written(&map.file.path) } {
+            return Ok(());
+        }
+    }
+    let (md, now) = map.file.handle.metadata_changes()?;
+    let written = if now == 0 { crate::locks::written(&map.file.path) } else { 0 };
+    if !force && (if now != 0 { map.changes.load(Acquire) == now } else { map.seen.load(Acquire) == written }) {
+        return Ok(());
+    }
+    const P: u64 = crate::mem::PAGE_SIZE;
+    // Only what the file holds (a page past its end is not the file's).
+    let held = map.len.min(md.size.saturating_sub(map.offset));
+    let mut buf = vec![0u8; P as usize];
+    let mut page = 0u64;
+    let mut kept = false;
+    while page * P < held {
+        let in_map = P.min(map.len - page * P) as usize;
+        let in_file = P.min(held - page * P) as usize;
+        buf[..in_map].fill(0);
+        let mut got = 0;
+        while got < in_file {
+            match map.file.handle.read_at(map.offset + page * P + got as u64, &mut buf[got..in_file])? {
+                0 => break,
+                n => got += n as usize,
+            }
+        }
+        let h = page_hash(&buf[..in_map]);
+        let slot = map.pages.get(page as usize);
+        let was = slot.map(|s| s.load(Relaxed));
+        if was != Some(h) && keep_own && was != Some(page_hash(m.read(map.start + page * P, in_map)?)) {
+            kept = true;
+        } else if was != Some(h) {
+            m.write(map.start + page * P, &buf[..in_map])?;
+            if let Some(s) = slot {
+                s.store(h, Relaxed);
+            }
+        }
+        page += 1;
+    }
+    if !kept {
+        map.changes.store(now, Release);
+        map.seen.store(written, Release);
+    }
+    Ok(())
+}
+
+/// Make this process's shared mappings of `file` and the file agree, at a
+/// point where programs synchronise across processes (a lock taken or
+/// given up on it, `msync(MS_INVALIDATE)`): its changed pages written back,
+/// then what other processes wrote back read in. A mapping is a copy per
+/// process (separate memories), so this, not every access, is where two
+/// processes' mappings meet -- which is where SQLite's WAL index, and
+/// anything else that locks around shared memory, looks for each other's
+/// writes. One empty-list test when the process maps nothing shared.
+///
+/// `seen`: the file's change count as the lock call that granted the lock
+/// answered it (the page's global kernel does), which spares asking again.
+pub fn sync_shared_file(shared: Option<&SharedMapView>, m: &mut GuestMem<'_>, file: &OpenFile, sync: MapSync, seen: Option<u64>) {
+    let Some(view) = shared else { return };
+    let maps = view.get();
+    if maps.is_empty() || file.handle.is_stream() {
+        return;
+    }
+    for map in maps.iter().filter(|s| s.file.same_file(file)) {
+        if sync != MapSync::Acquire {
+            let _ = write_back(m, map, 0, u64::MAX);
+        }
+        if sync != MapSync::Release {
+            let _ = refresh(m, map, false, seen, false);
+        }
+    }
+}
+
+/// Which way a lock call synchronises a process's shared mappings with
+/// other processes' ([`sync_shared_file`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapSync {
+    /// A lock taken: what others wrote back comes in.
+    Acquire,
+    /// A lock given up: this process's stores go out.
+    Release,
+}
 
 // -- coherence with shared file mappings ------------------------------------
 //
@@ -8247,8 +9417,10 @@ pub fn ident_call(m: &mut GuestMem<'_>, ctx_addr: u64, compat: bool, ids: &Ident
             x::GETPID => ids.pid,
             x::GETPPID if ids.ppid != 0 => ids.ppid,
             x::GETTID => ids.tid,
-            x::GETUID | x::GETEUID => creds.uid(),
-            x::GETGID | x::GETEGID => creds.gid(),
+            x::GETUID => creds.ruid(),
+            x::GETEUID => creds.uid(),
+            x::GETGID => creds.rgid(),
+            x::GETEGID => creds.gid(),
             _ => return false,
         }
     } else if gex_abi::X86 {
@@ -8257,8 +9429,10 @@ pub fn ident_call(m: &mut GuestMem<'_>, ctx_addr: u64, compat: bool, ids: &Ident
             x::GETPID => ids.pid,
             x::GETPPID if ids.ppid != 0 => ids.ppid,
             x::GETTID => ids.tid,
-            x::GETUID | x::GETEUID => creds.uid(),
-            x::GETGID | x::GETEGID => creds.gid(),
+            x::GETUID => creds.ruid(),
+            x::GETEUID => creds.uid(),
+            x::GETGID => creds.rgid(),
+            x::GETEGID => creds.gid(),
             _ => return false,
         }
     } else {
@@ -8266,8 +9440,10 @@ pub fn ident_call(m: &mut GuestMem<'_>, ctx_addr: u64, compat: bool, ids: &Ident
             nr::GETPID => ids.pid,
             nr::GETPPID if ids.ppid != 0 => ids.ppid,
             nr::GETTID => ids.tid,
-            nr::GETUID | nr::GETEUID => creds.uid(),
-            nr::GETGID | nr::GETEGID => creds.gid(),
+            nr::GETUID => creds.ruid(),
+            nr::GETEUID => creds.uid(),
+            nr::GETGID => creds.rgid(),
+            nr::GETEGID => creds.gid(),
             _ => return false,
         }
     };
@@ -8313,7 +9489,7 @@ fn traced_path(m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> String {
         | nr::FCHOWNAT
         | nr::FCHMODAT
         | nr::STATX => a[1],
-        nr::CHDIR | nr::STATFS | nr::MOUNT | nr::UMOUNT2 => a[0],
+        nr::CHDIR | nr::STATFS | nr::MOUNT | nr::UMOUNT2 | nr::TRUNCATE => a[0],
         nr::RENAMEAT | nr::RENAMEAT2 | nr::LINKAT => a[1],
         // `symlinkat` names the link it creates third, not second.
         nr::SYMLINKAT => a[2],
@@ -8676,6 +9852,11 @@ pub struct SharedMap {
     /// same range take `pages` rather than hash it again
     /// ([`SharedMaps::recall`]).
     pub changes: Arc<std::sync::atomic::AtomicU64>,
+    /// The file's write generation ([`crate::locks::written`]) its pages
+    /// were last brought up to date at, for a file whose filesystem keeps
+    /// no count (`changes` 0): what [`sync_shared_file`] compares to know
+    /// that no other process has written it back since.
+    pub seen: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Page hashes of a file range a shared mapping held, kept past its
@@ -8780,6 +9961,11 @@ pub struct SharedMaps {
 /// change, so a reader holds one consistent list for as long as it likes.
 pub struct SharedMapView {
     cur: gex_atomic::rcu::Published<Arc<[SharedMap]>>,
+    /// Whether the process maps any file shared: all a system call of a
+    /// process that maps none looks at ([`SharedMapView::catch_up`]).
+    any: std::sync::atomic::AtomicBool,
+    /// [`crate::locks::write_seq`] when the mappings were last caught up.
+    seq: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for SharedMapView {
@@ -8790,7 +9976,37 @@ impl std::fmt::Debug for SharedMapView {
 
 impl SharedMapView {
     fn new(list: &[SharedMap]) -> SharedMapView {
-        SharedMapView { cur: gex_atomic::rcu::Published::new(list.into(), crate::file::FD_READER_SLOTS) }
+        SharedMapView {
+            cur: gex_atomic::rcu::Published::new(list.into(), crate::file::FD_READER_SLOTS),
+            any: std::sync::atomic::AtomicBool::new(!list.is_empty()),
+            seq: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// At a system call's entry, and at the end of a wait (its wake can be
+    /// what orders this process after another's write-back): when any process has written a shared
+    /// mapping back since this one last looked, this process's mappings of
+    /// files that changed take in what they hold now -- except pages it
+    /// changed itself since its last sync, which wait for its next lock.
+    /// A program that reads shared memory with no lock call of its own in
+    /// between (SQLite's second connection in a process whose first holds
+    /// the wal-index read lock: SQLite counts those locks itself) still
+    /// sees other processes' writes at its next system call. One load for
+    /// a process that maps nothing shared; one more (the global kernel's
+    /// count, in the page a call) for one that does.
+    pub fn catch_up(&self, m: &mut GuestMem<'_>) {
+        use std::sync::atomic::Ordering::{AcqRel, Relaxed};
+        if !self.any.load(Relaxed) {
+            return;
+        }
+        let now = crate::locks::write_seq();
+        let was = self.seq.load(Relaxed);
+        if now == was || self.seq.compare_exchange(was, now, AcqRel, Relaxed).is_err() {
+            return;
+        }
+        for map in self.get().iter() {
+            let _ = refresh(m, map, false, None, true);
+        }
     }
 
     /// The mappings as they stand.
@@ -8802,6 +10018,47 @@ impl SharedMapView {
     pub fn of(&self, file: &Arc<OpenFile>) -> Option<SharedMap> {
         self.cur.read(crate::sync::me() as usize, |l| l.iter().find(|m| Arc::ptr_eq(&m.file, file)).cloned())
     }
+
+    /// The mapping that holds `file`'s first `len` bytes ([`pool_map`]).
+    pub fn pool(&self, file: &Arc<OpenFile>, len: u64) -> Option<SharedMap> {
+        self.cur.read(crate::sync::me() as usize, |l| pool_map(l.iter(), file, len).cloned())
+    }
+}
+
+/// Of the shared mappings `maps`, the one that holds `file`'s first `len`
+/// bytes: where a process that sent `file` to its compositor as a pool
+/// (`wl_shm.create_pool(fd, len)`, which is the file from offset 0) has the
+/// pool's pixels.
+///
+/// A program may map one file more than once, and at different lengths: Wine
+/// maps a 4 KiB view of the file that later backs a 3 MiB window buffer. The
+/// first mapping of the file in the list was then the 4 KiB one, too short
+/// for the buffer, which the compositor refused, and the window never showed.
+/// Which mapping came first depended on what the process had mapped before.
+///
+/// So any mapping of the file that holds the whole range will do, and the
+/// latest one is preferred, since a client maps its buffer just before
+/// sending it. A mapping of this description wins over a mapping of another
+/// `open` of the same file (the same pages, [`OpenFile::same_file`]), which
+/// is looked for only when this description has none. With none that holds
+/// the range, the longest from offset 0, so the caller can refuse it as too
+/// short.
+pub fn pool_map<'a>(
+    maps: impl Iterator<Item = &'a SharedMap> + Clone,
+    file: &Arc<OpenFile>,
+    len: u64,
+) -> Option<&'a SharedMap> {
+    let from0 = |m: &&SharedMap| m.offset == 0;
+    let holds = |m: &&SharedMap| m.len >= len;
+    let mine = maps.clone().filter(|m| Arc::ptr_eq(&m.file, file)).filter(from0);
+    if let Some(m) = mine.clone().filter(holds).last() {
+        return Some(m);
+    }
+    let same = maps.filter(|m| !Arc::ptr_eq(&m.file, file) && m.file.same_file(file)).filter(from0);
+    if let Some(m) = same.clone().filter(holds).last() {
+        return Some(m);
+    }
+    mine.chain(same).max_by_key(|m| m.len)
 }
 
 impl SharedMaps {
@@ -8816,6 +10073,7 @@ impl SharedMaps {
 
     fn publish(&self) {
         let l: Arc<[SharedMap]> = self.list.as_slice().into();
+        self.view.any.store(!l.is_empty(), std::sync::atomic::Ordering::Relaxed);
         self.view.cur.write(|_| (Some(l), ()));
     }
 
@@ -8841,6 +10099,7 @@ impl SharedMaps {
             .map(|s| SharedMap {
                 pages: s.pages.iter().map(|h| AtomicU64::new(h.load(Ordering::Relaxed))).collect(),
                 changes: Arc::new(AtomicU64::new(s.changes.load(Ordering::Relaxed))),
+                seen: Arc::new(AtomicU64::new(s.seen.load(Ordering::Relaxed))),
                 ..s.clone()
             })
             .collect();
@@ -8881,7 +10140,7 @@ impl SharedMaps {
             .collect::<Option<Arc<[std::sync::atomic::AtomicU64]>>>()?;
         // The count is not carried: the child's hashes are taken as unknown
         // against the file's count, and its next mapping hashes afresh.
-        self.push(SharedMap { start, len, file, offset, holders, pages, changes: Default::default() });
+        self.push(SharedMap { start, len, file, offset, holders, pages, changes: Default::default(), seen: Default::default() });
         Some(())
     }
 
@@ -8970,6 +10229,7 @@ impl SharedMaps {
                     holders: vec![(lo, hi - lo)],
                     pages,
                     changes: Arc::new(AtomicU64::new(s.changes.load(Relaxed))),
+                    seen: Arc::new(AtomicU64::new(s.seen.load(Relaxed))),
                 });
             }
         }
@@ -8977,6 +10237,21 @@ impl SharedMaps {
         if changed {
             self.publish();
         }
+    }
+
+    /// Mapping `[addr, ..)`, its only holder's, moved to `[dst, dst + len)`
+    /// with `pages` for its hashes (`mremap`): its file offset, or `None`
+    /// when no mapping starts at `addr`. Its count is unknown from here on.
+    pub fn moved(&mut self, addr: u64, dst: u64, len: u64, pages: Arc<[std::sync::atomic::AtomicU64]>) -> Option<u64> {
+        let s = self.list.iter_mut().find(|s| s.start == addr)?;
+        s.start = dst;
+        s.len = len;
+        s.holders = vec![(dst, len)];
+        s.pages = pages;
+        s.changes = Default::default();
+        let offset = s.offset;
+        self.publish();
+        Some(offset)
     }
 
     /// Keep the mappings `keep` says to; publishes only on a change.
@@ -9065,6 +10340,7 @@ pub struct PendingCall {
     pub retry_transfer: Option<(u64, [u64; 6])>,
     pub restore_sigmask: Option<u64>,
     pub retry_sigwait: Option<[u64; 6]>,
+    pub retry_lock: Option<i32>,
     /// The parked call's restart class and its syscall's return pc
     /// ([`Kernel::finish_blocking`]).
     pub block_restart: crate::signal::Restart,
@@ -9145,6 +10421,7 @@ impl Kernel {
             retry_transfer: self.retry_transfer.take(),
             restore_sigmask: self.restore_sigmask.take(),
             retry_sigwait: self.retry_sigwait.take(),
+            retry_lock: self.retry_lock.take(),
             block_restart: std::mem::take(&mut self.block_restart),
             block_pc: std::mem::take(&mut self.block_pc),
             darwin_finish: self.darwin_finish.take(),
@@ -9162,6 +10439,7 @@ impl Kernel {
         self.retry_transfer = call.retry_transfer;
         self.restore_sigmask = call.restore_sigmask;
         self.retry_sigwait = call.retry_sigwait;
+        self.retry_lock = call.retry_lock;
         self.block_restart = call.block_restart;
         self.block_pc = call.block_pc;
         self.darwin_finish = call.darwin_finish;
@@ -9282,6 +10560,7 @@ impl Kernel {
             tid: 1,
             exe_path,
             exec_mem64: None,
+            exec_image: None,
             argv: Vec::new(),
             envp: Vec::new(),
             creds: Creds::new(1000, 1000),
@@ -9289,7 +10568,7 @@ impl Kernel {
             futexes: Arc::new(FutexTable::new()),
             trace: false,
             unimplemented: Vec::new(),
-            next_ctx_slot: Arc::new(std::sync::atomic::AtomicU32::new(1)),
+            next_ctx_slot: Arc::new(CtxSlots::new(1)),
             live_threads: Arc::new(std::sync::atomic::AtomicU32::new(1)),
             procs: Arc::new(ProcTable::new()),
             pipes: None,
@@ -9303,6 +10582,7 @@ impl Kernel {
             retry_transfer: None,
             restore_sigmask: None,
             retry_sigwait: None,
+            retry_lock: None,
             started: 0,
             pins: Default::default(),
             place: None,
@@ -9357,10 +10637,18 @@ impl Kernel {
     /// `WINEGEX_IMAGE=<path>` entry: Wine execs its loader for every Windows
     /// program, and names the program's `.exe` there, so the attribute on
     /// the `.exe` applies to that program's process alone. That entry is
-    /// removed too.
-    pub fn exec_flavour(&self, path: &str, envp: &mut Vec<String>) -> Option<bool> {
+    /// removed too. Wine's loader started on a program by hand, with no
+    /// WINEGEX_IMAGE, names it as its first argument, a DOS path, found
+    /// through WINEPREFIX's dosdevices. The program is kept as
+    /// [`Kernel::exec_image`].
+    ///
+    /// Neither saying, the image itself may: an x86-64 one that cannot be
+    /// loaded anywhere but above the lowered memory's code space
+    /// ([`pe_needs_mem64`]) asks for a 64-bit memory.
+    pub fn exec_flavour(&mut self, path: &str, argv: &[String], envp: &mut Vec<String>) -> Option<bool> {
         let mut flag = None;
         let mut image = None;
+        let by_hand = wine_program(path, argv, envp);
         envp.retain(|e| {
             if let Some(v) = e.strip_prefix("GEX_MEM64=") {
                 flag = Some(v == "1");
@@ -9371,16 +10659,70 @@ impl Kernel {
             }
             false
         });
-        flag.or_else(|| {
+        self.exec_image = image.or(by_hand);
+        let image = self.exec_image.as_deref().unwrap_or(path);
+        let want = flag.or_else(|| {
             let mut b = [0u8; 8];
             let op = crate::vfs::XattrOp::Get { name: "user.gex.mem64", buf: &mut b };
-            let n = self.vfs.xattr(image.as_deref().unwrap_or(path), true, op).ok()?;
+            let n = self.vfs.xattr(image, true, op).ok()?;
             match &b[..n] {
                 b"1" | b"1\n" => Some(true),
                 b"0" | b"0\n" => Some(false),
                 _ => None,
             }
         })
+        .or_else(|| {
+            let head = self.read_head(image, 4096)?;
+            pe_needs_mem64(&head).then_some(true)
+        });
+        // The new program's record, its own reservations to come.
+        let was = std::mem::replace(&mut self.exec_mem64, want);
+        self.outgrow_arm(path, true);
+        self.exec_mem64 = was;
+        want
+    }
+
+    /// A reservation of `len` bytes found no room in this process's
+    /// lowered memory: [`note_short`].
+    pub fn note_short(&mut self, len: u64) {
+        if note_short(self.pid, len, self.compat, self.wasm32) {
+            self.signals.raise(crate::signal::sig::SIGKILL);
+        }
+    }
+
+    /// Ready this process's record for [`note_short`] and
+    /// [`outgrow_ending`]: the program it runs now (`path`, or the Windows
+    /// program Wine's loader runs), and whether it asked to keep the
+    /// lowered memory. At each exec (`exec`), which starts a new record,
+    /// and at a program's publication, which only fills in one the process
+    /// lacks (a host may publish before it knows the program's path, and
+    /// after its first reservations).
+    pub fn outgrow_arm(&self, path: &str, exec: bool) {
+        // (whether the host can move it is asked when it falls short: a
+        // host may set itself up after its first program is published)
+        if gex_abi::mem64() {
+            return;
+        }
+        // Never Wine's loader, which every Windows program shares.
+        let loader = |p: &str| p.rsplit('/').next().is_some_and(|n| n == "wine" || n == "wine.m64");
+        // (a process's first program, which no exec named, may be Wine's
+        // loader started by hand)
+        let image = self
+            .exec_image
+            .clone()
+            .or_else(|| (!exec).then(|| wine_program(path, &self.argv, &self.envp)).flatten())
+            .or_else(|| (!path.is_empty() && !loader(path)).then(|| path.to_string()));
+        let stay32 = self.exec_mem64 == Some(false);
+        let mut all = OUTGROW.lock();
+        match all.iter_mut().find(|o| o.pid == self.pid) {
+            Some(o) if exec => *o = Outgrow { pid: self.pid, image, stay32, ns: Arc::clone(self.vfs.view()), clock: self.clock, short: None, last: 0, ended: false, end: false, runtime: false },
+            Some(o) => {
+                if o.image.is_none() {
+                    o.image = image;
+                }
+            }
+            None => all.push(Outgrow { pid: self.pid, image, stay32, ns: Arc::clone(self.vfs.view()), clock: self.clock, short: None, last: 0, ended: false, end: false, runtime: false }),
+        }
     }
 
     /// Read one range of a file into `out`, returning bytes filled; the rest
@@ -9702,18 +11044,19 @@ impl Kernel {
             tid: self.tid,
             exe_path: self.exe_path.clone(),
             exec_mem64: None,
+            exec_image: self.exec_image.clone(),
             argv: self.argv.clone(),
             envp: self.envp.clone(),
             // The child's own ids from here on: a set in either is not the
             // other's.
-            creds: Creds::new(self.creds.uid(), self.creds.gid()),
+            creds: self.creds.fork(),
             trace: self.trace,
             // A fork resets pending signals but keeps the dispositions.
             signals: self.signals.fork(),
             // Futexes live in the address space, and the child has its own.
             futexes: Arc::new(FutexTable::new()),
             unimplemented: Vec::new(),
-            next_ctx_slot: Arc::new(std::sync::atomic::AtomicU32::new(self.next_ctx_slot.load(std::sync::atomic::Ordering::Acquire))),
+            next_ctx_slot: Arc::new(self.next_ctx_slot.fork()),
             live_threads: Arc::new(std::sync::atomic::AtomicU32::new(1)),
             // The table is the system's, not the process's.
             procs: Arc::clone(&self.procs),
@@ -9729,6 +11072,7 @@ impl Kernel {
             retry_transfer: None,
             restore_sigmask: None,
             retry_sigwait: None,
+            retry_lock: None,
             // Nor its accumulated time: the child's clock starts now.
             started: self.now_nanos(),
             // The layout a closure build assumed holds in every process of
@@ -9905,6 +11249,9 @@ impl Kernel {
 
     /// A guest syscall at `pc` (the trap instruction's own address).
     pub fn syscall(&mut self, m: &mut GuestMem<'_>, pc: u64) -> SyscallOutcome {
+        // Other processes' write-backs into this one's shared mappings,
+        // written as the kernel's own (no copyout check).
+        self.mem.shared_maps().catch_up(m);
         if self.darwin {
             self.signals.thread().cpu.enter();
         }
@@ -10216,7 +11563,7 @@ impl Kernel {
         if n == nr::EXECVE {
             return match self.prepare_exec(m, a) {
                 Ok((path, argv, mut envp)) => {
-                    self.exec_mem64 = self.exec_flavour(&path, &mut envp);
+                    self.exec_mem64 = self.exec_flavour(&path, &argv, &mut envp);
                     self.map_io().flush_all_shared(m);
                     if self.trace {
                         eprintln!("[gex:{}] execve({path:?}, {} args)", self.pid, argv.len());
@@ -10430,6 +11777,19 @@ impl Kernel {
         // returns that short count, which its callers loop on.
         // A blocking read can lose the same race to another reader of the
         // pipe (two readers of one pipe).
+        // A blocking read of a terminal in non-canonical mode with `VMIN` and
+        // `VTIME` 0 that found nothing: 0, at once (termios(3)), not a wait.
+        let outcome = match outcome {
+            Ok(Err(Errno::EAGAIN)) if matches!(n, nr::READ | nr::READV) && self.fd_io().polling_read(a[0]) => Ok(Ok(0)),
+            o => o,
+        };
+        // A mapping the lowered memory had no room for.
+        if matches!(outcome, Ok(Err(Errno::ENOMEM))) && matches!(n, nr::MMAP | nr::MREMAP) {
+            let len = self.mem.lock().take_short();
+            if len != 0 {
+                self.note_short(len);
+            }
+        }
         if let Ok(Err(Errno::EAGAIN)) = &outcome {
             if let Some(op) = self.eagain_park(m, n, a) {
                 self.write_blocked = matches!(op, BlockOp::WriteStream { .. }) && self.epipe_signals(n, &a);
@@ -10444,7 +11804,7 @@ impl Kernel {
                 self.signals.raise_from(
                     crate::signal::sig::SIGPIPE,
                     // Linux sends it as the writer itself sending it (SI_USER).
-                    crate::signal::Source { code: crate::signal::SI_USER, pid: self.pid, uid: self.creds.uid() },
+                    crate::signal::Source { code: crate::signal::SI_USER, pid: self.pid, uid: self.creds.ruid() },
                 );
             }
         }
@@ -10500,7 +11860,11 @@ impl Kernel {
         if n == nr::FUTEX {
             return self.lock_pi_op(m, a);
         }
-        self.fd_io().eagain_park(m, n, a)
+        let op = self.fd_io().eagain_park(m, n, a);
+        if matches!(op, Some(BlockOp::FileLock { .. })) {
+            self.retry_lock = Some(a[0] as i32);
+        }
+        op
     }
 
     /// The park for a `FUTEX_LOCK_PI` that found the lock held (`sys_futex`
@@ -10516,6 +11880,7 @@ impl Kernel {
             fds: &self.fds,
             compat: self.compat,
             darwin: self.darwin,
+            wasm32: self.wasm32,
             ns: &self.vfs,
             pid: self.pid,
             creds: &self.creds,
@@ -10690,6 +12055,11 @@ impl Kernel {
 
     /// A blocked call's wait has ended with `r`.
     pub fn finish_blocking(&mut self, m: &mut GuestMem<'_>, r: SysResult) -> SyscallOutcome {
+        // What other processes wrote back while the call waited: the wait's
+        // end can be what orders this process after their writes (a pipe
+        // read of a byte written after a commit), with no system call of
+        // its own before it reads the mapping ([`SharedMapView::catch_up`]).
+        self.mem.shared_maps().catch_up(m);
         if self.darwin {
             self.signals.thread().cpu.enter();
         }
@@ -10797,6 +12167,11 @@ impl Kernel {
             Some(a) if r.is_ok() => sigtimedwait(&self.signals, m, self.compat, a),
             _ => r,
         };
+        if let (Some(fd), Ok(_)) = (self.retry_lock.take(), &r) {
+            if let Ok(file) = self.fds.get(fd) {
+                sync_shared_file(Some(self.mem.shared_maps()), m, &file, MapSync::Acquire, None);
+            }
+        }
         // A wait a signal ended that Linux would restart (signal(7)): the
         // handler runs, then the call again ([`restart_call`]).
         let class = std::mem::replace(&mut self.block_restart, crate::signal::Restart::Never);
@@ -10834,7 +12209,7 @@ impl Kernel {
             self.signals.raise_from(
                 crate::signal::sig::SIGPIPE,
                 // Linux sends it as the writer itself sending it (SI_USER).
-                crate::signal::Source { code: crate::signal::SI_USER, pid: self.pid, uid: self.creds.uid() },
+                crate::signal::Source { code: crate::signal::SI_USER, pid: self.pid, uid: self.creds.ruid() },
             );
         }
         let ret = encode(r);
@@ -10879,12 +12254,23 @@ impl Kernel {
             }
             // The calls that need nothing of the process ([`quiet_call`],
             // the free path's code).
-            n if is_quiet(n, self.compat) => quiet_call(&self.fd_io(), &self.procs, m, self.ctx_addr, n, a),
+            n if is_quiet(n, self.compat) => {
+                let r = quiet_call(&self.fd_io(), &self.procs, self.tid, m, self.ctx_addr, n, a);
+                if n == nr::PRCTL && a[0] == crate::proc::PR_GEX_SHORT && outgrow_take_end(self.pid) {
+                    self.signals.raise(crate::signal::sig::SIGKILL);
+                }
+                r
+            }
 
             // -- x86-64 legacy forms (see `crate::x86`) ----------------------------
             // Only `x86::translate` produces these numbers; an AArch64 guest
             // issuing one raw falls through to ENOSYS below.
-            nr::DUP2 if gex_abi::X86 || self.compat => self.sys_dup2(a[0] as i32, a[1] as i32),
+            nr::DUP2 if gex_abi::X86 || self.compat => {
+                if a[0] != a[1] {
+                    self.fd_io().closing_writes(m, a[1], a[1]);
+                }
+                self.sys_dup2(a[0] as i32, a[1] as i32)
+            }
             nr::TIME if gex_abi::X86 || self.compat => self.sys_time(m, a[0]),
             nr::ALARM if gex_abi::X86 || self.compat => self.sys_alarm(a[0]),
 
@@ -10895,13 +12281,19 @@ impl Kernel {
             nr::READV => self.sys_readv(m, a[0] as i32, a[1], a[2]),
             nr::PREAD64 => self.sys_pread(m, a[0] as i32, a[1], a[2], a[3]),
             nr::PWRITE64 => self.sys_pwrite(m, a[0] as i32, a[1], a[2], a[3]),
-            nr::CLOSE => self.sys_close(a[0] as i32),
+            nr::CLOSE => {
+                self.fd_io().closing_writes(m, a[0], a[0]);
+                self.sys_close(a[0] as i32)
+            }
             nr::LSEEK => self
                 .fds
                 .get(a[0] as i32)
                 .and_then(|f| f.seek(a[1] as i64, a[2] as u32)),
             nr::DUP => self.sys_dup(a[0] as i32),
-            nr::DUP3 => self.sys_dup3(a[0] as i32, a[1] as i32, a[2]),
+            nr::DUP3 => {
+                self.fd_io().closing_writes(m, a[1], a[1]);
+                self.sys_dup3(a[0] as i32, a[1] as i32, a[2])
+            }
             nr::PIPE2 => self.sys_pipe2(m, a[0], a[1]),
             // The calls that make or work a descriptor's object
             // ([`fd_object_call`], the free path's code).
@@ -10913,6 +12305,7 @@ impl Kernel {
             nr::FCNTL => self.fd_io().fcntl_call(m, a[0] as i32, a[1], a[2]),
             nr::IOCTL => self.sys_ioctl(m, a[0] as i32, a[1], a[2]),
             nr::FTRUNCATE => self.fd_io().ftruncate(m, a[0] as i32, a[1]),
+            nr::TRUNCATE => self.path_io().truncate_target(m, a[0]).and_then(|f| self.fd_io().truncate_file(m, &f, a[1])),
             nr::FADVISE64 => self.fd_io().fadvise(a[0] as i32, a[1], a[2], a[3]),
             // `set_tid_address` and `unshare`.
             n if is_thread_own(n) => {
@@ -10953,10 +12346,13 @@ impl Kernel {
                 let cwd = self.vfs.cwd.clone();
                 self.net_io().call(&self.fd_io(), m, n, a, &cwd)
             }
-            nr::FLOCK => self.sys_flock(a[0] as i32, a[1]),
+            nr::FLOCK => self.fd_io().flock(m, a[0] as i32, a[1]),
             nr::EPOLL_CTL => self.sys_epoll_ctl(m, a[0] as i32, a[1], a[2] as i32, a[3]),
             nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2 => self.fd_io().poll_now(m, n, a),
-            nr::CLOSE_RANGE => self.sys_close_range(a[0], a[1], a[2]),
+            nr::CLOSE_RANGE => {
+                self.fd_io().closing_writes(m, a[0], a[1]);
+                self.sys_close_range(a[0], a[1], a[2])
+            }
             nr::CLOCK_GETTIME => self.sys_clock_gettime(m, a[0], a[1]),
             nr::CLOCK_GETRES => self.sys_clock_getres(m, a[1]),
             nr::GETTIMEOFDAY => self.sys_gettimeofday(m, a[0]),
@@ -10980,7 +12376,7 @@ impl Kernel {
             nr::GETPRIORITY => Ok(20),
             nr::SETPRIORITY => Ok(0),
             nr::TIMES => self.sys_times(m, a[0]),
-            nr::GETRUSAGE => self.sys_getrusage(m, a[1]),
+            nr::GETRUSAGE => self.sys_getrusage(m, a[0], a[1]),
             nr::SYSINFO => self.sys_sysinfo(m, a[0]),
             nr::PRLIMIT64 => self.sys_prlimit(m, a[1], a[2], a[3]),
             // A waitid that parks is `blocking_op`'s; one that gets here had bad arguments.
@@ -11115,7 +12511,7 @@ impl Kernel {
         if self.procs.has_signals(self.pid) {
             let mut other = false;
             for (tid, signo, from) in self.procs.take_thread_signals(self.pid, 0) {
-                let source = crate::signal::Source { code: crate::signal::SI_TKILL, pid: from, uid: self.creds.uid() };
+                let source = crate::signal::Source { code: crate::signal::SI_TKILL, pid: from, uid: self.creds.ruid() };
                 if tid == self.sig_tid || (self.sig_tid == 0 && tid == self.tid) {
                     self.signals.raise_from(signo, source);
                 } else if let Some(t) = self.thread_signals.get(tid) {
@@ -11131,7 +12527,7 @@ impl Kernel {
                 crate::wait::notify(self.procs.queue(self.pid));
             }
         }
-        let inbox = self.signals.process().collect(&self.procs, self.pid, self.creds.uid());
+        let inbox = self.signals.process().collect(&self.procs, self.pid, self.creds.ruid());
         if inbox != 0 && self.trace {
             eprintln!("[gex:{}] collected signals {inbox:#x}", self.pid);
         }
@@ -11213,7 +12609,11 @@ impl Kernel {
             fault_address,
             self.compat,
         ) {
-            Ok(resume) => Delivery::Resume(resume),
+            Ok(resume) => {
+                self.signals.process().note_fault_handled(signo);
+                self.fault_note(signo, pc, fault_address);
+                Delivery::Resume(resume)
+            }
             Err(_) => Delivery::Terminate {
                 signal: signo,
                 core: true,
@@ -11230,6 +12630,29 @@ impl Kernel {
             // proc_exit after fdt_invalidate: a session leader's terminal.
             self.darwin_tty_proc_exit();
         }
+    }
+
+    /// A fault that goes to the program's handler, said in a traced process
+    /// (`gexc run --strace`; off by default and nothing done then: Wine's
+    /// processes take handled faults routinely). A crash handler that
+    /// re-raises the signal (KCrash) otherwise leaves nothing of the real
+    /// fault. (The page's is `sigs::fault_note`.)
+    fn fault_note(&self, signo: u32, pc: u64, addr: u64) {
+        if !self.trace {
+            return;
+        }
+        let at = self
+            .mem
+            .lock()
+            .vmas()
+            .iter()
+            .find(|v| pc >= v.start && pc < v.end)
+            .map(|v| {
+                let n = v.code.as_ref().map(|(p, _)| p.as_str()).unwrap_or(&v.name);
+                format!("{} +{:#x}", n.rsplit('/').next().unwrap_or(n), pc - v.start)
+            })
+            .unwrap_or_default();
+        eprintln!("[gex:{}] {} at pc={pc:#x} {at} address {addr:#x}, to its handler", self.pid, signal::fault_name(signo));
     }
 
     /// A signal handler's return.
@@ -11432,15 +12855,11 @@ impl FdIo<'_> {
         Ok(0)
     }
 
-    /// `fcntl` as the call is made: F_GETLK and F_OFD_GETLK answer through
-    /// memory, nobody holding a lock (see [`FdIo::fcntl`]), so the answer is
-    /// l_type = F_UNLCK, which is the first field in every `struct flock`
-    /// layout (i386's flock and flock64, x86-64's, wasm32's).
+    /// `fcntl` as the call is made: the record-lock commands read and write
+    /// a `struct flock` ([`FdIo::record_lock`]).
     pub fn fcntl_call(&self, m: &mut GuestMem<'_>, fd: i32, cmd: u64, arg: u64) -> SysResult {
-        if cmd == 5 || cmd == 36 {
-            self.fds.get(fd)?;
-            const F_UNLCK: u16 = 2;
-            return m.write(arg, &F_UNLCK.to_le_bytes()).map(|_| 0);
+        if is_record_lock(cmd) {
+            return self.record_lock(m, fd, cmd, arg);
         }
         // The status flags in the guest's own spelling (an AArch64
         // program's `O_DIRECT` is not x86's).
@@ -11518,12 +12937,8 @@ impl FdIo<'_> {
                 f.set_flags(f.flags() & !SETTABLE | arg & SETTABLE);
                 Ok(0)
             }
-            // Advisory locks always succeed: gex runs one process tree over
-            // one namespace, so there is nobody to contend with.
-            F_SETLK | F_SETLKW | F_OFD_SETLK | F_OFD_SETLKW => {
-                self.fds.get(fd)?;
-                Ok(0)
-            }
+            // Through memory: `fcntl_call` (`record_lock`).
+            F_SETLK | F_SETLKW | F_OFD_SETLK | F_OFD_SETLKW => Err(Errno::EINVAL),
             // Sealing an anonymous shared file. Only a memfd has seals, and
             // Linux says EINVAL for anything else -- which is the answer
             // Xwayland was already getting, and it stopped rather than
@@ -11540,15 +12955,220 @@ impl FdIo<'_> {
     }
 
     /// `flock`. The open file description owns the lock, and its address is
-    /// a stable name for it while it is open.
-    pub fn flock(&self, fd: i32, op: u64) -> SysResult {
+    /// a stable name for it while it is open. Held in the way, a blocking
+    /// request parks ([`FdIo::lock_park`]).
+    pub fn flock(&self, m: &mut GuestMem<'_>, fd: i32, op: u64) -> SysResult {
+        use crate::locks::lock_op;
         let file = self.fds.get(fd)?;
-        let r = self.file_locks.flock(&file.path, file.lock_key(), op);
+        // This process's stores go out before anyone else can take the lock:
+        // an exclusive lock given up or turned shared (a writer holds one; a
+        // shared lock given up has nothing of its own to write).
+        let wkey = flock_owner(file.lock_key());
+        let gives_up = op & (lock_op::UN | lock_op::SH) != 0;
+        if gives_up && self.fds.release_write_lock(&file.path, wkey, 0, u64::MAX, false) {
+            sync_shared_file(self.shared, m, &file, MapSync::Release, None);
+        }
+        let (r, seen) = self.file_locks.flock_seen(&file.path, file.lock_key(), op, file.handle.remote_id());
         if r.is_ok() {
             file.note_locks(self.file_locks);
+            if gives_up {
+                self.fds.release_write_lock(&file.path, wkey, 0, u64::MAX, true);
+            } else if op & lock_op::EX != 0 {
+                self.fds.note_write_lock(&file.path, wkey, 0, u64::MAX);
+            }
+            if op & lock_op::UN == 0 {
+                sync_shared_file(self.shared, m, &file, MapSync::Acquire, seen);
+            }
         }
         r
     }
+
+    /// A record-lock command's `struct flock` at `arg`, as the request it
+    /// makes: the request, and whether it waits. `cmd` is canonical (5-7,
+    /// 36-38), or an i386 `struct flock`'s (`LK32` added: its offsets are
+    /// 32-bit).
+    fn lock_request(&self, m: &GuestMem<'_>, file: &Arc<OpenFile>, cmd: u64, arg: u64) -> Result<(crate::locks::LockReq, bool), Errno> {
+        use crate::locks::{lk, LockReq, Owner};
+        // (a wasm32 program's numbering is i386's, its struct the 64-bit one)
+        let small = cmd & LK32 != 0 && self.compat && !self.wasm32;
+        let packed = self.compat && !self.wasm32;
+        let cmd = cmd & !LK32;
+        // l_type, l_whence, l_start, l_len, l_pid: 64-bit offsets at 8 and 16
+        // (x86-64, AArch64, wasm32), i386's flock64 packed at 4 and 12, its
+        // flock's 32-bit at 4 and 8.
+        let h = m.read(arg, 4)?;
+        let (typ, whence) = (u16::from_le_bytes([h[0], h[1]]) as u32, u16::from_le_bytes([h[2], h[3]]));
+        let (start, len, pid_at) = if small {
+            (m.read_u32(arg + 4)? as i32 as i64, m.read_u32(arg + 8)? as i32 as i64, arg + 12)
+        } else if packed {
+            (m.read_u64(arg + 4)? as i64, m.read_u64(arg + 12)? as i64, arg + 20)
+        } else {
+            (m.read_u64(arg + 8)? as i64, m.read_u64(arg + 16)? as i64, arg + 24)
+        };
+        if typ > lk::UNLCK {
+            return Err(Errno::EINVAL);
+        }
+        let base = match whence {
+            0 => 0i64,
+            1 => file.offset() as i64,
+            2 => file.handle.metadata()?.size as i64,
+            _ => return Err(Errno::EINVAL),
+        };
+        let mut lo = base.checked_add(start).ok_or(Errno::EOVERFLOW)?;
+        let hi = if len > 0 {
+            lo.checked_add(len).ok_or(Errno::EOVERFLOW)? as u64
+        } else if len == 0 {
+            u64::MAX
+        } else {
+            let h = lo;
+            lo += len;
+            h as u64
+        };
+        if lo < 0 {
+            return Err(Errno::EINVAL);
+        }
+        let ofd = matches!(cmd, 36..=38);
+        if ofd && m.read_u32(pid_at)? != 0 {
+            return Err(Errno::EINVAL);
+        }
+        // A lock of a kind the descriptor cannot be used for (unlocking is
+        // always allowed).
+        if cmd != 5 && cmd != 36 && (typ == lk::RDLCK && !file.readable || typ == lk::WRLCK && !file.writable) {
+            return Err(Errno::EBADF);
+        }
+        let (owner, pid) = if ofd { (Owner::Desc(file.lock_key()), -1) } else { (Owner::Pid(self.pid), self.pid) };
+        let req = LockReq::Set { file: file.path.clone(), owner, pid, typ, start: lo as u64, end: hi };
+        Ok((req, matches!(cmd, 7 | 38)))
+    }
+
+    /// `F_GETLK`, `F_SETLK`, `F_SETLKW` and their OFD forms. A lock held in
+    /// the way answers `EAGAIN`, and a waiting one parks then
+    /// ([`FdIo::lock_park`]).
+    pub fn record_lock(&self, m: &mut GuestMem<'_>, fd: i32, cmd: u64, arg: u64) -> SysResult {
+        use crate::locks::{lk, LockReq};
+        let file = self.fds.get(fd)?;
+        let (req, wait) = self.lock_request(m, &file, cmd, arg)?;
+        let LockReq::Set { file: path, owner, pid, typ, start, end } = &req else { unreachable!() };
+        let (small, plain) = (cmd & LK32 != 0 && self.compat && !self.wasm32, cmd & !LK32);
+        if plain == 5 || plain == 36 {
+            if *typ == lk::UNLCK {
+                return Err(Errno::EINVAL);
+            }
+            let got = self.file_locks.get(path, *owner, *typ, *start, *end);
+            let Some(c) = got else {
+                return m.write(arg, &(lk::UNLCK as u16).to_le_bytes()).map(|_| 0);
+            };
+            let len = if c.end == u64::MAX { 0 } else { c.end - c.start };
+            m.write(arg, &(c.typ as u16).to_le_bytes())?;
+            m.write(arg + 2, &0u16.to_le_bytes())?;
+            if small {
+                if c.start > i32::MAX as u64 || len > i32::MAX as u64 {
+                    return Err(Errno::EOVERFLOW);
+                }
+                m.write_u32(arg + 4, c.start as u32)?;
+                m.write_u32(arg + 8, len as u32)?;
+                m.write_u32(arg + 12, c.pid as u32)?;
+            } else if self.compat && !self.wasm32 {
+                m.write_u64(arg + 4, c.start)?;
+                m.write_u64(arg + 12, len)?;
+                m.write_u32(arg + 20, c.pid as u32)?;
+            } else {
+                m.write_u64(arg + 8, c.start)?;
+                m.write_u64(arg + 16, len)?;
+                m.write_u32(arg + 24, c.pid as u32)?;
+            }
+            return Ok(0);
+        }
+        // This process's stores go out before anyone else can take the range:
+        // a write lock given up or turned read (writers hold one; giving up
+        // a read lock does not look at the mapping).
+        let wkey = owner.encode();
+        if *typ != lk::WRLCK && self.fds.release_write_lock(path, wkey, *start, *end, false) {
+            sync_shared_file(self.shared, m, &file, MapSync::Release, None);
+        }
+        let (r, seen) = self.file_locks.set_seen(path, *owner, *pid, *typ, *start, *end, wait, file.handle.remote_id());
+        r?;
+        if *typ == lk::WRLCK {
+            self.fds.note_write_lock(path, wkey, *start, *end);
+        } else {
+            self.fds.release_write_lock(path, wkey, *start, *end, true);
+        }
+        if *typ != lk::UNLCK {
+            match owner {
+                crate::locks::Owner::Pid(p) => self.fds.note_record_lock(self.file_locks, *p, path),
+                crate::locks::Owner::Desc(_) => file.note_locks(self.file_locks),
+            }
+            sync_shared_file(self.shared, m, &file, MapSync::Acquire, seen);
+        }
+        Ok(0)
+    }
+
+    /// Descriptors `lo..=hi` about to close: the process's record write
+    /// locks on their files go with any close (Linux's rule), so its stores
+    /// to shared mappings of those files go out first, as an unlock's do.
+    /// One load while it holds no write lock.
+    pub fn closing_writes(&self, m: &mut GuestMem<'_>, lo: u64, hi: u64) {
+        if !self.fds.holds_write_locks() {
+            return;
+        }
+        let me = crate::locks::Owner::Pid(self.pid).encode();
+        let files: Vec<Arc<OpenFile>> = if lo == hi {
+            self.fds.get(lo as i32).ok().into_iter().collect()
+        } else {
+            self.fds.list().into_iter().filter(|(fd, _)| (lo..=hi).contains(&(*fd as u64))).filter_map(|(fd, _)| self.fds.get(fd).ok()).collect()
+        };
+        for file in files {
+            if self.fds.drop_write_locks(&file.path, me, false) {
+                sync_shared_file(self.shared, m, &file, MapSync::Release, None);
+            }
+        }
+    }
+
+    /// The park for a lock request that found the lock held and waits
+    /// (`F_SETLKW`, `F_OFD_SETLKW`, `flock` without `LOCK_NB`).
+    fn lock_park(&self, m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> Option<BlockOp> {
+        let file = self.fds.get(a[0] as i32).ok()?;
+        let req = match n {
+            nr::FLOCK if a[1] & (crate::locks::lock_op::NB | crate::locks::lock_op::UN) == 0 => crate::locks::LockReq::Flock { file: file.path.clone(), key: file.lock_key(), op: a[1] },
+            nr::FCNTL if is_record_lock(a[1]) => match self.lock_request(m, &file, a[1], a[2]) {
+                Ok((req, true)) => req,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        // Noted now for when the host grants it: the close rule and the
+        // description's release then cover it (nothing to drop if it never is).
+        match &req {
+            crate::locks::LockReq::Set { owner: crate::locks::Owner::Pid(p), file: path, .. } => self.fds.note_record_lock(self.file_locks, *p, path),
+            _ => file.note_locks(self.file_locks),
+        }
+        // And a write lock as held (an extra look at the mapping at its
+        // release, if it never is).
+        match &req {
+            crate::locks::LockReq::Set { file: path, owner, typ, start, end, .. } if *typ == crate::locks::lk::WRLCK => self.fds.note_write_lock(path, owner.encode(), *start, *end),
+            crate::locks::LockReq::Flock { file: path, key, op } if op & crate::locks::lock_op::EX != 0 => self.fds.note_write_lock(path, flock_owner(*key), 0, u64::MAX),
+            _ => {}
+        }
+        Some(BlockOp::FileLock { locks: Arc::clone(self.file_locks), req })
+    }
+}
+
+/// An i386 `struct flock`'s record-lock commands (32-bit offsets): the
+/// canonical number with this added ([`crate::i386`]'s `fcntl`). A wasm32
+/// program's calls take i386's numbers too, and its 5-7 are the canonical
+/// ones (a 64-bit `struct flock`): the bit means nothing there.
+pub const LK32: u64 = 0x8000;
+
+/// A `flock` lock's owner among [`crate::file::FdTable::note_write_lock`]'s
+/// (bit 62 keeps it apart from the record-lock owners' encodings).
+fn flock_owner(key: u64) -> u64 {
+    key | 1 << 62
+}
+
+/// `F_GETLK`, `F_SETLK`, `F_SETLKW`, `F_OFD_GETLK`, `F_OFD_SETLK`,
+/// `F_OFD_SETLKW`, and the i386 `struct flock` forms ([`LK32`]).
+fn is_record_lock(cmd: u64) -> bool {
+    matches!(cmd, 5..=7 | 36..=38) || matches!(cmd ^ LK32, 5..=7)
 }
 
 impl FdIo<'_> {
@@ -12036,6 +13656,9 @@ fn signal_foreground(procs: &ProcTable, tty: &crate::tty::TtyRef, pid: i32, sign
 
 impl Kernel {
     fn sys_ioctl(&mut self, m: &mut GuestMem<'_>, fd: i32, req: u64, arg: u64) -> SysResult {
+        if let Some(r) = pty_peer_ioctl(&self.fds, &self.path_io(), fd, req, arg) {
+            return r;
+        }
         self.fd_io().ioctl(m, &self.procs, &self.tty, fd, req, arg)
     }
 
@@ -12131,7 +13754,7 @@ impl Kernel {
         if !self.procs.has_signals(self.pid) {
             return;
         }
-        self.signals.process().collect(&self.procs, self.pid, self.creds.uid());
+        self.signals.process().collect(&self.procs, self.pid, self.creds.ruid());
     }
 
     /// `mount`, for the filesystems gex has.
@@ -12250,9 +13873,6 @@ impl Kernel {
 
     /// `flock`. The open file description owns the lock, and its address is
     /// a stable name for it while it is open.
-    fn sys_flock(&mut self, fd: i32, op: u64) -> SysResult {
-        self.fd_io().flock(fd, op)
-    }
 
 
 
@@ -12342,7 +13962,10 @@ impl Kernel {
         const CLOCK_THREAD_CPUTIME_ID: u64 = 3;
         let (secs, nanos) = match clk {
             CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => {
-                let t = self.cpu_nanos();
+                let t = match crate::proc::cpu_clock(clk == CLOCK_THREAD_CPUTIME_ID) {
+                    Some(ns) => ns as u128,
+                    None => self.cpu_nanos(),
+                };
                 ((t / 1_000_000_000) as u64, (t % 1_000_000_000) as u32)
             }
             c if is_monotonic_clock(c) => monotonic_from((self.clock)()),
@@ -12388,6 +14011,10 @@ impl Kernel {
     /// ask for here). `openssl speed` divides by it, so zero printed every
     /// throughput as `infk`.
     pub fn cpu_nanos(&mut self) -> u128 {
+        // a host that measures it (`crate::proc::set_cpu_clock`)
+        if let Some(ns) = crate::proc::cpu_clock(false) {
+            return ns as u128;
+        }
         let now = self.now_nanos();
         if self.started == 0 {
             self.started = now;
@@ -12400,28 +14027,34 @@ impl Kernel {
     /// on Linux, and a return value on the same scale.
     fn sys_times(&mut self, m: &mut GuestMem<'_>, buf: u64) -> SysResult {
         let cpu = self.cpu_nanos();
-        times_answer(m, self.compat, cpu, buf)
+        times_answer(m, self.compat, cpu, child_cpu_of(&self.procs, self.pid), buf)
     }
 
     /// `getrusage`. Only the two times are filled in; the page-fault and
     /// context-switch counters stay zero, which is what a program that asks
     /// for them under emulation should expect to see.
-    fn sys_getrusage(&mut self, m: &mut GuestMem<'_>, buf: u64) -> SysResult {
+    fn sys_getrusage(&mut self, m: &mut GuestMem<'_>, who: u64, buf: u64) -> SysResult {
+        let own = self.cpu_nanos();
+        let ns = rusage_ns(
+            who,
+            || own,
+            || child_cpu_of(&self.procs, self.pid),
+            || crate::proc::cpu_clock(true).map_or(own, u128::from),
+        )?;
         if buf != 0 && self.compat {
             // i386: 32-bit timevals and longs (72 bytes)
-            let ns = self.cpu_nanos();
             m.zero(buf, 72)?;
             m.write_u32(buf, (ns / 1_000_000_000) as u32)?;
             m.write_u32(buf + 4, (ns % 1_000_000_000 / 1000) as u32)?;
         } else if buf != 0 {
             m.zero(buf, 144)?;
-            write_timeval(m, buf, self.cpu_nanos())?;
+            write_timeval(m, buf, ns)?;
         }
         Ok(0)
     }
 
     fn sys_sysinfo(&mut self, m: &mut GuestMem<'_>, buf: u64) -> SysResult {
-        sysinfo(m, self.compat, buf)
+        sysinfo(m, self.compat, buf, &self.procs, self.clock)
     }
 
     fn sys_process_vm(&mut self, m: &mut GuestMem<'_>, write: bool, a: [u64; 6]) -> SysResult {
@@ -12482,10 +14115,19 @@ pub fn statfs(m: &mut GuestMem<'_>, compat: bool, buf: u64) -> SysResult {
 const ST_VALID: u64 = 0x20;
 
 /// `sysinfo`: a constant machine (4 GiB, half free, one process).
-pub fn sysinfo(m: &mut GuestMem<'_>, compat: bool, buf: u64) -> SysResult {
+pub fn sysinfo(m: &mut GuestMem<'_>, compat: bool, buf: u64, procs: &ProcTable, clock: ClockFn) -> SysResult {
     if buf == 0 {
         return Err(Errno::EFAULT);
     }
+    // As `/proc` has them (`vfs::procfs`): the monotonic clock's uptime, the
+    // process table's load averages (fixed point, 1 << 16 is 1.0), free
+    // memory a fixed 4 GiB less what the processes have resident, and their
+    // count.
+    let up_ns = clock_ns(clock, 1);
+    let loads = procs.loadavg(up_ns).map(|h| h as u64 * 65536 / 100);
+    let (rss, count) = procs.memory();
+    let free = (4u64 << 30).saturating_sub(rss);
+    let count = count.clamp(1, u16::MAX as usize) as u16;
     // struct sysinfo: uptime, loads[3], totalram, freeram, sharedram,
     // bufferram, totalswap, freeswap, procs (u16), totalhigh, freehigh,
     // mem_unit. The 64-bit layout has 8-byte longs (112 bytes); the i386
@@ -12496,17 +14138,23 @@ pub fn sysinfo(m: &mut GuestMem<'_>, compat: bool, buf: u64) -> SysResult {
     // 32-bit process overwrote the stack canary.
     if compat {
         m.zero(buf, 64)?;
-        m.write_u32(buf, 1000)?; // uptime
+        m.write_u32(buf, (up_ns / 1_000_000_000) as u32)?; // uptime
+        for (i, l) in loads.iter().enumerate() {
+            m.write_u32(buf + 4 + 4 * i as u64, *l as u32)?;
+        }
         m.write_u32(buf + 16, 1 << 20)?; // totalram: 4 GiB in pages
-        m.write_u32(buf + 20, 1 << 19)?; // freeram
-        m.write(buf + 40, &1u16.to_le_bytes())?; // procs
+        m.write_u32(buf + 20, (free >> 12) as u32)?; // freeram
+        m.write(buf + 40, &count.to_le_bytes())?; // procs
         m.write_u32(buf + 52, 4096)?; // mem_unit
     } else {
         m.zero(buf, 112)?;
-        m.write_u64(buf, 1000)?; // uptime
+        m.write_u64(buf, up_ns / 1_000_000_000)?; // uptime
+        for (i, l) in loads.iter().enumerate() {
+            m.write_u64(buf + 8 + 8 * i as u64, *l)?;
+        }
         m.write_u64(buf + 32, 4 * 1024 * 1024 * 1024)?; // totalram
-        m.write_u64(buf + 40, 2 * 1024 * 1024 * 1024)?; // freeram
-        m.write(buf + 80, &1u16.to_le_bytes())?; // procs
+        m.write_u64(buf + 40, free)?; // freeram
+        m.write(buf + 80, &count.to_le_bytes())?; // procs
         m.write_u32(buf + 104, 1)?; // mem_unit
     }
     Ok(0)
@@ -12588,6 +14236,10 @@ pub fn wakes_fd_waiters(n: u64) -> bool {
             | nr::TKILL
             | nr::TGKILL
             | nr::TIMERFD_SETTIME
+            // A lock released: a blocked `F_SETLKW` or `flock` looks again.
+            | nr::FCNTL
+            | nr::FLOCK
+            | nr::DUP2
     )
 }
 
@@ -12616,6 +14268,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::RENAMEAT => "renameat",
         nr::RENAMEAT2 => "renameat2",
         nr::FTRUNCATE => "ftruncate",
+        nr::TRUNCATE => "truncate",
         nr::FADVISE64 => "fadvise64",
         nr::FACCESSAT | nr::FACCESSAT2 => "faccessat",
         nr::CHDIR => "chdir",
@@ -12670,6 +14323,8 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::FSTAT => "fstat",
         nr::FSYNC => "fsync",
         nr::FDATASYNC => "fdatasync",
+        nr::SYNC_FILE_RANGE => "sync_file_range",
+        nr::SYNCFS => "syncfs",
         nr::EXIT => "exit",
         nr::EXIT_GROUP => "exit_group",
         nr::SET_TID_ADDRESS => "set_tid_address",
@@ -12721,6 +14376,11 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::GETGROUPS => "getgroups",
         nr::SETGROUPS => "setgroups",
         nr::PRCTL => "prctl",
+        nr::CHROOT => "chroot",
+        nr::CAPGET => "capget",
+        nr::CAPSET => "capset",
+        nr::SETFSUID => "setfsuid",
+        nr::SETFSGID => "setfsgid",
         nr::SYNC => "sync",
         nr::STATX => "statx",
         nr::MOUNT => "mount",
@@ -12791,7 +14451,7 @@ const MAX_RW_COUNT: u64 = 0x7fff_f000;
 /// length past the end with a short file still reads; a `buf` outside the
 /// memory keeps its length and faults).
 fn rw_len(m: &GuestMem<'_>, buf: u64, len: u64) -> usize {
-    let room = (m.bytes.len() as u64).saturating_sub(buf);
+    let room = (m.len() as u64).saturating_sub(buf);
     (if room == 0 { len.min(MAX_RW_COUNT) } else { len.min(MAX_RW_COUNT).min(room) }) as usize
 }
 
@@ -12965,6 +14625,45 @@ mod tests {
         assert_eq!(k.fd_io().unix_of(pfd).err(), Some(Errno::ENOTSOCK));
     }
 
+    /// `times` and `getrusage(RUSAGE_CHILDREN)` count the reaped children's
+    /// time, the kernel's and the free path alike; a `who` past the three
+    /// is `EINVAL`.
+    #[test]
+    fn reaped_children_time_in_times_and_getrusage() {
+        if gex_abi::X86 {
+            return;
+        }
+        let (mut mem, mut k) = setup();
+        let at = k.ctx_addr;
+        let buf = 0x3000u64;
+        let child = k.procs.spawn(k.pid);
+        k.procs.set_usage(child, 2_500_000_000, 0, 0, 0);
+        k.procs.exit(child, 0);
+        k.procs.reap(child);
+        let procs = Arc::clone(&k.procs);
+        let pid = k.pid;
+        let children = move || child_cpu_of(&procs, pid);
+        for free in [false, true] {
+            let mut m = GuestMem::new(&mut mem);
+            let mut call = |m: &mut GuestMem<'_>, n: u64, args: &[u64]| {
+                m.zero(buf, 160).unwrap();
+                set_args(m, at, n, args);
+                if free {
+                    assert!(clock_call(m, at, false, k.clock, k.started, &children));
+                } else {
+                    k.syscall(m, 0);
+                }
+                ret(m, at)
+            };
+            assert_eq!(call(&mut m, nr::GETRUSAGE, &[(-1i64) as u64, buf]), 0, "free {free}");
+            assert_eq!((m.read_u64(buf).unwrap(), m.read_u64(buf + 8).unwrap()), (2, 500_000), "free {free}");
+            call(&mut m, nr::TIMES, &[buf]);
+            assert_eq!(m.read_u64(buf + 16).unwrap(), 250, "cutime, free {free}");
+            assert_eq!(call(&mut m, nr::GETRUSAGE, &[7, buf]), -(Errno::EINVAL.0 as i64), "free {free}");
+            assert_eq!(call(&mut m, nr::GETRUSAGE, &[1, 0]), 0, "RUSAGE_THREAD, free {free}");
+        }
+    }
+
     /// `ident_call` answers the id calls as the kernel does, and declines
     /// what it was not given.
     #[test]
@@ -13032,7 +14731,7 @@ mod tests {
             m.zero(buf, 160).unwrap();
             m.write_u64(at + ctx::x(0) as u64, 0x5555).unwrap();
             set_args(&mut m, at, n, &args);
-            assert!(clock_call(&mut m, at, false, fixed, k.started), "call {n}");
+            assert!(clock_call(&mut m, at, false, fixed, k.started, &|| 0), "call {n}");
             assert_eq!(m.read(buf, 160).unwrap(), &want[..], "call {n} {args:?}");
             assert_eq!(ret(&m, at), want_ret, "call {n}");
         }
@@ -13041,17 +14740,17 @@ mod tests {
         // process's start is known (no time used), and the resolution.
         let mut m = GuestMem::new(&mut mem);
         set_args(&mut m, at, nr::GETPID, &[]);
-        assert!(!clock_call(&mut m, at, false, fixed, k.started));
+        assert!(!clock_call(&mut m, at, false, fixed, k.started, &|| 0));
         set_args(&mut m, at, nr::CLOCK_GETTIME, &[0, 0]);
-        assert!(clock_call(&mut m, at, false, fixed, k.started));
+        assert!(clock_call(&mut m, at, false, fixed, k.started, &|| 0));
         assert_eq!(ret(&m, at) as i64, -(Errno::EFAULT.0 as i64));
         m.write_u64(buf, !0).unwrap();
         set_args(&mut m, at, nr::GETRUSAGE, &[0, buf]);
-        assert!(clock_call(&mut m, at, false, fixed, 0));
+        assert!(clock_call(&mut m, at, false, fixed, 0, &|| 0));
         assert_eq!(m.read_u64(buf).unwrap(), 0);
         assert_eq!(ret(&m, at), 0);
         set_args(&mut m, at, nr::CLOCK_GETRES, &[1, buf]);
-        assert!(clock_call(&mut m, at, false, fixed, k.started));
+        assert!(clock_call(&mut m, at, false, fixed, k.started, &|| 0));
         assert_eq!((m.read_u64(buf).unwrap(), m.read_u64(buf + 8).unwrap()), (0, 1));
         // i386: the number in eax, arguments in ebx/ecx, 32-bit layouts.
         let set32 = |m: &mut GuestMem<'_>, n: u64, a: [u64; 2]| {
@@ -13061,25 +14760,25 @@ mod tests {
         };
         let started = 1_699_999_990u128 * 1_000_000_000;
         set32(&mut m, crate::i386::raw::CLOCK_GETTIME, [0, buf]);
-        assert!(clock_call(&mut m, at, true, fixed, started));
+        assert!(clock_call(&mut m, at, true, fixed, started, &|| 0));
         assert_eq!(m.read_u32(buf).unwrap(), 1_700_000_000);
         assert_eq!(m.read_u32(buf + 4).unwrap(), 123_456_789);
         set32(&mut m, crate::i386::raw::GETTIMEOFDAY, [buf, 0]);
-        assert!(clock_call(&mut m, at, true, fixed, started));
+        assert!(clock_call(&mut m, at, true, fixed, started, &|| 0));
         assert_eq!(m.read_u32(buf + 4).unwrap(), 123_456);
         m.write_u64(buf + 64, !0).unwrap();
         m.write_u64(buf + 72, !0).unwrap();
         set32(&mut m, crate::i386::raw::GETRUSAGE, [0, buf]);
-        assert!(clock_call(&mut m, at, true, fixed, started));
+        assert!(clock_call(&mut m, at, true, fixed, started, &|| 0));
         assert_eq!(m.read_u32(buf).unwrap(), 10);
         assert_eq!(m.read_u32(buf + 4).unwrap(), 123_456);
         assert_eq!(m.read_u64(buf + 64).unwrap(), 0, "the 72-byte i386 rusage is cleared");
         assert_eq!(m.read_u64(buf + 72).unwrap(), !0, "and nothing past it");
         set32(&mut m, crate::i386::raw::SCHED_YIELD, [0, 0]);
-        assert!(clock_call(&mut m, at, true, fixed, started));
+        assert!(clock_call(&mut m, at, true, fixed, started, &|| 0));
         assert_eq!(m.read_u64(at + ctx::x(0) as u64).unwrap(), 0);
         set32(&mut m, crate::i386::raw::GETPID, [0, 0]);
-        assert!(!clock_call(&mut m, at, true, fixed, started));
+        assert!(!clock_call(&mut m, at, true, fixed, started, &|| 0));
     }
 
     /// What `clock_nanosleep` turns into: a sleep of the time left for an
@@ -13381,6 +15080,56 @@ mod tests {
         let mut b = s.as_bytes().to_vec();
         b.push(0);
         m.write(addr, &b).unwrap();
+    }
+
+    /// An epoll descriptor in a `poll` set is readable only while a wait on
+    /// it would report something, and never writable. Always readable, GLib
+    /// main loops that poll one (kded6's, plasmashell's) went round
+    /// `ppoll` and an empty `epoll_wait` at a core each, for good.
+    #[test]
+    fn an_epoll_descriptor_polls_readable_only_with_something_to_report() {
+        const EPOLLIN: u32 = 0x001;
+        let (mut buf, mut k) = setup();
+        let mut m = GuestMem::new(&mut buf);
+        let at = k.ctx_addr;
+        let call = |k: &mut Kernel, m: &mut GuestMem<'_>, n: u64, a: &[u64]| {
+            set_args(m, at, n, a);
+            k.syscall(m, 0);
+            ret(m, at)
+        };
+        // `ppoll` of the one descriptor for POLLIN|POLLOUT, not waiting: its revents.
+        let poll = |k: &mut Kernel, m: &mut GuestMem<'_>, fd: u64| -> u32 {
+            m.write_u64(0x20500, 0).unwrap();
+            m.write_u64(0x20508, 0).unwrap();
+            m.write_u32(0x20600, fd as u32).unwrap();
+            m.write_u32(0x20604, 0x5).unwrap();
+            let n = call(k, m, nr::PPOLL, &[0x20600, 1, 0x20500, 0, 8]);
+            assert!(n >= 0, "ppoll: {n}");
+            m.read_u32(0x20604).unwrap() >> 16
+        };
+        assert_eq!(call(&mut k, &mut m, nr::PIPE2, &[0x20010, 0]), 0);
+        let (rfd, wfd) = (m.read_u32(0x20010).unwrap() as u64, m.read_u32(0x20014).unwrap() as u64);
+        let ep = call(&mut k, &mut m, nr::EPOLL_CREATE1, &[0]) as u64;
+        assert_eq!(poll(&mut k, &mut m, ep), 0, "an empty set");
+        m.write_u32(0x20300, EPOLLIN).unwrap();
+        m.write_u64(if gex_abi::X86 { 0x20304 } else { 0x20308 }, 7).unwrap();
+        assert_eq!(call(&mut k, &mut m, nr::EPOLL_CTL, &[ep, 1, rfd, 0x20300]), 0);
+        assert_eq!(poll(&mut k, &mut m, ep), 0, "an empty pipe");
+        // A set watching that set (GLib's loop over a library's own epoll).
+        let outer = call(&mut k, &mut m, nr::EPOLL_CREATE1, &[0]) as u64;
+        assert_eq!(call(&mut k, &mut m, nr::EPOLL_CTL, &[outer, 1, ep, 0x20300]), 0);
+        assert_eq!(poll(&mut k, &mut m, ep), 0, "an empty pipe");
+        assert_eq!(poll(&mut k, &mut m, outer), 0, "an empty pipe, two sets deep");
+        m.write(0x21000, b"a").unwrap();
+        assert_eq!(call(&mut k, &mut m, nr::WRITE, &[wfd, 0x21000, 1]), 1);
+        assert_eq!(poll(&mut k, &mut m, ep), 1, "the pipe written: POLLIN only");
+        assert_eq!(poll(&mut k, &mut m, outer), 1, "the pipe written, two sets deep");
+        assert_eq!(call(&mut k, &mut m, nr::READ, &[rfd, 0x21100, 8]), 1);
+        assert_eq!(poll(&mut k, &mut m, ep), 0, "the pipe read again");
+        assert_eq!(poll(&mut k, &mut m, outer), 0, "the pipe read again, two sets deep");
+        // The watched descriptor closed: its watch reports nothing.
+        assert_eq!(call(&mut k, &mut m, nr::CLOSE, &[rfd]), 0);
+        assert_eq!(poll(&mut k, &mut m, ep), 0, "the pipe closed");
     }
 
     /// `EPOLLET` as Linux has it: an edge-triggered watch reports at each
@@ -14239,6 +15988,62 @@ mod tests {
         assert_eq!(k.creds.uid(), 4321);
     }
 
+    /// The real, effective and saved ids each call sets, as Linux sets
+    /// them for root, and the capability sets that follow (`Creds`).
+    #[test]
+    fn set_ids_and_capabilities_as_linux_for_root() {
+        let all = CAPS_ALL;
+        let c = Creds::new(0, 0);
+        assert_eq!(c.caps(), [all, all, 0]);
+        let run = |c: &Creds, n: u64, a: [u64; 3]| {
+            let mut buf = [0u8; 64];
+            let mut m = GuestMem::new(&mut buf);
+            cred_call(c, &ProcTable::new(), 1, &mut m, n, [a[0], a[1], a[2], 0, 0, 0]).unwrap();
+        };
+        let keep = u32::MAX as u64;
+        run(&c, nr::SETRESUID, [keep, 997, keep]);
+        assert_eq!(c.uids(), [0, 997, 0]);
+        assert_eq!(c.caps(), [0, all, 0]);
+        run(&c, nr::SETRESUID, [keep, 0, keep]);
+        assert_eq!(c.caps(), [all, all, 0]);
+        run(&c, nr::SETREUID, [keep, 998, 0]);
+        assert_eq!(c.uids(), [0, 998, 998]);
+        // The real id alone: no root id left, so no capabilities.
+        run(&c, nr::SETREUID, [995, keep, 0]);
+        assert_eq!(c.uids(), [995, 998, 998]);
+        assert_eq!(c.caps(), [0, 0, 0]);
+        // From root, the real id alone: the effective root keeps them.
+        let d = Creds::new(0, 0);
+        run(&d, nr::SETREUID, [995, keep, 0]);
+        assert_eq!((d.uids(), d.caps()), ([995, 0, 0], [all, all, 0]));
+        run(&c, nr::SETUID, [996, 0, 0]);
+        assert_eq!(c.uids(), [996, 996, 996]);
+        assert_eq!(c.caps(), [0, 0, 0]);
+        // A fork's copy, and an exec's sets.
+        let f = c.fork();
+        assert_eq!((f.uids(), f.caps()), ([996; 3], [0; 3]));
+        f.exec();
+        assert_eq!(f.caps(), [0; 3]);
+        // Granted, as root's would be, with root's sets.
+        run(&f, nr::SETUID, [0, 0, 0]);
+        assert_eq!((f.uids(), f.caps()), ([0; 3], [all, all, 0]));
+        // PR_SET_KEEPCAPS keeps the permitted set across leaving root.
+        let k = Creds::new(0, 0);
+        k.set_keep_caps(true);
+        run(&k, nr::SETUID, [996, 0, 0]);
+        assert_eq!(k.caps(), [0, all, 0]);
+        // capset within the sets only.
+        let r = Creds::new(0, 0);
+        assert_eq!(r.capset(all & !(1 << 13), all, 0), Ok(()));
+        assert_eq!(r.capset(all, all & !(1 << 13), 0), Err(Errno::EPERM));
+        assert_eq!(r.capset(all & !(1 << 13), all & !(1 << 13), 0), Ok(()));
+        assert_eq!(r.capset(all, all, 0), Err(Errno::EPERM));
+        // The bytes a page's other Worker restores from.
+        let b = Creds::new(0, 0);
+        b.restore(&c.save());
+        assert_eq!((b.uids(), b.gids(), b.caps()), (c.uids(), c.gids(), c.caps()));
+    }
+
     /// `kill`, `tkill` and `tgkill` answer as the kernel's arms do,
     /// and one for another thread of the process is raised on that
     /// thread's own state, found through the shared table.
@@ -14879,7 +16684,7 @@ mod tests {
         // own path answers it).
         m.write_u64(buf_at, !0).unwrap();
         set32(&mut m, raw::TIME, [buf_at, 0, 0]);
-        assert!(clock_call(&mut m, at, true, k.clock, k.started));
+        assert!(clock_call(&mut m, at, true, k.clock, k.started, &|| 0));
         assert_eq!(m.read_u32(buf_at + 4).unwrap(), u32::MAX, "only four bytes stored");
         assert_eq!(m.read_u32(buf_at).unwrap() as i32, r32(&m));
     }
@@ -15051,6 +16856,25 @@ mod tests {
             set_args(&mut m, at, nr::FTRUNCATE, &[999, 0]);
             call(&mut m, &mut k);
             assert_eq!(ret(&m, at), -(Errno::EBADF.0 as i64));
+            // truncate: by name, shorter and longer; no such file, a
+            // directory, a negative length.
+            for len in [10u64, 5000] {
+                set_args(&mut m, at, nr::TRUNCATE, &[0x20400, len]);
+                k.syscall(&mut m, 0);
+                assert_eq!(ret(&m, at), 0);
+                assert_eq!(k.fds.get(fd as i32).unwrap().handle.metadata().unwrap().size, len);
+            }
+            m.write(0x20410, b"/nope\0").unwrap();
+            set_args(&mut m, at, nr::TRUNCATE, &[0x20410, 0]);
+            k.syscall(&mut m, 0);
+            assert_eq!(ret(&m, at), -(Errno::ENOENT.0 as i64));
+            m.write(0x20420, b"/\0").unwrap();
+            set_args(&mut m, at, nr::TRUNCATE, &[0x20420, 0]);
+            k.syscall(&mut m, 0);
+            assert_eq!(ret(&m, at), -(Errno::EISDIR.0 as i64));
+            set_args(&mut m, at, nr::TRUNCATE, &[0x20400, u64::MAX]);
+            k.syscall(&mut m, 0);
+            assert_eq!(ret(&m, at), -(Errno::EINVAL.0 as i64));
             for f in [r, w, ep, fd] {
                 set_args(&mut m, at, nr::CLOSE, &[f]);
                 k.syscall(&mut m, 0);
@@ -16027,8 +17851,8 @@ mod tests {
         let mut maps = SharedMaps::new();
         let view = Arc::clone(maps.view());
         assert!(view.of(&a).is_none());
-        maps.push(SharedMap { start: 0x10000, len: 0x4000, file: Arc::clone(&a), offset: 0, holders: Vec::new(), pages: page_hashes(&[0; 0x4000]), changes: Default::default() });
-        maps.push(SharedMap { start: 0x20000, len: 0x1000, file: Arc::clone(&b), offset: 0, holders: Vec::new(), pages: page_hashes(&[0; 0x1000]), changes: Default::default() });
+        maps.push(SharedMap { start: 0x10000, len: 0x4000, file: Arc::clone(&a), offset: 0, holders: Vec::new(), pages: page_hashes(&[0; 0x4000]), changes: Default::default(), seen: Default::default() });
+        maps.push(SharedMap { start: 0x20000, len: 0x1000, file: Arc::clone(&b), offset: 0, holders: Vec::new(), pages: page_hashes(&[0; 0x1000]), changes: Default::default(), seen: Default::default() });
         let held = view.get();
         assert_eq!(view.of(&a).map(|m| (m.start, m.len)), Some((0x10000, 0x4000)));
         assert_eq!(view.of(&b).map(|m| m.start), Some(0x20000));
@@ -16037,6 +17861,26 @@ mod tests {
         assert!(view.of(&b).is_some());
         assert_eq!(held.len(), 2, "a reader's copy is whole");
         assert_eq!(maps.len(), 1);
+    }
+
+    /// A pool is where a mapping of its file holds all of it: a 4 KiB view
+    /// of the file mapped before the pool's 3 MiB one is not it (Wine maps
+    /// both, and the compositor took the first and refused the window's
+    /// buffer as longer than its pool).
+    #[test]
+    fn a_pool_is_the_mapping_that_holds_it() {
+        let file = |name: &str| OpenFile::new(Arc::new(crate::unix::MemFd::new(name)), name.into(), 0, true, true);
+        let a = file("pool");
+        let map = |start, len, offset| SharedMap { start, len, file: Arc::clone(&a), offset, holders: Vec::new(), pages: page_hashes(&[0; 0x1000]), changes: Default::default(), seen: Default::default() };
+        let mut maps = SharedMaps::new();
+        let view = Arc::clone(maps.view());
+        maps.push(map(0xde56000, 0x1000, 0));
+        assert_eq!(view.pool(&a, 0x30_0000).map(|m| m.start), Some(0xde56000), "too short, but the only one: the caller refuses it");
+        maps.push(map(0x40000000, 0x30_0000, 0x1000));
+        maps.push(map(0x22890000, 0x30_0000, 0));
+        assert_eq!(view.pool(&a, 0x30_0000).map(|m| m.start), Some(0x22890000));
+        assert_eq!(view.pool(&a, 0x1000).map(|m| m.start), Some(0x22890000), "the latest that holds it");
+        assert!(view.pool(&file("other"), 0x1000).is_none());
     }
 
     /// i386's `_llseek`, `pread64` and `pwrite64` in the lock-free class
@@ -16185,6 +18029,65 @@ mod tests {
     }
 
     #[test]
+    fn record_locks_contend_park_and_go_with_any_descriptor() {
+        use crate::locks::{lk, LockReq, Owner};
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        m.write(0x20000, b"/lk\0").unwrap();
+        let sys = |m: &mut GuestMem<'_>, k: &mut Kernel, n: u64, a: &[u64]| {
+            set_args(m, at, n, a);
+            let out = k.syscall(m, 0);
+            (out, ret(m, at))
+        };
+        let open = |m: &mut GuestMem<'_>, k: &mut Kernel| sys(m, k, nr::OPENAT, &[(-100i64) as u64, 0x20000, (oflags::O_RDWR | oflags::O_CREAT) as u64, 0o644]).1 as u64;
+        let (fd, fd2) = (open(&mut m, &mut k), open(&mut m, &mut k));
+        // struct flock at 0x25000: type, whence, start, len, pid.
+        let flock = |m: &mut GuestMem<'_>, typ: u16, start: u64, len: u64| {
+            m.write(0x25000, &[0u8; 32]).unwrap();
+            m.write(0x25000, &typ.to_le_bytes()).unwrap();
+            m.write_u64(0x25008, start).unwrap();
+            m.write_u64(0x25010, len).unwrap();
+        };
+        let me = Owner::Pid(k.pid);
+        flock(&mut m, lk::WRLCK as u16, 10, 10);
+        assert_eq!(sys(&mut m, &mut k, nr::FCNTL, &[fd, 6, 0x25000]).1, 0, "F_SETLK");
+        let locks = Arc::clone(&k.file_locks);
+        assert_eq!(locks.set("/lk", Owner::Pid(999), 999, lk::RDLCK, 15, 16, false), Err(Errno::EAGAIN), "another process is kept out");
+        assert_eq!(locks.set("/lk", Owner::Pid(999), 999, lk::WRLCK, 20, 30, false), Ok(0), "beside it is free");
+        // F_GETLK names the other process's lock and pid.
+        flock(&mut m, lk::WRLCK as u16, 0, 0);
+        assert_eq!(sys(&mut m, &mut k, nr::FCNTL, &[fd, 5, 0x25000]).1, 0);
+        assert_eq!(m.read(0x25000, 2).unwrap(), &(lk::WRLCK as u16).to_le_bytes());
+        assert_eq!((m.read_u64(0x25008).unwrap(), m.read_u64(0x25010).unwrap(), m.read_u32(0x25018).unwrap()), (20, 10, 999));
+        // F_SETLK in its way: EAGAIN; F_SETLKW: parks on the lock.
+        flock(&mut m, lk::RDLCK as u16, 25, 1);
+        assert_eq!(sys(&mut m, &mut k, nr::FCNTL, &[fd, 6, 0x25000]).1, -(Errno::EAGAIN.0 as i64));
+        let (out, _) = sys(&mut m, &mut k, nr::FCNTL, &[fd, 7, 0x25000]);
+        let SyscallOutcome::Blocking(BlockOp::FileLock { req, .. }) = out else { panic!("F_SETLKW parks: {out:?}") };
+        assert_eq!(req, LockReq::Set { file: "/lk".into(), owner: me, pid: k.pid, typ: lk::RDLCK, start: 25, end: 26 });
+        assert!(!locks.would_grant(&req));
+        locks.set("/lk", Owner::Pid(999), 999, lk::UNLCK, 0, u64::MAX, false).unwrap();
+        assert!(locks.would_grant(&req));
+        assert_eq!(locks.apply(&req), Ok(0));
+        // Closing the other descriptor of the file drops every lock the
+        // process has on it.
+        assert_eq!(locks.set("/lk", Owner::Pid(999), 999, lk::WRLCK, 0, u64::MAX, false), Err(Errno::EAGAIN));
+        sys(&mut m, &mut k, nr::CLOSE, &[fd2]);
+        assert_eq!(locks.set("/lk", Owner::Pid(999), 999, lk::WRLCK, 0, u64::MAX, false), Ok(0));
+        // An OFD lock is the description's, pid -1, and needs l_pid 0.
+        locks.set("/lk", Owner::Pid(999), 999, lk::UNLCK, 0, u64::MAX, false).unwrap();
+        flock(&mut m, lk::WRLCK as u16, 0, 5);
+        m.write_u32(0x25018, 1).unwrap();
+        assert_eq!(sys(&mut m, &mut k, nr::FCNTL, &[fd, 37, 0x25000]).1, -(Errno::EINVAL.0 as i64));
+        flock(&mut m, lk::WRLCK as u16, 0, 5);
+        assert_eq!(sys(&mut m, &mut k, nr::FCNTL, &[fd, 37, 0x25000]).1, 0);
+        assert_eq!(locks.get("/lk", Owner::Pid(999), lk::RDLCK, 0, 1).map(|c| c.pid), Some(-1));
+        sys(&mut m, &mut k, nr::CLOSE, &[fd]);
+        assert_eq!(locks.get("/lk", Owner::Pid(999), lk::WRLCK, 0, u64::MAX), None, "all gone with the last descriptor");
+    }
+
+    #[test]
     fn free_fd_table_calls_answer_as_the_kernel_does() {
         use crate::unix::lock_op;
         let (mut buf, mut k) = setup();
@@ -16230,7 +18133,7 @@ mod tests {
             got.push(sys(&mut m, &mut k, nr::FCNTL, &[21, F_GETFD]));
             got.push(sys(&mut m, &mut k, nr::FCNTL, &[fd, F_DUPFD_CLOEXEC, 30]));
             got.push(sys(&mut m, &mut k, nr::FCNTL, &[30, F_GETFD]));
-            m.write_u64(0x25000, !0).unwrap();
+            m.write(0x25000, &[0u8; 32]).unwrap();
             got.push(sys(&mut m, &mut k, nr::FCNTL, &[fd, F_GETLK, 0x25000]));
             got.push(m.read(0x25000, 2).unwrap()[0] as i64);
             got.push(sys(&mut m, &mut k, nr::FCNTL, &[fd, F_SETFL, oflags::O_NONBLOCK]));
@@ -17106,7 +19009,7 @@ mod tests {
             got.push(sys(&mut m, &mut k, raw::DUP3, [fd, 21, oflags::O_CLOEXEC]));
             got.push(sys(&mut m, &mut k, raw::FCNTL64, [21, 1, 0]));
             // F_GETLK64 (12) is the 32-bit ABI's F_GETLK.
-            m.write_u64(0x25000, !0).unwrap();
+            m.write(0x25000, &[0u8; 32]).unwrap();
             got.push(sys(&mut m, &mut k, raw::FCNTL64, [fd, 12, 0x25000]));
             got.push(m.read(0x25000, 2).unwrap()[0] as i32);
             got.push(sys(&mut m, &mut k, raw::FLOCK, [fd, 2, 0]));
@@ -17132,5 +19035,78 @@ mod tests {
         k.syscall(&mut m, 0);
         let arch = gex_abi::ARCH_NAME.as_bytes();
         assert_eq!(m.read(0x20000 + 65 * 4, arch.len()).unwrap(), arch);
+    }
+}
+
+/// The top of the code space of 64-bit Wine lowered to a wasm32 memory: its
+/// images, executable allocations and mappings go below it (Wine's
+/// virtual.c `w64_code_space_limit`).
+pub const W64_CODE_TOP: u64 = 0x7fff_0000;
+
+/// Whether the PE image whose headers start `head` is an x86-64 one that
+/// only a 64-bit memory can load: it has no relocations (stripped, or no
+/// relocation directory), so it goes at its preferred base alone, and that
+/// base puts it above [`W64_CODE_TOP`] (a linker's default x86-64 base,
+/// 0x140000000, is). Anything else, or headers that do not parse: false.
+pub fn pe_needs_mem64(head: &[u8]) -> bool {
+    let u16_at = |o: usize| head.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    let u32_at = |o: usize| head.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let u64_at = |o: usize| head.get(o..o + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()));
+    let parse = || -> Option<bool> {
+        if head.get(..2)? != b"MZ" {
+            return None;
+        }
+        let nt = u32_at(0x3c)? as usize;
+        if head.get(nt..nt + 4)? != b"PE\0\0" || u16_at(nt + 4)? != 0x8664 {
+            return None;
+        }
+        let chars = u16_at(nt + 22)?;
+        let opt = nt + 24;
+        if u16_at(opt)? != 0x20b {
+            return None;
+        }
+        let (base, size) = (u64_at(opt + 24)?, u32_at(opt + 56)? as u64);
+        let dirs = u32_at(opt + 108)?;
+        let relocs = if dirs > 5 { u32_at(opt + 112 + 5 * 8 + 4)? } else { 0 };
+        let fixed = chars & 1 != 0 || relocs == 0;
+        Some(fixed && base.saturating_add(size) > W64_CODE_TOP)
+    };
+    parse().unwrap_or(false)
+}
+
+#[cfg(test)]
+mod pe_mem64_tests {
+    use super::pe_needs_mem64;
+
+    /// A minimal PE32+ header: `base`, `chars`, the relocation directory's size.
+    fn pe(base: u64, chars: u16, relocs: u32, machine: u16) -> Vec<u8> {
+        let mut b = vec![0u8; 512];
+        b[..2].copy_from_slice(b"MZ");
+        b[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        b[0x80..0x84].copy_from_slice(b"PE\0\0");
+        b[0x84..0x86].copy_from_slice(&machine.to_le_bytes());
+        b[0x96..0x98].copy_from_slice(&chars.to_le_bytes());
+        let opt = 0x98;
+        b[opt..opt + 2].copy_from_slice(&0x20bu16.to_le_bytes());
+        b[opt + 24..opt + 32].copy_from_slice(&base.to_le_bytes());
+        b[opt + 56..opt + 60].copy_from_slice(&0x10000u32.to_le_bytes());
+        b[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes());
+        b[opt + 112 + 44..opt + 112 + 48].copy_from_slice(&relocs.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn fixed_high_base_needs_mem64() {
+        assert!(pe_needs_mem64(&pe(0x1_4000_0000, 0x23, 0, 0x8664)));
+        assert!(pe_needs_mem64(&pe(0x1_4000_0000, 0x22, 0, 0x8664)));
+    }
+
+    #[test]
+    fn relocatable_or_low_does_not() {
+        assert!(!pe_needs_mem64(&pe(0x1_4000_0000, 0x22, 0x200, 0x8664)));
+        assert!(!pe_needs_mem64(&pe(0x40_0000, 0x23, 0, 0x8664)));
+        assert!(!pe_needs_mem64(&pe(0x1_4000_0000, 0x23, 0, 0x14c)));
+        assert!(!pe_needs_mem64(b"MZ"));
+        assert!(!pe_needs_mem64(b"\x7fELF"));
     }
 }

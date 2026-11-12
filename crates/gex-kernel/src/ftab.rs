@@ -81,6 +81,7 @@ pub struct Func {
 }
 
 /// The process's function table, host side.
+#[derive(Clone)]
 pub struct FuncMap {
     next: u32,
     by_addr: BTreeMap<u64, Func>,
@@ -90,6 +91,9 @@ pub struct FuncMap {
     /// index is retired only when the last of them goes.
     refs: std::collections::HashMap<u32, u32>,
     installs: Vec<Install>,
+    /// Installs whose functions stay in the tables while no address maps
+    /// to them ([`FuncMap::keep`]).
+    kept: std::collections::HashSet<u32>,
     log: Vec<Event>,
     /// Indices handed out and later retired, for statistics.
     pub retired: u64,
@@ -103,7 +107,7 @@ impl Default for FuncMap {
 
 impl FuncMap {
     pub fn new() -> FuncMap {
-        FuncMap { next: RESERVED, by_addr: BTreeMap::new(), refs: Default::default(), installs: Vec::new(), log: Vec::new(), retired: 0 }
+        FuncMap { next: RESERVED, by_addr: BTreeMap::new(), refs: Default::default(), installs: Vec::new(), kept: Default::default(), log: Vec::new(), retired: 0 }
     }
 
     /// Map `addr` to `f`, and retire the index it had if nothing else
@@ -122,6 +126,9 @@ impl FuncMap {
         *n = n.saturating_sub(1);
         if *n == 0 {
             self.refs.remove(&idx);
+            if self.install_of(idx).is_some_and(|i| self.kept.contains(&i)) {
+                return;
+            }
             self.log.push(Event::Retire(idx));
             self.retired += 1;
         }
@@ -147,6 +154,28 @@ impl FuncMap {
     /// a unit installed one.
     pub fn twin(&self, addr: u64) -> Option<Func> {
         self.by_addr.get(&(addr | gex_abi::ftab::TWIN)).copied()
+    }
+
+    /// The install holding index `idx`, if any.
+    fn install_of(&self, idx: u32) -> Option<u32> {
+        // In index order (`publish`, `publish_at` past `next`).
+        let i = self.installs.partition_point(|x| x.base <= idx);
+        let n = i.checked_sub(1)?;
+        let x = &self.installs[n];
+        (idx < x.base + x.len.max(1)).then_some(n as u32)
+    }
+
+    /// Install `i`'s functions are the module's own for its whole life,
+    /// whichever addresses map to them (Wine's PE module, bound at each DLL's
+    /// skeleton as it maps): an index no address maps to any more is never
+    /// retired. Its function is also a C function pointer of the module's,
+    /// which native code calls by its index (the resolve stub there: an
+    /// indirect call type mismatch); and a DLL freed and loaded again, at
+    /// the base another DLL had meanwhile, maps its exports back to the
+    /// indices that DLL's mapping had retired, where the resolve stub
+    /// resolved each address to the same index for ever.
+    pub fn keep(&mut self, i: u32) {
+        self.kept.insert(i);
     }
 
     pub fn installs(&self) -> &[Install] {
@@ -297,10 +326,11 @@ pub struct Request<'a> {
     /// tier-1 guards each block there (`Block::guard`) and the function
     /// JIT leaves it alone.
     pub volatile: &'a dyn Fn(u64) -> bool,
-    /// The value `gex_abi::PAGE_GEN` holds for a page (guest address /
-    /// `DISPATCH_PAGE`) now, never 0: what the translation's page checks
-    /// compare against. Asking numbers the page if it was not.
-    pub page_gen: &'a dyn Fn(u64) -> u32,
+    /// The `gex_abi::PAGE_GEN` word of a page (guest address /
+    /// `DISPATCH_PAGE`): its guest address, and the value it holds now,
+    /// never 0, which the translation's page checks compare against.
+    /// Asking numbers the page if it was not.
+    pub page_gen: &'a dyn Fn(u64) -> (u64, u32),
     /// An i386 (compatibility-mode) program.
     pub class32: bool,
 }
@@ -346,12 +376,9 @@ pub fn translator() -> Option<&'static dyn Translator> {
 /// Write `addr → idx` into the probe cache in guest memory `mem`. An
 /// address or index no entry can hold (`gex_abi::fcache_pack`) clears the
 /// slot instead, so it is left to miss.
-pub fn fcache_write(mem: &mut [u8], addr: u64, idx: u32) {
-    let at = gex_abi::fcache_entry(addr) as usize;
+pub fn fcache_write(mem: &mut crate::GuestMem<'_>, addr: u64, idx: u32) {
     let v = gex_abi::fcache_pack(addr, idx).unwrap_or(FCACHE_EMPTY);
-    if let Some(e) = mem.get_mut(at..at + 8) {
-        e.copy_from_slice(&v.to_le_bytes());
-    }
+    let _ = mem.write_u64(gex_abi::fcache_entry(addr), v);
 }
 
 /// An empty probe cache entry: address 0, the resolve stub.
@@ -361,10 +388,9 @@ const FCACHE_EMPTY: u64 = 0;
 /// whose cache names another table's indices -- an `execve`'s new program,
 /// or a fork's child, whose low region (and the cache in it) is a copy of
 /// the parent's while its table is its own.
-pub fn fcache_reset(mem: &mut [u8]) {
-    let (lo, hi) = (gex_abi::FCACHE as usize, (gex_abi::FCACHE + gex_abi::FCACHE_BYTES) as usize);
+pub fn fcache_reset(mem: &mut crate::GuestMem<'_>) {
     let empty = FCACHE_EMPTY.to_le_bytes();
-    if let Some(c) = mem.get_mut(lo..hi) {
+    if let Ok(c) = mem.read_mut(gex_abi::FCACHE, gex_abi::FCACHE_BYTES as usize) {
         for e in c.chunks_exact_mut(8) {
             e.copy_from_slice(&empty);
         }
@@ -373,13 +399,10 @@ pub fn fcache_reset(mem: &mut [u8]) {
 
 /// Clear `addr`'s probe cache entry if it names `addr` (another address in
 /// the slot keeps it).
-pub fn fcache_clear(mem: &mut [u8], addr: u64) {
-    let at = gex_abi::fcache_entry(addr) as usize;
-    if let Some(e) = mem.get_mut(at..at + 8) {
-        let v = u64::from_le_bytes(e.try_into().unwrap());
-        if v & gex_abi::FCACHE_TAG_MASK == addr {
-            e.copy_from_slice(&FCACHE_EMPTY.to_le_bytes());
-        }
+pub fn fcache_clear(mem: &mut crate::GuestMem<'_>, addr: u64) {
+    let at = gex_abi::fcache_entry(addr);
+    if mem.read_u64(at).is_ok_and(|v| v & gex_abi::FCACHE_TAG_MASK == addr) {
+        let _ = mem.write_u64(at, FCACHE_EMPTY);
     }
 }
 
@@ -549,16 +572,38 @@ mod tests {
     }
 
     #[test]
+    fn a_kept_install_keeps_its_indices() {
+        // One DLL's skeleton at 0x7fae_0000 (its entry bound to slot 1 of
+        // the module), freed; another DLL at the same base takes the
+        // address (slot 5); the first loaded again there.
+        let mut m = FuncMap::new();
+        let a = m.publish(8, 7, Tier::Unit, &[(0x7fae_1000, 1)]);
+        m.keep(a);
+        let first = m.get(0x7fae_1000).unwrap().idx;
+        let before = m.log_len();
+        m.bind(a, &[(0x7fae_1000, 5)]);
+        m.bind(a, &[(0x7fae_1000, 1)]);
+        assert_eq!(m.retire(0x7fae_1000), Some(first));
+        assert!(m.log_from(before).is_empty(), "a kept install's index was retired");
+        // Another install's index is retired as before.
+        m.publish(2, 9, Tier::Jit, &[(0x5000, 0)]);
+        let idx = m.get(0x5000).unwrap().idx;
+        let before = m.log_len();
+        m.publish(1, 10, Tier::Jit, &[(0x5000, 0)]);
+        assert!(m.log_from(before).contains(&Event::Retire(idx)));
+    }
+
+    #[test]
     fn probe_cache_entries() {
         let mut mem = vec![0u8; (gex_abi::FCACHE + gex_abi::FCACHE_BYTES) as usize];
-        fcache_write(&mut mem, 0x40_1234, 99);
+        fcache_write(&mut crate::GuestMem::new(&mut mem), 0x40_1234, 99);
         let at = gex_abi::fcache_entry(0x40_1234) as usize;
         let v = u64::from_le_bytes(mem[at..at + 8].try_into().unwrap());
         assert_eq!(gex_abi::fcache_probe(v, 0x40_1234), 99);
         // Another address sharing the slot does not clear it.
-        fcache_clear(&mut mem, 0x40_1235);
+        fcache_clear(&mut crate::GuestMem::new(&mut mem), 0x40_1235);
         assert_eq!(u64::from_le_bytes(mem[at..at + 8].try_into().unwrap()), v);
-        fcache_clear(&mut mem, 0x40_1234);
+        fcache_clear(&mut crate::GuestMem::new(&mut mem), 0x40_1234);
         assert_eq!(u64::from_le_bytes(mem[at..at + 8].try_into().unwrap()), 0);
     }
 
@@ -572,23 +617,23 @@ mod tests {
         assert_eq!(gex_abi::fcache_entry(t), gex_abi::fcache_entry(high));
         let at = gex_abi::fcache_entry(t) as usize;
         let entry = |mem: &[u8]| u64::from_le_bytes(mem[at..at + 8].try_into().unwrap());
-        fcache_write(&mut mem, high, 7);
+        fcache_write(&mut crate::GuestMem::new(&mut mem), high, 7);
         assert_eq!(gex_abi::fcache_probe(entry(&mem), high), 7);
         assert_eq!(gex_abi::fcache_probe(entry(&mem), t), gex_abi::ftab::RESOLVE);
-        fcache_write(&mut mem, t, 8);
+        fcache_write(&mut crate::GuestMem::new(&mut mem), t, 8);
         assert_eq!(gex_abi::fcache_probe(entry(&mem), t), 8);
         assert_eq!(gex_abi::fcache_probe(entry(&mem), high), gex_abi::ftab::RESOLVE);
         // A Wine image near the top of a 16 GiB memory.
-        fcache_write(&mut mem, 0x3_ffdd_1ce4, 9);
+        fcache_write(&mut crate::GuestMem::new(&mut mem), 0x3_ffdd_1ce4, 9);
         let at = gex_abi::fcache_entry(0x3_ffdd_1ce4) as usize;
         assert_eq!(gex_abi::fcache_probe(u64::from_le_bytes(mem[at..at + 8].try_into().unwrap()), 0x3_ffdd_1ce4), 9);
         // The other address clearing the slot leaves it; its own clears it.
-        fcache_clear(&mut mem, 0x3_ffdd_1ce4 + (1 << 32));
+        fcache_clear(&mut crate::GuestMem::new(&mut mem), 0x3_ffdd_1ce4 + (1 << 32));
         assert_ne!(u64::from_le_bytes(mem[at..at + 8].try_into().unwrap()), 0);
-        fcache_clear(&mut mem, 0x3_ffdd_1ce4);
+        fcache_clear(&mut crate::GuestMem::new(&mut mem), 0x3_ffdd_1ce4);
         assert_eq!(u64::from_le_bytes(mem[at..at + 8].try_into().unwrap()), 0);
         // What no entry can hold misses rather than wraps.
-        fcache_write(&mut mem, 1 << 40, 3);
+        fcache_write(&mut crate::GuestMem::new(&mut mem), 1 << 40, 3);
         let at = gex_abi::fcache_entry(1 << 40) as usize;
         assert_eq!(u64::from_le_bytes(mem[at..at + 8].try_into().unwrap()), 0);
     }

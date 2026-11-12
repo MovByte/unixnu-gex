@@ -1,6 +1,6 @@
-// The package web/runtime/build.sh makes (run.mjs builds it into the work
+// The package page/runtime/build.sh makes (run.mjs builds it into the work
 // directory), imported as a page would, with no baseUrl: it finds its files
-// beside its modules.
+// itself.
 
 export const meta = { hosts: ['browser'], images: ['busybox', 'package'], timeout: 120 };
 
@@ -9,9 +9,9 @@ export default async function (t) {
   // Not literals, which vite would try to resolve as its own.
   const pkg = t.work('pkg/');
   const { System } = await import(/* @vite-ignore */ `${pkg}index.mjs`);
-  const { Filesystem } = await import(/* @vite-ignore */ `${pkg}fs.mjs`);
+  const { MemoryFilesystem } = await import(/* @vite-ignore */ `${pkg}fs.mjs`);
   const sys = new System();
-  const fs = new Filesystem(sys);
+  const fs = new MemoryFilesystem(sys);
   fs.addTar(t.work('bb.tar.zst'));
   const t0 = performance.now();
   await timeout(sys.boot(), 60000, 'boot');

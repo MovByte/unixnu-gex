@@ -2,10 +2,10 @@
 // windows laid out by bare-desktop.js, which the page reads at
 // `__gexCompositor`) and an X client's window there, the X server started at
 // its first connection.
-import { setGlobals } from '../../web/src/page-globals.js';
-import { runProgram } from '../../web/src/runtime.js';
-import { untar } from '../../web/src/tar.js';
-import { unzstd } from '../../web/src/zfetch.js';
+import { setGlobals } from '../../page/src/page-globals.js';
+import { runProgram } from '../../page/src/run.js';
+import { untar } from '../../page/src/tar.js';
+import { unzstd } from '../../page/src/zfetch.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 120, html: `<div id="desk" style="position:relative;width:800px;height:600px"></div>` };
 
@@ -24,6 +24,7 @@ export default async function (t) {
     onData: () => ({ dispose() {} }), onResize: () => ({ dispose() {} }), focus() {},
   };
   runProgram(term, {
+    filesystem: 'memory',
     elf: tree.files['/bin/rt-x11'], args: ['/bin/rt-x11', 'demo'], files: tree.files, dirs: tree.dirs, modes: tree.modes, symlinks: tree.links, hard: tree.hard,
     env: ['DISPLAY=:0', 'PATH=/bin'], wl: desk, hostX: true, onDesktop: (x) => { raw = x; },
   }).then((r) => { out += `\n[ended ${JSON.stringify(r?.status)}]`; }, (e) => { out += `\n[threw ${e}]`; });

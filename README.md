@@ -12,7 +12,7 @@ of the tree is upstream gex.
 
 **Where it stands.** Darwin programs run today under gex's native host,
 `gexc`, which runs the translated program on wasmtime. The browser host
-(`shims/browser`) does not start Darwin processes yet. See [Status](#status).
+(`hosts/browser`) does not start Darwin processes yet. See [Status](#status).
 
 ## gex, upstream
 
@@ -24,10 +24,10 @@ on wasmtime, for debugging and for building what a page loads ahead of time.
 
 The Linux and Windows support is upstream's, and this README does not
 document it again. Upstream's README is the reference for the base engine:
-[the revision this branch was taken from](https://github.com/HeyPuter/gex/blob/5d8888635798512ac96e6b4e6275157abea4b463/README.md)
-matches this tree's layout (`shims/`, `web/`, `tools/`). Upstream has
-reorganised its tree since, so its current README describes a newer layout.
-`web/README.md` covers the page's builds.
+[the revision this branch last merged](https://github.com/HeyPuter/gex/blob/8d55896e61824a0bc534d3c9c2de1b175f1b4a8f/README.md)
+matches this tree's layout (`hosts/`, `page/`, `toolchain/`, `scripts/`,
+`wine/`); a later upstream revision may describe a newer one.
+`page/README.md` covers the page's builds.
 
 ## The Darwin personality
 
@@ -136,7 +136,7 @@ Outside the kernel crate:
   calls; corecrypto uses these instructions without asking.
 - `crates/gexc/src/darwin_run.rs` is `gexc run` for a Mach-O file, and
   `crates/gexc/src/dsc_info.rs` is `gexc dsc-info`.
-- `shims/native/src/darwin_image.rs` loads a program and its dyld, for the
+- `hosts/native/src/darwin_image.rs` loads a program and its dyld, for the
   first program and for `execve`.
 
 ## Principles
@@ -352,7 +352,7 @@ The Darwin work, beside upstream's tree:
 | `crates/gex-ld/src/macho.rs`, `dsc.rs` | Mach-O loading; the dyld shared cache |
 | `crates/gex-abi/src/crypto.rs` | the A64 cryptographic extension |
 | `crates/gexc/src/darwin_run.rs`, `dsc_info.rs` | `gexc run` for Mach-O; `gexc dsc-info` |
-| `shims/native/src/darwin_image.rs` | a Darwin program's image, as exec loads it |
+| `hosts/native/src/darwin_image.rs` | a Darwin program's image, as exec loads it |
 | `tests/darwin/src/` | the test programs, and the entitlements some are signed with |
 | `tests/darwin/build.sh`, `run.sh` | building and running them |
 | `tools/darwin-trust-cache.py` | making a trust cache bundle |

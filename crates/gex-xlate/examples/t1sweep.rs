@@ -116,6 +116,7 @@ fn main() {
                 safepoint: 8,
                 x87: 9,
                 mx: 10,
+                crypto: 11,
                 block_ty: 0,
                 entry_ty: 0,
                 blocks: &ids,
@@ -123,7 +124,9 @@ fn main() {
                 profile: None,
                 page_bases: pages.then_some(&page_bases),
                 dense_global: None,
+                alt_dir: None,
                 module_id: 0,
+                module_id_global: None,
                 loop_heads: Some(&heads),
                 enter: Some(10),
             };

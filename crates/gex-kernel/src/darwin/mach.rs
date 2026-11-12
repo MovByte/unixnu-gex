@@ -939,10 +939,10 @@ impl Kernel {
 
     /// The range a map's anywhere allocations are made in
     /// (`vm_map_get_range` of a map without user ranges: from its minimum
-    /// or its first page to its end), within the memory gex backs, its high
-    /// arena.
+    /// or its first page to its end), within the memory gex backs, above
+    /// its tables ([`gex_abi::DARWIN_GUEST_FLOOR`]).
     pub(crate) fn darwin_effective_range(&self) -> (u64, u64) {
-        (gex_abi::HIGH_ARENA_BASE.max(self.dtask.map_min).max(PAGE_MASK + 1), self.darwin_map_max().min(gex_abi::LIMIT64))
+        (gex_abi::DARWIN_GUEST_FLOOR.max(self.dtask.map_min).max(PAGE_MASK + 1), self.darwin_map_max().min(gex_abi::LIMIT64))
     }
 
     /// `vm_map_random_address_for_size`: up to 1000 random page-aligned
