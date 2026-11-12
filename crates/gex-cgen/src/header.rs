@@ -23,8 +23,8 @@ pub fn header() -> String {
     }
     let _ = writeln!(w, "#define GEX_RESUMABLE_PC 0x{:x}ull", crate::RESUMABLE_PC);
     // The flavour's directory and patched bits: an M64 unit's are the dense
-    // tables above 4 GiB (gex_abi::DISPATCH_DIR64), hence `ull` there; an M32
-    // unit's header is as it was.
+    // tables (gex_abi::tables64: above 4 GiB, a Darwin process's in its page
+    // zero), hence `ull` there; an M32 unit's header is as it was.
     let sfx = if gex_abi::mem64() { "ull" } else { "u" };
     let _ = writeln!(w, "#define GEX_DISPATCH_DIR 0x{:x}{sfx}", gex_abi::dispatch_dir());
     let _ = writeln!(w, "#define GEX_DISPATCH_PAGE 0x{:x}u", gex_abi::DISPATCH_PAGE);

@@ -673,12 +673,14 @@ pub fn note_address_space_short(len: u64) {
 ///   arena: in the browser the shim shares the guest's memory and keeps its
 ///   own stack and data there. Natively it is only unused, and refusing it
 ///   moves a guest's mapping elsewhere, which is harmless.
-/// - in an M64 memory, `[DISPATCH_DIR64, HIGH_TABLES_END)`: its dense
-///   directory and patched-page bits.
+/// - in an M64 memory, its dense directory and patched-page bits
+///   (`gex_abi::tables64_range`: above 4 GiB, or a Darwin process's in its
+///   page zero).
 pub fn hits_runtime(start: u64, end: u64) -> bool {
+    let (tables, tables_end) = gex_abi::tables64_range();
     start < gex_abi::DISPATCH_DIR_END
         || (start < MMAP_BOTTOM && end > gex_abi::STACK_TOP)
-        || (gex_abi::mem64() && start < gex_abi::HIGH_TABLES_END && end > gex_abi::DISPATCH_DIR64)
+        || (gex_abi::mem64() && start < tables_end && end > tables)
 }
 
 pub fn page_align_up(v: u64) -> u64 {

@@ -135,26 +135,42 @@ pub const LIMIT64_PAGES: u64 = LIMIT64 / WASM_PAGE;
 /// directory, one `u32` for every page of `[0, LIMIT64)`, so code can live
 /// anywhere in the memory (a W^X JIT's high pages made executable), and its
 /// [`PATCHED_PAGES`] bits after it. At the bottom of the high region, below
-/// the arena. An M32 process uses the low region's directory instead; see
+/// the arena. An M32 process uses the low region's directory instead, and a
+/// Darwin process the same tables at [`DARWIN_TABLES64`]; see
 /// [`dispatch_dir`].
 pub const DISPATCH_DIR64: u64 = 1 << 32;
 
 /// Pages [`DISPATCH_DIR64`] covers: all of [`LIMIT64`].
 pub const DISPATCH_MAX_PAGES64: u64 = LIMIT64 / DISPATCH_PAGE;
 
+/// Where in the M64 tables the [`PATCHED_PAGES`] bits start, and where a
+/// Darwin process's protection table ([`PERM_TABLE64`]) does.
+const TABLES64_PATCHED: u64 = DISPATCH_MAX_PAGES64 * 4;
+const TABLES64_PERM: u64 = TABLES64_PATCHED + DISPATCH_MAX_PAGES64 / 8;
+
 /// The M64 [`PATCHED_PAGES`]: one bit per page of [`DISPATCH_MAX_PAGES64`].
-pub const PATCHED_PAGES64: u64 = DISPATCH_DIR64 + DISPATCH_MAX_PAGES64 * 4;
+pub const PATCHED_PAGES64: u64 = DISPATCH_DIR64 + TABLES64_PATCHED;
+
+/// Where a Darwin process keeps its M64 tables: inside the 4 GiB
+/// `__PAGEZERO` every arm64 program has, which its map never reaches
+/// (`load_machfile` refuses a program without it and raises the map's
+/// minimum past it), so that its address space starts at 4 GiB, as XNU's
+/// does, with its image slid from there. Above every table and context the
+/// runtime keeps low ([`DISPATCH_DIR_END`]) and the low arena
+/// ([`MMAP_TOP`]); laid out as the high region's tables are, with the
+/// protection table ([`PERM_TABLE64`]) after them.
+pub const DARWIN_TABLES64: u64 = 0xc000_0000;
 
 /// A Darwin process's page protections, as its translated code and its
 /// kernel's copies check them: one byte per [`PERM_PAGE`] of [`LIMIT64`],
-/// after [`PATCHED_PAGES64`]. A byte's low four bits are 0 where nothing is
-/// mapped, else [`perm::MAPPED`] with the mapping's protection bits; its
-/// high four ([`perm::BOTH_SHIFT`]) are what this page and the next both
-/// allow, so an access that may reach the next page is let through with one
-/// look. Every page below [`DARWIN_GUEST_FLOOR`] reads 0. Kept by the
-/// process's kernel as its map changes, before the change returns to the
-/// program.
-pub const PERM_TABLE64: u64 = PATCHED_PAGES64 + DISPATCH_MAX_PAGES64 / 8;
+/// after its patched bits in [`DARWIN_TABLES64`]. A byte's low four bits are
+/// 0 where nothing is mapped, else [`perm::MAPPED`] with the mapping's
+/// protection bits; its high four ([`perm::BOTH_SHIFT`]) are what this page
+/// and the next both allow, so an access that may reach the next page is let
+/// through with one look. Every page below [`DARWIN_GUEST_FLOOR`] reads 0.
+/// Kept by the process's kernel as its map changes, before the change
+/// returns to the program.
+pub const PERM_TABLE64: u64 = DARWIN_TABLES64 + TABLES64_PERM;
 
 /// The page [`PERM_TABLE64`] has a byte for: a Darwin process's 16 KiB.
 pub const PERM_PAGE_SHIFT: u32 = 14;
@@ -174,8 +190,13 @@ pub mod perm {
     pub const BOTH_SHIFT: u32 = 4;
 }
 
-/// End of the M64 tables, rounded to 1 MiB.
-pub const HIGH_TABLES_END: u64 = (PERM_TABLE64 + PERM_TABLE_BYTES + 0xf_ffff) & !0xf_ffff;
+/// The M64 tables' size, rounded to 1 MiB: room for the protection table
+/// whichever tables hold it, and the zero byte past it an access check may
+/// read.
+pub const TABLES64_BYTES: u64 = (TABLES64_PERM + PERM_TABLE_BYTES + 0xf_ffff) & !0xf_ffff;
+
+/// End of the M64 tables.
+pub const HIGH_TABLES_END: u64 = DISPATCH_DIR64 + TABLES64_BYTES;
 
 /// The bottom of an M64 process's high arena: non-executable data (Linux
 /// `mmap` without `PROT_EXEC`, NT allocations without an executable
@@ -183,11 +204,25 @@ pub const HIGH_TABLES_END: u64 = (PERM_TABLE64 + PERM_TABLE_BYTES + 0xf_ffff) & 
 /// the M64 tables.
 pub const HIGH_ARENA_BASE: u64 = HIGH_TABLES_END;
 
+/// Where this process's M64 tables are: [`DISPATCH_DIR64`], or a Darwin
+/// process's [`DARWIN_TABLES64`] ([`commpage_fold`] says which).
+#[inline]
+pub fn tables64() -> u64 {
+    if commpage_fold() { DARWIN_TABLES64 } else { DISPATCH_DIR64 }
+}
+
+/// [`tables64`]'s byte range, `[start, end)`.
+#[inline]
+pub fn tables64_range() -> (u64, u64) {
+    (tables64(), tables64() + TABLES64_BYTES)
+}
+
 /// The dispatch directory of this process's memory flavour: the low region's
-/// [`DISPATCH_DIR`] for M32, [`DISPATCH_DIR64`] for M64. Also [`page_gen`].
+/// [`DISPATCH_DIR`] for M32, the M64 tables' ([`tables64`]) for M64. Also
+/// [`page_gen`].
 #[inline]
 pub fn dispatch_dir() -> u64 {
-    if mem64() { DISPATCH_DIR64 } else { DISPATCH_DIR }
+    if mem64() { tables64() } else { DISPATCH_DIR }
 }
 
 /// Pages [`dispatch_dir`] covers.
@@ -205,7 +240,7 @@ pub fn page_gen() -> u64 {
 /// The [`PATCHED_PAGES`] bits of this flavour.
 #[inline]
 pub fn patched_pages() -> u64 {
-    if mem64() { PATCHED_PAGES64 } else { PATCHED_PAGES }
+    if mem64() { tables64() + TABLES64_PATCHED } else { PATCHED_PAGES }
 }
 
 /// The directory's byte range `[dispatch_dir(), end)`.
@@ -1246,12 +1281,12 @@ pub const DARWIN_ADDR_MASK: u64 = LIMIT64 - 1;
 /// at the top of the 64-bit memory, a range the kernel reserves for it.
 pub const DARWIN_COMMPAGE_ALIAS: u64 = DARWIN_COMMPAGE_RO & DARWIN_ADDR_MASK;
 
-/// The lowest address a Darwin process's code may reach: below it are the
+/// The lowest address a Darwin process's code may reach: the end of the
 /// 4 GiB `__PAGEZERO` every arm64 program has (`load_machfile` refuses one
-/// without; the map's minimum is raised past it) and the tables gex keeps
-/// above it, where the process has nothing mapped. Every translated access
-/// below it traps, as on the device the access would fault.
-pub const DARWIN_GUEST_FLOOR: u64 = HIGH_ARENA_BASE;
+/// without; the map's minimum is raised past it), inside which gex keeps
+/// the process's tables ([`DARWIN_TABLES64`]). Every translated access below
+/// it traps, as on the device the access would fault.
+pub const DARWIN_GUEST_FLOOR: u64 = 1 << 32;
 
 static COMMPAGE_FOLD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -1391,8 +1426,13 @@ mod tests {
         // The M64 tables sit above every M32 address, below the arena.
         assert!(DISPATCH_DIR64 >= GUEST_LIMIT);
         assert!(DISPATCH_MAX_PAGES64 * DISPATCH_PAGE == LIMIT64);
-        assert!(PATCHED_PAGES64 + DISPATCH_MAX_PAGES64 / 8 <= PERM_TABLE64);
-        assert!(PERM_TABLE64 + PERM_TABLE_BYTES <= HIGH_TABLES_END && HIGH_TABLES_END <= DARWIN_GUEST_FLOOR);
+        assert!(PATCHED_PAGES64 + DISPATCH_MAX_PAGES64 / 8 <= DISPATCH_DIR64 + TABLES64_PERM);
+        assert!(TABLES64_PERM + PERM_TABLE_BYTES < TABLES64_BYTES);
+        // A Darwin process's tables are inside its page zero, above what
+        // the runtime keeps low and the low arena.
+        assert!(DARWIN_TABLES64 >= DISPATCH_DIR_END && DARWIN_TABLES64 >= MMAP_TOP);
+        assert!(PERM_TABLE64 + PERM_TABLE_BYTES < DARWIN_TABLES64 + TABLES64_BYTES);
+        assert!(DARWIN_TABLES64 + TABLES64_BYTES <= DARWIN_GUEST_FLOOR && DARWIN_GUEST_FLOOR == DISPATCH_DIR64);
         assert!(HIGH_ARENA_BASE < LIMIT64 && HIGH_ARENA_BASE % WASM_PAGE == 0);
     }
 }

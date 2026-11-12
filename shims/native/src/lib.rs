@@ -2947,9 +2947,10 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         let low = gex_abi::DISPATCH_DIR_END as usize;
         dst[..low].copy_from_slice(&src[..low]);
         // An M64 memory's directory and patched bits are its dense tables
-        // above 4 GiB instead.
+        // instead (above 4 GiB, or a Darwin process's in its page zero).
         if gex_abi::mem64() {
-            let (a, b) = (gex_abi::DISPATCH_DIR64 as usize, gex_abi::HIGH_TABLES_END as usize);
+            let (a, b) = gex_abi::tables64_range();
+            let (a, b) = (a as usize, b as usize);
             dst[a..b].copy_from_slice(&src[a..b]);
         }
         let mut sparse = SparseCopy::new();

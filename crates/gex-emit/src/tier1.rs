@@ -1553,7 +1553,7 @@ impl<'a> Emitter<'a> {
         // A byte's page's protection. The first byte's index is in the
         // table when the static offset is under a page (the address was
         // wrapped into the memory, and the byte past the table reads 0,
-        // `HIGH_TABLES_END` padding it); else, and for the last byte, the
+        // `TABLES64_BYTES` padding it); else, and for the last byte, the
         // index is held to the table's end.
         let small = (0..PERM_PAGE as i64).contains(&offset);
         let byte = |e: &mut Self, past: u32, clamp: bool| {
