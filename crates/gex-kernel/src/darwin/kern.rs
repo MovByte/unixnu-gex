@@ -433,6 +433,9 @@ impl Kernel {
         if let Some(r) = self.darwin_filesec_call(m, raw, a) {
             return Some(res(r));
         }
+        if let Some(e) = self.darwin_sb_socket_call(m, raw, a) {
+            return Some(neg(e));
+        }
         if let Some(e) = self.darwin_sock_refused(raw, a) {
             return Some(neg(e));
         }

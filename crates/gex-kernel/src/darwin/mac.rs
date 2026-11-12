@@ -15,13 +15,17 @@
 //! checks among them: file-read*, file-write*, ...) are not called, for the
 //! platform profile's rules as for a sandbox's. The call filters ask of the
 //! Unix calls, Mach traps and kernel MIG routines a process's masks do not
-//! let through (syscall-unix, syscall-mach, syscall-mig).
+//! let through (syscall-unix, syscall-mach, syscall-mig). The socket calls
+//! ask network-bind, -inbound and -outbound, system-socket and the
+//! socket-option and socket-ioctl operations, a unix socket's operations
+//! being allowed at once.
 
 use std::sync::Arc;
 
 use super::sandbox::{self, Facts, Outcome, Stop, Value};
 use super::sandboxes::Sandbox;
 use crate::syscalls::Kernel;
+use crate::GuestMem;
 
 /// Darwin's errnos the framework selects between.
 mod e {
@@ -61,7 +65,13 @@ pub mod op {
     pub const PROCESS_INFO_PIDINFO: usize = 128;
     pub const PROCESS_INFO_CODESIGNATURE: usize = 124;
     pub const PROCESS_LEGACY_CODESIGNING_STATUS_SET: usize = 142;
+    pub const NETWORK_INBOUND: usize = 110;
+    pub const NETWORK_BIND: usize = 111;
+    pub const NETWORK_OUTBOUND: usize = 112;
     pub const SIGNAL: usize = 146;
+    pub const SOCKET_IOCTL: usize = 147;
+    pub const SOCKET_OPTION_GET: usize = 149;
+    pub const SOCKET_OPTION_SET: usize = 150;
     pub const SYSCALL_UNIX: usize = 152;
     pub const SYSCALL_MACH: usize = 153;
     pub const SYSCALL_MIG: usize = 154;
@@ -71,6 +81,7 @@ pub mod op {
     pub const SYSTEM_KAS_INFO: usize = 166;
     pub const SYSTEM_MAC_SYSCALL: usize = 173;
     pub const SYSTEM_SCHED: usize = 180;
+    pub const SYSTEM_SOCKET: usize = 182;
     pub const SYSTEM_SUSPEND_RESUME: usize = 183;
     pub const STORAGE_CLASS_MAP: usize = 189;
     pub const PROCESS_EXEC_UPDATE_LABEL: usize = 190;
@@ -148,6 +159,27 @@ pub struct SbArgs {
     pub xpc: bool,
     /// A vnode operation's vnode (kind 1).
     pub vnode: Option<SbVnode>,
+    /// A socket operation's socket (kind 2).
+    pub socket: Option<SbSocket>,
+}
+
+/// What a socket operation's filters read of its socket: whether there is
+/// one (`+0xe8`; `socket_check_create` has none yet), its domain, type and
+/// protocol (`sock_gettype`, `+0x104`), its local address (`+0xd8`: the
+/// hook's, else the socket's name, which the kext fetches when a filter
+/// asks, and which an inet socket here always has), the remote one the hook
+/// names (`+0xe0`), each as sockaddr bytes, a socket option's level and
+/// name (`+0xfc`, `+0xf8`), and an ioctl's command (`+0xf0`).
+#[derive(Clone, Debug, Default)]
+pub struct SbSocket {
+    pub present: bool,
+    pub domain: u32,
+    pub ty: u32,
+    pub protocol: u32,
+    pub local: Option<Vec<u8>>,
+    pub remote: Option<Vec<u8>>,
+    pub option: (u32, u32),
+    pub command: u64,
 }
 
 /// What a vnode operation's filters read of its vnode.
@@ -175,6 +207,39 @@ impl SbVnode {
         let mount_len = if path == on { -1 } else { on.len() as i64 };
         SbVnode { path: path.as_bytes().to_vec(), mount_len, vtype, tty, mode: (mode & 0xfff) as u16, flags }
     }
+}
+
+/// `getsockaddr` of the `len` bytes the caller's address at `at` has: its
+/// length field the length, and AF_UNSPEC an inet socket's AF_INET for a
+/// sockaddr_in's length when `translate_unspec`; none when there is none
+/// to copy (no address, a length out of bounds, a fault).
+fn sockaddr_in(m: &GuestMem<'_>, so: &SbSocket, at: u64, len: u64, translate_unspec: bool) -> Option<Vec<u8>> {
+    if at == 0 || !(2..=255).contains(&len) {
+        return None;
+    }
+    let mut sa = m.read(at, len as usize).ok()?.to_vec();
+    sa[0] = len as u8;
+    if translate_unspec && sa[1] == 0 && so.domain == 2 && len == 16 {
+        sa[1] = 2;
+    }
+    Some(sa)
+}
+
+/// The socket behind file `h`, as Sandbox reads it (`sock_gettype`'s
+/// domain, type and `pr_protocol`, and an inet socket's name); none for a
+/// file that is no socket.
+pub fn sb_socket(h: &Arc<dyn crate::vfs::FileHandle>) -> Option<SbSocket> {
+    let so = |domain, ty, protocol, local| Some(SbSocket { present: true, domain, ty, protocol, local, ..Default::default() });
+    if Arc::clone(h).as_unix_dgram().is_some() {
+        return so(1, 2, 0, None);
+    }
+    if Arc::clone(h).as_unix_socket().is_some() || Arc::clone(h).as_remote_unix().is_some() {
+        return so(1, 1, 0, None);
+    }
+    let s = Arc::clone(h).as_inet_socket()?;
+    let (ip, port) = s.local();
+    let (ty, protocol) = if s.kind == crate::net::Kind::Udp { (2, 17) } else { (1, 6) };
+    so(2, ty, protocol, Some(super::sockaddr::out_inet(ip, port)))
 }
 
 /// The kernel's answers to Sandbox's filters, for an operation of the
@@ -338,6 +403,40 @@ impl Facts for KernelFacts<'_> {
     }
     fn developer_mode(&self) -> bool {
         super::amfi::DEVELOPER_MODE
+    }
+    fn socket(&self) -> Option<sandbox::SocketType> {
+        let s = self.a.socket.as_ref()?;
+        Some(sandbox::SocketType { present: s.present, domain: s.domain, ty: s.ty, protocol: s.protocol })
+    }
+    fn socket_local(&mut self) -> Result<Option<Vec<u8>>, Stop> {
+        Ok(self.a.socket.as_ref().and_then(|s| s.local.clone()))
+    }
+    fn socket_remote(&self) -> Option<Vec<u8>> {
+        self.a.socket.as_ref().and_then(|s| s.remote.clone())
+    }
+    fn socket_option(&self) -> (u32, u32) {
+        self.a.socket.as_ref().map_or((0, 0), |s| s.option)
+    }
+    fn socket_command(&self) -> u64 {
+        self.a.socket.as_ref().map_or(0, |s| s.command)
+    }
+    fn host_address(&mut self, sa: &[u8]) -> Result<bool, Stop> {
+        // The unspecified address is the host's; an interface's are not
+        // modelled (only lo0 is, and not its addresses).
+        match sa.get(1).copied().map(u32::from) {
+            Some(2) if sa.len() >= 8 => {
+                if sa[4..8] == [0; 4] {
+                    return Ok(true);
+                }
+            }
+            Some(30) if sa.len() >= 24 => {
+                if sa[8..24] == [0; 16] {
+                    return Ok(true);
+                }
+            }
+            _ => return Ok(false),
+        }
+        Err(Stop::Unported("sandbox: whether an address is one of the host's interfaces' (ifnet_list_get)".into()))
     }
     fn host_special_port(&self) -> u16 {
         self.a.number as u16
@@ -716,6 +815,165 @@ impl Kernel {
         const KERN_DENIED: i32 = 53;
         let a = SbArgs { kind: sandbox::kind::SYSCALL_MIG, number: idx, ..Default::default() };
         if self.darwin_sb_evaluate(op::SYSCALL_MIG, &a) == 0 { 0 } else { KERN_DENIED }
+    }
+
+    /// The socket of descriptor `fd`, as its operations' filters read it
+    /// ([`SbSocket`]); none for a descriptor that is no socket.
+    pub(crate) fn darwin_sb_socket_of(&self, fd: i32) -> Option<SbSocket> {
+        let f = self.fd_io().fds.get(fd).ok()?;
+        sb_socket(&f.handle)
+    }
+
+    /// Sandbox's socket hooks' common part (`0x...a00b50`): operation `op`
+    /// of socket `so` (no user socket is the kernel's), with the local and
+    /// remote addresses the hook names.
+    fn darwin_sb_socket(&mut self, op: usize, mut so: SbSocket, local: Option<Vec<u8>>, remote: Option<Vec<u8>>) -> u32 {
+        if local.is_some() {
+            so.local = local;
+        }
+        so.remote = remote;
+        let a = SbArgs { kind: sandbox::kind::SOCKET, socket: Some(so), ..Default::default() };
+        self.darwin_sb_evaluate(op, &a)
+    }
+
+    /// The socket calls' MAC checks, at the places XNU makes them, before
+    /// the protocols' own refusals; the error of a refusal. A descriptor
+    /// that is no socket, or an address the call cannot copy in, is not
+    /// asked about: the call fails as it would.
+    pub(crate) fn darwin_sb_socket_call(&mut self, m: &GuestMem<'_>, raw: u64, a: &[u64; 6]) -> Option<crate::errno::Errno> {
+        use super::sysno as sys;
+        let refusal = |e: u32| (e != 0).then(|| super::errno::errno_of(e as i32));
+        let so = |k: &Kernel| k.darwin_sb_socket_of(a[0] as i32);
+        let e = match raw {
+            // socket_common, first (socketpair has no check).
+            sys::SOCKET => self.darwin_mac_check_socket_create(a[0] as u32, a[1] as u32, a[2] as u32),
+            // bind, with its address (getsockaddr, AF_UNSPEC an inet
+            // socket's AF_INET); an AF_SYSTEM one is not asked about.
+            sys::BIND => {
+                let so = so(self)?;
+                let sa = sockaddr_in(m, &so, a[1], a[2], true)?;
+                if u32::from(sa[1]) == 32 {
+                    return None;
+                }
+                self.darwin_mac_check_socket_bind(so, sa)
+            }
+            sys::LISTEN => {
+                let so = so(self)?;
+                self.darwin_mac_check_socket_inbound(so)
+            }
+            // connectit (getsockaddr_s, AF_UNSPEC translated for a stream
+            // socket).
+            sys::CONNECT | sys::CONNECT_NOCANCEL => {
+                let so = so(self)?;
+                let dgram = so.ty == 2;
+                let sa = sockaddr_in(m, &so, a[1], a[2], !dgram)?;
+                self.darwin_mac_check_socket_connect(so, sa)
+            }
+            // sendit, for a call naming a destination.
+            sys::SENDTO | sys::SENDTO_NOCANCEL => {
+                let so = so(self)?;
+                let sa = sockaddr_in(m, &so, a[4], a[5], true)?;
+                self.darwin_mac_check_socket_send(so, sa)
+            }
+            sys::SENDMSG | sys::SENDMSG_NOCANCEL => {
+                let so = so(self)?;
+                // struct msghdr: msg_name, then msg_namelen.
+                let (name, len) = (m.read_u64(a[1]).ok()?, m.read_u32(a[1] + 8).ok()?);
+                let sa = sockaddr_in(m, &so, name, u64::from(len), true)?;
+                self.darwin_mac_check_socket_send(so, sa)
+            }
+            // recvit, for a socket that is not connected and whose protocol
+            // does not ask it to be (an unconnected UDP socket here; unix
+            // sockets' operations are always allowed).
+            sys::RECVFROM | sys::RECVFROM_NOCANCEL | sys::RECVMSG | sys::RECVMSG_NOCANCEL => {
+                let so = so(self)?;
+                let f = self.fd_io().fds.get(a[0] as i32).ok()?;
+                let inet = Arc::clone(&f.handle).as_inet_socket()?;
+                if inet.kind != crate::net::Kind::Udp || inet.peer().is_some() {
+                    return None;
+                }
+                self.darwin_mac_check_socket_inbound(so)
+            }
+            // setsockopt, past its EFAULT for a null value of a length;
+            // getsockopt, past its copyin of the length.
+            sys::SETSOCKOPT => {
+                if a[3] == 0 && a[4] != 0 {
+                    return None;
+                }
+                let so = so(self)?;
+                self.darwin_mac_check_sockopt(so, true, a[1] as u32, a[2] as u32)
+            }
+            sys::GETSOCKOPT => {
+                if a[4] != 0 && m.read_u32(a[4]).is_err() {
+                    return None;
+                }
+                let so = so(self)?;
+                self.darwin_mac_check_sockopt(so, false, a[1] as u32, a[2] as u32)
+            }
+            _ => return None,
+        };
+        refusal(e)
+    }
+
+    /// `mac_socket_check_create` (Sandbox's hook, slot 177): a unix, inet
+    /// or inet6 stream or datagram socket is not asked about; another is
+    /// system-socket of its domain, type and protocol.
+    pub(crate) fn darwin_mac_check_socket_create(&mut self, domain: u32, ty: u32, protocol: u32) -> u32 {
+        if domain <= 30 && (1u32 << domain) & 0x4000_0006 != 0 && matches!(ty, 1 | 2) {
+            return 0;
+        }
+        let socket = SbSocket { domain, ty, protocol, ..Default::default() };
+        let a = SbArgs { kind: sandbox::kind::SOCKET, socket: Some(socket), ..Default::default() };
+        self.darwin_sb_evaluate(op::SYSTEM_SOCKET, &a)
+    }
+
+    /// `mac_socket_check_bind` (slot 175): network-bind of the address.
+    pub(crate) fn darwin_mac_check_socket_bind(&mut self, so: SbSocket, addr: Vec<u8>) -> u32 {
+        self.darwin_sb_socket(op::NETWORK_BIND, so, Some(addr), None)
+    }
+
+    /// `mac_socket_check_connect` (slot 176): network-outbound of the
+    /// address, none asked of an address shorter than its family's field
+    /// or of AF_UNSPEC.
+    pub(crate) fn darwin_mac_check_socket_connect(&mut self, so: SbSocket, addr: Vec<u8>) -> u32 {
+        if addr.len() < 2 || addr[0] < 2 || addr[1] == 0 {
+            return 0;
+        }
+        self.darwin_sb_socket(op::NETWORK_OUTBOUND, so, None, Some(addr))
+    }
+
+    /// `mac_socket_check_listen` and `mac_socket_check_receive` (slots 181
+    /// and 182): network-inbound.
+    pub(crate) fn darwin_mac_check_socket_inbound(&mut self, so: SbSocket) -> u32 {
+        self.darwin_sb_socket(op::NETWORK_INBOUND, so, None, None)
+    }
+
+    /// `mac_socket_check_send` (slot 185): network-outbound of the address.
+    pub(crate) fn darwin_mac_check_socket_send(&mut self, so: SbSocket, addr: Vec<u8>) -> u32 {
+        self.darwin_sb_socket(op::NETWORK_OUTBOUND, so, None, Some(addr))
+    }
+
+    /// `mac_socket_check_setsockopt` and `_getsockopt` (slots 187 and 188):
+    /// socket-option-set or -get of the option's level and name.
+    pub(crate) fn darwin_mac_check_sockopt(&mut self, mut so: SbSocket, set: bool, level: u32, name: u32) -> u32 {
+        so.option = (level, name);
+        let a = SbArgs { kind: sandbox::kind::SOCKET, socket: Some(so), ..Default::default() };
+        self.darwin_sb_evaluate(if set { op::SOCKET_OPTION_SET } else { op::SOCKET_OPTION_GET }, &a)
+    }
+
+    /// `mac_socket_check_ioctl` (slot 212): socket-ioctl of the command,
+    /// but for FIOASYNC, FIONBIO, FIODTYPE and FIONREAD, and an AF_AFP
+    /// (36) stream socket of protocol 250.
+    pub(crate) fn darwin_mac_check_socket_ioctl(&mut self, mut so: SbSocket, command: u64) -> u32 {
+        if matches!(command, 0x8004_667d | 0x8004_667e | 0x4004_667a | 0x4004_667f) {
+            return 0;
+        }
+        if (so.domain, so.ty, so.protocol) == (36, 1, 250) {
+            return 0;
+        }
+        so.command = command;
+        let a = SbArgs { kind: sandbox::kind::SOCKET, socket: Some(so), ..Default::default() };
+        self.darwin_sb_evaluate(op::SOCKET_IOCTL, &a)
     }
 
     pub(crate) fn darwin_mac_check_fork(&mut self) -> u32 {

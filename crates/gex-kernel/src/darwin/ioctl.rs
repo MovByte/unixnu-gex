@@ -265,8 +265,9 @@ impl Kernel {
                 }
                 _ => Err(Errno::ENOTTY),
             },
-            // soo_ioctl: the descriptor's FNONBLOCK is what the socket here
-            // goes by.
+            // soo_ioctl: soioctl's MAC check first; the descriptor's
+            // FNONBLOCK is what the socket here goes by.
+            Kind::Socket if let Some(e) = super::mac::sb_socket(&file.handle).map(|so| self.darwin_mac_check_socket_ioctl(so, com)).filter(|&e| e != 0) => Err(super::errno::errno_of(e as i32)),
             Kind::Socket => match com {
                 cmd::FIONBIO => Ok(()),
                 cmd::FIOASYNC if int(data) == 0 => Ok(()),

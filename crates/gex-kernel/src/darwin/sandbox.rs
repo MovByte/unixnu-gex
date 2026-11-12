@@ -239,8 +239,24 @@ pub mod kind {
     pub const SYSCALL_UNIX: u32 = 0x14;
     pub const SYSCALL_MACH: u32 = 0x16;
     pub const SYSCALL_MIG: u32 = 0x17;
+    pub const NECP_ACTION: u32 = 0x1a;
     pub const MAC_SYSCALL: u32 = 0x19;
 }
+
+/// A socket's `sock_gettype`, and whether the operation has a socket.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SocketType {
+    pub present: bool,
+    pub domain: u32,
+    pub ty: u32,
+    pub protocol: u32,
+}
+
+const AF_UNIX: u32 = 1;
+const AF_INET: u32 = 2;
+const AF_SYSTEM: u32 = 32;
+const AF_INET6: u32 = 30;
+const AF_MULTIPATH: u32 = 39;
 
 /// What evaluation asks of the system: the operation's subject (the
 /// process and credential), its objects, and the system's state. Each
@@ -313,6 +329,32 @@ pub trait Facts {
     /// `kern.osreleasetype`, as launchd set it (empty before).
     fn os_release_type(&self) -> Vec<u8>;
     fn developer_mode(&self) -> bool;
+    /// A socket operation's socket (kind 2): its domain, type and protocol,
+    /// and whether there is one (`socket_check_create` has none).
+    fn socket(&self) -> Option<SocketType> {
+        None
+    }
+    /// Its local address: the hook's, else its name (`sock_getsockname`),
+    /// none for a socket with none (EOPNOTSUPP); another error refuses.
+    fn socket_local(&mut self) -> Result<Option<Vec<u8>>, Stop> {
+        Ok(None)
+    }
+    /// The remote address the hook names, a socket option's level and
+    /// name, an ioctl's command.
+    fn socket_remote(&self) -> Option<Vec<u8>> {
+        None
+    }
+    fn socket_option(&self) -> (u32, u32) {
+        (0, 0)
+    }
+    fn socket_command(&self) -> u64 {
+        0
+    }
+    /// Whether `sa` is an address of the host's own (`0x...a08950`): the
+    /// unspecified address, or one of an interface's.
+    fn host_address(&mut self, _sa: &[u8]) -> Result<bool, Stop> {
+        Ok(false)
+    }
     /// The operation's numbers: the host special port (kind 7), the reboot
     /// flags, the call number (`+0xd8`: a Unix call's, kind 0x14; a Mach
     /// trap's, kind 0x16; a kernel MIG routine's index, kind 0x17), the MAC
@@ -966,6 +1008,46 @@ fn operand(b: &[u8], p: &Profile, arg: u16) -> Result<(usize, Vec<u8>), Stop> {
 /// Apple-signed.
 const CAN_EXECUTE_CDHASH: &[u8] = b"com.apple.private.amfi.can-execute-cdhash";
 
+/// The local and remote filters' compare (`0x...a06394`) of address `sa`
+/// of a socket of `domain` and `ty` against the operand at `arg`: its flags
+/// (bit 0 inet, bit 1 inet6, bit 2 stream only, bit 3 datagram only), its
+/// host byte (non-zero: the host's own address) and port (non-zero: that
+/// port). A cut operand refuses.
+fn address_match(b: &[u8], p: &Profile, arg: u16, sa: Option<&[u8]>, domain: u32, ty: u32, facts: &mut dyn Facts) -> Result<bool, Stop> {
+    let r = p.nodes_end + usize::from(arg) * NODE;
+    let refused = Stop::Refuse(REFUSED);
+    let (Some(&flags), Some(&host), Some(port)) = (b.get(r), b.get(r + 1), u16_at(b, r + 2)) else { return Err(refused) };
+    let family_ok = match domain {
+        AF_INET => flags & 1 != 0,
+        AF_INET6 => flags & 2 != 0,
+        AF_MULTIPATH => flags & 3 != 0,
+        _ => false,
+    };
+    if !family_ok || (ty != 1 && flags & 4 != 0) || (ty != 2 && flags & 8 != 0) {
+        return Ok(false);
+    }
+    let Some(sa) = sa else { return Ok(false) };
+    let mut leg = |family: u32, facts: &mut dyn Facts| -> Result<bool, Stop> {
+        if sa.len() < 4 || u32::from(sa[1]) != family {
+            return Ok(false);
+        }
+        if port != 0 && u16::from_be_bytes([sa[2], sa[3]]) != port {
+            return Ok(false);
+        }
+        if host != 0 && !facts.host_address(sa)? {
+            return Ok(false);
+        }
+        Ok(true)
+    };
+    if matches!(domain, AF_INET | AF_MULTIPATH) && leg(AF_INET, facts)? {
+        return Ok(true);
+    }
+    if matches!(domain, AF_INET6 | AF_MULTIPATH) && leg(AF_INET6, facts)? {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 /// One filter node: whether it matches.
 fn filter(b: &[u8], p: &Profile, ty: u8, flag: bool, arg: u16, facts: &mut dyn Facts, scratch: &mut Scratch) -> Result<bool, Stop> {
     let k = facts.kind();
@@ -1063,6 +1145,49 @@ fn filter(b: &[u8], p: &Profile, ty: u8, flag: bool, arg: u16, facts: &mut dyn F
         // host-special-port, syscall-number, mac-syscall-number.
         47 => k == kind::HOST_SPECIAL_PORT && int_match(b, p, flag, arg, u64::from(facts.host_special_port()))?,
         65 => k == kind::SYSCALL_UNIX && int_match(b, p, flag, arg, u64::from(facts.syscall_number()))?,
+        // local / remote (`0x...a0444c`): the socket's local or remote
+        // address against the operand's families, types, host and port; a
+        // socket operation's local address fetched first, for either.
+        8 | 9 => {
+            if k != kind::SOCKET {
+                false
+            } else {
+                match facts.socket().filter(|s| s.present) {
+                    None => false,
+                    Some(t) => {
+                        let local = facts.socket_local()?;
+                        let sa = if ty == 8 { local } else { facts.socket_remote() };
+                        address_match(b, p, arg, sa.as_deref(), t.domain, t.ty, facts)?
+                    }
+                }
+            }
+        }
+        // control-name (`0x...a04604`): a kernel control's name, of a remote
+        // AF_SYSTEM address of SYSPROTO_CONTROL.
+        10 => {
+            let sys = k == kind::SOCKET && facts.socket_remote().is_some_and(|sa| sa.len() >= 4 && u32::from(sa[1]) == AF_SYSTEM && u16::from_le_bytes([sa[2], sa[3]]) == 2);
+            if sys {
+                return Err(facts.unported("a kernel control's name (ctl_name_by_id)".into()));
+            }
+            false
+        }
+        // socket-domain, socket-type, socket-protocol (the protocol's low 16
+        // bits, unchecked).
+        11 | 12 => match facts.socket().filter(|_| k == kind::SOCKET) {
+            Some(t) => int_match(b, p, flag, arg, u64::from(if ty == 11 { t.domain } else { t.ty }))?,
+            None => false,
+        },
+        13 => match facts.socket().filter(|_| k == kind::SOCKET) {
+            Some(t) => int_match_any(b, p, flag, arg, u64::from(t.protocol & 0xffff))?,
+            None => false,
+        },
+        // ioctl-command: a socket ioctl's, its low 16 bits.
+        16 if k == kind::SOCKET => int_match_any(b, p, flag, arg, facts.socket_command() & 0xffff)?,
+        // A socket option's level and name.
+        79 => k == kind::SOCKET && int_match(b, p, flag, arg, u64::from(facts.socket_option().0))?,
+        80 => k == kind::SOCKET && int_match(b, p, flag, arg, u64::from(facts.socket_option().1))?,
+        // An NECP client action's number.
+        83 => k == kind::NECP_ACTION && int_match(b, p, flag, arg, u64::from(facts.syscall_number()))?,
         // A Mach trap's number; a kernel MIG routine's index (the one
         // Sandbox gave its message id at boot).
         75 => k == kind::SYSCALL_MACH && int_match(b, p, flag, arg, u64::from(facts.syscall_number()))?,
@@ -1254,6 +1379,11 @@ fn filter(b: &[u8], p: &Profile, ty: u8, flag: bool, arg: u16, facts: &mut dyn F
 pub fn evaluate(b: &[u8], p: &Profile, op: usize, facts: &mut dyn Facts, scratch: &mut Scratch) -> Outcome {
     let refused = Outcome::Decided(REFUSED, Effects::default());
     let Some(idx) = (op < OPERATIONS).then(|| u16_at(b, p.ops + 2 * op)).flatten() else { return refused };
+    // The interpreter's prelude (`0x...a041f0`): a socket operation on a
+    // unix domain socket is allowed at once, with no report.
+    if facts.kind() == kind::SOCKET && facts.socket().is_some_and(|s| s.present && s.domain == AF_UNIX) {
+        return Outcome::Decided(Decision { errno: 0, flags: 0 }, Effects::default());
+    }
     let mut at = p.nodes + usize::from(idx) * NODE;
     loop {
         if at < p.nodes || at >= p.nodes_end || at + NODE > b.len() {
