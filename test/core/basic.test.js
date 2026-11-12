@@ -1,21 +1,24 @@
 // System, spawn (pipes and a terminal), run, kill, and the Filesystem.
-import { System } from '../../web/runtime/src/index.js';
-import { Filesystem } from '../../web/runtime/src/fs.js';
+import { System } from '../../page/runtime/src/index.js';
+import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 
 export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 180 };
 
 export default async function (t) {
   const { say, check, eq, timeout } = t;
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
-  const fs = new Filesystem(sys);
+  const fs = new MemoryFilesystem(sys);
   fs.addTar(t.work('bb.tar.zst'));
   fs.addFiles({ '/etc/hello': 'hello from addFiles\n' });
   check('a second System throws', (() => { try { new System(); return false; } catch (e) { return /one system/.test(e.message); } })());
-  check('a second Filesystem throws', (() => { try { new Filesystem(sys); return false; } catch { return true; } })());
+  check('an arch the runtime has none of throws', (() => { try { new System({ arch: 'mips' }); return false; } catch (e) { return e instanceof TypeError && /arch is one of x86, aarch64/.test(e.message); } })());
+  check('a second Filesystem throws', (() => { try { new MemoryFilesystem(sys); return false; } catch { return true; } })());
   const t0 = performance.now();
   await timeout(sys.boot(), 60000, 'boot');
   say(`booted in ${(performance.now() - t0).toFixed(0)} ms`);
   eq('state', sys.state.phase, 'running');
+  // The architecture the run names (t.debug's), or the tree's.
+  if (t.arch) eq('describe() says the architecture', sys.describe().arch, t.arch);
 
   const env = { PATH: '/bin:/usr/bin', HOME: '/root' };
   // Pid 1 is the kernel's: a program's parent, an orphan's, and named init.
@@ -40,6 +43,15 @@ export default async function (t) {
   eq('run stdout', r.stdout, 'out\nhello from addFiles\n');
   eq('run stderr', r.stderr, 'err\n');
   eq('run code', r.code, 3);
+  // A daemon it leaves holding its pipes: run ends with the program, with
+  // what it wrote, and the daemon's later writes neither block nor kill it.
+  start = performance.now();
+  const dm = await timeout(sys.run(['sh', '-c', '(sleep 2; echo late; echo late >&2; sleep 1; echo alive > /tmp/daemon) & echo early; echo early >&2'], { env }), 30000, 'run with a daemon');
+  eq('run with a daemon: its own output', [dm.code, dm.stdout, dm.stderr], [0, 'early\n', 'early\n']);
+  check('run with a daemon: ends with the program', performance.now() - start < 1800, `${(performance.now() - start).toFixed(0)} ms`);
+  const daemonSaw = async () => fs.readFile('/tmp/daemon', { encoding: 'utf-8' }).catch(() => '');
+  for (let i = 0; i < 200 && !(await daemonSaw()); i++) await new Promise((res) => setTimeout(res, 50));
+  eq('run with a daemon: the daemon writes on', await daemonSaw(), 'alive\n');
 
   const c = await timeout(sys.run(['cat'], { env, input: 'piped through\n' }), 30000, 'cat');
   eq('stdin piped', c.stdout, 'piped through\n');
@@ -120,6 +132,19 @@ export default async function (t) {
   // The filesystem from the page.
   await fs.writeFile('/root/note.txt', 'from the page\n');
   eq('guest reads the page\'s file', (await sys.run(['cat', '/root/note.txt'], { env })).stdout, 'from the page\n');
+  // A file the page makes takes writeFile's mode (one already there keeps its own).
+  await fs.writeFile('/root/hi.sh', '#!/bin/sh\necho made by the page\n', { mode: 0o755 });
+  eq('writeFile\'s mode', [(await fs.stat('/root/hi.sh')).mode & 0o777, (await sys.run(['/root/hi.sh'], { env })).stdout], [0o755, 'made by the page\n']);
+  await fs.writeFile('/root/hi.sh', '#!/bin/sh\necho again\n', { mode: 0o600 });
+  eq('writeFile over a file keeps its mode', (await fs.stat('/root/hi.sh')).mode & 0o777, 0o755);
+  await fs.rm('/root/hi.sh');
+  // A program's O_CREAT mode, less its umask.
+  // open(O_CREAT, 0) makes a 0000 file, 0666 under umask 022 a 0644 one,
+  // and fstat says the mode stat does, a chmod later too.
+  eq('open(O_CREAT, 0)', (await sys.run(['rt-probe', 'creat', '/tmp/m0', '0'], { env })).stdout, '0000 0000\n');
+  eq('open(O_CREAT, 0666) under umask 022', (await sys.run(['rt-probe', 'creat', '/tmp/m1', '666'], { env })).stdout, '0644 0644\n');
+  eq('fstat after chmod', (await sys.run(['rt-probe', 'chmod', '/tmp/m1', '751'], { env })).stdout, '0751 0751\n');
+  eq('open\'s mode less the umask', (await sys.run(['sh', '-c', 'umask 077; echo > /tmp/u; umask 0; echo > /tmp/v; ls -l /tmp/u /tmp/v | cut -c1-10'], { env })).stdout, '-rw-------\n-rw-rw-rw-\n');
   await sys.run(['sh', '-c', 'mkdir -p /root/d/e && echo guest > /root/d/e/f && ln -s e/f /root/d/link'], { env });
   eq('page reads the guest\'s file', await fs.readFile('/root/d/e/f', { encoding: 'utf-8' }), 'guest\n');
   const stt = await fs.stat('/root/d/e/f');

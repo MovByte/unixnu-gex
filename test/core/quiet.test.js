@@ -2,8 +2,8 @@
 // line at the console's log, info, warning or error level (browser), none on
 // the process's output (node). Programs run with pipes and on a terminal, a
 // pipeline ends, a program is killed. A program that crashes is still said.
-import { System } from '../../web/runtime/src/index.js';
-import { Filesystem } from '../../web/runtime/src/fs.js';
+import { System } from '../../page/runtime/src/index.js';
+import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 
 export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 180 };
 
@@ -20,7 +20,7 @@ export default async function (t) {
   };
   // t.debug(): only what the run needs (vite's Workers, the arch); no `log`.
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
-  const fs = new Filesystem(sys);
+  const fs = new MemoryFilesystem(sys);
   fs.addTar(t.work('bb.tar.zst'));
   await timeout(sys.boot(), 60000, 'boot');
   const env = { PATH: '/bin:/usr/bin', HOME: '/root' };
@@ -35,15 +35,19 @@ export default async function (t) {
   const before = await noise();
   eq('nothing said for it', before, []);
 
-  // A pipeline's ordinary end: `yes` dies of SIGPIPE.
+  // A pipeline's ordinary end: `yes` ends on its write with no reader.
   eq('a pipeline ends', (await sys.run(['sh', '-c', 'yes | head -1'], { env })).stdout, 'y\n');
+  // And one that surely dies of it (busybox's `yes` may end on EPIPE).
+  const piped = await sys.run(['rt-probe', 'sigpipe'], { env });
+  eq('a write with no reader ends it by SIGPIPE', piped.signal, 'SIGPIPE');
   await new Promise((r) => setTimeout(r, 500));
   const after = (await noise()).slice(before.length);
-  t.known('nothing said for a SIGPIPE', after.length === 0, JSON.stringify(after.slice(0, 3)),
-    'the crash report for SIGPIPE goes quiet with kc/sigpipe-quiet bd0f8073');
+  t.check('nothing said for a SIGPIPE', after.length === 0, JSON.stringify(after.slice(0, 3)));
   // A real crash is still said: the default keeps errors.
   const seg = await sys.run(['rt-probe', 'trap'], { env });
-  t.check('a program that traps dies of a signal', !!seg.signal, JSON.stringify(seg));
+  // A 127 is a program whose Worker never started: what the system said why.
+  t.check('a program that traps dies of a signal', !!seg.signal,
+    `${JSON.stringify(seg)}${seg.signal ? '' : `; said ${JSON.stringify((await noise()).slice(-4))}`}`);
   await new Promise((r) => setTimeout(r, 500));
   const crash = (await noise()).slice(before.length + after.length);
   t.check('and its crash is said', crash.some((l) => /signal|trap/.test(l)), JSON.stringify(crash.slice(0, 3)));

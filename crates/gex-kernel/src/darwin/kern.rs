@@ -311,7 +311,7 @@ fn darwin_gettimeofday(m: &mut GuestMem<'_>, tp: u64, tzp: u64, abs: u64) -> Res
         let tbr = super::mach::absolute_time();
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
         let frac = (u128::from(now.subsec_nanos()) << 64) / 1_000_000_000;
-        super::commpage::set_timestamp(m.bytes, tbr, now.as_secs(), frac as u64);
+        super::commpage::set_timestamp(m, tbr, now.as_secs(), frac as u64);
         let mut tv = [0u8; 16];
         tv[..8].copy_from_slice(&(now.as_secs() as i64).to_le_bytes());
         tv[8..12].copy_from_slice(&(now.subsec_micros() as i32).to_le_bytes());

@@ -125,7 +125,7 @@ pub struct Config {
     /// `"unit"`, `"function"`; [`gex_split::Clustering`]) or `"none"`, the
     /// default for a config without the setting. `"instrument"` builds
     /// units that report the functions a run calls, for a recording of the
-    /// site to take its coverage from (tools/eject/record-wine32.mjs). Each unit keeps the
+    /// site to take its coverage from (site/record-wine32.mjs). Each unit keeps the
     /// functions the recorded run called; the rest are fetched in clusters
     /// on first call (crates/gex-eject/README.md, "Cold code"). `"jit"`: the rest are not
     /// in the site at all; the page's function JIT translates each from the
@@ -177,7 +177,7 @@ pub struct Config {
 }
 
 /// `"start"`'s settings: app.js `start()` options a build may default.
-pub const START_OPTIONS: &[&str] = &["args", "env", "cwd", "size", "mtimes", "strace", "trapstack", "persist", "ready"];
+pub const START_OPTIONS: &[&str] = &["args", "env", "cwd", "size", "mtimes", "strace", "trapstack", "filesystem", "ready"];
 
 impl Default for Config {
     fn default() -> Self {
@@ -375,6 +375,9 @@ impl Config {
                         let build_side = matches!(k.as_str(), "compositor" | "gl" | "translation" | "fjit" | "multiprocess" | "units" | "bundle" | "hostx" | "mem64");
                         if build_side {
                             bail!("{what}: \"start\": \"{k}\" changes the build's output, so it is a build setting (\"features\" or \"bundle\"), not a start default");
+                        }
+                        if k == "persist" {
+                            bail!("{what}: \"start\": \"persist\" is gone: a filesystem kept across loads keeps the whole root, \"filesystem\": {{\"kind\": \"opfs\", \"name\": ...}} (IndexedDB saves of the old \"persist\" are not read)");
                         }
                         bail!("{what}: \"start\": unknown option \"{k}\" (known: {})", START_OPTIONS.join(", "));
                     }

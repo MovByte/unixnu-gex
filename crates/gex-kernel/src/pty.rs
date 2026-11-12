@@ -122,6 +122,17 @@ impl Pty {
         r.signals
     }
 
+    /// Set the terminal's termios. A line part-typed in canonical mode stays
+    /// input when the mode is left (`Tty::set_termios_keeping`): the slave
+    /// reads it next.
+    pub fn set_termios(&self, src: &[u8]) {
+        let kept = self.tty.set_termios_keeping(src);
+        if !kept.is_empty() {
+            self.lock().to_slave.extend(kept);
+            self.queue.notify();
+        }
+    }
+
     /// The slave wrote: program output. Output-processed, then queued for the
     /// master.
     pub fn slave_write(&self, bytes: &[u8]) {
@@ -279,8 +290,9 @@ pub const fn tty_nr(n: u32) -> i32 {
 
 /// A pty pair that lives in another wasm module, reached by number and a table
 /// of `extern "C"` calls -- the [`crate::pipe::Remote`] shape, with the terminal
-/// added. `id` names the pair; `master` picks the end. Data calls copy through
-/// the caller's memory at `at`/`len` and return bytes or `-errno`.
+/// added (natively, the pairs live in the host process: `hosts/native`'s
+/// `pty.rs`). `id` names the pair; `master` picks the end. Data calls take the
+/// kernel's own buffer and return bytes or `-errno`.
 #[derive(Clone, Copy)]
 pub struct Remote {
     /// Open `/dev/ptmx`: make a fresh locked pair with the master open. Returns
@@ -293,16 +305,16 @@ pub struct Remote {
     pub open_end: extern "C" fn(id: i32, master: i32),
     /// Drop a descriptor. The last on an end is the other end's EOF/hangup.
     pub close_end: extern "C" fn(id: i32, master: i32),
-    pub read: extern "C" fn(id: i32, master: i32, at: crate::PAddr, len: u32) -> i32,
-    pub write: extern "C" fn(id: i32, master: i32, at: crate::PAddr, len: u32) -> i32,
+    pub read: fn(id: i32, master: i32, buf: &mut [u8]) -> i32,
+    pub write: fn(id: i32, master: i32, buf: &[u8]) -> i32,
     pub readable: extern "C" fn(id: i32, master: i32) -> i32,
     pub available: extern "C" fn(id: i32, master: i32) -> i32,
     pub ptn: extern "C" fn(id: i32) -> i32,
     pub get_lock: extern "C" fn(id: i32) -> i32,
     pub set_lock: extern "C" fn(id: i32, locked: i32),
     /// The shared terminal state, in the byte shapes the ioctls exchange.
-    pub get_termios: extern "C" fn(id: i32, at: crate::PAddr, len: u32) -> i32,
-    pub set_termios: extern "C" fn(id: i32, at: crate::PAddr, len: u32, flush: i32) -> i32,
+    pub get_termios: fn(id: i32, buf: &mut [u8]) -> i32,
+    pub set_termios: fn(id: i32, src: &[u8], flush: i32) -> i32,
     pub winsize: extern "C" fn(id: i32) -> u64,
     /// Sets the window size and, when it changed, delivers `SIGWINCH` to the
     /// foreground group itself (only the global kernel can, being next to the
@@ -353,14 +365,14 @@ impl RemotePty {
 
 impl crate::vfs::FileHandle for RemotePty {
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
-        match (self.remote.read)(self.id, self.m(), buf.as_mut_ptr() as crate::PAddr, buf.len() as u32) {
+        match (self.remote.read)(self.id, self.m(), buf) {
             n if n >= 0 => Ok(n as u64),
             n => Err(Errno(-n)),
         }
     }
 
     fn write_at(&self, _offset: u64, buf: &[u8]) -> SysResult {
-        match (self.remote.write)(self.id, self.m(), buf.as_ptr() as crate::PAddr, buf.len() as u32) {
+        match (self.remote.write)(self.id, self.m(), buf) {
             n if n >= 0 => Ok(n as u64),
             n => Err(Errno(-n)),
         }
@@ -391,6 +403,18 @@ impl crate::vfs::FileHandle for RemotePty {
         true
     }
 
+    /// The slave in non-canonical mode with `VMIN` 0 and `VTIME` 0: btop's
+    /// input loop reads until a read gives 0, and parked on the second read of
+    /// every key instead, so it froze on the first key.
+    fn empty_read_returns(&self) -> bool {
+        if self.master {
+            return false;
+        }
+        let mut t = [0u8; 60];
+        (self.remote.get_termios)(self.id, &mut t);
+        crate::tty::polling_read(&t)
+    }
+
     /// Both ends of this pair live in the global kernel, and the other one is
     /// held by a program in another Worker -- a terminal emulator. Its write is
     /// what ends a wait here, and it wakes on its way out of the syscall.
@@ -410,11 +434,15 @@ impl crate::vfs::FileHandle for RemotePty {
         Some((self.remote.available)(self.id, self.m()).max(0) as u64)
     }
 
+    fn pty_peer(&self) -> Option<i32> {
+        if self.master { Some((self.remote.ptn)(self.id)) } else { None }
+    }
+
     fn claim_session(&self, sid: i32) {
         // What `TIOCSCTTY` means for a pty that lives in the global kernel.
         //
         // The session is recorded there, where the hangup rule can ask whether
-        // it is still alive (see `hangup_is_real` in shims/kernel) -- and so is
+        // it is still alive (see `hangup_is_real` in hosts/kernel) -- and so is
         // the foreground process group, because claiming a controlling terminal
         // is what makes the claimer's group the foreground one. Only a session
         // leader may claim, and a session leader's group is its own pid, which
@@ -470,6 +498,25 @@ mod tests {
         assert_eq!(p.master_read(&mut buf), Ok(3), "what it wrote first");
         assert_eq!(p.master_read(&mut buf), Err(crate::errno::Errno::EIO));
         assert!(p.master_readable(), "a hangup is readable, so poll wakes the reader");
+    }
+
+    /// Keys typed while the terminal is cooked (a command running) and before
+    /// the shell's line editor makes it raw again are read by the line
+    /// editor, not dropped: `ls` typed after `clear` ran as `s`.
+    #[test]
+    fn a_part_typed_line_is_input_once_canonical_mode_is_left() {
+        let p = super::Pty::new(0);
+        p.open_slave();
+        p.master_write(b"l");
+        let mut buf = [0u8; 8];
+        assert_eq!(p.slave_read(&mut buf), Err(crate::errno::Errno::EAGAIN), "cooked: no line yet");
+        let mut t = p.tty.termios();
+        let l = u32::from_le_bytes([t[12], t[13], t[14], t[15]]) & !(crate::tty::lflag::ICANON | crate::tty::lflag::ECHO);
+        t[12..16].copy_from_slice(&l.to_le_bytes());
+        p.set_termios(&t);
+        p.master_write(b"s");
+        assert_eq!(p.slave_read(&mut buf), Ok(2));
+        assert_eq!(&buf[..2], b"ls");
     }
 
     #[test]
@@ -540,13 +587,13 @@ impl RemotePty {
         match req {
             ioc::TCGETS => {
                 let mut buf = [0u8; 60];
-                (r.get_termios)(id, buf.as_mut_ptr() as crate::PAddr, buf.len() as u32);
+                (r.get_termios)(id, &mut buf);
                 m.write(arg, &buf[..KERNEL_TERMIOS])?;
                 Ok(0)
             }
             ioc::TCGETS2 => {
                 let mut buf = [0u8; 60];
-                (r.get_termios)(id, buf.as_mut_ptr() as crate::PAddr, buf.len() as u32);
+                (r.get_termios)(id, &mut buf);
                 let mut out = [0u8; KERNEL_TERMIOS + 8];
                 out[..KERNEL_TERMIOS].copy_from_slice(&buf[..KERNEL_TERMIOS]);
                 out[KERNEL_TERMIOS..KERNEL_TERMIOS + 4].copy_from_slice(&38400u32.to_le_bytes());
@@ -557,13 +604,13 @@ impl RemotePty {
             ioc::TCSETS | ioc::TCSETSW | ioc::TCSETSF => {
                 let src = m.read(arg, KERNEL_TERMIOS)?.to_vec();
                 let flush = (req == ioc::TCSETSF) as i32;
-                (r.set_termios)(id, src.as_ptr() as crate::PAddr, src.len() as u32, flush);
+                (r.set_termios)(id, &src, flush);
                 Ok(0)
             }
             ioc::TCSETS2 | ioc::TCSETSW2 | ioc::TCSETSF2 => {
                 let src = m.read(arg, KERNEL_TERMIOS)?.to_vec();
                 let flush = (req == ioc::TCSETSF2) as i32;
-                (r.set_termios)(id, src.as_ptr() as crate::PAddr, src.len() as u32, flush);
+                (r.set_termios)(id, &src, flush);
                 Ok(0)
             }
             ioc::TIOCGWINSZ => {
@@ -654,10 +701,10 @@ impl RemotePty {
                 m.write_u32(arg, 0)?;
                 Ok(0)
             }
-            // Opening the peer without a path: the syscall layer must install a
-            // new descriptor, which a handle cannot do, so it is refused here and
-            // glibc falls back to opening `/dev/pts/N` by name.
-            ioc::TIOCGPTPEER => Err(Errno::EINVAL),
+            // Opening the peer: the syscall layer installs the descriptor
+            // (`pty_peer`), before this handle is asked; here only for the
+            // slave, which has no peer to open.
+            ioc::TIOCGPTPEER => Err(Errno::ENOTTY),
             // The descriptor-level ioctls (FIOCLEX, FIONBIO, ...) are the same
             // for any file; let the kernel's own handling take them.
             _ => Err(Errno::ENOTTY),

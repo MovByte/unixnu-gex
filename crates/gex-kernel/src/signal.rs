@@ -185,6 +185,19 @@ pub struct ProcSig {
     /// What each signal does with no handler, for a personality whose
     /// defaults are not Linux's ([`default_action`] when unset).
     defaults: std::sync::OnceLock<fn(u32) -> DefaultAction>,
+    /// The signal a delivery last found fatal (no handler), who sent it,
+    /// and whether it was the thread's own: the death report's "sent by".
+    /// Written once per process at most, just before it dies.
+    fatal: Mutex<Option<(u32, Option<Source>, bool)>>,
+    /// The last fault signal (SEGV, BUS, ILL, FPE) a delivery gave a
+    /// handler, with its sender: a handler that re-raises it (KCrash) dies
+    /// of a signal whose first sending this says. Rare, so a lock.
+    handled: Mutex<Option<(u32, Option<Source>, bool)>>,
+    /// The last fault signal one of this process's threads sent with
+    /// `kill`, `tkill` or `tgkill`: sending thread, target (pid; 0 for a
+    /// thread of this process), target thread (0 for `kill`), signal. What
+    /// says which thread of a process sent its own death.
+    fault_send: Mutex<Option<(i32, i32, i32, u32)>>,
 }
 
 impl std::fmt::Debug for ProcSig {
@@ -210,6 +223,9 @@ impl ProcSig {
             to_assign: Mutex::new(Vec::new()),
             post_hook: std::sync::OnceLock::new(),
             defaults: std::sync::OnceLock::new(),
+            fatal: Mutex::new(None),
+            handled: Mutex::new(None),
+            fault_send: Mutex::new(None),
         }
     }
 
@@ -258,6 +274,35 @@ impl ProcSig {
     /// at each.
     pub fn take_to_assign(&self) -> Vec<(u32, Option<Note>)> {
         std::mem::take(&mut *self.to_assign.lock())
+    }
+
+    /// The signal a delivery found fatal, its sender and whether it was the
+    /// thread's own ([`dispatch`]); `None` when none was.
+    pub fn fatal(&self) -> Option<(u32, Option<Source>, bool)> {
+        *self.fatal.lock()
+    }
+
+    /// A synchronous fault given to a handler (no sender: the instruction).
+    pub fn note_fault_handled(&self, signal: u32) {
+        *self.handled.lock() = Some((signal, None, true));
+    }
+
+    /// A fault signal (SEGV, BUS, ILL, FPE) one of this process's threads
+    /// sent; any other is not kept.
+    pub fn note_send(&self, from_tid: i32, pid: i32, tid: i32, signal: u32) {
+        if matches!(signal, sig::SIGSEGV | sig::SIGBUS | sig::SIGILL | sig::SIGFPE) {
+            *self.fault_send.lock() = Some((from_tid, pid, tid, signal));
+        }
+    }
+
+    /// The last fault signal this process sent ([`ProcSig::note_send`]).
+    pub fn fault_send(&self) -> Option<(i32, i32, i32, u32)> {
+        *self.fault_send.lock()
+    }
+
+    /// The last fault signal a handler was given, and its sender.
+    pub fn handled_fault(&self) -> Option<(u32, Option<Source>, bool)> {
+        *self.handled.lock()
     }
 
     /// Mark a process-directed signal pending: whichever thread does not
@@ -1197,6 +1242,17 @@ pub mod xframe {
     pub const GPR_ORDER: [u8; 16] = [8, 9, 10, 11, 12, 13, 14, 15, 7, 6, 5, 3, 2, 0, 1, 4];
 }
 
+/// A fault signal's name, for a line that says one was taken.
+pub fn fault_name(signo: u32) -> &'static str {
+    match signo {
+        sig::SIGSEGV => "SIGSEGV",
+        sig::SIGBUS => "SIGBUS",
+        sig::SIGILL => "SIGILL",
+        sig::SIGFPE => "SIGFPE",
+        _ => "a fault signal",
+    }
+}
+
 /// Build a handler frame for `signal` and point the context at the handler.
 ///
 /// Returns the address to resume at. The caller has already established that
@@ -1385,8 +1441,10 @@ fn setup_frame_x86(
     let pc = m.read_u64(ctx_addr + ctx::PC as u64)?;
     m.write_u64(mc + xframe::MC_RIP as u64, pc)?;
     m.write_u64(mc + xframe::MC_EFLAGS as u64, read_rflags(m, ctx_addr)?)?;
-    // cs = __USER_CS (0x33), the other selectors zero.
-    m.write_u64(mc + xframe::MC_CS as u64, 0x33)?;
+    // cs: the interrupted code's (__USER_CS, 0x33, or __USER32_CS, 0x23,
+    // for a WoW64 thread's 32-bit code), the other selectors zero.
+    let cs = m.read_u32(ctx_addr + ctx::CS as u64)?;
+    m.write_u64(mc + xframe::MC_CS as u64, if cs == 0 { ctx::CS_LONG as u64 } else { cs as u64 })?;
     m.write_u64(mc + xframe::MC_TRAPNO as u64, if signal == sig::SIGSEGV { 14 } else { 0 })?;
     m.write_u64(mc + xframe::MC_OLDMASK as u64, saved_mask)?;
     m.write_u64(mc + xframe::MC_CR2 as u64, fault_address)?;
@@ -1422,6 +1480,8 @@ fn setup_frame_x86(
     m.write_u64(ctx_addr + ctx::x(2) as u64, uc)?;
     m.write_u64(ctx_addr + ctx::x(0) as u64, 0)?;
     m.write_u64(ctx_addr + ctx::PC as u64, action.handler)?;
+    // The handler is 64-bit code, whatever was interrupted.
+    m.write_u32(ctx_addr + ctx::CS as u64, 0)?;
     Ok(action.handler)
 }
 
@@ -1435,6 +1495,14 @@ fn sigreturn_x86(signals: &Signals, m: &mut GuestMem<'_>, ctx_addr: u64) -> Resu
         let v = m.read_u64(mc + i as u64 * 8)?;
         m.write_u64(ctx_addr + ctx::x(*reg) as u64, v)?;
     }
+    // Back to 64-bit or 32-bit code (a WoW64 thread's); any other selector
+    // is no code segment, and the return fails (SIGSEGV).
+    let cs = match m.read_u64(mc + xframe::MC_CS as u64)? as u16 as u32 {
+        ctx::CS_LONG => 0,
+        ctx::CS_COMPAT => ctx::CS_COMPAT,
+        _ => return Err(Errno::EFAULT),
+    };
+    m.write_u32(ctx_addr + ctx::CS as u64, cs)?;
     let pc = m.read_u64(mc + xframe::MC_RIP as u64)?;
     m.write_u64(ctx_addr + ctx::PC as u64, pc)?;
     write_rflags(m, ctx_addr, m.read_u64(mc + xframe::MC_EFLAGS as u64)?)?;
@@ -1814,12 +1882,13 @@ pub fn dispatch(
     // Taken off the pending sets before anything else: another thread of the
     // process may be delivering at the same time, without the kernel lock,
     // and a process-directed signal is for one of them only.
-    let (signal, source) = loop {
+    let (signal, source, own) = loop {
         let Some(signal) = signals.next_deliverable() else {
             return Ok(Delivery::None);
         };
+        let own = signals.cur.pending() & bit(signal) != 0;
         if let Some(source) = signals.claim(signal) {
-            break (signal, source);
+            break (signal, source, own);
         }
     };
     let action = signals.action(signal);
@@ -1827,7 +1896,7 @@ pub fn dispatch(
         return Ok(Delivery::None);
     }
     if action.handler == SIG_DFL {
-        return Ok(match default_action(signal) {
+        let d = match default_action(signal) {
             DefaultAction::Ignore => Delivery::None,
             // The three a terminal raises, with no handler and no scheduler to
             // resume from: doing nothing matches a shell with no job control (a
@@ -1844,10 +1913,19 @@ pub fn dispatch(
                 signal,
                 core: false,
             },
-        });
+        };
+        if matches!(d, Delivery::Terminate { .. }) {
+            *signals.proc.fatal.lock() = Some((signal, source, own));
+        }
+        return Ok(d);
     }
     match build_frame(signals, m, ctx_addr, signal, 0, compat, Taken::Claimed(source)) {
-        Ok(resume) => Ok(Delivery::Resume(resume)),
+        Ok(resume) => {
+            if matches!(signal, sig::SIGSEGV | sig::SIGBUS | sig::SIGILL | sig::SIGFPE) {
+                *signals.proc.handled.lock() = Some((signal, source, own));
+            }
+            Ok(Delivery::Resume(resume))
+        }
         Err(e) => {
             // No frame: the signal stays pending, as it was.
             signals.cur.raise(signal, source);
@@ -2012,6 +2090,16 @@ mod tests {
                 core: false
             }
         );
+    }
+
+    #[test]
+    fn a_fatal_delivery_keeps_its_sender() {
+        let (mut buf, mut s) = setup();
+        let mut m = GuestMem::new(&mut buf);
+        assert_eq!(s.process().fatal(), None);
+        s.raise_from(sig::SIGSEGV, Source { code: SI_TKILL, pid: 92, uid: 0 });
+        assert!(matches!(dispatch(&mut s, &mut m, CTX, false).unwrap(), Delivery::Terminate { signal: sig::SIGSEGV, .. }));
+        assert_eq!(s.process().fatal(), Some((sig::SIGSEGV, Some(Source { code: SI_TKILL, pid: 92, uid: 0 }), true)));
     }
 
     #[test]

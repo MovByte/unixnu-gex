@@ -13,6 +13,14 @@
 
 use std::sync::Mutex;
 
+/// Whether a read of a terminal with these termios (the kernel's layout)
+/// returns at once when there is nothing to read: non-canonical, `VMIN` 0
+/// and `VTIME` 0.
+pub fn polling_read(t: &[u8; 60]) -> bool {
+    let l = u32::from_le_bytes([t[12], t[13], t[14], t[15]]);
+    l & lflag::ICANON == 0 && t[CC_AT + cc::VMIN] == 0 && t[CC_AT + cc::VTIME] == 0
+}
+
 /// Indices into `c_cc`. The kernel's `NCCS` is 19 on this architecture, not
 /// the 32 a C library declares for its own larger structure.
 pub mod cc {
@@ -281,14 +289,27 @@ impl Tty {
     /// `TCSETS`. Short input sets only what it covers, which is how a
     /// kernel-sized `struct termios` of 36 bytes leaves the rest alone.
     pub fn set_termios(&self, src: &[u8]) {
+        // The page's own terminal: what was typed of a line when its program
+        // leaves canonical mode is dropped (its reader is the page's, not
+        // this one's; see `set_termios_keeping`).
+        let _ = self.set_termios_keeping(src);
+    }
+
+    /// Set the termios, and hand back what was typed of a line when this
+    /// leaves canonical mode. Linux keeps those bytes: they become input a
+    /// non-canonical read returns at once. That is a shell's typeahead: keys
+    /// typed while `clear` runs (the terminal cooked again for the command)
+    /// arrive before readline has the terminal raw, and readline reads them
+    /// then. Dropping them lost the first key typed after a command (`ls`
+    /// ran as `s`).
+    pub fn set_termios_keeping(&self, src: &[u8]) -> Vec<u8> {
         let mut s = self.lock();
         let n = src.len().min(60);
         s.termios[..n].copy_from_slice(&src[..n]);
-        // Leaving canonical mode abandons a part-typed line, as Linux does:
-        // the bytes belong to a discipline that is no longer running.
         if s.lflag() & lflag::ICANON == 0 {
-            s.line.clear();
+            return s.line.drain(..).map(|(c, _)| c).collect();
         }
+        Vec::new()
     }
 
     /// `TIOCGLCKTRMIOS` and its setter, which nothing enforces.
@@ -893,6 +914,20 @@ mod tests {
 
     fn typed(t: &Tty, s: &str) -> Input {
         t.input(s.as_bytes())
+    }
+
+    #[test]
+    fn only_raw_vmin_0_vtime_0_is_a_polling_read() {
+        // btop's key loop reads until a read gives 0: a cooked terminal, or a
+        // raw one with VMIN 1 or a VTIME, waits instead.
+        let mut t = COOKED;
+        assert!(!polling_read(&t));
+        t[12] &= !(lflag::ICANON as u8);
+        assert!(!polling_read(&t), "VMIN 1");
+        t[CC_AT + cc::VMIN] = 0;
+        assert!(polling_read(&t));
+        t[CC_AT + cc::VTIME] = 5;
+        assert!(!polling_read(&t), "VTIME 5");
     }
 
     #[test]

@@ -75,6 +75,8 @@ pub struct Remote {
     pub queue: extern "C" fn(pid: i32) -> u32,
     /// What `/proc/<pid>` says about a process: see [`ProcTable::set_info`].
     pub set_info: extern "C" fn(pid: i32, at: crate::PAddr, len: u32),
+    /// Its ids and capabilities: see [`ProcTable::set_creds`].
+    pub set_creds: extern "C" fn(pid: i32, at: crate::PAddr, len: u32),
     /// Every process, encoded by [`encode_entries`], into `cap` bytes at `at`;
     /// returns the full length (larger than `cap`: ask again with more room).
     pub snapshot: extern "C" fn(at: crate::PAddr, cap: u32) -> i32,
@@ -85,6 +87,134 @@ pub struct Remote {
     pub end_tid: extern "C" fn(tid: i32),
     /// See [`ProcTable::task_owner`]; zero for no such task.
     pub task_owner: extern "C" fn(id: i32) -> i32,
+    /// See [`ProcTable::set_usage`].
+    pub set_usage: extern "C" fn(pid: i32, cpu_ns: u64, rss: u64, vsize: u64, start_ns: u64),
+    /// See [`ProcTable::add_task_cpu`].
+    pub add_task_cpu: extern "C" fn(tid: i32, ns: u64),
+    /// See [`ProcTable::set_task_name`].
+    pub set_task_name: extern "C" fn(tid: i32, at: crate::PAddr, len: u32),
+    /// See [`ProcTable::cpu_total`].
+    pub cpu_total: extern "C" fn() -> u64,
+    /// See [`ProcTable::loadavg`], the three packed by [`pack_load`].
+    pub loadavg: extern "C" fn(now_ns: u64) -> u64,
+    /// See [`ProcTable::memory`]: the bytes, and the count.
+    pub rss_total: extern "C" fn() -> u64,
+    pub count: extern "C" fn() -> i32,
+    /// See [`ProcTable::set_crash`].
+    pub set_crash: extern "C" fn(pid: i32, at: crate::PAddr, len: u32),
+}
+
+/// What a process has used, as it last said ([`ProcTable::set_usage`]):
+/// processor time, memory, and when it started.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Usage {
+    /// Processor time, nanoseconds. In the browser: the time its Workers
+    /// were not parked waiting (the browser says nothing of which core ran
+    /// them, or for how long the system had them descheduled).
+    pub cpu_ns: u64,
+    /// The processor time of its children it has collected, and of theirs.
+    pub child_cpu_ns: u64,
+    /// Bytes mapped and accessible ([`crate::mem::MemoryMap::vm_counters`]:
+    /// what its memory has grown to back), and bytes mapped at all.
+    pub rss: u64,
+    pub vsize: u64,
+    /// When it started, on the monotonic clock (nanoseconds since boot).
+    pub start_ns: u64,
+}
+
+/// One task (thread) of a process as `/proc/<pid>/task/<tid>` has it: the
+/// processor time it has used, as its host said ([`ProcTable::add_task_cpu`]),
+/// and the name it gave itself (`prctl(PR_SET_NAME)`, which
+/// `pthread_setname_np` makes): NUL-padded, all NULs for none, when it goes
+/// by its process's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TaskUsage {
+    pub cpu_ns: u64,
+    pub name: [u8; 16],
+}
+
+impl TaskUsage {
+    /// Its own name, if it gave itself one.
+    pub fn own_name(&self) -> Option<String> {
+        let end = self.name.iter().position(|&b| b == 0).unwrap_or(15).min(15);
+        (end > 0).then(|| String::from_utf8_lossy(&self.name[..end]).into_owned())
+    }
+}
+
+/// The host's processor-time clock: this process's time (`thread` false) or
+/// the calling thread's, in nanoseconds ([`set_cpu_clock`]).
+static CPU_CLOCK: std::sync::OnceLock<fn(bool) -> u64> = std::sync::OnceLock::new();
+
+/// Set by a host that measures processor time (the browser's: the time its
+/// Workers were not parked). Without one the processor clocks count from the
+/// process's start.
+pub fn set_cpu_clock(f: fn(bool) -> u64) {
+    let _ = CPU_CLOCK.set(f);
+}
+
+/// See [`set_cpu_clock`].
+pub fn cpu_clock(thread: bool) -> Option<u64> {
+    CPU_CLOCK.get().map(|f| f(thread))
+}
+
+/// Linux's load average: an exponentially decaying average of how many
+/// tasks were running, sampled every five seconds, over one, five and
+/// fifteen minutes. Here "running" is measured, not sampled: over each
+/// interval, the processor time all processes used divided by its length
+/// (the mean number running). Fixed point, `LOAD_ONE` is 1.0.
+#[derive(Clone, Copy, Debug, Default)]
+struct Load {
+    avg: [u64; 3],
+    /// The end of the last interval counted, and the total processor time
+    /// then.
+    at_ns: u64,
+    cpu_ns: u64,
+}
+
+const LOAD_ONE: u64 = 1 << 11;
+const LOAD_EVERY_NS: u64 = 5_000_000_000;
+/// Linux's `EXP_1`, `EXP_5`, `EXP_15`: `LOAD_ONE / exp(5s / 1, 5, 15 min)`.
+const LOAD_EXP: [u64; 3] = [1884, 2014, 2037];
+
+impl Load {
+    /// Count the whole intervals up to `now_ns`, at `cpu_ns` of processor
+    /// time in all. The intervals since the last count share its mean.
+    fn advance(&mut self, now_ns: u64, cpu_ns: u64) {
+        if self.at_ns == 0 || now_ns < self.at_ns {
+            self.at_ns = now_ns;
+            self.cpu_ns = cpu_ns;
+            return;
+        }
+        let n = (now_ns - self.at_ns) / LOAD_EVERY_NS;
+        if n == 0 {
+            return;
+        }
+        let span = n * LOAD_EVERY_NS;
+        let used = cpu_ns.saturating_sub(self.cpu_ns) as u128;
+        let active = (used * LOAD_ONE as u128 / (now_ns - self.at_ns) as u128) as u64;
+        for _ in 0..n.min(1000) {
+            for (a, e) in self.avg.iter_mut().zip(LOAD_EXP) {
+                *a = (*a * e + active * (LOAD_ONE - e)) / LOAD_ONE;
+            }
+        }
+        // what the counted intervals used, at that mean
+        self.cpu_ns += (used * span as u128 / (now_ns - self.at_ns) as u128) as u64;
+        self.at_ns += span;
+    }
+
+    /// Hundredths, as `/proc/loadavg` prints them.
+    fn hundredths(&self) -> [u32; 3] {
+        self.avg.map(|a| ((a * 100 + LOAD_ONE / 2) / LOAD_ONE).min(0x1f_ffff) as u32)
+    }
+}
+
+/// Three load averages in hundredths, 21 bits each, in one `u64`.
+pub fn pack_load(l: [u32; 3]) -> u64 {
+    l[0] as u64 | (l[1] as u64) << 21 | (l[2] as u64) << 42
+}
+
+pub fn unpack_load(v: u64) -> [u32; 3] {
+    [(v & 0x1f_ffff) as u32, (v >> 21 & 0x1f_ffff) as u32, (v >> 42 & 0x1f_ffff) as u32]
 }
 
 /// One process as another process's `/proc` sees it.
@@ -101,6 +231,14 @@ pub struct ProcEntry {
     pub info: Vec<u8>,
     /// Its threads besides the first (whose id is the pid), in order.
     pub tids: Vec<i32>,
+    /// Its ids and capability sets as it last published them
+    /// ([`crate::syscalls::Creds::save`]; empty: never, a parent's at a
+    /// spawn). `/proc/<pid>/status`'s `Uid:`, `Gid:` and `Cap*:` lines.
+    pub creds: Vec<u8>,
+    /// What it has used, as it last said.
+    pub usage: Usage,
+    /// Each task's own time and name, in [`Self::tasks`]' order.
+    pub task_usage: Vec<TaskUsage>,
 }
 
 impl ProcEntry {
@@ -117,6 +255,14 @@ impl ProcEntry {
     pub fn tasks(&self) -> Vec<i32> {
         std::iter::once(self.pid).chain(self.tids.iter().copied()).collect()
     }
+    /// Task `tid`'s own time and name (none said: nothing yet).
+    pub fn task(&self, tid: i32) -> TaskUsage {
+        self.tasks().iter().position(|&t| t == tid).and_then(|i| self.task_usage.get(i)).copied().unwrap_or_default()
+    }
+    /// The name task `tid`'s `comm` and `stat` give: its own, or the process's.
+    pub fn task_comm(&self, tid: i32) -> String {
+        self.task(tid).own_name().unwrap_or_else(|| self.comm())
+    }
     /// `/proc/<pid>/cmdline`.
     pub fn cmdline(&self) -> &[u8] {
         match self.info.iter().position(|&b| b == b'\n') {
@@ -127,18 +273,30 @@ impl ProcEntry {
 }
 
 /// The wire form of a process list: per entry five `i32`s (pid, ppid, pgid,
-/// sid, zombie), the thread count and the info's length, the thread ids, the
-/// info, padded to four bytes.
+/// sid, zombie), the thread count and the info's length, the [`Usage`] as
+/// five `u64`s, the thread ids, each task's [`TaskUsage`] (its time, then its
+/// 16-byte name; the first thread's first), the info and the creds, padded
+/// to four bytes.
 pub fn encode_entries(entries: &[ProcEntry]) -> Vec<u8> {
     let mut out = Vec::new();
     for e in entries {
-        for v in [e.pid, e.ppid, e.pgid, e.sid, i32::from(e.zombie), e.tids.len() as i32, e.info.len() as i32] {
+        for v in [e.pid, e.ppid, e.pgid, e.sid, i32::from(e.zombie), e.tids.len() as i32, e.info.len() as i32, e.creds.len() as i32] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        let u = &e.usage;
+        for v in [u.cpu_ns, u.child_cpu_ns, u.rss, u.vsize, u.start_ns] {
             out.extend_from_slice(&v.to_le_bytes());
         }
         for t in &e.tids {
             out.extend_from_slice(&t.to_le_bytes());
         }
+        for i in 0..=e.tids.len() {
+            let u = e.task_usage.get(i).copied().unwrap_or_default();
+            out.extend_from_slice(&u.cpu_ns.to_le_bytes());
+            out.extend_from_slice(&u.name);
+        }
         out.extend_from_slice(&e.info);
+        out.extend_from_slice(&e.creds);
         while out.len() % 4 != 0 {
             out.push(0);
         }
@@ -149,22 +307,35 @@ pub fn encode_entries(entries: &[ProcEntry]) -> Vec<u8> {
 pub fn decode_entries(mut b: &[u8]) -> Vec<ProcEntry> {
     let mut out = Vec::new();
     let word = |b: &[u8], i: usize| i32::from_le_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]]);
-    while b.len() >= 28 {
-        let (t, n) = (word(b, 5).max(0) as usize, word(b, 6).max(0) as usize);
-        let at = 28 + 4 * t;
-        if b.len() < at + n {
+    let long = |b: &[u8], i: usize| u64::from_le_bytes(b[32 + i * 8..40 + i * 8].try_into().unwrap());
+    const HEAD: usize = 32 + 5 * 8;
+    const TASK: usize = 8 + 16;
+    while b.len() >= HEAD {
+        let (t, n, c) = (word(b, 5).max(0) as usize, word(b, 6).max(0) as usize, word(b, 7).max(0) as usize);
+        let tasks = HEAD + 4 * t;
+        let at = tasks + TASK * (t + 1);
+        if b.len() < at + n + c {
             break;
         }
+        let task_usage = (0..=t)
+            .map(|i| {
+                let o = tasks + TASK * i;
+                TaskUsage { cpu_ns: u64::from_le_bytes(b[o..o + 8].try_into().unwrap()), name: b[o + 8..o + 24].try_into().unwrap() }
+            })
+            .collect();
         out.push(ProcEntry {
             pid: word(b, 0),
             ppid: word(b, 1),
             pgid: word(b, 2),
             sid: word(b, 3),
             zombie: word(b, 4) != 0,
-            tids: (0..t).map(|i| word(b, 7 + i)).collect(),
+            tids: (0..t).map(|i| word(b, HEAD / 4 + i)).collect(),
             info: b[at..at + n].to_vec(),
+            creds: b[at + n..at + n + c].to_vec(),
+            usage: Usage { cpu_ns: long(b, 0), child_cpu_ns: long(b, 1), rss: long(b, 2), vsize: long(b, 3), start_ns: long(b, 4) },
+            task_usage,
         });
-        b = &b[(at + n + 3) & !3..];
+        b = &b[(at + n + c + 3) & !3..];
     }
     out
 }
@@ -284,6 +455,8 @@ struct Proc {
     queue: crate::wait::Queue,
     /// See [`ProcTable::set_info`].
     info: Vec<u8>,
+    /// Its ids and capabilities ([`ProcEntry::creds`]).
+    creds: Vec<u8>,
     /// Its address space, for another process's `process_vm_readv` and
     /// `process_vm_writev`: see [`ProcTable::set_vm`]. `None` once it exits.
     vm: Option<Arc<PeerVm>>,
@@ -296,6 +469,13 @@ struct Proc {
     /// When it became a zombie, in the order processes did (XNU's
     /// `zombproc` list has the latest first); 0 while it lives.
     zseq: u64,
+    /// See [`ProcTable::set_usage`].
+    usage: Usage,
+    /// How it crashed, as it said before it ended ([`ProcTable::set_crash`]):
+    /// empty when it has not.
+    crash: Vec<u8>,
+    /// A line gex adds to its crash's reason ([`ProcTable::add_crash_line`]).
+    crash_more: Vec<u8>,
 }
 
 /// Another process's memory as a host holds it: bytes at a guest address,
@@ -316,6 +496,116 @@ pub struct PeerVm {
     pub mem: Arc<dyn PeerMem>,
 }
 
+/// `prctl` option gex adds: the calling process has crashed (`arg2` the
+/// note's address, `arg3` its length; [`ProcTable::set_crash`]).
+pub const PR_GEX_CRASH: u64 = 0x4745_0002;
+
+/// `prctl` option gex adds: a reservation of `arg2` bytes with no address
+/// could not be placed in the calling process's lowered memory (64-bit
+/// Wine's `map_view`, which looks for room itself and never asks the
+/// kernel for a mapping it has no gap for). `Kernel::note_short`.
+pub const PR_GEX_SHORT: u64 = 0x4745_0003;
+
+/// A note's first byte when it gives way to one the process gave itself
+/// ([`ProcTable::set_crash_unless_said`]).
+const UNLESS_SAID: u8 = 1;
+
+/// A note's first byte when the rest is one more line for its crash's
+/// reason ([`ProcTable::add_crash_line`]).
+const ADD_LINE: u8 = 2;
+
+/// The most crashes kept for a reader that has not taken them.
+const CRASHES_KEPT: usize = 64;
+
+/// A process that crashed, as its exit reports it: one that said it had
+/// ([`ProcTable::set_crash`]) or that a signal which dumps core ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Crash {
+    pub pid: i32,
+    /// Its program's name (a Windows program's `.exe`).
+    pub name: String,
+    /// What happened, in a few words.
+    pub reason: String,
+    /// Its exit status: the program's own when it gave one (a Windows
+    /// exception code), else what a shell sees (128 plus the signal).
+    pub code: u32,
+    /// The signal that ended it, 0 for none.
+    pub signal: u32,
+}
+
+/// The signals whose default action dumps core: a program's crash.
+fn core_signal(sig: u32) -> bool {
+    matches!(sig, 3 | 4 | 5 | 6 | 7 | 8 | 11 | 24 | 25 | 31)
+}
+
+/// Linux's name for signal `sig`.
+pub fn signal_name(sig: u32) -> &'static str {
+    match sig {
+        1 => "SIGHUP", 2 => "SIGINT", 3 => "SIGQUIT", 4 => "SIGILL", 5 => "SIGTRAP", 6 => "SIGABRT",
+        7 => "SIGBUS", 8 => "SIGFPE", 9 => "SIGKILL", 11 => "SIGSEGV", 13 => "SIGPIPE", 15 => "SIGTERM",
+        24 => "SIGXCPU", 25 => "SIGXFSZ", 31 => "SIGSYS",
+        _ => "a signal",
+    }
+}
+
+impl Crash {
+    /// Process `pid` (`/proc`'s `info`) ending with wait status `status`, its
+    /// own `note`: a crash, or not.
+    /// `more`: a line gex adds to the reason ([`ProcTable::add_crash_line`]),
+    /// which makes an end that is no crash otherwise (a nonzero exit) one.
+    fn of(pid: i32, info: &[u8], note: Vec<u8>, more: Vec<u8>, status: i32) -> Option<Crash> {
+        let sig = (status & 0x7f) as u32;
+        let signaled = sig != 0 && sig != 0x7f;
+        if note.is_empty() && more.is_empty() && !(signaled && core_signal(sig)) {
+            return None;
+        }
+        let exited = (!signaled && note.is_empty()).then(|| format!("exited with code {}", (status >> 8) & 0xff));
+        let mut parts = note.split(|&b| b == 0).map(|b| String::from_utf8_lossy(b).into_owned());
+        let (name, reason, code) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default(), parts.next());
+        let own = || {
+            let end = info.iter().position(|&b| b == b'\n').unwrap_or(info.len());
+            String::from_utf8_lossy(&info[..end]).into_owned()
+        };
+        let code = code.and_then(|c| c.trim().parse::<u32>().ok()).unwrap_or(if signaled { 128 + sig } else { ((status >> 8) & 0xff) as u32 });
+        Some(Crash {
+            pid,
+            name: if name.is_empty() { own() } else { name },
+            reason: {
+                let r = if !reason.is_empty() { reason } else if signaled { signal_name(sig).to_string() } else { exited.unwrap_or_else(|| "crashed".to_string()) };
+                if more.is_empty() { r } else { format!("{r}; {}", String::from_utf8_lossy(&more)) }
+            },
+            code,
+            signal: if signaled { sig } else { 0 },
+        })
+    }
+
+    /// As one line of JSON: `{"pid","name","reason","code","signal"}`.
+    pub fn json(&self) -> String {
+        fn q(s: &str) -> String {
+            let mut o = String::from('"');
+            for c in s.chars() {
+                match c {
+                    '"' => o.push_str("\\\""),
+                    '\\' => o.push_str("\\\\"),
+                    c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+                    c => o.push(c),
+                }
+            }
+            o.push('"');
+            o
+        }
+        format!(r#"{{"pid":{},"name":{},"reason":{},"code":{},"signal":{}}}"#, self.pid, q(&self.name), q(&self.reason), self.code, self.signal)
+    }
+}
+
+/// A host's own report of each crash as it is recorded ([`set_crash_hook`]).
+static CRASH_HOOK: std::sync::OnceLock<fn(&Crash)> = std::sync::OnceLock::new();
+
+/// Have `f` hear of each crash the table records (a native host's line).
+pub fn set_crash_hook(f: fn(&Crash)) {
+    let _ = CRASH_HOOK.set(f);
+}
+
 struct Table {
     /// The next task id, a process's or a thread's: one numbering, as
     /// Linux's pids and tids are one, so an id names exactly one task.
@@ -333,9 +623,56 @@ struct Table {
     /// the group it was given, not its number).
     pgserial: std::collections::HashMap<i32, u64>,
     next_pgserial: u64,
+    /// Each task's own time and name, a process's first thread's under its
+    /// pid: the tasks that have said either ([`ProcTable::add_task_cpu`],
+    /// [`ProcTable::set_task_name`]).
+    tasks: std::collections::HashMap<i32, TaskUsage>,
+    /// The processor time of every process no longer in the table.
+    gone_cpu_ns: u64,
+    load: Load,
+    /// The crashes not yet taken ([`ProcTable::take_crashes`]), oldest first.
+    crashes: std::collections::VecDeque<Crash>,
 }
 
 impl Table {
+    /// Process `pid`'s crash, if ending with `status` is one: heard by the
+    /// host's hook and kept for the reader. Whether it was.
+    fn record_crash(&mut self, pid: i32, status: i32) -> bool {
+        let Some(c) = self.procs.iter_mut().find(|p| p.pid == pid).and_then(|p| Crash::of(pid, &p.info, std::mem::take(&mut p.crash), std::mem::take(&mut p.crash_more), status)) else {
+            return false;
+        };
+        if let Some(f) = CRASH_HOOK.get() {
+            f(&c);
+        }
+        if self.crashes.len() >= CRASHES_KEPT {
+            self.crashes.pop_front();
+        }
+        self.crashes.push_back(c);
+        true
+    }
+
+    /// Take the processes `gone` says out of the table, their processor
+    /// time kept: in the total, and in their parent's children's time.
+    fn forget(&mut self, gone: impl Fn(&Proc) -> bool) {
+        let mut left = Vec::with_capacity(self.procs.len());
+        let mut owed = Vec::new();
+        for p in std::mem::take(&mut self.procs) {
+            if gone(&p) {
+                self.tasks.remove(&p.pid);
+                self.gone_cpu_ns += p.usage.cpu_ns;
+                owed.push((p.ppid, p.usage.cpu_ns + p.usage.child_cpu_ns));
+            } else {
+                left.push(p);
+            }
+        }
+        self.procs = left;
+        for (ppid, ns) in owed {
+            if let Some(p) = self.procs.iter_mut().find(|p| p.pid == ppid) {
+                p.usage.child_cpu_ns += ns;
+            }
+        }
+    }
+
     /// `fixjobc(p, pgrp, entering)`: process `pid` entering or leaving group
     /// `pgid` of session `sess`. Its parent qualifies it for its group when
     /// in another group of the session, and it qualifies each child in
@@ -393,6 +730,10 @@ impl Table {
             p.sid = sess;
         }
     }
+
+    fn cpu_total(&self) -> u64 {
+        self.gone_cpu_ns + self.procs.iter().map(|p| p.usage.cpu_ns).sum::<u64>()
+    }
 }
 
 /// Moved after every signal left in a process's inbox (`kill`, a group's
@@ -428,6 +769,9 @@ pub struct ProcTable {
     pub jetsam: Mutex<crate::darwin::memorystatus::Jetsam>,
     /// The scheduler's runnable threads and averages, the whole system's.
     pub sched: crate::darwin::sched::Sched,
+    /// Notified when a process crashes ([`ProcTable::crash_queue`]); made
+    /// when first asked for, once the host's queues are there.
+    crash_q: std::sync::OnceLock<crate::wait::Queue>,
 }
 
 impl std::fmt::Debug for ProcTable {
@@ -458,9 +802,11 @@ impl ProcTable {
             remote: None,
             virtual_init: AtomicBool::new(false),
             darwin_ipc: Default::default(),
+            crash_q: std::sync::OnceLock::new(),
             inner: Mutex::new(Table {
                 next_pid: INIT_PID + 1,
                 threads: std::collections::HashMap::new(),
+                tasks: std::collections::HashMap::new(),
                 jobc: std::collections::HashMap::new(),
                 pgserial: std::collections::HashMap::new(),
                 next_pgserial: 1,
@@ -494,11 +840,18 @@ impl ProcTable {
                     to_threads: Vec::new(),
                     queue: crate::wait::Queue::new(),
                     info: Vec::new(),
+                    creds: Vec::new(),
                     vm: None,
                     host_child: false,
                     darwin: None,
                     zseq: 0,
+                    usage: Usage::default(),
+                    crash: Vec::new(),
+                    crash_more: Vec::new(),
                 }],
+                gone_cpu_ns: 0,
+                load: Load::default(),
+                crashes: std::collections::VecDeque::new(),
             }),
         };
         // forkproc's cloning of initproc: init is internal, in no band.
@@ -525,9 +878,10 @@ impl ProcTable {
         let mut t = self.lock();
         let pid = t.next_pid;
         t.next_pid += 1;
-        let (pgid, sid) = match t.procs.iter().find(|p| p.pid == ppid) {
-            Some(p) => (p.pgid, p.sid),
-            None => (pid, pid),
+        // (and the parent's ids, which a fork copies, until the child says)
+        let (pgid, sid, creds) = match t.procs.iter().find(|p| p.pid == ppid) {
+            Some(p) => (p.pgid, p.sid, p.creds.clone()),
+            None => (pid, pid, Vec::new()),
         };
         // forkproc's copy of p_nice, the uid and the persona, and
         // task_create's task_policy_create from the parent's policy, with
@@ -580,10 +934,14 @@ impl ProcTable {
             to_threads: Vec::new(),
             queue: crate::wait::Queue::new(),
             info: Vec::new(),
+            creds,
             vm: None,
             host_child,
             darwin: None,
             zseq: 0,
+            usage: Usage::default(),
+            crash: Vec::new(),
+            crash_more: Vec::new(),
         });
         drop(t);
         // forkproc's memorystatus init, then memorystatus_add.
@@ -635,7 +993,11 @@ impl ProcTable {
         if let Some(r) = self.remote {
             return (r.end_tid)(tid);
         }
-        self.lock().threads.remove(&tid);
+        {
+            let mut t = self.lock();
+            t.threads.remove(&tid);
+            t.tasks.remove(&tid);
+        }
         self.sched.thread_gone(tid);
     }
 
@@ -670,8 +1032,108 @@ impl ProcTable {
         if let Some(r) = self.remote {
             return (r.set_info)(pid, info.as_ptr() as usize as crate::PAddr, info.len() as u32);
         }
-        if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
+        let mut t = self.lock();
+        if let Some(p) = t.procs.iter_mut().find(|p| p.pid == pid) {
             p.info = info.to_vec();
+        }
+        // a new image: the first thread goes by its name again, as an
+        // `execve` resets `comm` on Linux
+        if let Some(u) = t.tasks.get_mut(&pid) {
+            u.name = [0; 16];
+        }
+    }
+
+    /// Process `pid`'s ids and capabilities as they are now
+    /// ([`crate::syscalls::Creds::save`]), for the others' `/proc/<pid>/status`.
+    pub fn set_creds(&self, pid: i32, creds: &[u8]) {
+        let creds = &creds[..creds.len().min(256)];
+        if let Some(r) = self.remote {
+            return (r.set_creds)(pid, creds.as_ptr() as usize as crate::PAddr, creds.len() as u32);
+        }
+        if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
+            p.creds = creds.to_vec();
+        }
+    }
+
+    /// Process `pid` has crashed and is about to end, `note` saying how:
+    /// `NAME\0REASON`, and optionally `\0CODE` (a decimal status of the
+    /// program's own, such as Windows's exception code), its name (empty:
+    /// its own, as `/proc` has it) and what happened, for the report its exit
+    /// makes ([`Crash`]). A process that ends by a signal that would dump
+    /// core crashes without saying so; this gives the reason (where a host
+    /// knows more) or the crash (a Windows program, which ends with its
+    /// exception code as an exit status). The `prctl` gex adds,
+    /// [`PR_GEX_CRASH`], or the host's own.
+    pub fn set_crash(&self, pid: i32, note: &[u8]) {
+        let note = &note[..note.len().min(1024)];
+        if let Some(r) = self.remote {
+            return (r.set_crash)(pid, note.as_ptr() as usize as crate::PAddr, note.len() as u32);
+        }
+        if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
+            match note.split_first() {
+                Some((&UNLESS_SAID, rest)) if p.crash.is_empty() => p.crash = rest.to_vec(),
+                Some((&UNLESS_SAID, _)) => {}
+                Some((&ADD_LINE, rest)) => p.crash_more = rest.to_vec(),
+                _ => p.crash = note.to_vec(),
+            }
+        }
+    }
+
+    /// The queue notified when a crash is recorded, for
+    /// [`ProcTable::take_crashes`]'s reader; 0 when the host has no queues.
+    pub fn crash_queue(&self) -> u32 {
+        self.crash_q.get_or_init(crate::wait::Queue::new).id()
+    }
+
+    /// The crashes recorded since the last call, oldest first.
+    pub fn take_crashes(&self) -> Vec<Crash> {
+        self.lock().crashes.drain(..).collect()
+    }
+
+    /// One more line for the reason process `pid`'s crash gives, which
+    /// makes its end a crash if it would not be one (a nonzero exit): what
+    /// gex knows of why it ended (`outgrow_ending`).
+    pub fn add_crash_line(&self, pid: i32, line: &str) {
+        let mut v = Vec::with_capacity(line.len() + 1);
+        v.push(ADD_LINE);
+        v.extend_from_slice(line.as_bytes());
+        self.set_crash(pid, &v);
+    }
+
+    /// `note` for process `pid` as [`ProcTable::set_crash`], unless it has
+    /// said how it crashed itself: a host's account of what ended it, which
+    /// a program's own (a Windows program's exception) outranks. (Marked
+    /// for the table with a leading [`UNLESS_SAID`].)
+    pub fn set_crash_unless_said(&self, pid: i32, note: &[u8]) {
+        let mut v = Vec::with_capacity(note.len() + 1);
+        v.push(UNLESS_SAID);
+        v.extend_from_slice(note);
+        self.set_crash(pid, &v);
+    }
+
+    /// Process `pid` ends with wait status `status` and is not collected
+    /// here (the host's first process, whose end is the run's): its crash,
+    /// if it is one, reported as [`ProcTable::exit`] reports one.
+    pub fn report_end(&self, pid: i32, status: i32) {
+        if self.remote.is_some() {
+            return;
+        }
+        if self.lock().record_crash(pid, status) {
+            self.crash_notify();
+        }
+    }
+
+    fn crash_notify(&self) {
+        if let Some(q) = self.crash_q.get() {
+            crate::wait::notify(q.id());
+        }
+    }
+
+    /// Give back crashes taken and not delivered, ahead of the newer ones.
+    pub fn put_back_crashes(&self, back: Vec<Crash>) {
+        let mut t = self.lock();
+        for c in back.into_iter().rev() {
+            t.crashes.push_front(c);
         }
     }
 
@@ -704,7 +1166,8 @@ impl ProcTable {
                 .map(|p| {
                     let mut tids: Vec<i32> = t.threads.iter().filter(|&(_, &o)| o == p.pid).map(|(&tid, _)| tid).collect();
                     tids.sort_unstable();
-                    let e = ProcEntry { pid: p.pid, ppid: p.ppid, pgid: p.pgid, sid: p.sid, zombie: false, info: p.info.clone(), tids };
+                    let task_usage = std::iter::once(p.pid).chain(tids.iter().copied()).map(|id| t.tasks.get(&id).copied().unwrap_or_default()).collect();
+                    let e = ProcEntry { pid: p.pid, ppid: p.ppid, pgid: p.pgid, sid: p.sid, zombie: false, info: p.info.clone(), creds: p.creds.clone(), tids, usage: p.usage, task_usage };
                     (e, Arc::clone(&p.child.status))
                 })
                 .collect()
@@ -754,11 +1217,26 @@ impl ProcTable {
         if let Some(r) = self.remote {
             return (r.exit)(pid, status);
         }
+        self.end(pid, status, status);
+    }
+
+    /// [`ProcTable::exit`] for a table whose statuses are exit codes, or the
+    /// negated signal number for a death by one (the page kernel's), not
+    /// wait statuses.
+    pub fn exit_code(&self, pid: i32, code: i32) {
+        let word = if code < 0 { (-code) & 0x7f } else { (code & 0xff) << 8 };
+        self.end(pid, code, word);
+    }
+
+    /// `pid` ends with `status` kept for its parent; `word` is the same end
+    /// as a wait status, which says whether it is a crash.
+    fn end(&self, pid: i32, status: i32, word: i32) {
         // proc_exit's memorystatus_remove.
         self.jetsam().remove(pid);
         // Its threads are not runnable any more.
         self.sched.task_gone(pid);
         let virtual_init = self.virtual_init.load(Ordering::Acquire);
+        let crashed;
         let mut jobc_orphaned = Vec::new();
         let (cell, done, was_ppid, own_q, orphans) = {
             let mut t = self.lock();
@@ -782,7 +1260,12 @@ impl ProcTable {
                 }
             }
             // Its threads went with it.
-            t.threads.retain(|_, p| *p != pid);
+            let gone: Vec<i32> = t.threads.iter().filter(|&(_, &p)| p == pid).map(|(&tid, _)| tid).collect();
+            for tid in gone {
+                t.threads.remove(&tid);
+                t.tasks.remove(&tid);
+            }
+            crashed = t.record_crash(pid, word);
             match t.procs.iter_mut().find(|p| p.pid == pid) {
                 Some(p) => {
                     p.vm = None;
@@ -791,6 +1274,9 @@ impl ProcTable {
                 None => return,
             }
         };
+        if crashed {
+            self.crash_notify();
+        }
         // Its children that had ended already and are given to a virtual
         // init: nobody will collect them, so they go now. (Each status is
         // read with the table let go, as in `entries`.)
@@ -800,7 +1286,7 @@ impl ProcTable {
             .map(|(pid, _)| pid)
             .collect();
         if !ended.is_empty() {
-            self.lock().procs.retain(|p| !(ended.contains(&p.pid) && p.ppid == INIT_PID));
+            self.lock().forget(|p| ended.contains(&p.pid) && p.ppid == INIT_PID);
         }
         // Published outside the table lock: a waiter wakes on `done` then wants
         // the table, so holding both here in the other order deadlocks.
@@ -808,7 +1294,7 @@ impl ProcTable {
         let xstat = {
             let mut t = self.lock();
             let p = t.procs.iter_mut().find(|p| p.pid == pid);
-            let w = status as u32;
+            let w = word as u32;
             let x = match p.as_ref().and_then(|p| p.rval) {
                 // Its own exit(), not a signal that came first.
                 Some(rval) if w & 0x7f == 0 && (w >> 8) & 0xff == rval & 0xff => rval.wrapping_shl(8),
@@ -855,7 +1341,7 @@ impl ProcTable {
                     Some(i) if t.procs[i].host_child => t.procs.iter().find(|p| p.pid == INIT_PID).map_or(0, |p| p.queue.id()),
                     Some(i) => {
                         t.procs[i].child.reaped.store(true, Ordering::Release);
-                        t.procs.remove(i);
+                        t.forget(|p| p.pid == pid);
                         0
                     }
                     None => 0,
@@ -942,14 +1428,87 @@ impl ProcTable {
                 parent.children_cpu.1 += sys;
             }
         }
-        {
-            let mut t = self.lock();
-            t.procs.retain(|p| p.pid != pid);
-        }
+        self.lock().forget(|p| p.pid == pid);
         // A process reaped unseen (a spawn that failed) leaves the bands.
         self.jetsam().remove(pid);
         // reap_child_locked's NOTE_REAP.
         crate::procnote::post(pid, crate::procnote::note::REAP);
+    }
+
+    /// What `pid` has used, said by the process itself as it goes: its
+    /// processor time, its memory, and when it started (see [`Usage`]).
+    /// Its children's time is the table's to keep.
+    pub fn set_usage(&self, pid: i32, cpu_ns: u64, rss: u64, vsize: u64, start_ns: u64) {
+        if let Some(r) = self.remote {
+            return (r.set_usage)(pid, cpu_ns, rss, vsize, start_ns);
+        }
+        if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
+            // never back: a late word from a Worker that said less
+            let cpu_ns = cpu_ns.max(p.usage.cpu_ns);
+            // the process's start, not an `execve`'s
+            let start_ns = if p.usage.start_ns != 0 { p.usage.start_ns } else { start_ns };
+            p.usage = Usage { cpu_ns, rss, vsize, start_ns, ..p.usage };
+        }
+    }
+
+    /// Task `tid` (a thread, or a process's first under its pid) has used
+    /// `ns` more processor time: said by its host as it goes, as
+    /// [`Self::set_usage`] is for the whole process. `/proc/<pid>/task/<tid>/stat`.
+    pub fn add_task_cpu(&self, tid: i32, ns: u64) {
+        if let Some(r) = self.remote {
+            return (r.add_task_cpu)(tid, ns);
+        }
+        let mut t = self.lock();
+        if t.procs.iter().any(|p| p.pid == tid) || t.threads.contains_key(&tid) {
+            t.tasks.entry(tid).or_default().cpu_ns += ns;
+        }
+    }
+
+    /// Task `tid` calls itself `name` (`prctl(PR_SET_NAME)`): at most 15
+    /// bytes, up to a NUL; empty goes back to the process's.
+    pub fn set_task_name(&self, tid: i32, name: &[u8]) {
+        let end = name.iter().position(|&b| b == 0).unwrap_or(name.len()).min(15);
+        let name = &name[..end];
+        if let Some(r) = self.remote {
+            return (r.set_task_name)(tid, name.as_ptr() as usize as crate::PAddr, name.len() as u32);
+        }
+        let mut t = self.lock();
+        if t.procs.iter().any(|p| p.pid == tid) || t.threads.contains_key(&tid) {
+            let u = t.tasks.entry(tid).or_default();
+            u.name = [0; 16];
+            u.name[..end].copy_from_slice(name);
+        }
+    }
+
+    /// The processor time every process has used, those gone included:
+    /// `/proc/stat`'s and `/proc/uptime`'s busy time.
+    pub fn cpu_total(&self) -> u64 {
+        if let Some(r) = self.remote {
+            return (r.cpu_total)();
+        }
+        self.lock().cpu_total()
+    }
+
+    /// The memory every process has mapped and accessible, summed, and how
+    /// many processes there are (`sysinfo`'s free memory and count).
+    pub fn memory(&self) -> (u64, usize) {
+        if let Some(r) = self.remote {
+            return ((r.rss_total)(), (r.count)().max(0) as usize);
+        }
+        let t = self.lock();
+        (t.procs.iter().map(|p| p.usage.rss).sum(), t.procs.len())
+    }
+
+    /// The one, five and fifteen minute load averages at `now_ns` on the
+    /// monotonic clock, in hundredths (see [`Load`]).
+    pub fn loadavg(&self, now_ns: u64) -> [u32; 3] {
+        if let Some(r) = self.remote {
+            return unpack_load((r.loadavg)(now_ns));
+        }
+        let mut t = self.lock();
+        let cpu = t.cpu_total();
+        t.load.advance(now_ns, cpu);
+        t.load.hundredths()
     }
 
     pub fn ppid(&self, pid: i32) -> i32 {
@@ -1583,7 +2142,7 @@ impl ProcTable {
 
     /// Take the thread-directed signals sent to `pid`'s thread `tid`, or
     /// (`tid` 0) to any of its threads: (tid, signo, sender). A page's Worker
-    /// takes its own thread's without the kernel lock (shims/browser sigs.rs),
+    /// takes its own thread's without the kernel lock (hosts/browser sigs.rs),
     /// as it has no other thread's signal state; the kernel takes them all.
     pub fn take_thread_signals(&self, pid: i32, tid: i32) -> Vec<(i32, u32, i32)> {
         if let Some(r) = self.remote {
@@ -1913,6 +2472,90 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_crash_is_reported_once_with_what_the_process_said() {
+        let t = ProcTable::new();
+        let (a, b, c, d) = (t.spawn(INIT_PID), t.spawn(INIT_PID), t.spawn(INIT_PID), t.spawn(INIT_PID));
+        t.set_info(a, b"prog\nprog\0");
+        // a crash signal (SIGSEGV), with a host's account
+        t.set_crash_unless_said(a, b"\0SIGSEGV at 0x1234");
+        t.exit(a, 11);
+        // a Windows program's own account, which the host's does not replace
+        t.set_crash(b, b"app.exe\0page fault on read access to 00000000\03221225477");
+        t.set_crash_unless_said(b, b"\0gex could not run it on");
+        t.exit(b, 5 << 8);
+        // an ordinary exit, and SIGTERM: no crash
+        t.exit(c, 0);
+        t.exit(d, 15);
+        let got = t.take_crashes();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], Crash { pid: a, name: "prog".into(), reason: "SIGSEGV at 0x1234".into(), code: 139, signal: 11 });
+        assert_eq!(got[1], Crash { pid: b, name: "app.exe".into(), reason: "page fault on read access to 00000000".into(), code: 0xc0000005, signal: 0 });
+        assert_eq!(got[1].json(), format!(r#"{{"pid":{b},"name":"app.exe","reason":"page fault on read access to 00000000","code":3221225477,"signal":0}}"#));
+        assert!(t.take_crashes().is_empty());
+    }
+
+    #[test]
+    fn a_line_gex_adds_ends_the_crash_reason() {
+        let t = ProcTable::new();
+        let (a, b, c) = (t.spawn(INIT_PID), t.spawn(INIT_PID), t.spawn(INIT_PID));
+        t.set_info(a, b"prog\nprog\0");
+        // the host's account and gex's line, in either order
+        t.add_crash_line(a, "needs more");
+        t.set_crash_unless_said(a, b"\0SIGABRT at 0x10");
+        t.exit(a, 6);
+        // a Windows program's own account keeps it too
+        t.set_crash(b, b"app.exe\0page fault on read access to 00000000\03221225477");
+        t.add_crash_line(b, "needs more");
+        t.exit(b, 5 << 8);
+        // a nonzero exit that said nothing else is a crash only with the line
+        t.add_crash_line(c, "needs more");
+        t.exit(c, 1 << 8);
+        let got = t.take_crashes();
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].reason, "SIGABRT at 0x10; needs more");
+        assert_eq!(got[1].reason, "page fault on read access to 00000000; needs more");
+        assert_eq!(got[2].reason, "exited with code 1; needs more");
+    }
+
+    #[test]
+    fn processor_time_outlives_the_process_and_goes_to_its_parent() {
+        let t = ProcTable::new();
+        let a = t.spawn(INIT_PID);
+        let b = t.spawn(a);
+        t.set_usage(a, 300, 4096, 8192, 5);
+        t.set_usage(b, 200, 4096, 4096, 7);
+        // never back, and the start is the first one said
+        t.set_usage(b, 150, 4096, 4096, 9);
+        let e = |pid| t.entries().into_iter().find(|e| e.pid == pid).unwrap().usage;
+        assert_eq!(e(b), Usage { cpu_ns: 200, child_cpu_ns: 0, rss: 4096, vsize: 4096, start_ns: 7 });
+        assert_eq!(t.cpu_total(), 500);
+        t.exit(b, 0);
+        t.reap(b);
+        assert_eq!(t.cpu_total(), 500, "a collected child's time stays in the total");
+        assert_eq!(e(a).child_cpu_ns, 200);
+        // and on the wire
+        let all = t.entries();
+        assert_eq!(decode_entries(&encode_entries(&all)), all);
+    }
+
+    #[test]
+    fn the_load_average_is_the_mean_running_count_decayed() {
+        let t = ProcTable::new();
+        let s = 1_000_000_000u64;
+        assert_eq!(t.loadavg(100 * s), [0, 0, 0]);
+        // one process busy all the time for a minute: 1 - 1/e of 1.00 over
+        // one minute, less over five and fifteen
+        t.set_usage(INIT_PID, 60 * s, 0, 0, 0);
+        let l = t.loadavg(160 * s);
+        assert!((62..=64).contains(&l[0]), "{l:?}");
+        assert!((17..=19).contains(&l[1]) && (5..=7).contains(&l[2]), "{l:?}");
+        // and idle for five more: it decays
+        let m = t.loadavg(460 * s);
+        assert!(m[0] < 2 && m[1] < l[1], "{m:?}");
+        assert_eq!(unpack_load(pack_load([123, 4567, 89])), [123, 4567, 89]);
+    }
+
+    #[test]
     fn the_host_collects_what_it_started_and_a_virtual_init_its_orphans() {
         let t = ProcTable::new();
         t.set_virtual_init(true);
@@ -2001,6 +2644,36 @@ mod tests {
         assert_eq!(t.entries().iter().find(|e| e.pid == a).unwrap().tids, vec![t1]);
         t.exit(a, 0);
         assert!(t.entries().iter().find(|e| e.pid == a).unwrap().zombie);
+    }
+
+    #[test]
+    fn each_task_has_its_own_time_and_name() {
+        let t = ProcTable::new();
+        let a = t.spawn(INIT_PID);
+        t.set_info(a, b"prog\nprog\0");
+        let (x, y) = (t.new_tid(a), t.new_tid(a));
+        t.add_task_cpu(a, 5);
+        t.add_task_cpu(x, 300);
+        t.add_task_cpu(x, 100);
+        t.add_task_cpu(y, 700);
+        t.set_task_name(x, b"worker-x\0junk");
+        t.set_task_name(y, b"a name longer than fifteen");
+        // not a task: nothing
+        t.add_task_cpu(9999, 1);
+        let e = t.entries();
+        let mine = e.iter().find(|e| e.pid == a).unwrap();
+        assert_eq!((mine.task(a).cpu_ns, mine.task(x).cpu_ns, mine.task(y).cpu_ns), (5, 400, 700));
+        assert_eq!((mine.task_comm(a), mine.task_comm(x), mine.task_comm(y)), ("prog".into(), "worker-x".into(), "a name longer t".into()));
+        assert_eq!(decode_entries(&encode_entries(&e)), e);
+        // a thread's end takes its count; an exec resets the first's name
+        t.set_task_name(a, b"renamed");
+        assert_eq!(t.entries().iter().find(|e| e.pid == a).unwrap().task_comm(a), "renamed");
+        t.end_tid(x);
+        t.set_info(a, b"next\nnext\0");
+        let mine = t.entries().into_iter().find(|e| e.pid == a).unwrap();
+        assert_eq!((mine.task_comm(a), mine.task(a).cpu_ns, mine.task(y).cpu_ns), ("next".into(), 5, 700));
+        let x2 = t.new_tid(a);
+        assert_eq!(t.entries().into_iter().find(|e| e.pid == a).unwrap().task(x2), TaskUsage::default());
     }
 
     #[test]

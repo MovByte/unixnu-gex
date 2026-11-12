@@ -88,6 +88,7 @@ pub fn header() -> String {
         ("TID", ctx::TID),
         ("LAST_TARGET", ctx::LAST_TARGET),
         ("LAST_SOURCE", ctx::LAST_SOURCE),
+        ("CS", ctx::CS),
         ("LAST_SYSCALL", ctx::LAST_SYSCALL),
         ("V", ctx::V),
         ("X87", ctx::X87),
@@ -155,6 +156,7 @@ pub fn header() -> String {
         if gex_abi::kuser_fold() {
             let _ = writeln!(w, "#define GEX_KUSER_GUARD 0x{:x}ull", gex_abi::KUSER_GUARD);
             let _ = writeln!(w, "#define GEX_BRK_KUSER_UNFOLDED ({})", imports::BRK_KUSER_UNFOLDED);
+            let _ = writeln!(w, "#define GEX_BRK_KUSER_UNFOLDED_RESUMABLE ({})", imports::BRK_KUSER_UNFOLDED_RESUMABLE);
             w.push_str(&kuser_helpers());
         }
     }
@@ -255,6 +257,15 @@ GEX_INLINE uint32_t gex_k(int ctx, uint64_t pc, uint64_t a) {
         gex_kuser_miss(ctx, pc, a);
     return (uint32_t)a;
 }
+/* gex_k in a body that goes on after a fault (one with a fault exit): the
+ * host delivers the access violation in place where it can, so the native
+ * frames that called the body keep theirs, and the body leaves for the
+ * context's PC (`exit`, its fault exit). Only the slow path differs. */
+__attribute__((noinline, cold, unused)) static void gex_kuser_fault(int ctx, uint64_t pc, uint64_t a) {
+    GEX_C64(GEX_CTX_PC) = pc;
+    gex_breakpoint(ctx, (int64_t)((pc & 0xffffffffull) | (a << 32)), GEX_BRK_KUSER_UNFOLDED_RESUMABLE);
+}
+#define gex_k_r(ctx, pc, a, exit) ({ uint64_t gex_ka_ = (a); if (__builtin_expect(gex_ka_ >= GEX_KUSER_GUARD, 0)) { gex_kuser_fault((ctx), (pc), gex_ka_); exit } (uint32_t)gex_ka_; })
 "#;
 
 /// The null guard (gex-emit `null_guard_on`), a debugging opt-in: off, the
@@ -527,6 +538,96 @@ pub const ABI_REFUSED: &str = "built for gex's native ABI";
 /// A walk of the section headers only, nothing inside them parsed. `Err` for
 /// bytes that are not a module, or objects that disagree.
 pub fn native_abi(wasm: &[u8]) -> Result<u32, String> {
+    abi_section(wasm).map(|v| v.unwrap_or(1))
+}
+
+/// Whether a native module is bound to the probe layout: it carries the
+/// `gex.abi` section (built with gex_abi.h), imports `gex.call_out` (calls
+/// guest code, as Wine's loader does, a loader from before the section
+/// too), or is bytes this cannot read. A 64-bit native module with neither
+/// is a program of gex's own guest ABI, not Wine's loader.
+pub fn abi_bound(wasm: &[u8]) -> bool {
+    !matches!(abi_section(wasm), Ok(None)) || imports_gex(wasm, imports::CALL_OUT).unwrap_or(true)
+}
+
+/// Whether a module imports `gex.NAME`: its import section walked, `None`
+/// for bytes that are not a module.
+fn imports_gex(wasm: &[u8], name: &str) -> Option<bool> {
+    fn leb(b: &[u8], at: &mut usize) -> Option<usize> {
+        let (mut v, mut shift) = (0usize, 0);
+        loop {
+            let x = *b.get(*at)?;
+            *at += 1;
+            v |= ((x & 0x7f) as usize) << shift;
+            if x & 0x80 == 0 {
+                return Some(v);
+            }
+            shift += 7;
+            if shift > 63 {
+                return None;
+            }
+        }
+    }
+    fn str<'a>(b: &'a [u8], at: &mut usize) -> Option<&'a [u8]> {
+        let n = leb(b, at)?;
+        let s = b.get(*at..at.checked_add(n)?)?;
+        *at += n;
+        Some(s)
+    }
+    if wasm.get(..4) != Some(b"\0asm") {
+        return None;
+    }
+    let mut at = 8;
+    while at < wasm.len() {
+        let id = wasm[at];
+        at += 1;
+        let size = leb(wasm, &mut at)?;
+        let end = at.checked_add(size).filter(|&e| e <= wasm.len())?;
+        if id == 2 {
+            let mut p = at;
+            for _ in 0..leb(wasm, &mut p)? {
+                let (m, n) = (str(wasm, &mut p)?, str(wasm, &mut p)?);
+                if m == IMPORT_MODULE.as_bytes() && n == name.as_bytes() {
+                    return Some(true);
+                }
+                let kind = *wasm.get(p)?;
+                p += 1;
+                match kind {
+                    0 => {
+                        leb(wasm, &mut p)?;
+                    }
+                    1 => {
+                        p += 1;
+                        let f = leb(wasm, &mut p)?;
+                        leb(wasm, &mut p)?;
+                        if f & 1 != 0 {
+                            leb(wasm, &mut p)?;
+                        }
+                    }
+                    2 => {
+                        let f = leb(wasm, &mut p)?;
+                        leb(wasm, &mut p)?;
+                        if f & 1 != 0 {
+                            leb(wasm, &mut p)?;
+                        }
+                    }
+                    3 => p += 2,
+                    4 => {
+                        p += 1;
+                        leb(wasm, &mut p)?;
+                    }
+                    _ => return None,
+                }
+            }
+            return Some(false);
+        }
+        at = end;
+    }
+    Some(false)
+}
+
+/// [`native_abi`]'s walk: the section's value, `None` without one.
+fn abi_section(wasm: &[u8]) -> Result<Option<u32>, String> {
     fn leb(b: &[u8], at: &mut usize) -> Option<usize> {
         let (mut v, mut shift) = (0usize, 0);
         loop {
@@ -568,7 +669,7 @@ pub fn native_abi(wasm: &[u8]) -> Result<u32, String> {
         }
         at = end;
     }
-    Ok(found.unwrap_or(1))
+    Ok(found)
 }
 
 /// Why a 32-bit Wine native module (`what`: Wine's loader or PE module) cannot run
@@ -619,5 +720,24 @@ mod abi_tests {
         let e = abi_refusal(&module(&[]), "m").unwrap();
         assert!(e.starts_with("m is built for gex's native ABI 1, this gex's is"), "{e}");
         assert!(abi_refusal(&module(&[&[gex_abi::NATIVE_ABI + 1]]), "m").unwrap().contains(ABI_REFUSED));
+        assert!(!abi_bound(&module(&[])));
+        assert!(abi_bound(&module(&[&[gex_abi::NATIVE_ABI]])));
+        assert!(abi_bound(b"ELF"));
+        // an import section: gex.syscall (a function), then gex.call_out
+        let imp = |names: &[&str]| {
+            let mut body = vec![names.len() as u8];
+            for n in names {
+                body.extend_from_slice(&[3, b'g', b'e', b'x', n.len() as u8]);
+                body.extend_from_slice(n.as_bytes());
+                body.extend_from_slice(&[0, 0]);
+            }
+            let mut m = module(&[]);
+            m.push(2);
+            m.push(body.len() as u8);
+            m.extend_from_slice(&body);
+            m
+        };
+        assert!(!abi_bound(&imp(&[imports::SYSCALL])));
+        assert!(abi_bound(&imp(&[imports::SYSCALL, imports::CALL_OUT])));
     }
 }

@@ -6,7 +6,7 @@
 // every base the cache holds translations of the other image's bytes, which
 // must not run. The restored run translates under 5% of the first run's
 // blocks in the two images (the runtime's exit lines, `log: 'debug'`).
-import { bootWine, exitStats, blocksIn, printedRanges } from '../lib/wine.mjs';
+import { bootWine, exitStats, exitLineOf, blocksIn, printedRanges } from '../lib/wine.mjs';
 import { expect } from '../fixtures/wine/bigdll.mjs';
 
 export const meta = { hosts: ['browser', 'node'], arches: ['x86'], images: ['wine64', 'win-progs'], timeout: 1200 };
@@ -15,7 +15,9 @@ const PHASES = ['save', 'restore', 'swapped'];
 
 export default async function (t) {
   const phase = PHASES[t.phase - 1];
-  const w = await bootWine(t, { system: { xcache: true }, debug: { log: 'debug' } });
+  // A cache of its own name: another test's on the same page path would
+  // be restored and saved over this one's when the two run at once.
+  const w = await bootWine(t, { system: { xcache: 'xcache2' }, debug: { log: 'debug' } });
   await w.put('xca.dll');
   await w.put('xcb.dll');
   const [p, q] = phase === 'swapped' ? ['xcb', 'xca'] : ['xca', 'xcb'];
@@ -26,6 +28,8 @@ export default async function (t) {
   // The program's own lines: a process's cache save may be said among them.
   const own = r.stdout.split('\n').filter((l) => /^(xc[ab]\.dll |unloaded$)/.test(l)).join('\n');
   t.check(`${phase}: every call's result`, r.code === 0 && want.test(own), `exit ${r.code}; stdout ${JSON.stringify(r.stdout.slice(-300))}; stderr ${JSON.stringify(r.stderr.trim().split('\n').slice(-4).join(' / '))}`);
+  // Its exit line, which says what it translated: after its save.
+  t.check(`${phase}: xcload2's exit line`, await exitLineOf(t, /xcload2\.exe/), 'none in 60 s');
   await w.sys.shutdown();
   const blocks = blocksIn(await exitStats(t), printedRanges(own));
   t.record(`${phase} DLL blocks`, blocks);
