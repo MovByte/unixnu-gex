@@ -779,6 +779,46 @@ pub fn note_store(k: &mut Kernel, m: &mut GuestMem<'_>, page: u64) -> bool {
     true
 }
 
+/// Surface `id` as the executor's table describes it; none for an id no
+/// surface has.
+pub fn describe(id: u32) -> Option<executor::SurfaceDesc> {
+    root(|r| {
+        let s = r.surfaces.get(&id)?;
+        let d = &s.desc;
+        let planes = d
+            .planes
+            .iter()
+            .map(|p| executor::PlaneDesc { offset: p.offset, width: p.width, height: p.height, bytes_per_row: p.bytes_per_row, bytes_per_element: u32::from(p.bytes_per_element), element_width: u32::from(p.element_width), element_height: u32::from(p.element_height), size: p.size })
+            .collect();
+        Some(executor::SurfaceDesc { id, pixel_format: d.pixel_format, alloc_size: d.alloc_size, planes, seed: ro_u32(r, id, ro::SEED) })
+    })
+}
+
+/// Surface `id` handed to the GPU (a GPU client's use of it: a texture or
+/// buffer over its bytes) through the executor's surface table; from then
+/// on its locks read the GPU's writes back and its unlocks hand over the
+/// CPU's. `Err` says what is missing: no such surface, or no executor.
+pub fn bind_gpu(id: u32) -> Result<(), String> {
+    let desc = describe(id).ok_or_else(|| format!("binding IOSurface {id:#x} to the GPU: no such surface"))?;
+    executor::bind(&desc)?;
+    root(|r| {
+        if let Some(s) = r.surfaces.get_mut(&id) {
+            s.gpu = true;
+        }
+    });
+    Ok(())
+}
+
+/// `f` with surface `id`'s bytes, every task's changes gathered into them
+/// first: what the executor reads when the GPU uses the surface.
+pub fn with_bytes<R>(k: &mut Kernel, id: u32, f: impl FnOnce(&mut [u8]) -> R) -> Option<R> {
+    root(|r| {
+        let mem = r.surfaces.get_mut(&id)?.memory.as_mut()?;
+        k.darwin_own_memory(|k, m| mem.gather(k, m)).ok()?;
+        Some(f(&mut mem.backing))
+    })
+}
+
 /// The graphics comm page's first word (IOGPUFamily's selector 3).
 pub fn comm_word() -> u32 {
     root(|r| r.shared.comm_word())
