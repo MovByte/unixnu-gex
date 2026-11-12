@@ -239,6 +239,7 @@ pub mod kind {
     pub const SYSCALL_UNIX: u32 = 0x14;
     pub const SYSCALL_MACH: u32 = 0x16;
     pub const SYSCALL_MIG: u32 = 0x17;
+    pub const FCNTL: u32 = 0x18;
     pub const NECP_ACTION: u32 = 0x1a;
     pub const MAC_SYSCALL: u32 = 0x19;
 }
@@ -505,12 +506,35 @@ pub fn string(b: &[u8], p: &Profile, index: u16) -> Option<Vec<u8>> {
 pub const MASK_BYTES: usize = 70;
 
 /// A filter mask (`proc_set_syscall_filter_mask`'s): bit `n` set lets call
-/// `n` through unasked; a clear one has the MAC policies asked.
-pub type FilterMask = std::sync::Arc<[u8; MASK_BYTES]>;
+/// `n` through unasked; a clear one has the MAC policies asked. A
+/// sandbox's is the one its process is filtered by, which Sandbox's
+/// evaluator sets bits of as it goes ([`mask_set`]).
+pub type FilterMask = std::sync::Arc<MaskBits>;
+
+/// A mask's bytes, which a bit may be set in while it is in use.
+pub type MaskBits = [std::sync::atomic::AtomicU8; MASK_BYTES];
+
+/// A mask of `bytes`.
+pub fn mask_of(bytes: [u8; MASK_BYTES]) -> FilterMask {
+    std::sync::Arc::new(bytes.map(std::sync::atomic::AtomicU8::new))
+}
+
+/// A mask's bytes as they are now.
+pub fn mask_bytes(mask: &MaskBits) -> [u8; MASK_BYTES] {
+    std::array::from_fn(|i| mask[i].load(std::sync::atomic::Ordering::Relaxed))
+}
 
 /// `bitstr_test`: whether `mask` lets call `n` through.
-pub fn mask_allows(mask: &[u8; MASK_BYTES], n: usize) -> bool {
-    mask.get(n / 8).is_some_and(|b| b & (1 << (n % 8)) != 0)
+pub fn mask_allows(mask: &MaskBits, n: usize) -> bool {
+    mask.get(n / 8).is_some_and(|b| b.load(std::sync::atomic::Ordering::Relaxed) & (1 << (n % 8)) != 0)
+}
+
+/// `0x...9f3a90`: call `n` let through from now on (`zalloc_ro_mut_atomic`'s
+/// or), for a number the mask has a bit for.
+pub fn mask_set(mask: &MaskBits, n: usize) {
+    if let Some(b) = mask.get(n / 8) {
+        b.fetch_or(1 << (n % 8), std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// What a profile's call operation (syscall-unix, syscall-mach,
@@ -568,7 +592,7 @@ pub fn profile_mask(b: &[u8], p: &Profile, op: usize, ty: u8, stacks_protobox: b
     }
     let mut m = [0u8; MASK_BYTES];
     m[..bits.len()].copy_from_slice(bits);
-    Ok(ProfileMask { mask: Some(std::sync::Arc::new(m)), defer })
+    Ok(ProfileMask { mask: Some(mask_of(m)), defer })
 }
 
 /// `0x...a095d4`: whether the calls a bitmap filter does not match all
@@ -1618,9 +1642,9 @@ mod tests {
         };
         assert!(none(allow()).mask.is_none());
         let m = none([1, 0, 4, 0, 0, 0, 0, 0]);
-        assert!(m.defer && m.mask.is_some_and(|m| m.iter().all(|&x| x == 0)));
+        assert!(m.defer && m.mask.is_some_and(|m| mask_bytes(&m) == [0; MASK_BYTES]));
         let m = none(deny());
-        assert!(!m.defer && m.mask.is_some_and(|m| m.iter().all(|&x| x == 0)));
+        assert!(!m.defer && m.mask.is_some_and(|m| mask_bytes(&m) == [0; MASK_BYTES]));
         // syscall-unix's bitmap filter (65 with bit 7) names an integer
         // object of two bytes: its bits are the mask's, the rest clear.
         let mut b = blob(0, &[[0, 65 | 0x80, 0, 0, 1, 0, 2, 0], allow(), deny()]);
@@ -1631,7 +1655,7 @@ mod tests {
         assert_eq!((0..16).filter(|&n| mask_allows(&mask, n)).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4, 6, 7, 8, 9, 10]);
         assert!(!m.defer);
         // Another operation's filter is no bitmap of its own: all clear.
-        assert!(profile_mask(&b, &p, 153, 75, false).unwrap().mask.is_some_and(|m| m.iter().all(|&x| x == 0)));
+        assert!(profile_mask(&b, &p, 153, 75, false).unwrap().mask.is_some_and(|m| mask_bytes(&m) == [0; MASK_BYTES]));
         // Stacking a protobox profile, the bitmap's no-match edge decides:
         // a denial does not defer; an allow with flag 10 alone does.
         assert!(!profile_mask(&b, &p, 152, 65, true).unwrap().defer);
@@ -1645,6 +1669,18 @@ mod tests {
         b.extend_from_slice(&[0xff; 71]);
         let p = single(&b).unwrap();
         assert!(profile_mask(&b, &p, 152, 65, false).is_err());
+    }
+
+    #[test]
+    fn a_masks_bit_is_set_in_place() {
+        let m = mask_of([0; MASK_BYTES]);
+        let shared = std::sync::Arc::clone(&m);
+        assert!(!mask_allows(&shared, 205));
+        mask_set(&m, 205);
+        assert!(mask_allows(&shared, 205) && !mask_allows(&shared, 204));
+        // Past the mask: nothing set, nothing let through.
+        mask_set(&m, MASK_BYTES * 8);
+        assert!(!mask_allows(&m, MASK_BYTES * 8));
     }
 
     #[test]

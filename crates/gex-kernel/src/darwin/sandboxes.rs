@@ -325,11 +325,12 @@ pub fn kobj_index(id: u32) -> Option<usize> {
 pub fn combine(defer: bool, prof: Option<&sandbox::FilterMask>, pb: Option<&sandbox::FilterMask>, plat: Option<&sandbox::FilterMask>) -> Option<sandbox::FilterMask> {
     let own = if pb.is_some() || !defer { prof } else { None };
     let Some(own) = own else { return plat.cloned() };
-    let own: [u8; sandbox::MASK_BYTES] = match (defer, pb) {
+    let own = sandbox::mask_bytes(own);
+    let own: [u8; sandbox::MASK_BYTES] = match (defer, pb.map(|m| sandbox::mask_bytes(m))) {
         (true, Some(pb)) => std::array::from_fn(|i| own[i] | pb[i]),
-        _ => **own,
+        _ => own,
     };
-    Some(Arc::new(match plat {
+    Some(sandbox::mask_of(match plat.map(|m| sandbox::mask_bytes(m)) {
         Some(plat) => std::array::from_fn(|i| own[i] & plat[i]),
         None => own,
     }))
@@ -917,18 +918,19 @@ mod tests {
         let m = |bytes: &[u8]| {
             let mut a = [0u8; sandbox::MASK_BYTES];
             a[..bytes.len()].copy_from_slice(bytes);
-            Arc::new(a)
+            sandbox::mask_of(a)
         };
         let (prof, pb, plat) = (m(&[0b0011]), m(&[0b0101]), m(&[0b0110]));
         // No mask anywhere: none; the platform's alone: the platform's.
         assert!(combine(false, None, None, None).is_none());
         assert!(combine(false, None, None, Some(&plat)).is_some_and(|x| Arc::ptr_eq(&x, &plat)));
         // Its own and-ed with the platform's, or alone.
-        assert_eq!(combine(false, Some(&prof), Some(&pb), Some(&plat)).unwrap()[0], 0b0010);
-        assert_eq!(combine(false, Some(&prof), None, None).unwrap()[0], 0b0011);
+        let first = |m: Option<sandbox::FilterMask>| sandbox::mask_bytes(&m.unwrap())[0];
+        assert_eq!(first(combine(false, Some(&prof), Some(&pb), Some(&plat))), 0b0010);
+        assert_eq!(first(combine(false, Some(&prof), None, None)), 0b0011);
         // Deferring: or-ed with the protobox profile's first; with none
         // stacked, its own does not count.
-        assert_eq!(combine(true, Some(&prof), Some(&pb), Some(&plat)).unwrap()[0], 0b0110);
+        assert_eq!(first(combine(true, Some(&prof), Some(&pb), Some(&plat))), 0b0110);
         assert!(combine(true, Some(&prof), None, Some(&plat)).is_some_and(|x| Arc::ptr_eq(&x, &plat)));
         assert!(combine(true, Some(&prof), None, None).is_none());
     }

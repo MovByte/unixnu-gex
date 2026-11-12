@@ -77,6 +77,7 @@ pub mod op {
     pub const SYSCALL_MIG: usize = 154;
     pub const SYSCTL_READ: usize = 156;
     pub const SYSCTL_WRITE: usize = 157;
+    pub const SYSTEM_FCNTL: usize = 163;
     pub const SYSTEM_FSCTL: usize = 164;
     pub const SYSTEM_KAS_INFO: usize = 166;
     pub const SYSTEM_MAC_SYSCALL: usize = 173;
@@ -641,6 +642,27 @@ impl Kernel {
             };
             if tagged || (reports == 0 && own_reports != 0) {
                 flags = (flags & 0x1fff_ffff) | tag;
+            }
+        }
+        // An allowed call of a mask's kind its flags report is let through
+        // the sandbox's mask from now on (`0x...9f3a90`): not the platform
+        // profile's masks, which a sandbox may share.
+        if errno == 0 && flags & 0x0100_0084 != 0 {
+            let slot = match (op, a.kind) {
+                (op::SYSCALL_UNIX, _) => Some(0),
+                (op::SYSCALL_MACH, _) => Some(1),
+                (op::SYSCALL_MIG, sandbox::kind::SYSCALL_MIG) => Some(2),
+                (op::SYSTEM_FCNTL, sandbox::kind::FCNTL) => Some(3),
+                _ => None,
+            };
+            if let (Some(i), Some(sb)) = (slot, sb) {
+                let number = if i == 3 { a.number as i32 as i64 as u64 } else { u64::from(a.number) };
+                let platform = platform_masks();
+                if let Some(mask) = &sb.masks[i] {
+                    if (number as usize) < sandbox::MASK_BYTES * 8 && !platform.iter().flatten().any(|p| Arc::ptr_eq(p, mask)) {
+                        sandbox::mask_set(mask, number as usize);
+                    }
+                }
             }
         }
         // Reported when its flags ask (bits 2, 7 and 24): the operation and
