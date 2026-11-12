@@ -1009,6 +1009,27 @@ impl Kernel {
         }
     }
 
+    /// An IOKit mapping of kernel memory into the task
+    /// (`IOMemoryDescriptorMapAlloc`'s `vm_map_enter_mem_object` for a user
+    /// map): `len` bytes anywhere, tagged VM_MEMORY_IOKIT, with `cur` as
+    /// both its protection and its maximum, inherited by no child.
+    pub(crate) fn darwin_iokit_map(&mut self, m: &mut GuestMem<'_>, len: u64, cur: u64) -> Result<u64, u64> {
+        const VM_MEMORY_IOKIT: u64 = 21;
+        let mut addr = 0;
+        match self.vm_allocate(m, &mut addr, len, 0, vmf::ANYWHERE | VM_MEMORY_IOKIT << 24, cur) {
+            kr::SUCCESS => {}
+            e => return Err(e),
+        }
+        match self.vm_protect(m, addr, len, true, cur) {
+            kr::SUCCESS => {}
+            e => return Err(e),
+        }
+        match self.darwin_vm_inherit(addr, len, u32::from(super::vm::inherit::NONE)) {
+            kr::SUCCESS => Ok(addr),
+            e => Err(e),
+        }
+    }
+
     /// `vm_map_region`'s entry reports. The `*_COUNT` a caller has too
     /// little room for is KERN_INVALID_ARGUMENT, as is another flavor.
     pub(crate) fn darwin_vm_map_region(&mut self, addr: u64, flavor: i32, count: u32) -> Result<(u64, u64, Vec<u32>), super::kobject::Reply> {

@@ -46,7 +46,7 @@ pub fn superclasses(class: &str) -> &'static [&'static str] {
         "IORegistryEntry" => &["IORegistryEntry"],
         "IOUserClient" => &["IOUserClient", "IOService", "IORegistryEntry"],
         "AppleAPFSUserClient" => &["AppleAPFSUserClient", "IOUserClient", "IOService", "IORegistryEntry"],
-        _ => &[],
+        _ => super::accel::superclasses(class),
     }
 }
 
@@ -90,6 +90,7 @@ pub fn parse(b: &[u8]) -> Result<Vec<Node>, String> {
 pub fn set_tree(b: &[u8]) -> Result<(), String> {
     let mut t = parse(b)?;
     add_volumes(&mut t);
+    super::accel::add_service(&mut t);
     add_root(&mut t);
     let _ = TREE.set(t);
     Ok(())
@@ -166,6 +167,9 @@ pub fn links(t: &[Node], i: u32, plane: Plane, parents: bool) -> Result<Vec<u32>
     match (plane, parents) {
         (Plane::DeviceTree, _) => Ok(Vec::new()),
         (Plane::Service, true) => n.parent.map(|p| vec![p]).ok_or_else(|| format!("the provider of {} (the storage controller)", n.name)),
+        // The user clients a service has opened are attached to it, and
+        // they are not registry entries here.
+        (Plane::Service, false) if super::accel::is_service(i) => Err(format!("the user clients of {} as its children in the IOService plane", n.name)),
         (Plane::Service, false) => Ok(n.children.clone()),
     }
 }
@@ -270,10 +274,11 @@ pub fn matching(tree: &[Node], dict: &[(String, DictValue)]) -> Result<Vec<u32>,
             && props.iter().all(|&(k, v)| n.service_props.iter().any(|(pk, pv)| pk == k && matches!(pv, Prop::Str(s) if s == v)))
     };
     let found: Vec<u32> = tree.iter().enumerate().filter(|(_, n)| wanted(n)).map(|(i, _)| i as u32).collect();
-    // APFS's own classes are all here. Of the classes above them (and of
-    // services by property alone) the storage drivers' and the whole disk's
-    // are not, so those are answered only by a BSD name found here.
-    let complete = matches!(class, Some("AppleAPFSVolume" | "AppleAPFSContainer" | "AppleAPFSMedia" | "AppleAPFSContainerScheme"));
+    // APFS's own classes are all here, and so are the accelerator's (one
+    // GPU, one accelerator). Of the classes above them (and of services by
+    // property alone) the storage drivers' and the whole disk's are not, so
+    // those are answered only by a BSD name found here.
+    let complete = matches!(class, Some("AppleAPFSVolume" | "AppleAPFSContainer" | "AppleAPFSMedia" | "AppleAPFSContainerScheme")) || class.is_some_and(super::accel::class_complete);
     let by_name = props.iter().any(|&(k, _)| k == "BSD Name");
     if !complete && !(by_name && !found.is_empty()) {
         return Err(format!("the services of class {class:?} with {props:?}: the drivers' own are not here"));
@@ -711,6 +716,8 @@ pub fn no_method(a: &MethodArgs) -> i32 {
 pub enum Kind {
     /// AppleAPFSContainer's.
     Apfs,
+    /// One of the accelerator's ([`super::accel`]).
+    Accel(super::accel::Client),
 }
 
 /// An `IOUserClient` a task opened: the service it is attached to, its
@@ -782,6 +789,13 @@ pub fn open_user_client(k: &mut crate::syscalls::Kernel, service: u32, ty: u32) 
         // (its personality's), for any type; the apfs kext does not depend
         // on IOSurface.
         "AppleAPFSContainer" => ("AppleAPFSUserClient", Kind::Apfs, true),
+        c if c == super::accel::CLASS => {
+            let (class, client) = super::accel::new_user_client(k, service, ty)?;
+            // IOGPUFamily depends on IOSurface; the WebMetal client is
+            // the kernel's own and depends on nothing.
+            let locking = class == super::accel::WIRE_CLASS;
+            (class, Kind::Accel(client), locking)
+        }
         _ => {
             k.darwin_unimplemented(format!("newUserClient of {} (type {ty:#x})", name(t, service)));
             return Err(ret::UNSUPPORTED);
@@ -791,12 +805,13 @@ pub fn open_user_client(k: &mut crate::syscalls::Kernel, service: u32, ty: u32) 
 }
 
 /// The client's `clientClose`.
-pub fn client_close(_k: &mut crate::syscalls::Kernel, c: &mut UserClient) {
+pub fn client_close(k: &mut crate::syscalls::Kernel, c: &mut UserClient) {
     match &mut c.kind {
         // AppleAPFSUserClient's (0xfffffff00666facc) closes what the client
         // opened on its container and terminates it; neither has a state
         // here, the container's opens not being modelled.
         Kind::Apfs => {}
+        Kind::Accel(a) => super::accel::client_close(k, a),
     }
 }
 
@@ -810,12 +825,17 @@ pub fn client_died(k: &mut crate::syscalls::Kernel, id: u32) {
         c.closed = true;
         client_close(k, &mut c);
     }
+    if let Kind::Accel(a) = &mut c.kind {
+        super::accel::client_free(k, a);
+    }
 }
 
-/// `getService`: none, IOUserClient's default.
+/// `getService`: the provider for the accelerator's clients, none for
+/// IOUserClient's default.
 pub fn client_service(c: &UserClient) -> Option<u32> {
     match &c.kind {
         Kind::Apfs => None,
+        Kind::Accel(a) => super::accel::client_service(c.service, a),
     }
 }
 
@@ -826,12 +846,13 @@ pub fn client_memory_for_type(_k: &mut crate::syscalls::Kernel, _c: &mut UserCli
 }
 
 /// `registerNotificationPort(port, type, refCon)`.
-pub fn register_notification_port(k: &mut crate::syscalls::Kernel, c: &mut UserClient, _port: Option<super::ipc::ObjId>, _ty: u32, _reference: u64) -> i32 {
+pub fn register_notification_port(k: &mut crate::syscalls::Kernel, c: &mut UserClient, port: Option<super::ipc::ObjId>, ty: u32, reference: u64) -> i32 {
     match &mut c.kind {
         Kind::Apfs => {
             k.darwin_unimplemented("AppleAPFSUserClient::registerNotificationPort".to_string());
             ret::UNSUPPORTED
         }
+        Kind::Accel(a) => super::accel::register_notification_port(k, a, port, ty, reference),
     }
 }
 
@@ -839,6 +860,7 @@ pub fn register_notification_port(k: &mut crate::syscalls::Kernel, c: &mut UserC
 pub fn external_method(k: &mut crate::syscalls::Kernel, c: &mut UserClient, a: &mut MethodArgs) -> i32 {
     match &mut c.kind {
         Kind::Apfs => apfs_method(k, c.service, a),
+        Kind::Accel(x) => super::accel::external_method(k, x, a),
     }
 }
 
@@ -865,7 +887,7 @@ pub fn client_property(c: &UserClient, name: &str) -> Result<Option<Prop>, Strin
     match name {
         "IOUserClientCreator" => Ok(Some(Prop::Str(c.creator.clone()))),
         "IOUserClientDefaultLocking" if c.default_locking => Ok(Some(Prop::Bool(true))),
-        _ => Ok(None),
+        _ => super::accel::client_property(c, name),
     }
 }
 
@@ -955,6 +977,7 @@ impl crate::syscalls::Kernel {
                 self.darwin_unimplemented(format!("AppleAPFSUserClient trap {index}"));
                 ret::UNSUPPORTED
             }
+            Kind::Accel(x) => super::accel::trap(self, x, index, [a[2], a[3], a[4], a[5]]),
         };
         r
     }

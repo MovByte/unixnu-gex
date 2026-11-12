@@ -325,7 +325,7 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
                 (None, None) => {
                     let mut r = Reply::err(K_IO_RETURN_NO_RESOURCES);
                     let root = Some(*i) == super::iokit::root();
-                    if (!node.class.is_empty() || *i == 0) && !(root && !super::iokit::root_has(&name)) {
+                    if (!node.class.is_empty() || *i == 0) && !(root && !super::iokit::root_has(&name)) && super::accel::property_unknown(*i, &name) {
                         r.unimplemented = Some(format!("the {} property {name:?}", super::iokit::name(super::iokit::tree(), *i)));
                     }
                     return r;
@@ -365,7 +365,7 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
                 // besides the device tree's.
                 let mut r = Reply::err(K_IO_RETURN_NOT_FOUND);
                 let root = Some(*i) == super::iokit::root();
-                if (!node.class.is_empty() || *i == 0) && !(root && !super::iokit::root_has(&name)) {
+                if (!node.class.is_empty() || *i == 0) && !(root && !super::iokit::root_has(&name)) && super::accel::property_unknown(*i, &name) {
                     r.unimplemented = Some(format!("the {} property {name:?}", super::iokit::name(super::iokit::tree(), *i)));
                 }
                 return r;
