@@ -326,6 +326,17 @@ pub trait Facts {
     fn vnode_mode(&mut self) -> Result<Option<u16>, Stop> {
         Err(Stop::Unported("sandbox: a vnode's mode".into()))
     }
+    /// A vnode operation's file flags (`args[0x138]`, its `va_flags`),
+    /// none without a vnode.
+    fn vnode_flags(&mut self) -> Result<Option<u32>, Stop> {
+        Err(Stop::Unported("sandbox: a vnode's flags".into()))
+    }
+    /// A vnode operation's storage class (`args[0x108]`, its name): the one
+    /// the platform profile's storage-class-map gives the vnode, none when
+    /// it gives none.
+    fn storage_class(&mut self) -> Result<Option<Vec<u8>>, Stop> {
+        Err(Stop::Unported("sandbox: a vnode's storage class".into()))
+    }
     /// A vnode operation's extended attribute name (`args[0xe8]`).
     fn xattr_name(&mut self) -> Option<Vec<u8>> {
         None
@@ -1026,6 +1037,37 @@ fn filter(b: &[u8], p: &Profile, ty: u8, flag: bool, arg: u16, facts: &mut dyn F
                 }
             }
             hit
+        }
+        // A file's attribute, by the vnode's flags: argument 0 goes on only
+        // for SF_RESTRICTED or SF_NOUNLINK, 1 only for UF_DATAVAULT, and
+        // one past 22 never matches. What Sandbox checks next of a file
+        // that has the flag (the system's integrity configuration, the
+        // subject's entitlements) is not ported.
+        57 => {
+            if k != kind::VNODE || arg > 22 {
+                return Ok(false);
+            }
+            let Some(flags) = facts.vnode_flags()? else { return Ok(false) };
+            let bits = match arg {
+                0 => 0x0008_0000 | 0x0010_0000,
+                1 => 0x0000_0080,
+                _ => return Err(facts.unported(format!("sandbox file attribute {arg}"))),
+            };
+            if flags & bits != 0 {
+                return Err(facts.unported(format!("sandbox file attribute {arg} of a file with its flags {flags:#x}")));
+            }
+            false
+        }
+        // storage-class: the vnode has a class, and its name is the
+        // argument's string (strcmp).
+        58 => {
+            if k != kind::VNODE {
+                return Ok(false);
+            }
+            match facts.storage_class()? {
+                Some(class) => operand(b, p, arg)?.1 == class,
+                None => false,
+            }
         }
         40 | 46 | 67 => false,
         _ => return Err(facts.unported(format!("sandbox filter type {ty} ({arg})"))),

@@ -52,6 +52,7 @@ pub mod op {
     pub const SYSTEM_MAC_SYSCALL: usize = 173;
     pub const SYSTEM_SCHED: usize = 180;
     pub const SYSTEM_SUSPEND_RESUME: usize = 183;
+    pub const STORAGE_CLASS_MAP: usize = 189;
 }
 
 /// The operations' names (the kext's `operation_names`), by index.
@@ -124,6 +125,35 @@ pub struct SbArgs {
     /// service's (`args[0xe1]`).
     pub global: bool,
     pub xpc: bool,
+    /// A vnode operation's vnode (kind 1).
+    pub vnode: Option<SbVnode>,
+}
+
+/// What a vnode operation's filters read of its vnode.
+#[derive(Clone, Debug, Default)]
+pub struct SbVnode {
+    /// Its path (`vn_getpath`), canonical.
+    pub path: Vec<u8>,
+    /// Its mount point's length in the path (`args[0x160]`), -1 when the
+    /// path is the mount point's own.
+    pub mount_len: i64,
+    /// `enum vtype`, and whether it is a terminal (`VISTTY`).
+    pub vtype: u32,
+    pub tty: bool,
+    /// `va_mode & 0xfff`.
+    pub mode: u16,
+    /// `va_flags`.
+    pub flags: u32,
+}
+
+impl SbVnode {
+    /// The vnode at canonical `path`, of type `vtype`, mode `mode` and
+    /// file flags `flags`, on the mount it is under.
+    pub fn at(path: &str, vtype: u32, tty: bool, mode: u32, flags: u32) -> SbVnode {
+        let on = super::kern::mount_of(path).on;
+        let mount_len = if path == on { -1 } else { on.len() as i64 };
+        SbVnode { path: path.as_bytes().to_vec(), mount_len, vtype, tty, mode: (mode & 0xfff) as u16, flags }
+    }
 }
 
 /// The kernel's answers to Sandbox's filters, for an operation of the
@@ -276,7 +306,35 @@ impl Facts for KernelFacts<'_> {
         self.a.string.clone()
     }
     fn vnode_type(&mut self) -> Result<Option<(u32, bool)>, Stop> {
-        Ok(None)
+        Ok(self.a.vnode.as_ref().map(|v| (v.vtype, v.tty)))
+    }
+    fn path(&mut self) -> Result<Option<(Vec<u8>, i64)>, Stop> {
+        Ok(self.a.vnode.as_ref().map(|v| (v.path.clone(), v.mount_len)))
+    }
+    fn vnode_mode(&mut self) -> Result<Option<u16>, Stop> {
+        Ok(self.a.vnode.as_ref().map(|v| v.mode))
+    }
+    fn vnode_flags(&mut self) -> Result<Option<u32>, Stop> {
+        Ok(self.a.vnode.as_ref().map(|v| v.flags))
+    }
+    /// The vnode's class (`0x...78cc`): a file Sandbox protects
+    /// (SF_RESTRICTED, SF_NOUNLINK) or a data vault (UF_DATAVAULT) is
+    /// classed by those first, which is not ported; any other has the class
+    /// the platform profile's storage-class-map names for it, or none.
+    fn storage_class(&mut self) -> Result<Option<Vec<u8>>, Stop> {
+        let Some(v) = self.a.vnode.clone() else { return Ok(None) };
+        if v.flags & 0x0018_0080 != 0 {
+            return Err(Stop::Unported(format!("sandbox: the storage class of a file with flags {:#x}", v.flags)));
+        }
+        let Some(Some((blob, profile))) = PLATFORM.get() else {
+            return Err(Stop::Unported("the Sandbox's platform profile (the boot payload's Sandbox/Platform)".into()));
+        };
+        let a = SbArgs { kind: sandbox::kind::VNODE, vnode: Some(v), ..Default::default() };
+        let mut scratch = sandbox::Scratch::default();
+        match sandbox::evaluate(blob, profile, op::STORAGE_CLASS_MAP, &mut KernelFacts { k: &mut *self.k, a: &a }, &mut scratch) {
+            Outcome::Decided(_, fx) => Ok(fx.storage_class),
+            Outcome::Unported(what) => Err(Stop::Unported(what)),
+        }
     }
     fn mach_name(&mut self) -> Option<(Vec<u8>, bool, bool)> {
         self.a.string.clone().map(|s| (s, self.a.global, self.a.xpc))
@@ -498,6 +556,18 @@ impl Kernel {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_vnodes_mount_length() {
+        use super::SbVnode;
+        // A device on devfs: "/dev", then "/null" within it.
+        assert_eq!(SbVnode::at("/dev/null", 4, false, 0o20666, 0).mount_len, 4);
+        // The root's own mount point, and a file under it.
+        assert_eq!(SbVnode::at("/", 2, false, 0o40755, 0).mount_len, -1);
+        assert_eq!(SbVnode::at("/usr/lib/dyld", 1, false, 0o100755, 0).mount_len, 1);
+        assert_eq!(SbVnode::at("/dev/null", 4, false, 0o20666, 0).mode, 0o666);
+    }
+
     #[test]
     fn errors_are_selected_by_precedence() {
         use super::*;
