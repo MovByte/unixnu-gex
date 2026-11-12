@@ -19,3 +19,4 @@ tests/darwin/build.sh                    build the Darwin test programs with Xco
 tests/darwin/run.sh                      run the Darwin test programs under gexc (GEX_DARWIN_ROOT, GEX_DARWIN_BOOT)
 tools/darwin-gen-sysno.py                regenerate the Darwin system call numbers from XNU's syscalls.master
 tools/darwin-sysctl-nodes.py             regenerate the Darwin sysctl nodes from a kernelcache
+tools/darwin-sandbox-blobs.py            extract the Sandbox kext's profile blobs (the boot payload's) from a kernelcache

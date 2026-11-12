@@ -286,6 +286,18 @@ pub trait Facts {
     /// when it is gone; and AMFI's boolean query on it.
     fn ensure_target(&mut self) -> Result<(), Stop>;
     fn target_entitlement_bool(&mut self, key: &[u8]) -> Result<Option<bool>, Stop>;
+    /// The target process's relation to the subject the target filter
+    /// asks about (`0x...a05584`), its target there: 1, itself; 2, in its
+    /// process group; 3, in another; 4, its child; 5, of the same sandbox
+    /// (the one evaluated with, none being one); 6, the initial process;
+    /// 7, platform code.
+    fn target_is(&mut self, which: u16) -> Result<bool, Stop> {
+        Err(Stop::Unported(format!("sandbox: the target process's relation {which}")))
+    }
+    /// The sandbox evaluated with holds an extension of `class`.
+    fn has_extension(&mut self, _class: &[u8]) -> bool {
+        false
+    }
     /// The current thread's persona's uid and type (`current_persona_get`),
     /// none without one.
     fn persona(&mut self) -> Result<Option<(i32, u32)>, Stop>;
@@ -404,13 +416,15 @@ pub struct Scratch {
 }
 
 /// What a terminal's modifiers left for the operation's caller to act on
-/// (`0xfffffff006a072f8`'s records): message strings, kept the first time
-/// each is set, and a storage class to name for a vnode operation.
+/// (`0xfffffff006a072f8`'s records, kept the first time each is set): the
+/// strings of modifiers 9 and 10 (`args+112`, `args+120`), the profile
+/// modifier 11 names (`args+128`: the one process-exec-update-label gives
+/// an exec), and a storage class to name for a vnode operation.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Effects {
     pub message: Option<Vec<u8>>,
     pub message2: Option<Vec<u8>>,
-    pub message3: Option<Vec<u8>>,
+    pub profile: Option<Vec<u8>>,
     pub storage_class: Option<Vec<u8>>,
 }
 
@@ -430,6 +444,44 @@ fn string_at(b: &[u8], p: &Profile, at: usize) -> Option<Vec<u8>> {
     let n = usize::from(u16_at(b, at)?);
     let s = b.get(at + 2..at + 2 + n)?;
     (n != 0 && s[n - 1] == 0).then(|| s[..n - 1].to_vec())
+}
+
+/// The string a profile names by `index` (a collection's profile names
+/// are such strings), without its NUL.
+pub fn string(b: &[u8], p: &Profile, index: u16) -> Option<Vec<u8>> {
+    string_at(b, p, p.nodes_end + usize::from(index) * NODE)
+}
+
+/// What a profile's syscall operation (syscall-unix, syscall-mach,
+/// syscall-mig, system-fcntl) makes of the mask a sandbox filters those
+/// calls by (`0x...a09308`, the loader's): `present` unless the
+/// operation's first node is a terminal that allows with no flags and no
+/// modifiers (a call is then never asked about); `defer` when that
+/// terminal allows with flag 10 alone (the protobox profile decides); and
+/// `undecided` when the first node is the bitmap filter of a profile that
+/// stacks a protobox profile, whose deferral the loader works out further
+/// (`0x...a095d4`), which is not followed here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Mask {
+    pub present: bool,
+    pub defer: bool,
+    pub undecided: bool,
+}
+
+/// The mask operation `op` of profile `p` leaves; for a filter, `ty` is the
+/// filter type of the call's number (65, 75, 76 and 78).
+pub fn syscall_mask(b: &[u8], p: &Profile, op: usize, ty: u8, stacks_protobox: bool) -> Mask {
+    let Some(idx) = (op < OPERATIONS).then(|| u16_at(b, p.ops + 2 * op)).flatten() else { return Mask { present: true, ..Mask::default() } };
+    let at = p.nodes + usize::from(idx) * NODE;
+    let Some(n) = b.get(at..at + NODE) else { return Mask { present: true, ..Mask::default() } };
+    match n[0] {
+        1 => {
+            let word = u32::from(n[1]) | u32::from(n[2]) << 8 | u32::from(n[3]) << 16;
+            Mask { present: word != 0 || n[4] != 0, defer: word == 0x400 && n[4] == 0, undecided: false }
+        }
+        0 if n[1] == ty | 0x80 && stacks_protobox => Mask { present: true, defer: false, undecided: true },
+        _ => Mask { present: true, ..Mask::default() },
+    }
 }
 
 /// Apply one 4-byte modifier record at `at`; false refuses the decision.
@@ -455,7 +507,7 @@ fn modify(b: &[u8], p: &Profile, at: usize, d: &mut Decision, fx: &mut Effects, 
             let slot = match r[0] {
                 9 => &mut fx.message,
                 10 => &mut fx.message2,
-                _ => &mut fx.message3,
+                _ => &mut fx.profile,
             };
             if slot.is_none() {
                 *slot = Some(s);
@@ -987,6 +1039,27 @@ fn filter(b: &[u8], p: &Profile, ty: u8, flag: bool, arg: u16, facts: &mut dyn F
         // extension, storage-class-extension, and the extension ancestry
         // filter: a process without a sandbox has no extensions.
         23 | 56 | 59 if !facts.sandboxed() => false,
+        // extension (`0x...a047c0`): for a vnode operation its path first;
+        // then the sandbox's extensions of the class. With none, no match;
+        // matching one against the operation's object is not ported.
+        23 => {
+            let (_, class) = operand(b, p, arg)?;
+            if k == kind::VNODE && facts.path()?.is_none() {
+                return Ok(false);
+            }
+            if facts.has_extension(&class) {
+                return Err(facts.unported(format!("sandbox extension filter of class {} for an operation of kind {k}", String::from_utf8_lossy(&class))));
+            }
+            false
+        }
+        // The target process (`0x...a046dc`), of a process operation.
+        14 => {
+            if k != kind::PROCESS {
+                return Ok(false);
+            }
+            facts.ensure_target()?;
+            (1..=7).contains(&arg) && facts.target_is(arg)?
+        }
         // extension-class.
         24 => match facts.extension_class() {
             Some(c) => str_match(b, p, flag, arg, &c, facts)?,
@@ -1368,5 +1441,27 @@ mod platform {
             }
         }
         eprintln!("decided {decided}, unported {unported:?}");
+    }
+
+    /// A real builtin collection (`GEX_SANDBOX_BUILTIN`, the kernelcache's
+    /// blob): its profiles load, and what each decides of a few operations
+    /// for a subject that answers little. Not run without it.
+    #[test]
+    fn a_builtin_collections_profiles_evaluate() {
+        let Some(path) = std::env::var_os("GEX_SANDBOX_BUILTIN") else { return };
+        let b = std::fs::read(path).unwrap();
+        let ps = collection(&b).unwrap();
+        assert_eq!(ps.len(), 272);
+        for p in &ps {
+            let name = String::from_utf8_lossy(&string(&b, p, p.name).unwrap()).into_owned();
+            let out: Vec<String> = [9usize, 98, 103, 122, 128, 146, 156, 157, 164, 173]
+                .iter()
+                .map(|&op| match evaluate(&b, p, op, &mut super::tests::Flags(0), &mut Scratch::default()) {
+                    Outcome::Decided(d, _) => format!("{op}:{}/{:#x}", d.errno, d.flags),
+                    Outcome::Unported(w) => format!("{op}:?{w}"),
+                })
+                .collect();
+            eprintln!("{name} {:#x} {}", p.flags, out.join(" "));
+        }
     }
 }

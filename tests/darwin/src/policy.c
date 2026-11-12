@@ -1,5 +1,7 @@
 // The code signing policies as an iPad without Developer Mode applies
-// them to a platform program with no entitlements: its csops status (valid,
+// them to a platform program whose one entitlement is no-container (what
+// the platform profile asks of a program that execs from /private/var):
+// its csops status (valid,
 // signed, a platform binary, killed and hardened when invalid, library
 // validation, enforcement), its cdhash and identifier and no team; dyld's
 // policy from AMFI; no task port of its own from task_for_pid (AMFI allows

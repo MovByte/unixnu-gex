@@ -216,6 +216,25 @@ pub fn cred_label_update_execve(sig: Option<&CodeSign>, csflags: &mut u32) -> Re
     Ok(ents)
 }
 
+/// `amfi_copy_seatbelt_profile_names` (`0x...ab5264`): the names the
+/// `seatbelt-profiles` entitlement lists (an array of strings; none for any
+/// other value; an error for an element that is not a string), and whether
+/// the code is trusted to run outside a container: platform code (its
+/// label's byte 74), or code entitled `platform-application`.
+pub fn seatbelt_profile_names(platform_binary: bool, ents: &Entitlements) -> (Result<Vec<Vec<u8>>, ()>, bool) {
+    let names = match ents.get(b"seatbelt-profiles") {
+        Some(Ent::Array(a)) => a
+            .iter()
+            .map(|e| match e {
+                Ent::String(s) => Ok(s.clone()),
+                _ => Err(()),
+            })
+            .collect(),
+        _ => Ok(Vec::new()),
+    };
+    (names, platform_binary || ents.bool_true(b"platform-application"))
+}
+
 /// `mpo_proc_check_map_anon` (`0x...b7d30`) for a `MAP_JIT` mapping: a
 /// platform binary with `dynamic-codesigning`, or a browser's web content
 /// allowed to JIT; else EPERM.
