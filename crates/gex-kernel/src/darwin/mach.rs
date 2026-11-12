@@ -877,8 +877,8 @@ impl Kernel {
                 return kr::INVALID_ADDRESS;
             }
             // Without VM_FLAGS_OVERWRITE a fixed request over anything
-            // mapped fails.
-            if flags & vmf::OVERWRITE == 0 && self.mem.lock().vmas().iter().any(|v| v.start < start + len && start < v.end) {
+            // mapped fails, the shared region's submap included.
+            if flags & vmf::OVERWRITE == 0 && (self.darwin_in_shared_region(start, start + len) || self.mem.lock().vmas().iter().any(|v| v.start < start + len && start < v.end)) {
                 return kr::NO_SPACE;
             }
             return match self.canonical(m, nr::MMAP, [start, len, linux_prot, mf::PRIVATE | mf::ANONYMOUS | mf::FIXED, u64::MAX, 0]) {
@@ -945,6 +945,13 @@ impl Kernel {
         (gex_abi::DARWIN_GUEST_FLOOR.max(self.dtask.map_min).max(PAGE_MASK + 1), self.darwin_map_max().min(gex_abi::LIMIT64))
     }
 
+    /// Whether `[start, end)` meets the shared region the task's map nests
+    /// (`vm_shared_region_enter`'s one submap entry over all of it).
+    pub(crate) fn darwin_in_shared_region(&self, start: u64, end: u64) -> bool {
+        let (base, size) = self.darwin_region;
+        size != 0 && start < base + size && base < end
+    }
+
     /// `vm_map_random_address_for_size`: up to 1000 random page-aligned
     /// addresses of the effective range (`random()`'s 31 bits in pages),
     /// the first that starts a hole of `size` bytes; KERN_NO_SPACE without
@@ -959,17 +966,19 @@ impl Kernel {
         }
         let space = space - size;
         let map_max = self.darwin_map_max();
+        let (region, region_end) = (self.darwin_region.0, self.darwin_region.0 + self.darwin_region.1);
         let mm = self.mem.lock();
         let vmas = mm.vmas();
         for _ in 0..MAX_TRIES_TO_GET_RANDOM_ADDRESS {
-            let mut b = [0u8; 4];
-            crate::vfs::devfs::fill_random(&mut b);
-            let r = u64::from(u32::from_le_bytes(b) & 0x7fff_ffff) << VM_MAP_PAGE_SHIFT;
+            let r = u64::from(super::exec::random()) << VM_MAP_PAGE_SHIFT;
             let addr = (min + r % space) & !PAGE_MASK;
-            if mm.vma_at(addr).is_some() {
+            if mm.vma_at(addr).is_some() || self.darwin_in_shared_region(addr, addr + 1) {
                 continue;
             }
-            let hole_end = vmas.get(vmas.partition_point(|v| v.start <= addr)).map_or(map_max, |v| v.start);
+            let mut hole_end = vmas.get(vmas.partition_point(|v| v.start <= addr)).map_or(map_max, |v| v.start);
+            if region_end > region && addr < region {
+                hole_end = hole_end.min(region);
+            }
             if hole_end - addr >= size {
                 return Ok(addr);
             }
@@ -980,12 +989,18 @@ impl Kernel {
     /// `vm_map_store_find_space` from `hint`: the first `size` bytes free
     /// at or after it, aligned to `mask`, ending by `limit`.
     pub(crate) fn darwin_find_space(&self, hint: u64, limit: u64, size: u64, mask: u64) -> Option<u64> {
+        let region_end = self.darwin_region.0 + self.darwin_region.1;
         let mm = self.mem.lock();
         let mut at = hint.checked_add(mask)? & !mask;
         loop {
             let end = at.checked_add(size)?;
             if end > limit {
                 return None;
+            }
+            // The shared region's submap is one entry, its holes included.
+            if self.darwin_in_shared_region(at, end) {
+                at = region_end.checked_add(mask)? & !mask;
+                continue;
             }
             match mm.vmas().iter().find(|v| v.start < end && at < v.end) {
                 Some(v) => at = v.end.checked_add(mask)? & !mask,
@@ -1164,6 +1179,17 @@ impl Kernel {
     pub(crate) fn darwin_vm_enter_anon(&mut self, start: u64, end: u64, attrs: super::vm::Attrs, cur: u64) {
         let below = self.mem.lock().vma_at(start.wrapping_sub(1)).map(|v| u64::from(v.prot)) == Some(cur);
         self.dtask.vm.enter_anon(start, end, attrs, below);
+    }
+
+    /// `vm_shared_region_remove`: the region's range, cache and holes
+    /// alike, overwritten with a reservation nothing may touch, tagged
+    /// `VM_MEMORY_DYLD`; the task keeps the address space.
+    pub(crate) fn darwin_shared_region_remove(&mut self, m: &mut GuestMem<'_>, start: u64, size: u64) {
+        use crate::mem::flags as mf;
+        self.dtask.vm.clear(start, start + size);
+        if self.canonical(m, nr::MMAP, [start, size, 0, mf::PRIVATE | mf::ANONYMOUS | mf::FIXED, u64::MAX, 0]).is_ok() {
+            self.darwin_vm_enter_anon(start, start + size, super::vm::Attrs { alias: super::vm::tag::DYLD, max: 0, ..Default::default() }, 0);
+        }
     }
 
     /// `mach_vm_deallocate`: unmapped parts of the range are skipped

@@ -14,6 +14,10 @@ use crate::stack::StackLayout;
 /// Where arm64 Darwin maps the shared cache (`SHARED_REGION_BASE_ARM64`).
 pub const SHARED_REGION_BASE: u64 = 0x1_8000_0000;
 
+/// The shared region's size (`SHARED_REGION_SIZE_ARM64`): every task's map
+/// nests all of it, to 0x3_0000_0000, whatever the cache in it uses.
+pub const SHARED_REGION_SIZE: u64 = 0x1_8000_0000;
+
 pub const MH_MAGIC_64: u32 = 0xfeed_facf;
 pub const CPU_TYPE_ARM64: u32 = 0x0100_000c;
 
@@ -688,6 +692,7 @@ mod tests {
     #[test]
     fn the_shared_region_is_inside_a_darwin_process_s_memory() {
         assert!(SHARED_REGION_BASE >= gex_abi::DARWIN_GUEST_FLOOR);
+        assert!(SHARED_REGION_BASE + SHARED_REGION_SIZE < gex_abi::DARWIN_COMMPAGE_ALIAS);
     }
 
     #[test]

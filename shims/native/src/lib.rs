@@ -4691,7 +4691,9 @@ fn place_image(
 /// Map a dyld shared cache, its main file and every subcache it names, at
 /// the addresses it was linked for, rebased by its slide info at a zero
 /// slide, and record each mapping as the kernel would. Returns the shared
-/// region as `(start, size)`.
+/// region as `(start, size)`: arm64's (`SHARED_REGION_BASE_ARM64` and
+/// `SHARED_REGION_SIZE_ARM64`), which every mapping must be inside
+/// (`vm_shared_region_map_file`).
 fn map_shared_cache(store: &mut Store<HostState>, memory: &gex_mem::GuestMemory, main: &std::path::Path) -> Result<(u64, u64)> {
     use gex_ld::dsc;
     use std::io::{Read, Seek, SeekFrom};
@@ -4712,10 +4714,14 @@ fn map_shared_cache(store: &mut Store<HostState>, memory: &gex_mem::GuestMemory,
         }
         files.push((p, sh));
     }
+    let (region, region_size) = (gex_ld::macho::SHARED_REGION_BASE, gex_ld::macho::SHARED_REGION_SIZE);
     let data = memory.bytes();
     for (p, fh) in &files {
         let mut f = std::fs::File::open(p).with_context(|| format!("opening {}", p.display()))?;
         for m in &fh.mappings {
+            if m.address < region || m.address.checked_add(m.size).is_none_or(|e| e > region + region_size) {
+                bail!("{}'s mapping {:#x}+{:#x} is outside the shared region {region:#x}+{region_size:#x}", p.display(), m.address, m.size);
+            }
             let (start, end) = (m.address as usize, (m.address + m.size) as usize);
             if end > data.len() {
                 bail!("shared cache mapping {:#x}..{:#x} does not fit in guest memory", m.address, m.address + m.size);
@@ -4777,7 +4783,7 @@ fn map_shared_cache(store: &mut Store<HostState>, memory: &gex_mem::GuestMemory,
         data[start..start + hdr.len()].copy_from_slice(&hdr);
         store.data_mut().with_kernel(|k| k.mem.lock().insert(at, at + size, prot::READ | prot::WRITE, "[shared-cache-data]"));
     }
-    Ok((h.shared_region_start, h.shared_region_size))
+    Ok((region, region_size))
 }
 
 /// The file a shared cache mapping is kept in slid (at its linked

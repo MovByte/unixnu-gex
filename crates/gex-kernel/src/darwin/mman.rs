@@ -533,9 +533,12 @@ impl Kernel {
     /// makes jumbo and a spawn's `psa_max_addr` may raise
     /// (`vm_map_set_max_addr`; the field holds the spawn's until now).
     pub(crate) fn darwin_vm_policies(&mut self) {
+        // vm_shared_region_enter: one pmap-nested entry over the whole
+        // region, read-only and shared with a fork's child.
         let (base, size) = self.darwin_region;
         if base != 0 {
-            self.dtask.vm.enter(base, base + size, Attrs { kind: kind::SUBMAP, ..Attrs::default() }, 0);
+            let attrs = Attrs { kind: kind::SUBMAP, max: prot::READ as u8, alias: vm::tag::SHARED_PMAP, inherit: inherit::SHARE, ..Attrs::default() };
+            self.dtask.vm.enter(base, base + size, attrs, 0);
         }
         // A JIT-entitled image (mac_proc_check_map_anon's MAP_JIT probe)
         // gets a jumbo map; vm_map_set_jit_entitled's pmap_set_jit_entitled

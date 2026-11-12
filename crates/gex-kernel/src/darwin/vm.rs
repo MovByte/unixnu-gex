@@ -95,6 +95,8 @@ pub mod tag {
     pub const MALLOC_TINY: u8 = 7;
     pub const MALLOC_LARGE_REUSABLE: u8 = 8;
     pub const MALLOC_LARGE_REUSED: u8 = 9;
+    pub const SHARED_PMAP: u8 = 32;
+    pub const DYLD: u8 = 60;
 }
 
 /// One entry's attributes.
