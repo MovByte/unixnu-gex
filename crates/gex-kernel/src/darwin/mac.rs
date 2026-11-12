@@ -4,12 +4,22 @@
 //! (`mac_error_select`).
 //!
 //! Sandbox's hooks build an argument block for the operation and evaluate
-//! it (`cred_sb_evaluate`): the platform profile, which applies to every
-//! process, then the process's own profile when it has a sandbox. No
-//! process here has one: the profile Sandbox would apply at exec is not
-//! chosen yet, and an exec that would get one is refused loudly.
+//! it (`cred_sb_evaluate`, `0x...a03b90`): the platform profile, which
+//! applies to every process, then, when the process has a sandbox and the
+//! platform profile allowed, the sandbox's profile, deferring to the
+//! protobox profile stacked under it where that profile says (flag 10).
+//! How a process gets its sandbox is `sandboxes.rs`.
+//!
+//! Only the hooks below are wired; Sandbox's others (the vnode checks among
+//! them: file-read*, file-write*, process-exec*, ...) are not called, for
+//! the platform profile's rules as for a sandbox's. An exec by a process
+//! with a sandbox therefore stops loudly at its process-exec* check
+//! (`mpo_vnode_check_exec`).
+
+use std::sync::Arc;
 
 use super::sandbox::{self, Facts, Outcome, Stop, Value};
+use super::sandboxes::Sandbox;
 use crate::syscalls::Kernel;
 
 /// Darwin's errnos the framework selects between.
@@ -36,6 +46,7 @@ pub fn error_select(a: u32, b: u32) -> u32 {
 pub mod op {
     pub const DYNAMIC_CODE_GENERATION: usize = 9;
     pub const FILE_REVOKE: usize = 25;
+    pub const MACH_PRIV_HOST_PORT: usize = 98;
     pub const MACH_PRIV_TASK_PORT: usize = 99;
     pub const MACH_TASK_INSPECT: usize = 102;
     pub const MACH_TASK_NAME: usize = 103;
@@ -54,6 +65,7 @@ pub mod op {
     pub const SYSTEM_SCHED: usize = 180;
     pub const SYSTEM_SUSPEND_RESUME: usize = 183;
     pub const STORAGE_CLASS_MAP: usize = 189;
+    pub const PROCESS_EXEC_UPDATE_LABEL: usize = 190;
 }
 
 /// The operations' names (the kext's `operation_names`), by index.
@@ -158,10 +170,12 @@ impl SbVnode {
 }
 
 /// The kernel's answers to Sandbox's filters, for an operation of the
-/// current process.
+/// current process evaluated with sandbox `sb` (its credential's, or the
+/// one an exec carries over).
 struct KernelFacts<'a> {
     k: &'a mut Kernel,
     a: &'a SbArgs,
+    sb: Option<&'a Sandbox>,
 }
 
 impl KernelFacts<'_> {
@@ -224,14 +238,16 @@ impl Facts for KernelFacts<'_> {
     fn rsr(&mut self) -> Result<bool, Stop> {
         Ok(false)
     }
+    // The sandbox evaluated with: whether there is one, whether its
+    // profile is the protobox collection's, its shared state's byte +59.
     fn sandboxed(&self) -> bool {
-        false
+        self.sb.is_some()
     }
     fn protoboxed(&self) -> Result<bool, Stop> {
-        Ok(false)
+        Ok(self.sb.is_some_and(Sandbox::protoboxed))
     }
     fn sandbox_flag_3b(&self) -> Result<bool, Stop> {
-        Ok(false)
+        Ok(self.sb.is_some_and(|s| s.flag_3b))
     }
     fn entitlement_bool(&mut self, key: &[u8]) -> Result<Option<bool>, Stop> {
         Ok(self.ents().map(|e| e.bool_true(key)))
@@ -266,18 +282,48 @@ impl Facts for KernelFacts<'_> {
         let t = self.a.target.unwrap_or(0);
         Ok(self.sig_of(t).flatten().map(|c| c.ents.bool_true(key)))
     }
+    fn target_is(&mut self, which: u16) -> Result<bool, Stop> {
+        let (me, t) = (self.k.pid, self.a.target.unwrap_or(0));
+        let pgrp = |k: &Kernel, pid: i32| k.procs.pgid(pid, pid).ok();
+        Ok(match which {
+            1 => t == me,
+            2 => pgrp(self.k, t) == pgrp(self.k, me),
+            3 => pgrp(self.k, t) != pgrp(self.k, me),
+            4 => self.k.procs.ppid(t) == me,
+            // The target's credential's sandbox is the very one.
+            5 => {
+                let theirs = if t == me {
+                    self.k.darwin_sandbox()
+                } else {
+                    let ipc = self.k.ipc();
+                    ipc.links.values().find(|l| l.pid == t).and_then(|l| super::sandboxes::of(&l.sandbox))
+                };
+                match (theirs, self.sb) {
+                    (Some(a), Some(b)) => std::ptr::eq(Arc::as_ptr(&a), b),
+                    (None, None) => true,
+                    _ => false,
+                }
+            }
+            6 => t == crate::proc::INIT_PID,
+            _ => self.sig_of(t).flatten().is_some_and(|c| c.platform_binary),
+        })
+    }
+    fn has_extension(&mut self, class: &[u8]) -> bool {
+        self.sb.is_some_and(|s| s.extensions.iter().any(|e| e.class == class))
+    }
     fn persona(&mut self) -> Result<Option<(i32, u32)>, Stop> {
         Ok(self.k.darwin_current_persona().map(|p| (p.get_uid() as i32, p.get_type() as u32)))
     }
-    // Sandbox's user records come from its system calls; none were made.
+    // The user states policy_init made, of the credential's uid and of the
+    // front user's.
     fn home(&mut self) -> Result<Option<Vec<u8>>, Stop> {
-        Ok(None)
+        Ok(super::sandboxes::user_state(self.k.creds.uid()).map(|u| u.home.as_bytes().to_vec()))
     }
     fn front_user_home(&mut self) -> Result<Option<Vec<u8>>, Stop> {
-        Ok(None)
+        Ok(super::sandboxes::user_state(super::sandboxes::FRONT_USER).map(|u| u.home.as_bytes().to_vec()))
     }
     fn temp_dir(&mut self) -> Result<Option<Vec<u8>>, Stop> {
-        Ok(None)
+        Ok(super::sandboxes::user_state(self.k.creds.uid()).map(|u| u.tmp.as_bytes().to_vec()))
     }
     fn os_release_type(&self) -> Vec<u8> {
         super::sysctl::os_release_type()
@@ -332,7 +378,7 @@ impl Facts for KernelFacts<'_> {
         };
         let a = SbArgs { kind: sandbox::kind::VNODE, vnode: Some(v), ..Default::default() };
         let mut scratch = sandbox::Scratch::default();
-        match sandbox::evaluate(blob, profile, op::STORAGE_CLASS_MAP, &mut KernelFacts { k: &mut *self.k, a: &a }, &mut scratch) {
+        match sandbox::evaluate(blob, profile, op::STORAGE_CLASS_MAP, &mut KernelFacts { k: &mut *self.k, a: &a, sb: self.sb }, &mut scratch) {
             Outcome::Decided(_, fx) => Ok(fx.storage_class),
             Outcome::Unported(what) => Err(Stop::Unported(what)),
         }
@@ -389,24 +435,38 @@ pub fn set_platform_profile(blob: Option<Vec<u8>>) -> Result<(), String> {
 }
 
 impl Kernel {
-    /// `cred_sb_evaluate` for the current process: the platform profile
-    /// (but for system-kas-info), then a process profile when the process
-    /// has a sandbox (none does here). The errno its hook returns; a
-    /// report goes to the kernel's log unless quiet.
+    /// `cred_sb_evaluate` for the current process, with its credential's
+    /// sandbox. The errno its hook returns.
     pub(crate) fn darwin_sb_evaluate(&mut self, op: usize, a: &SbArgs) -> u32 {
+        let sb = self.darwin_sandbox();
+        self.darwin_sb_evaluate_with(sb.as_ref(), op, a).0
+    }
+
+    /// `cred_sb_evaluate` (`0x...a03b90`) of operation `op` with sandbox
+    /// `sb`: the platform profile (but for system-kas-info), then, unless it
+    /// denied or its flags have bit 6, the sandbox's profile, whose flag 10
+    /// defers to the protobox profile under it (a denial, EPERM, without
+    /// one). Its errno and what the terminals' modifiers left; a report goes
+    /// to the kernel's log unless quiet.
+    pub(crate) fn darwin_sb_evaluate_with(&mut self, sb: Option<&Arc<Sandbox>>, op: usize, a: &SbArgs) -> (u32, sandbox::Effects) {
         let Some(Some((blob, profile))) = PLATFORM.get() else {
             self.darwin_unimplemented("the Sandbox's platform profile (the boot payload's Sandbox/Platform)".into());
-            return e::EPERM;
+            return (e::EPERM, sandbox::Effects::default());
         };
+        let sb = sb.map(Arc::as_ref);
+        let mut scratch = sandbox::Scratch::default();
+        let mut fx = sandbox::Effects::default();
         let (mut errno, mut flags) = (0u32, 0u32);
         if op != op::SYSTEM_KAS_INFO {
-            let mut scratch = sandbox::Scratch::default();
-            let out = sandbox::evaluate(blob, profile, op, &mut KernelFacts { k: self, a }, &mut scratch);
+            let out = sandbox::evaluate(blob, profile, op, &mut KernelFacts { k: self, a, sb }, &mut scratch);
             let d = match out {
-                Outcome::Decided(d, _) => d,
+                Outcome::Decided(d, effects) => {
+                    fx = effects;
+                    d
+                }
                 Outcome::Unported(what) => {
                     self.darwin_unimplemented(format!("{what} (sandbox operation {op})"));
-                    return e::EPERM;
+                    return (e::EPERM, fx);
                 }
             };
             if d.flags & 1 != 0 {
@@ -414,15 +474,60 @@ impl Kernel {
             } else {
                 flags = d.flags & 0x1fff_ffff;
             }
-            if u64::from(d.flags) << 32 & 0x85_0000_0000 != 0 {
+            if d.flags & 0x85 != 0 {
                 flags = 0x2000_0000 | (flags & 0x1fff_ffff);
             }
         }
-        // Reported when its flags ask (bits 2, 7 and 24).
-        if flags & 0x0100_0084 != 0 && !a.quiet && self.trace {
-            eprintln!("[gex:{}] Sandbox: {}({}) {}({errno}) operation {op}", self.pid, self.exe_path, self.pid, if errno != 0 { "deny" } else { "allow" });
+        if let Some(sb) = sb.filter(|_| errno == 0 && flags & 0x40 == 0) {
+            let mut decide = |k: &mut Kernel, p: super::sandboxes::ProfileRef| match sandbox::evaluate(p.blob(), p.profile(), op, &mut KernelFacts { k, a, sb: Some(sb) }, &mut scratch) {
+                Outcome::Decided(d, effects) => {
+                    fx.message = fx.message.take().or(effects.message);
+                    fx.message2 = fx.message2.take().or(effects.message2);
+                    fx.profile = fx.profile.take().or(effects.profile);
+                    Ok(d)
+                }
+                Outcome::Unported(what) => Err(what),
+            };
+            let d = match decide(self, sb.profile) {
+                Ok(d) if d.flags & 0x400 == 0 => Ok((d, 0x6000_0000)),
+                Ok(_) => match sb.protobox {
+                    Some(p) => decide(self, p).map(|d| (d, 0x8000_0000)),
+                    None => Ok((sandbox::Decision { errno: e::EPERM, flags: 5 }, 0x8000_0000)),
+                },
+                Err(what) => Err(what),
+            };
+            let (d, tag) = match d {
+                Ok(d) => d,
+                Err(what) => {
+                    self.darwin_unimplemented(format!("{what} (sandbox operation {op}, profile {})", String::from_utf8_lossy(sb.profile.name())));
+                    return (e::EPERM, fx);
+                }
+            };
+            // The two decisions' flags: an allowance adds the profile's to
+            // the platform's; a denial is the profile's; either takes the
+            // profile's tag when the platform's report bits do not already
+            // cover the profile's.
+            let (reports, own_reports) = (flags & 0x84, d.flags & 0x84);
+            let tagged = if d.flags & 1 == 0 {
+                flags |= d.flags & 0x1fff_ffff & !0x10;
+                false
+            } else {
+                // (The platform's decision is never a denial here.)
+                let platform_denied = flags & 1 != 0;
+                (errno, flags) = (d.errno, d.flags & !0x10);
+                !platform_denied
+            };
+            if tagged || (reports == 0 && own_reports != 0) {
+                flags = (flags & 0x1fff_ffff) | tag;
+            }
         }
-        errno
+        // Reported when its flags ask (bits 2, 7 and 24): the operation and
+        // the object it names.
+        if flags & 0x0100_0084 != 0 && !a.quiet && self.trace {
+            let object = a.string.as_deref().map(|s| format!(" {}", String::from_utf8_lossy(s))).unwrap_or_default();
+            eprintln!("[gex:{}] Sandbox: {}({}) {}({errno}) {}{object}", self.pid, self.exe_path, self.pid, if errno != 0 { "deny" } else { "allow" }, OPERATION_NAMES.get(op).copied().unwrap_or("?"));
+        }
+        (errno, fx)
     }
 
     /// `mac_system_check_sysctlbyname` (Sandbox's hook; AMFI has none): a

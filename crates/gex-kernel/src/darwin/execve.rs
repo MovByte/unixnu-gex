@@ -61,6 +61,9 @@ pub struct Image {
     pub spawn: Option<super::spawn::After>,
     /// What the image's load left ([`Kernel::darwin_load_signatures`]).
     pub load: super::codesign::LoadResult,
+    /// What Sandbox's hook is to see of the exec: the script, the spawn's
+    /// Sandbox attributes.
+    pub sandbox: super::sandboxes::Pending,
     /// An exec in place's new thread (`cloneproc`'s): its thread id. Zero
     /// for a spawn's child, whose thread the spawn made.
     pub thread_id: u64,
@@ -231,6 +234,7 @@ impl Kernel {
                 if self.trace {
                     eprintln!("[gex:{}] darwin execve({path:?}, {} args)", self.pid, argv.len());
                 }
+                self.dtask.exec_sandbox = Some(img.sandbox.clone());
                 self.darwin_exec = Some(Box::new(img));
                 SyscallOutcome::Exec { path, argv, envp }
             }
@@ -252,6 +256,8 @@ impl Kernel {
         strings.save_user_path(m, fname)?;
         let mut img = Imgp { strings, vdata: Vec::new(), interpret: false, interp_buffer: Vec::new(), origcputype: 0, origcpusubtype: 0, arch_offset: 0, arch_size: 0, path: String::new(), size: 0, binprefs };
         let mut itercount = 0;
+        // ip_scriptvp: the script an interpreter runs.
+        let mut script = None;
         'again: loop {
             self.darwin_exec_lookup(&mut img)?;
             img.vdata = self.darwin_exec_read_page(&img.path, 0)?;
@@ -269,7 +275,10 @@ impl Kernel {
                 }
                 match act {
                     Act::Encapsulated => continue,
-                    Act::Interpreter => continue 'again,
+                    Act::Interpreter => {
+                        script = Some(img.path.clone());
+                        continue 'again;
+                    }
                     Act::NotMine => return Err(Errno::ENOEXEC),
                     Act::Done => break 'again,
                 }
@@ -280,7 +289,8 @@ impl Kernel {
         let size = if img.arch_size != 0 { img.arch_size } else { bytes.len() as u64 };
         let slice = bytes.get(img.arch_offset as usize..(img.arch_offset + size) as usize).ok_or(ebadmacho())?;
         let load = self.darwin_load_signatures(&img.path, img.arch_offset, slice)?;
-        Ok(Image { path: img.path, arch_offset: img.arch_offset, arch_size: img.arch_size, cputype: img.origcputype, cpusubtype: img.origcpusubtype, strings: img.strings, spawn: None, load, thread_id: 0 })
+        let sandbox = super::sandboxes::Pending { script, spawnattrs: None };
+        Ok(Image { path: img.path, arch_offset: img.arch_offset, arch_size: img.arch_size, cputype: img.origcputype, cpusubtype: img.origcpusubtype, strings: img.strings, spawn: None, load, thread_id: 0, sandbox })
     }
 
     /// `namei` of the saved path, links followed, then
@@ -307,6 +317,14 @@ impl Kernel {
         // the caller (gex's files have no owner of their own).
         if self.creds.uid() != 0 && md.mode & 0o100 == 0 {
             return Err(Errno::EACCES);
+        }
+        // mac_vnode_check_exec: Sandbox's process-exec* (its
+        // process-exec-interpreter for a script's interpreter) is not run,
+        // for the platform profile as for a sandbox's (mac.rs); a caller
+        // with a sandbox, whose profile would be asked, stops here.
+        if self.darwin_sandbox().is_some() {
+            self.darwin_unimplemented(format!("Sandbox's process-exec check (mpo_vnode_check_exec) of {abs} by a process with a sandbox"));
+            return Err(Errno::EPERM);
         }
         img.arch_offset = 0;
         img.arch_size = md.size;

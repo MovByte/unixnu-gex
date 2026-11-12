@@ -97,6 +97,8 @@ impl PosixCred {
 struct SpawnCreds {
     pcred: Option<PosixCred>,
     persona: Option<super::persona::SpawnPersona>,
+    /// The data of the MAC extension named `Sandbox`, for its exec hook.
+    sandbox: Option<Vec<u8>>,
 }
 
 fn le16(b: &[u8], o: usize) -> u16 {
@@ -294,8 +296,12 @@ impl Kernel {
             cputype: t.cputype,
             uuid: t.uuid,
             p_name: t.p_name,
-            // forkproc: the credential, and P_SUGID with the flags it keeps.
+            // forkproc: the credential, its Sandbox label with it, and P_SUGID
+            // with the flags it keeps; task_create_internal: the parent's
+            // message filtering.
             cred: t.cred.clone(),
+            sandbox: std::sync::Arc::new(std::sync::Mutex::new(super::sandboxes::of(&t.sandbox))),
+            filter_msg: t.filter_msg,
             sugid: t.sugid,
             csflags: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(t.csflags.load(std::sync::atomic::Ordering::Acquire) & !super::amfi::cs::KILLED)),
             // forkproc: the parent's persona.
@@ -454,6 +460,7 @@ impl Kernel {
                 let lossy = |v: Vec<&[u8]>| v.into_iter().map(|s| String::from_utf8_lossy(s).into_owned()).collect::<Vec<_>>();
                 let (argv, envp) = (lossy(img.strings.args()), lossy(img.strings.envs()));
                 let path = img.path.clone();
+                self.dtask.exec_sandbox = Some(img.sandbox.clone());
                 self.darwin_exec = Some(img);
                 SyscallOutcome::Exec { path, argv, envp }
             }
@@ -531,7 +538,7 @@ impl Kernel {
                 creds.pcred = Some(PosixCred::parse(c));
             }
             if mx_size != 0 {
-                self.darwin_spawn_macpolicyinfo(m, mx_size, mx)?;
+                creds.sandbox = self.darwin_spawn_macpolicyinfo(m, mx_size, mx)?;
             }
             // A subsystem root takes an entitlement the caller is checked for.
             if root_size > 0 && root_size <= PATH_MAX as u64 && self.dtask.codesign.as_ref().is_some_and(|c| c.entitled("com.apple.private.spawn-subsystem-root")) {
@@ -662,6 +669,7 @@ impl Kernel {
                 return Err(e);
             }
         };
+        img.sandbox.spawnattrs = creds.sandbox.clone();
         if let Some(at) = attr {
             // setpgid() and setsid_internal() as the child calls them.
             let r = (|| {
@@ -731,6 +739,7 @@ impl Kernel {
             child.dtask.pcaction.store(pcaction_of(pc), std::sync::atomic::Ordering::Release);
         }
         img.spawn = Some(after);
+        child.dtask.exec_sandbox = Some(img.sandbox.clone());
         child.darwin_exec = Some(Box::new(img));
         Ok(())
     }
@@ -902,6 +911,7 @@ impl Kernel {
         // On a failure, what the actions opened goes with the copy (never
         // its close_all_fds, which would end this process's locks).
         let mut img = activated?;
+        img.sandbox.spawnattrs = creds.sandbox.clone();
         self.fds = std::sync::Arc::clone(&copy.fds);
         // POSIX_SPAWN_RESETIDS's credential, the exec's.
         if copy.dtask.cred != self.dtask.cred {
@@ -955,8 +965,10 @@ impl Kernel {
     }
 
     /// `spawn_copyin_macpolicyinfo`: the extensions' sizes checked and
-    /// their data copied in. No MAC policy is loaded to read them.
-    fn darwin_spawn_macpolicyinfo(&mut self, m: &GuestMem<'_>, size: u64, at: u64) -> Result<(), Errno> {
+    /// their data copied in; the data of the first named `Sandbox`
+    /// (`exec_spawnattr_getmacpolicyinfo`), for that policy's exec hook.
+    /// AMFI's exec hook reads none.
+    fn darwin_spawn_macpolicyinfo(&mut self, m: &GuestMem<'_>, size: u64, at: u64) -> Result<Option<Vec<u8>>, Errno> {
         if size < MAC_HDR + MAC_EXT_SIZE || size > super::exec::PAGE_SIZE {
             return Err(Errno::EINVAL);
         }
@@ -974,11 +986,17 @@ impl Kernel {
             }
             total = total.checked_add(len).ok_or(Errno::ENOMEM)?;
         }
+        let mut sandbox = None;
         for i in 0..count as usize {
             let e = MAC_HDR as usize + MAC_EXT_SIZE as usize * i;
-            m.read(le64(&b, e + 128), le64(&b, e + 136) as usize).map_err(|_| Errno::ENOMEM)?;
+            let data = m.read(le64(&b, e + 128), le64(&b, e + 136) as usize).map_err(|_| Errno::ENOMEM)?;
+            // strncmp of the 128-byte name with "Sandbox".
+            let name = &b[e..e + 128];
+            if sandbox.is_none() && name[..name.iter().position(|&c| c == 0).unwrap_or(128)] == *b"Sandbox" {
+                sandbox = Some(data.to_vec());
+            }
         }
-        Ok(())
+        Ok(sandbox)
     }
 
     /// `exec_handle_file_actions` on this (the child's) descriptor table:

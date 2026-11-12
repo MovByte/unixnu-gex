@@ -93,9 +93,13 @@ mod amfi_call {
     pub const GET_LOCAL_SIGNING_PRIVATE_KEY: u64 = 97;
 }
 
-/// The Sandbox policy's `__mac_syscall` calls: `sandbox_check` and its
-/// variants, and `sandbox_get_container_expected`.
+/// The Sandbox policy's `__mac_syscall` calls: `sandbox_init` of a builtin
+/// profile, `sandbox_check` and its variants, whether a builtin profile is
+/// named so (libsandbox's `sandbox_compile_named`), and
+/// `sandbox_get_container_expected`.
+const SANDBOX_APPLY_BUILTIN: u64 = 1;
 const SANDBOX_CHECK: u64 = 2;
+const SANDBOX_BUILTIN_EXISTS: u64 = 22;
 const SANDBOX_CONTAINER_EXPECTED: u64 = 67;
 
 /// `CS_OPS_*`.
@@ -1817,37 +1821,39 @@ impl Kernel {
             if id == 0 || id > 0xffff_ffff {
                 return Err(EINVAL);
             }
-            // No sandbox references are made: no process has a sandbox.
+            // A reference is made by Sandbox's calls that make one, which
+            // are not served (each is refused loudly): none names this id.
             return Err(ENOENT);
         }
-        // The process by pid, with its pidversion or its unique id to match.
-        let found = |k: &mut Kernel, pid: i64, version: Option<u64>, unique: Option<u64>| -> bool {
-            let Ok(pid) = i32::try_from(pid) else { return false };
-            let ids = if pid == k.pid {
-                Some((k.dtask.pidversion, k.dtask.uniqueid))
+        // The process by pid, with its pidversion or its unique id to match:
+        // its credential's sandbox.
+        let found = |k: &mut Kernel, pid: i64, version: Option<u64>, unique: Option<u64>| -> Option<Option<std::sync::Arc<super::sandboxes::Sandbox>>> {
+            let pid = i32::try_from(pid).ok()?;
+            let (v, u, sb) = if pid == k.pid {
+                (k.dtask.pidversion, k.dtask.uniqueid, k.darwin_sandbox())
             } else {
                 let ipc = k.ipc();
-                ipc.links.values().find(|l| l.pid == pid).map(|l| (l.pidversion, l.uniqueid))
+                ipc.links.values().find(|l| l.pid == pid).map(|l| (l.pidversion, l.uniqueid, super::sandboxes::of(&l.sandbox)))?
             };
-            ids.is_some_and(|(v, u)| version.is_none_or(|w| i64::from(v) == w as i64) && unique.is_none_or(|w| u == w))
+            (version.is_none_or(|w| i64::from(v) == w as i64) && unique.is_none_or(|w| u == w)).then_some(sb)
         };
-        if !found(self, pid, (selector == 1).then_some(id), (selector == 2).then_some(id)) {
+        let Some(sandbox) = found(self, pid, (selector == 1).then_some(id), (selector == 2).then_some(id)) else { return answer(m, 3) };
+        if flags & 0x100_0000 != 0 && found(self, q(0x70) as i64, Some(q(0x78)), None).is_none() {
             return answer(m, 3);
         }
-        if flags & 0x100_0000 != 0 && !found(self, q(0x70) as i64, Some(q(0x78)), None) {
-            return answer(m, 3);
-        }
-        // No process has a sandbox: with no operation the answer is that,
-        // and a forbidden- operation is allowed.
+        // With no operation, the answer is whether the target has a sandbox.
         if op_at == 0 {
-            return answer(m, 0);
+            return answer(m, u64::from(sandbox.is_some()));
         }
         let mut buf = [0u8; 0x35];
         let name = match m.read_cstr_into(op_at, &mut buf).map_err(fault)? {
             Some(n) => buf[..n].to_vec(),
             None => return Err(ENAMETOOLONG),
         };
-        if name.starts_with(b"forbidden-") {
+        // A forbidden- pseudo-operation: allowed without a sandbox; denied
+        // with one, and reported unless quiet.
+        let forbidden = name.starts_with(b"forbidden-");
+        if forbidden && sandbox.is_none() {
             return answer(m, 0);
         }
         let mut s = [0u8; 0x400];
@@ -1897,6 +1903,12 @@ impl Kernel {
                 return Err(EINVAL);
             }
         }
+        if forbidden {
+            if flags & 1 == 0 {
+                self.darwin_sb_report(&String::from_utf8_lossy(&name));
+            }
+            return answer(m, 1);
+        }
         let Some(op) = super::mac::OPERATION_NAMES.iter().position(|n| n.as_bytes() == name.as_slice()) else { return Err(EINVAL) };
         if pid != i64::from(self.pid) {
             self.darwin_unimplemented("sandbox_check of another process (its credential as the subject)".into());
@@ -1938,14 +1950,19 @@ impl Kernel {
     fn darwin_sandbox_syscall(&mut self, m: &mut GuestMem<'_>, call: u64, arg: u64) -> Result<(), i32> {
         let fault = |_| 14;
         match call {
+            SANDBOX_APPLY_BUILTIN => self.darwin_sb_apply_builtin(m, arg),
             SANDBOX_CHECK => self.darwin_sandbox_check(m, arg),
-            // {&expected, &has_container}: what the process's sandbox says;
-            // a process without a sandbox has neither.
+            SANDBOX_BUILTIN_EXISTS => self.darwin_sb_builtin_exists(m, arg),
+            // {&expected, &has_container} (`0x...a0fbf0`): what the process's
+            // sandbox says; a process without one has neither.
             SANDBOX_CONTAINER_EXPECTED => {
                 let (a, b) = (m.read_u64(arg).map_err(fault)?, m.read_u64(arg + 8).map_err(fault)?);
-                for out in [a, b] {
+                let sb = self.darwin_sandbox();
+                let expected = sb.as_ref().is_some_and(|s| s.container_expected);
+                let has = sb.as_ref().is_some_and(|s| s.container.is_some());
+                for (out, v) in [(a, expected), (b, has)] {
                     if out != 0 {
-                        m.write_u64(out, 0).map_err(fault)?;
+                        m.write_u64(out, u64::from(v)).map_err(fault)?;
                     }
                 }
                 Ok(())
