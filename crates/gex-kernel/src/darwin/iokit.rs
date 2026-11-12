@@ -801,7 +801,83 @@ pub fn open_user_client(k: &mut crate::syscalls::Kernel, service: u32, ty: u32) 
             return Err(ret::UNSUPPORTED);
         }
     };
-    Ok(client_add(service, class, creator, default_locking, kind))
+    let id = client_add(service, class, creator, default_locking, kind);
+    // is_io_service_open_extended, the client made: the MAC policies'
+    // mac_iokit_check_open, then, allowed, Sandbox's filter resolver; a
+    // refusal is the open's result, the client closed and let go.
+    let Some(cell) = client(id) else { return Err(ret::ERROR) };
+    let object = sb_client(&cell.lock().unwrap_or_else(|e| e.into_inner()));
+    let res = match k.darwin_mac_check_iokit_open(object.clone()) {
+        0 => match k.darwin_sb_iokit_resolve(object) {
+            ret::UNSUPPORTED => ret::SUCCESS,
+            r => r,
+        },
+        _ => ret::NOT_PERMITTED,
+    };
+    if res != ret::SUCCESS {
+        if let Some(cell) = client_remove(id) {
+            let mut c = cell.lock().unwrap_or_else(|e| e.into_inner());
+            c.closed = true;
+            client_close(k, &mut c);
+            if let Kind::Accel(a) = &mut c.kind {
+                super::accel::client_free(k, a);
+            }
+        }
+        return Err(res);
+    }
+    Ok(id)
+}
+
+/// A class with its superclasses and OSObject, as a Sandbox class walk
+/// visits them (`getMetaClass`, then each `getSuperClass`); none for a
+/// class this registry does not know.
+fn class_chain(class: &str) -> Option<Vec<&'static str>> {
+    let s = superclasses(class);
+    if s.is_empty() {
+        return None;
+    }
+    let mut v = s.to_vec();
+    v.push("OSObject");
+    Some(v)
+}
+
+/// The class chains from entry `at` up the IOService plane: its own, each
+/// ancestor's, then the registry's root's (an IORegistryEntry).
+fn chains_from(t: &[Node], mut at: Option<u32>) -> Vec<Option<Vec<&'static str>>> {
+    let mut out = Vec::new();
+    while let Some(i) = at {
+        out.push(class(t, i).ok().and_then(class_chain));
+        at = t.get(i as usize).and_then(|n| n.parent);
+    }
+    out.push(Some(vec!["IORegistryEntry", "OSObject"]));
+    out
+}
+
+/// Registry entry `i` as a Sandbox IOKit operation names it.
+pub fn sb_entry(i: u32) -> super::sandbox::IoKitObject {
+    super::sandbox::IoKitObject { chains: chains_from(tree(), Some(i)), ..Default::default() }
+}
+
+/// User client `c` as a Sandbox IOKit operation names it: its classes,
+/// then its provider's (the service it was opened on, which it is attached
+/// to) and up; and its provider's USB device class and subclass.
+pub fn sb_client(c: &UserClient) -> super::sandbox::IoKitObject {
+    let t = tree();
+    let mut chains = vec![class_chain(c.class)];
+    chains.extend(chains_from(t, Some(c.service)));
+    let num = |name: &str| {
+        t.get(c.service as usize)?.service_props.iter().find(|(k, _)| k == name).and_then(|(_, p)| match p {
+            Prop::Num(v, bits) => Some((*v, *bits)),
+            _ => None,
+        })
+    };
+    super::sandbox::IoKitObject { chains, usb_class: num("bDeviceClass"), usb_subclass: num("bDeviceSubClass"), ..Default::default() }
+}
+
+/// Whether entry `i` is the NVRAM's (IODTNVRAM, which the platform expert
+/// publishes on `/options`: `createNVRAM`).
+pub fn is_nvram(i: u32) -> bool {
+    from_path(tree(), "IODeviceTree:/options").ok().flatten() == Some(i)
 }
 
 /// The client's `clientClose`.

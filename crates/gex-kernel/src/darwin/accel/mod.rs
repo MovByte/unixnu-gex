@@ -13,10 +13,11 @@
 //!
 //! Its user clients are attached to it in the IOService plane, so the
 //! shipped Sandbox profiles admit them by that ancestry: their
-//! `iokit-registry-entry-class` filter (`0xfffffff0069f2564`) walks the
-//! entry's provider chain and each class's superclasses, and the
-//! `container`, `backboardd`, `runningboardd` and `com.apple.WebKit.GPU`
-//! profiles allow `iokit-open-user-client` under an `IOGPU`.
+//! `iokit-connection` filter (19; `0xfffffff0069f2564`) walks the entry and
+//! its providers, each with its superclasses (`iokit-registry-entry-class`,
+//! 17, walks the entry's own classes only), and the `container`,
+//! `backboardd`, `runningboardd` and `com.apple.WebKit.GPU` profiles allow
+//! `iokit-open-user-client` under an `IOGPU`.
 
 pub mod iogpu;
 pub mod wire;

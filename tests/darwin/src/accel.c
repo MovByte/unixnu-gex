@@ -6,12 +6,18 @@
 // method argument checks as IOUserClient makes them, the asynchronous
 // method and notification port calls, memory mapping, traps, closing, and
 // the client going with its connection's last send right.
+//
+// It runs as an app does, in the container profile's sandbox: the platform
+// profile admits a GPU user client to no unsandboxed program but those it
+// names by signing identifier, and the container profile admits one whose
+// provider is an IOGPU (iokit-connection).
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #include <mach/mach.h>
 #include <mach/mig.h>
 #include <mach/mig_errors.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +34,10 @@ static kern_return_t trap0(io_connect_t conn, unsigned int index) {
 static void port_free(mach_port_t port) {
     mach_port_mod_refs(mach_task_self(), port, MACH_PORT_RIGHT_RECEIVE, -1);
 }
+
+#define SANDBOX_NAMED_BUILTIN 2
+
+int sandbox_init(const char *profile, uint64_t flags, char **errorbuf);
 
 static int bad(const char *what, long got, long want) {
     printf("accel: %s: %#lx, want %#lx\n", what, got, want);
@@ -352,6 +362,8 @@ static int restricted_client(io_service_t accel) {
 }
 
 int main(int argc, char **argv) {
+    char *err = NULL;
+    if (sandbox_init("container", SANDBOX_NAMED_BUILTIN, &err) != 0) return bad("the container sandbox", 0, 1);
     // Metal.framework's _MTLRegisterDevices: every IOAcceleratorES.
     io_iterator_t it = IO_OBJECT_NULL;
     kern_return_t kr = IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOAcceleratorES"), &it);

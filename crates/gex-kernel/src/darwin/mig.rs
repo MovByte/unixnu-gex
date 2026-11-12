@@ -311,6 +311,10 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             const IO_STRUCT_INBAND_MAX: usize = 4096;
             let Some((name, next)) = inline_cstr(req, 0, 128) else { return bad() };
             let Some(cnt) = i32_at(&req.body, next) else { return bad() };
+            // mac_iokit_check_get_property, before the lookup.
+            if k.darwin_mac_check_iokit_get_property(super::iokit::sb_entry(*i), super::iokit::is_nvram(*i), name) != 0 {
+                return Reply::err(super::iokit::ret::NOT_PERMITTED);
+            }
             const K_IO_RETURN_BAD_ARGUMENT: i32 = 0xe00002c2_u32 as i32;
             let Some(node) = super::iokit::tree().get(*i as usize) else { return bad() };
             let name = String::from_utf8_lossy(name);
@@ -349,6 +353,10 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             let Some((name, next)) = inline_cstr_at(req, next, 128) else { return bad() };
             let (Some(options), Some(buf), Some(bufsize)) = (i32_at(&req.body, next), req.body.get(next + 4..next + 12), req.body.get(next + 12..next + 20)) else { return bad() };
             let (buf, bufsize) = (u64::from_le_bytes(buf.try_into().unwrap()), u64::from_le_bytes(bufsize.try_into().unwrap()));
+            // mac_iokit_check_get_property of the entry asked, first.
+            if k.darwin_mac_check_iokit_get_property(super::iokit::sb_entry(*i), super::iokit::is_nvram(*i), name) != 0 {
+                return Reply::err(super::iokit::ret::NOT_PERMITTED);
+            }
             let Some(node) = super::iokit::tree().get(*i as usize) else { return bad() };
             let name = String::from_utf8_lossy(name).into_owned();
             if options as u32 & K_IO_REGISTRY_ITERATE_RECURSIVELY != 0 && !plane.is_empty() || name == "IORegistryEntryPropertyKeys" {
@@ -1953,6 +1961,10 @@ fn io_service_open(k: &mut Kernel, req: &Kmsg, service: u32) -> Reply {
     if !is_own_task(k, task) {
         return Reply::err(ret::BAD_ARGUMENT);
     }
+    // mac_iokit_check_open_service, before the properties are looked at.
+    if k.darwin_mac_check_iokit_open_service(super::iokit::sb_entry(service), ty as u32) != 0 {
+        return Reply::err(ret::NOT_PERMITTED);
+    }
     if !data.is_empty() {
         return Reply::err(ret::UNSUPPORTED);
     }
@@ -2057,6 +2069,9 @@ fn connect_routine(k: &mut Kernel, req: &Kmsg, id: u32, n: i32) -> Reply {
         2812 => match inline_cstr(req, 0, 128) {
             Some((name, next)) => {
                 let Some(cnt) = i32_at(&req.body, next) else { return bad() };
+                if k.darwin_mac_check_iokit_get_property(super::iokit::sb_client(&c), false, name) != 0 {
+                    return Reply::err(ret::NOT_PERMITTED);
+                }
                 match super::iokit::client_property(&c, &String::from_utf8_lossy(name)).map(|p| p.map(|p| super::iokit::prop_bytes(&p))) {
                     Err(what) => {
                         let mut r = Reply::err(ret::NO_RESOURCES);
@@ -2266,6 +2281,9 @@ fn client_property_bin_buf(k: &mut Kernel, req: &Kmsg, c: &super::iokit::UserCli
     let Some((name, next)) = inline_cstr_at(req, next, 128) else { return Reply::err(MIG_BAD_ARGUMENTS) };
     let (Some(_options), Some(buf), Some(bufsize)) = (i32_at(&req.body, next), req.body.get(next + 4..next + 12), req.body.get(next + 12..next + 20)) else { return Reply::err(MIG_BAD_ARGUMENTS) };
     let (buf, bufsize) = (u64::from_le_bytes(buf.try_into().unwrap()), u64::from_le_bytes(bufsize.try_into().unwrap()));
+    if k.darwin_mac_check_iokit_get_property(super::iokit::sb_client(c), false, name) != 0 {
+        return Reply::err(super::iokit::ret::NOT_PERMITTED);
+    }
     let p = match super::iokit::client_property(c, &String::from_utf8_lossy(name)) {
         Ok(Some(p)) => p,
         Ok(None) => return Reply::err(super::iokit::ret::NOT_FOUND),

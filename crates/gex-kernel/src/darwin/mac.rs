@@ -18,7 +18,9 @@
 //! let through (syscall-unix, syscall-mach, syscall-mig). The socket calls
 //! ask network-bind, -inbound and -outbound, system-socket and the
 //! socket-option and socket-ioctl operations, a unix socket's operations
-//! being allowed at once.
+//! being allowed at once. IOKit's opens ask iokit-open-service and
+//! iokit-open-user-client (and the user client filter resolver asks the
+//! latter again), its property reads iokit-get-properties or nvram-get.
 
 use std::sync::Arc;
 
@@ -51,6 +53,9 @@ pub fn error_select(a: u32, b: u32) -> u32 {
 /// Sandbox's operations (its `operation_names` table) the hooks here use.
 pub mod op {
     pub const DYNAMIC_CODE_GENERATION: usize = 9;
+    pub const IOKIT_GET_PROPERTIES: usize = 60;
+    pub const IOKIT_OPEN_USER_CLIENT: usize = 63;
+    pub const IOKIT_OPEN_SERVICE: usize = 64;
     pub const FILE_REVOKE: usize = 25;
     pub const MACH_HOST_SPECIAL_PORT_SET: usize = 93;
     pub const MACH_PRIV_HOST_PORT: usize = 98;
@@ -66,6 +71,7 @@ pub mod op {
     pub const PROCESS_INFO_CODESIGNATURE: usize = 124;
     pub const PROCESS_LEGACY_CODESIGNING_STATUS_SET: usize = 142;
     pub const NETWORK_INBOUND: usize = 110;
+    pub const NVRAM_GET: usize = 115;
     pub const NETWORK_BIND: usize = 111;
     pub const NETWORK_OUTBOUND: usize = 112;
     pub const SIGNAL: usize = 146;
@@ -162,6 +168,8 @@ pub struct SbArgs {
     pub vnode: Option<SbVnode>,
     /// A socket operation's socket (kind 2).
     pub socket: Option<SbSocket>,
+    /// An IOKit operation's object (kind 8).
+    pub iokit: Option<sandbox::IoKitObject>,
 }
 
 /// What a socket operation's filters read of its socket: whether there is
@@ -404,6 +412,9 @@ impl Facts for KernelFacts<'_> {
     }
     fn developer_mode(&self) -> bool {
         super::amfi::DEVELOPER_MODE
+    }
+    fn iokit(&self) -> Option<sandbox::IoKitObject> {
+        self.a.iokit.clone()
     }
     fn socket(&self) -> Option<sandbox::SocketType> {
         let s = self.a.socket.as_ref()?;
@@ -837,6 +848,68 @@ impl Kernel {
         const KERN_DENIED: i32 = 53;
         let a = SbArgs { kind: sandbox::kind::SYSCALL_MIG, number: idx, ..Default::default() };
         if self.darwin_sb_evaluate(op::SYSCALL_MIG, &a) == 0 { 0 } else { KERN_DENIED }
+    }
+
+    /// `mac_iokit_check_open_service` (Sandbox's hook, slot 201; AMFI has
+    /// none): iokit-open-service of the service, with the user client type
+    /// the open asks for.
+    pub(crate) fn darwin_mac_check_iokit_open_service(&mut self, service: sandbox::IoKitObject, ty: u32) -> u32 {
+        let a = SbArgs { kind: sandbox::kind::IOKIT, iokit: Some(sandbox::IoKitObject { client_type: ty, ..service }), ..Default::default() };
+        self.darwin_sb_evaluate(op::IOKIT_OPEN_SERVICE, &a)
+    }
+
+    /// `mac_iokit_check_open` (slot 317): iokit-open-user-client of the new
+    /// client (the type is not passed on).
+    pub(crate) fn darwin_mac_check_iokit_open(&mut self, client: sandbox::IoKitObject) -> u32 {
+        let a = SbArgs { kind: sandbox::kind::IOKIT, iokit: Some(client), ..Default::default() };
+        self.darwin_sb_evaluate(op::IOKIT_OPEN_USER_CLIENT, &a)
+    }
+
+    /// Sandbox's IOUserClient filter resolver (`0x...9f3b14`, which it
+    /// registers with `IOUserClient::registerFilterCallbacks`), asked at an
+    /// open the MAC check allowed: iokit-open-user-client of the client
+    /// again, whose modifier would associate the client's call filters;
+    /// this collection's profiles associate none, so an allowance is
+    /// kIOReturnUnsupported (the open goes on with no filter). A denial
+    /// (EPERM) is kIOReturnNotPermitted, another error
+    /// kIOReturnInternalError.
+    pub(crate) fn darwin_sb_iokit_resolve(&mut self, client: sandbox::IoKitObject) -> i32 {
+        const K_IO_RETURN_UNSUPPORTED: i32 = 0xe00002c7_u32 as i32;
+        const K_IO_RETURN_NOT_PERMITTED: i32 = 0xe00002e2_u32 as i32;
+        const K_IO_RETURN_INTERNAL_ERROR: i32 = 0xe00002c9_u32 as i32;
+        let a = SbArgs { kind: sandbox::kind::IOKIT, iokit: Some(client), ..Default::default() };
+        match self.darwin_sb_evaluate(op::IOKIT_OPEN_USER_CLIENT, &a) {
+            0 => K_IO_RETURN_UNSUPPORTED,
+            1 => K_IO_RETURN_NOT_PERMITTED,
+            _ => K_IO_RETURN_INTERNAL_ERROR,
+        }
+    }
+
+    /// `mac_iokit_check_get_property` (slot 334): nvram-get of the name for
+    /// the NVRAM entry (`0x...9f2940`: IODTNVRAM, which is `/options`), but
+    /// for the twelve names of the registry's own (`0x...9f2990`); else
+    /// iokit-get-properties of the entry and the name.
+    pub(crate) fn darwin_mac_check_iokit_get_property(&mut self, entry: sandbox::IoKitObject, nvram: bool, name: &[u8]) -> u32 {
+        const REGISTRY_NAMES: [&[u8]; 12] = [
+            b"BSD Major",
+            b"BSD Minor",
+            b"BSD Name",
+            b"BSD Names",
+            b"BSD Unit",
+            b"IOClassNameOverride",
+            b"IOMatchCategory",
+            b"IONameMatch",
+            b"IORegistryEntryAllowableSetProperties",
+            b"IORegistryEntryDefaultLockingSetProperties",
+            b"IOUserServiceProperties",
+            b"exclave-assigned",
+        ];
+        if nvram && !REGISTRY_NAMES.contains(&name) {
+            let a = SbArgs { kind: sandbox::kind::NVRAM, string: Some(name.to_vec()), ..Default::default() };
+            return self.darwin_sb_evaluate(op::NVRAM_GET, &a);
+        }
+        let a = SbArgs { kind: sandbox::kind::IOKIT, iokit: Some(sandbox::IoKitObject { property: Some(name.to_vec()), ..entry }), ..Default::default() };
+        self.darwin_sb_evaluate(op::IOKIT_GET_PROPERTIES, &a)
     }
 
     /// The socket of descriptor `fd`, as its operations' filters read it

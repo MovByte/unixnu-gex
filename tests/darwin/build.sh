@@ -28,6 +28,7 @@ cc -O2 -framework CoreFoundation -o "$OUT/cfrunloop" "$HERE/src/cfrunloop.c"
 cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/iokit" "$HERE/src/iokit.c"
 cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/ioreg" "$HERE/src/ioreg.c"
 cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/accel" "$HERE/src/accel.c"
+cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/sbxiokit" "$HERE/src/sbxiokit.c"
 # accelr: accel in a task entitled to be a restricted GPU client.
 cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/accelr" "$HERE/src/accel.c"
 # amfi's: a program in no trust cache, and one holding get-task-allow.

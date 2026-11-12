@@ -444,7 +444,10 @@ is the reference (search `crates/gex-kernel/src/` for
   hooks (the other vnode checks among them) are not called. A process's
   Unix calls, Mach traps and kernel MIG routines are filtered by the masks
   its sandbox (or, with none, the platform profile) gives it, as XNU
-  filters them; the socket calls are checked where XNU checks them. Not ported, and reported where the kext would act: the
+  filters them; the socket calls, IOKit's opens and its property reads
+  are checked where XNU checks them. A class walk of an IORegistry entry
+  whose class this registry does not know (the device tree's nubs, and
+  the drivers between them) is reported. Not ported, and reported where the kext would act: the
   profiles of the `com.apple.private.sandbox.profile` entitlements,
   containers and containermanagerd's upcall, the extensions of the
   `com.apple.security.exception.*` entitlements, matching an extension

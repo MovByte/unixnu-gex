@@ -236,6 +236,8 @@ pub mod kind {
     pub const SYSCTL: u32 = 0xf;
     pub const POSIX_IPC: u32 = 6;
     pub const HOST_SPECIAL_PORT: u32 = 7;
+    pub const IOKIT: u32 = 8;
+    pub const NVRAM: u32 = 0x11;
     pub const SYSCALL_UNIX: u32 = 0x14;
     pub const SYSCALL_MACH: u32 = 0x16;
     pub const SYSCALL_MIG: u32 = 0x17;
@@ -251,6 +253,22 @@ pub struct SocketType {
     pub domain: u32,
     pub ty: u32,
     pub protocol: u32,
+}
+
+/// What an IOKit operation's filters read of its object (kind 8): the
+/// class chains (each class with its superclasses, to OSObject) of the
+/// object and then of each of its IOService-plane ancestors, to the
+/// registry's root, none for an entry whose class this registry does not
+/// know; the property the operation names (`+0xe0`); the user client type
+/// an open asks for (`+0xf0`); and, for a user client, its provider's USB
+/// device class and subclass (`OSNumber`s: value and size in bits).
+#[derive(Clone, Debug, Default)]
+pub struct IoKitObject {
+    pub chains: Vec<Option<Vec<&'static str>>>,
+    pub property: Option<Vec<u8>>,
+    pub client_type: u32,
+    pub usb_class: Option<(u64, u32)>,
+    pub usb_subclass: Option<(u64, u32)>,
 }
 
 const AF_UNIX: u32 = 1;
@@ -350,6 +368,10 @@ pub trait Facts {
     }
     fn socket_command(&self) -> u64 {
         0
+    }
+    /// An IOKit operation's object (kind 8).
+    fn iokit(&self) -> Option<IoKitObject> {
+        None
     }
     /// Whether `sa` is an address of the host's own (`0x...a08950`): the
     /// unspecified address, or one of an interface's.
@@ -1032,6 +1054,20 @@ fn operand(b: &[u8], p: &Profile, arg: u16) -> Result<(usize, Vec<u8>), Stop> {
 /// Apple-signed.
 const CAN_EXECUTE_CDHASH: &[u8] = b"com.apple.private.amfi.can-execute-cdhash";
 
+/// `0x...9f2358`: the filter's string against each class of `chain` in
+/// turn: a match ends it; an error does not, but is the answer when the
+/// last class's compare is one.
+fn class_walk(b: &[u8], p: &Profile, flag: bool, arg: u16, chain: &[&str], facts: &mut dyn Facts) -> Result<bool, Stop> {
+    let mut last = Ok(false);
+    for class in chain {
+        last = str_match(b, p, flag, arg, class.as_bytes(), facts);
+        if matches!(last, Ok(true)) {
+            return Ok(true);
+        }
+    }
+    last.map(|_| false)
+}
+
 /// The local and remote filters' compare (`0x...a06394`) of address `sa`
 /// of a socket of `domain` and `ty` against the operand at `arg`: its flags
 /// (bit 0 inet, bit 1 inet6, bit 2 stream only, bit 3 datagram only), its
@@ -1212,6 +1248,48 @@ fn filter(b: &[u8], p: &Profile, ty: u8, flag: bool, arg: u16, facts: &mut dyn F
         80 => k == kind::SOCKET && int_match(b, p, flag, arg, u64::from(facts.socket_option().1))?,
         // An NECP client action's number.
         83 => k == kind::NECP_ACTION && int_match(b, p, flag, arg, u64::from(facts.syscall_number()))?,
+        // iokit-registry-entry-class (and iokit-user-client-class): the
+        // object's class and superclasses (`0x...9f2358`); iokit-connection:
+        // those of the object and of each IOService-plane ancestor in turn
+        // (`0x...9f2564`).
+        17 | 19 => match facts.iokit().filter(|_| k == kind::IOKIT) {
+            None => false,
+            Some(o) => {
+                let walks = if ty == 17 { 1 } else { o.chains.len() };
+                let mut last = Ok(false);
+                for chain in o.chains.iter().take(walks) {
+                    let Some(chain) = chain else {
+                        return Err(facts.unported("the class of an IORegistry entry this registry does not know".into()));
+                    };
+                    last = class_walk(b, p, flag, arg, chain, facts);
+                    if matches!(last, Ok(true)) {
+                        break;
+                    }
+                }
+                last?
+            }
+        },
+        // iokit-property: the property the operation names.
+        18 => match facts.iokit().filter(|_| k == kind::IOKIT).and_then(|o| o.property) {
+            Some(name) => str_match(b, p, flag, arg, &name, facts)?,
+            None => false,
+        },
+        // iokit-usb-interface-class and -subclass: a user client's
+        // provider's, an OSNumber of at most two bytes; the argument is the
+        // operand itself.
+        60 | 61 => match facts.iokit().filter(|_| k == kind::IOKIT).and_then(|o| if ty == 60 { o.usb_class } else { o.usb_subclass }) {
+            Some((v, bits)) => bits <= 16 && v == u64::from(arg),
+            None => false,
+        },
+        // iokit-method-number and iokit-trap-number: only a user client's
+        // call filter sets the call's kind and number, which no hook here
+        // does.
+        73 | 74 => false,
+        // iokit-user-client-type: the type an open asks for.
+        77 => match facts.iokit().filter(|_| k == kind::IOKIT) {
+            Some(o) => int_match(b, p, flag, arg, u64::from(o.client_type))?,
+            None => false,
+        },
         // A Mach trap's number; a kernel MIG routine's index (the one
         // Sandbox gave its message id at boot).
         75 => k == kind::SYSCALL_MACH && int_match(b, p, flag, arg, u64::from(facts.syscall_number()))?,
