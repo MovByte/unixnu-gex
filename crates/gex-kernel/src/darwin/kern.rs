@@ -411,7 +411,7 @@ impl Kernel {
         if let Some(r) = self.darwin_fs_call(m, raw, a) {
             return Some(res(r));
         }
-        if let Some(r) = self.darwin_fixed_call(m, raw, a) {
+        if let Some(r) = self.darwin_fixed_call(raw, a) {
             return Some(res(r));
         }
         if let Some(r) = self.darwin_aio_call(m, raw, a) {

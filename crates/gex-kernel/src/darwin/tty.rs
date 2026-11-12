@@ -406,13 +406,25 @@ pub enum Chan {
     PtcWrite,
     /// `&ttread`, which nothing wakes: `ttread`'s delayed-suspend nap.
     Ttread,
+    /// `&vp->v_iocount`: a revoke's `vnode_drain`, waiting for the calls in
+    /// its vnode to leave.
+    Drain,
+    /// `&vp->v_lflag`: a call that came to a vnode being revoked, waiting
+    /// for its reclaim (`vnode_getiocount`).
+    Reclaim,
 }
 
-/// A thread asleep on one of the terminal's channels.
+/// A terminal vnode: its device and the identity (`v_id`) it has until a
+/// revoke reclaims it.
+pub type Vnode = (u32, u64);
+
+/// A thread asleep on one of the terminal's channels, and the vnode it is
+/// in a call on (holding an iocount), if any.
 struct Sleeper {
     chan: Chan,
     token: u64,
     waker: Wake,
+    via: Option<Vnode>,
 }
 
 /// How a sleeper is woken: a thread waiting as a call does, or one
@@ -630,6 +642,14 @@ pub struct Tty {
     pub pti: Option<super::ptmx::Pti>,
     sleepers: Vec<Sleeper>,
     next_token: u64,
+    /// The calls running in each of its vnodes now (their iocounts, but
+    /// for those asleep, which their sleepers count).
+    vnode_io: std::collections::HashMap<Vnode, u32>,
+    /// Sleepers in a vnode woken and not yet back in their call, by token:
+    /// they hold its iocount still.
+    woken: std::collections::HashMap<u64, Vnode>,
+    /// The revokes draining one of its vnodes.
+    draining: u32,
 }
 
 /// A terminal and its lock.
@@ -732,6 +752,9 @@ impl Tty {
             pti: None,
             sleepers: Vec::new(),
             next_token: 1,
+            vnode_io: std::collections::HashMap::new(),
+            woken: std::collections::HashMap::new(),
+            draining: 0,
         }
     }
 
@@ -748,10 +771,11 @@ impl Tty {
 
     /// Queue the calling thread on `req`'s channel; the token that
     /// [`Self::unsleep`] takes it off with.
-    pub fn enqueue(&mut self, req: &SleepReq, waker: Waker) -> u64 {
+    /// `via`: the vnode the call sleeps in, whose iocount it holds.
+    pub fn enqueue(&mut self, req: &SleepReq, waker: Waker, via: Option<Vnode>) -> u64 {
         let token = self.next_token;
         self.next_token += 1;
-        self.sleepers.push(Sleeper { chan: req.chan, token, waker: Wake::Thread(waker) });
+        self.sleepers.push(Sleeper { chan: req.chan, token, waker: Wake::Thread(waker), via });
         token
     }
 
@@ -759,13 +783,78 @@ impl Tty {
     pub fn enqueue_sync(&mut self, req: &SleepReq, w: Arc<SyncWake>) -> u64 {
         let token = self.next_token;
         self.next_token += 1;
-        self.sleepers.push(Sleeper { chan: req.chan, token, waker: Wake::Sync(w) });
+        self.sleepers.push(Sleeper { chan: req.chan, token, waker: Wake::Sync(w), via: None });
         token
     }
 
     /// Take a thread whose sleep ended some other way off its channel.
+    /// A sleeper in a vnode that goes leaves it, its iocount with it.
     pub fn unsleep(&mut self, token: u64) {
+        let asleep = self.sleepers.iter().any(|s| s.token == token && s.via.is_some());
         self.sleepers.retain(|s| s.token != token);
+        let woken = self.woken.remove(&token).is_some();
+        if asleep || woken {
+            self.vnode_left();
+        }
+    }
+
+    // --- A revoke's drain of one of its vnodes (`vnode_reclaim_internal`).
+
+    /// A call enters vnode `v` (takes an iocount).
+    pub fn io_enter(&mut self, v: Vnode) {
+        *self.vnode_io.entry(v).or_insert(0) += 1;
+    }
+
+    /// A call leaves vnode `v` (`vnode_dropiocount`): a draining revoke
+    /// looks again.
+    pub fn io_leave(&mut self, v: Vnode) {
+        if let Some(n) = self.vnode_io.get_mut(&v) {
+            *n -= 1;
+            if *n == 0 {
+                self.vnode_io.remove(&v);
+            }
+        }
+        self.vnode_left();
+    }
+
+    /// A call left one of its vnodes, or a sleeper in one went.
+    fn vnode_left(&mut self) {
+        if self.draining > 0 {
+            self.wakeup(Chan::Drain);
+        }
+    }
+
+    /// Whether a call other than the revoke's own is in vnode `v` (its
+    /// iocount above one): running in it, or asleep in it.
+    pub fn vnode_busy(&self, v: Vnode) -> bool {
+        self.vnode_io.contains_key(&v) || self.sleepers.iter().any(|s| s.via == Some(v)) || self.woken.values().any(|&w| w == v)
+    }
+
+    /// A revoke of vnode `v` begins: its drain counted, and, with a call
+    /// in the vnode, TIOCREVOKE sent (whether it was).
+    pub fn revoke_begin(&mut self, v: Vnode) -> bool {
+        self.draining += 1;
+        let busy = self.vnode_busy(v);
+        if busy {
+            self.revoke_tty();
+        }
+        busy
+    }
+
+    /// A revoke's drain is over: TIOCREVOKECLEAR, if it sent TIOCREVOKE.
+    pub fn revoke_end(&mut self, sent: bool) {
+        self.draining -= 1;
+        if sent {
+            self.state &= !ts::REVOKE;
+        }
+    }
+
+    /// `TIOCREVOKE`.
+    fn revoke_tty(&mut self) {
+        self.state |= ts::REVOKE;
+        self.gen += 1;
+        // Only ttread's channel: it is the one that has hung.
+        self.wakeup(Chan::HupOrInput);
     }
 
     /// `ttysleep`'s end: `msleep0`'s error, or ERESTART when the terminal
@@ -789,6 +878,11 @@ impl Tty {
         while i < self.sleepers.len() {
             if self.sleepers[i].chan == chan {
                 let s = self.sleepers.swap_remove(i);
+                // Woken, it is still in its vnode until it is back in its
+                // call ([`Self::unsleep`]).
+                if let Some(v) = s.via {
+                    self.woken.insert(s.token, v);
+                }
                 match &s.waker {
                     Wake::Thread(w) => wake(w),
                     Wake::Sync(w) => w.wake(),
@@ -2591,12 +2685,7 @@ impl Tty {
                 self.wakeup(Chan::OLowat);
             }
             TIOCGDRAINWAIT => put_int(data, self.timeout / HZ),
-            TIOCREVOKE => {
-                self.state |= ts::REVOKE;
-                self.gen += 1;
-                // Only ttread's channel: it is the one that has hung.
-                self.wakeup(Chan::HupOrInput);
-            }
+            TIOCREVOKE => self.revoke_tty(),
             TIOCREVOKECLEAR => self.state &= !ts::REVOKE,
             _ => return done(self.ttcompat(com, data, env)),
         }

@@ -56,6 +56,8 @@ struct Dev {
     vid: u64,
     times: super::devfs::DnTimes,
     ino: u64,
+    /// A revoke is reclaiming its vnode (`VL_TERMINATE`).
+    terminating: bool,
 }
 
 static DEVS: Mutex<Option<HashMap<u32, Dev>>> = Mutex::new(None);
@@ -81,9 +83,41 @@ fn with_dev<R>(dev: u32, f: impl FnOnce(&mut Dev) -> R) -> R {
     let map = g.get_or_insert_with(HashMap::new);
     let d = map.entry(dev).or_insert_with(|| {
         let (ino, times) = made(dev);
-        Dev { opens: 0, vid: 1, times, ino }
+        Dev { opens: 0, vid: 1, times, ino, terminating: false }
     });
     f(d)
+}
+
+/// Device `dev`'s record as it is, if its node has one: its opens (the
+/// vnode's use count), its `v_id`, and whether a revoke is reclaiming it.
+fn peek_dev(dev: u32) -> Option<(u32, u64, bool)> {
+    let g = DEVS.lock().unwrap_or_else(|e| e.into_inner());
+    g.as_ref()?.get(&dev).map(|d| (d.opens, d.vid, d.terminating))
+}
+
+/// The sleep of a call that came to a vnode being revoked: until the
+/// reclaim, uninterruptibly.
+fn reclaim_wait(cell: &Arc<TtyCell>) -> SleepReq {
+    SleepReq { chan: tty::Chan::Reclaim, timo: 0, pcatch: false, gen: cell.lock().gen }
+}
+
+/// A call in a terminal's vnode (its iocount), for as long as it runs.
+struct IoRef {
+    cell: Arc<TtyCell>,
+    v: tty::Vnode,
+}
+
+impl IoRef {
+    fn enter(cell: &Arc<TtyCell>, v: tty::Vnode) -> IoRef {
+        cell.lock().io_enter(v);
+        IoRef { cell: Arc::clone(cell), v }
+    }
+}
+
+impl Drop for IoRef {
+    fn drop(&mut self) {
+        self.cell.lock().io_leave(self.v);
+    }
 }
 
 /// The node a device's times are kept on: the ptmx node for every clone.
@@ -102,7 +136,7 @@ fn pts_node_made(minor: u32) {
     let map = g.get_or_insert_with(HashMap::new);
     let vid = map.get(&dev).map_or(1, |d| d.vid + 1);
     let (ino, times) = made(dev);
-    map.insert(dev, Dev { opens: 0, vid, times, ino });
+    map.insert(dev, Dev { opens: 0, vid, times, ino, terminating: false });
 }
 
 /// devfs's attributes of a terminal node (`devfs_getattr`).
@@ -142,6 +176,30 @@ pub fn node_attrs(node: Node) -> (u32, u32, u32) {
 
 /// The owner and group of the terminal node of device `rdev` (Linux's
 /// encoding, as a stat has it).
+/// The Darwin device number of terminal node `md`, if it is one kept here.
+fn tty_dev_of(md: &Metadata) -> Option<u32> {
+    if md.file_type != FileType::CharDevice {
+        return None;
+    }
+    let major = (((md.rdev >> 8) & 0xfff) | ((md.rdev >> 32) & !0xfff)) as u32;
+    let minor = ((md.rdev & 0xff) | ((md.rdev >> 12) & !0xff)) as u32;
+    let dev = makedev(major, minor);
+    dev_node(dev).map(|_| dev)
+}
+
+/// The node of terminal device `dev`.
+fn dev_node(dev: u32) -> Option<Node> {
+    let (major, minor) = (dev >> 24, dev & 0x00ff_ffff);
+    Some(match major {
+        PTMX_MAJOR => Node::Ptmx,
+        PTSD_MAJOR => Node::Pts(minor),
+        PTS_MAJOR if minor < ptmx::NPTY => Node::Ttyp(minor),
+        PTC_MAJOR if minor < ptmx::NPTY => Node::Ptyp(minor),
+        CTTY_MAJOR if minor == 0 => Node::Ctty,
+        _ => return None,
+    })
+}
+
 pub fn node_owner(md: &Metadata) -> Option<(u32, u32)> {
     if md.file_type != FileType::CharDevice {
         return None;
@@ -270,6 +328,12 @@ impl TtyDev {
         let o = self.opened.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
         let live = with_dev(self.dev(), |d| d.vid) == o.vid;
         live.then_some(o)
+    }
+
+    /// Whether a revoke is reclaiming the vnode: a call that comes to it
+    /// waits (`vnode_getiocount`).
+    pub fn terminating(&self) -> bool {
+        peek_dev(self.dev()).is_some_and(|d| d.2)
     }
 
     /// Whether a revoke has made the vnode dead.
@@ -815,6 +879,8 @@ pub enum Op {
     Ioctl { fd: i32, com: u64, data: Vec<u8>, udata: u64, st: ptmx::PtyIoctl },
     Open { fd: i32, dflags: u64, pdev: u32, st: ptmx::PtsOpen },
     Close { pdev: u32, fflag: i32, st: ptmx::PtsClose },
+    /// `revoke(2)`'s drain of the vnode.
+    Revoke { r: Revoking },
 }
 
 /// A sleeping call, its terminal, the sleep and the thread's place on the
@@ -825,6 +891,8 @@ pub struct Pending {
     cell: Arc<TtyCell>,
     req: SleepReq,
     token: u64,
+    /// The vnode the call sleeps in.
+    via: Option<tty::Vnode>,
 }
 
 impl std::fmt::Debug for Pending {
@@ -1154,15 +1222,21 @@ impl Kernel {
     /// Queue the thread on the terminal's channel and wait: the call goes
     /// on in [`Self::darwin_tty_wait_done`].
     fn darwin_tty_sleep(&mut self, m: &mut GuestMem<'_>, op: Op, dev: Arc<TtyDev>, cell: Arc<TtyCell>, req: SleepReq) -> SyscallOutcome {
-        let token = cell.lock().enqueue(&req, self.darwin_waker());
-        self.dtask.ttyops.insert(self.tid, Pending { op, dev, cell, req, token });
+        // A call asleep in the terminal's vnode keeps its iocount; a call
+        // waiting to come into one, or a revoke's drain, has none.
+        let via = if matches!(op, Op::Revoke { .. }) || req.chan == tty::Chan::Reclaim { None } else { self.darwin_tty_vnode(&dev) };
+        let token = cell.lock().enqueue(&req, self.darwin_waker(), via);
+        self.dtask.ttyops.insert(self.tid, Pending { op, dev, cell, req, token, via });
         let deadline = (req.timo > 0).then(|| super::wait::deadline_in(Duration::from_millis(req.timo as u64 * 1000 / tty::HZ as u64)));
         self.darwin_block(m, Wait { deadline, cont: Finish::Tty })
     }
 
     /// A terminal call's sleep ended: it goes on from its `ttysleep`.
     pub(crate) fn darwin_tty_wait_done(&mut self, m: &mut GuestMem<'_>, res: WaitResult) -> Option<SyscallOutcome> {
-        let Pending { op, dev, cell, req, token } = self.dtask.ttyops.remove(&self.tid)?;
+        let Pending { op, dev, cell, req, token, via } = self.dtask.ttyops.remove(&self.tid)?;
+        // Back in its call, it is in the vnode as a running call before it
+        // stops being a sleeper in it.
+        let _io = via.map(|v| IoRef::enter(&cell, v));
         cell.lock().unsleep(token);
         let woke = match res {
             WaitResult::Awakened => Woke::Awakened,
@@ -1179,6 +1253,7 @@ impl Kernel {
             Op::Ioctl { fd, com, data, udata, st } => self.darwin_tty_ioctl_step(m, fd, dev, com, data, udata, st, resumed),
             Op::Open { fd, dflags, pdev, st } => self.darwin_pts_open(m, fd, dflags, dev, pdev, st, resumed),
             Op::Close { pdev, fflag, st } => self.darwin_pts_close_step(m, dev, cell, pdev, fflag, st, resumed),
+            Op::Revoke { r } => self.darwin_revoke_step(m, dev, cell, r),
         })
     }
 
@@ -1302,6 +1377,17 @@ impl Kernel {
         };
         // deadfs: a revoked character device reads as EOF.
         let Some(o) = target.opened() else { return self.darwin_tty_result(m, Ok(0)) };
+        // A call that comes to a vnode being revoked waits for its reclaim
+        // (vnode_getiocount), then finds it dead.
+        let resumed = match resumed {
+            Some((r, _)) if r.chan == tty::Chan::Reclaim => None,
+            r => r,
+        };
+        if resumed.is_none() && target.terminating() {
+            let req = reclaim_wait(&o.cell);
+            return self.darwin_tty_sleep(m, Op::Read { fd, iov, st }, dev, o.cell, req);
+        }
+        let _io = IoRef::enter(&o.cell, (target.dev(), o.vid));
         let count = iov.total;
         if count == 0 {
             // spec_read: nothing asked, nothing done.
@@ -1340,6 +1426,15 @@ impl Kernel {
         };
         // deadfs: EIO.
         let Some(o) = target.opened() else { return self.darwin_tty_result(m, Err(Errno::EIO)) };
+        let resumed = match resumed {
+            Some((r, _)) if r.chan == tty::Chan::Reclaim => None,
+            r => r,
+        };
+        if resumed.is_none() && target.terminating() {
+            let req = reclaim_wait(&o.cell);
+            return self.darwin_tty_sleep(m, Op::Write { fd, iov, st, ptc }, dev, o.cell, req);
+        }
+        let _io = IoRef::enter(&o.cell, (target.dev(), o.vid));
         let count = iov.total;
         let flag = if file.flags() & crate::fs::oflags::O_NONBLOCK != 0 { tty::IO_NDELAY } else { 0 };
         let p = self.darwin_tty_caller();
@@ -1408,6 +1503,10 @@ impl Kernel {
         if dev.dead() {
             return Some(Err(Errno::ENOTTY));
         }
+        if target.terminating() {
+            self.darwin_unimplemented("fcntl of a terminal being revoked (vnode_getwithref's wait for the reclaim)".into());
+            return Some(Err(Errno::EINVAL));
+        }
         let Some(o) = target.opened() else { return Some(Err(Errno::ENOTTY)) };
         let p = self.darwin_tty_caller();
         let mut env = self.darwin_tty_env();
@@ -1427,6 +1526,76 @@ impl Kernel {
         })
     }
 
+    /// `revoke(path)`: of a character device that the caller owns, or as
+    /// the superuser, after the MAC check; VNOP_REVOKE while it is in use,
+    /// the call waiting for the vnode's drain.
+    pub(crate) fn darwin_revoke(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> SyscallOutcome {
+        let dev = match self.darwin_revoke_check(m, a[0]) {
+            Ok(Some(d)) => d,
+            Ok(None) => return self.darwin_tty_result(m, Ok(0)),
+            Err(e) => return self.darwin_tty_result(m, Err(e)),
+        };
+        let Some((cell, r)) = revoke_begin(dev) else { return self.darwin_tty_result(m, Ok(0)) };
+        let node = TtyDev::new(dev_node(dev).expect("a terminal's device"));
+        self.darwin_revoke_step(m, node, cell, r)
+    }
+
+    /// `revoke`'s checks, in its order: the lookup, a character device
+    /// (ENOTSUP otherwise), `mac_vnode_check_revoke`, then the owner
+    /// (`va_uid`) or `suser`. The terminal device to revoke, or none when
+    /// nothing has it in use.
+    fn darwin_revoke_check(&mut self, m: &mut GuestMem<'_>, path: u64) -> Result<Option<u32>, Errno> {
+        let abs = self.path_io().at_path(m, super::bsd::dirfd(super::bsd::AT_FDCWD as u64) as i32, path)?;
+        let md = self.vfs.metadata(&abs)?;
+        // (No block device is kept here: there is none mounted on.)
+        if md.file_type != FileType::CharDevice {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        let canonical = self.vfs.canonical(&abs);
+        let tty_dev = tty_dev_of(&md);
+        let owner = node_owner(&md).or_else(|| super::devfs::node_of(&md).map(|n| (n.uid, n.gid)));
+        // VCHR, a terminal's with VISTTY; a devfs node has no file flags.
+        let e = self.darwin_mac_check_vnode_revoke(super::mac::SbVnode::at(&canonical, 4, tty_dev.is_some(), md.mode, 0));
+        if e != 0 {
+            return Err(super::errno::errno_of(e as i32));
+        }
+        let Some((uid, _)) = owner else {
+            self.darwin_unimplemented(format!("revoke of {canonical}: its owner (va_uid)"));
+            return Err(Errno::EOPNOTSUPP);
+        };
+        if self.dtask.cred.uid != uid {
+            self.darwin_suser()?;
+        }
+        match tty_dev {
+            Some(dev) if !matches!(dev_node(dev), Some(Node::Ptmx | Node::Ctty)) => Ok(Some(dev)),
+            _ => {
+                self.darwin_unimplemented(format!("revoke of {canonical} (deadfs for its descriptors)"));
+                Err(Errno::EOPNOTSUPP)
+            }
+        }
+    }
+
+    /// `revoke`'s drain, then the rest of the revoke.
+    fn darwin_revoke_step(&mut self, m: &mut GuestMem<'_>, node: Arc<TtyDev>, cell: Arc<TtyCell>, r: Revoking) -> SyscallOutcome {
+        if let Err(req) = revoke_drained(&cell, &r) {
+            return self.darwin_tty_sleep(m, Op::Revoke { r }, node, cell, req);
+        }
+        revoke_finish(cell, r, Some(Arc::clone(&self.procs)), self.pid);
+        self.darwin_tty_result(m, Ok(0))
+    }
+
+    /// The vnode a call on `dev` is in: the terminal's (the controlling
+    /// terminal's for `/dev/tty`), its device and `v_id`.
+    fn darwin_tty_vnode(&self, dev: &Arc<TtyDev>) -> Option<tty::Vnode> {
+        let target = self.darwin_tty_target(dev).ok()?;
+        let d = target.dev();
+        let vid = match target.opened() {
+            Some(o) => o.vid,
+            None => peek_dev(d)?.1,
+        };
+        Some((d, vid))
+    }
+
     /// `vn_ioctl` and `ptyioctl` of a terminal, until they end or sleep.
     #[allow(clippy::too_many_arguments)]
     fn darwin_tty_ioctl_step(&mut self, m: &mut GuestMem<'_>, fd: i32, dev: Arc<TtyDev>, com: u64, mut data: Vec<u8>, udata: u64, mut st: ptmx::PtyIoctl, resumed: Option<(SleepReq, Woke)>) -> SyscallOutcome {
@@ -1441,6 +1610,18 @@ impl Kernel {
         };
         if !file.readable && !file.writable {
             return self.darwin_tty_result(m, Err(Errno::EBADF));
+        }
+        let resumed = match resumed {
+            Some((r, _)) if r.chan == tty::Chan::Reclaim => None,
+            r => r,
+        };
+        if resumed.is_none() {
+            if let Some(t) = self.darwin_tty_target(&dev).ok().filter(|t| t.terminating()) {
+                if let Some(o) = t.opened() {
+                    let req = reclaim_wait(&o.cell);
+                    return self.darwin_tty_sleep(m, Op::Ioctl { fd, com, data, udata, st }, dev, o.cell, req);
+                }
+            }
         }
         let size = (com >> 16) & IOCPARM_MASK;
         let r: Result<(), Errno> = if resumed.is_none() && dev.dead() {
@@ -1487,6 +1668,7 @@ impl Kernel {
                 // Revoked since: VBAD's ENOTTY.
                 None => Err(Errno::ENOTTY),
                 Some(o) => {
+                    let _io = IoRef::enter(&o.cell, (target.dev(), o.vid));
                     let p = self.darwin_tty_caller();
                     let mut env = self.darwin_tty_env();
                     if com == tty::cmd::TIOCPTYGRANT {
@@ -1546,6 +1728,10 @@ impl Kernel {
             return Err(if self.darwin_cttyvp().is_some() { Errno::EINVAL } else { Errno::EIO });
         }
         let target = self.darwin_tty_target(dev)?;
+        if target.terminating() {
+            self.darwin_unimplemented("an ioctl of a terminal being revoked (vnode_getwithref's wait for the reclaim)".into());
+            return Err(Errno::EINVAL);
+        }
         let o = target.opened().ok_or(Errno::ENOTTY)?;
         let p = self.darwin_tty_caller();
         let mut env = self.darwin_tty_env();
@@ -1570,6 +1756,11 @@ impl Kernel {
     /// foreground group hung up, the terminal drained and revoked, and the
     /// session left without a leader.
     pub(crate) fn darwin_tty_proc_exit(&self) {
+        // Its threads' calls asleep in terminals end with them, their
+        // iocounts given up.
+        for p in self.dtask.ttyops.values() {
+            p.cell.lock().unsleep(p.token);
+        }
         let Ok(sid) = self.procs.sid(self.pid, self.pid) else { return };
         if sid != self.pid {
             return;
@@ -1613,23 +1804,76 @@ impl Kernel {
     }
 }
 
-/// `VNOP_REVOKE(vp, REVOKEALL)` of a terminal device: every vnode of it
-/// dead, the device closed once with IO_REVOKE if it was open.
-pub fn revoke(dev: u32, procs: Option<Arc<ProcTable>>, caller: i32) {
-    let was_open = with_dev(dev, |d| {
-        let open = d.opens > 0;
-        d.opens = 0;
-        d.vid += 1;
-        open
-    });
-    if !was_open {
-        return;
+/// A revoke of a terminal device's vnode under way
+/// (`vnode_reclaim_internal` with REVOKEALL): the vnode, and whether
+/// TIOCREVOKE was sent to the terminal.
+#[derive(Clone, Copy, Debug)]
+pub struct Revoking {
+    v: tty::Vnode,
+    sent: bool,
+}
+
+/// A revoke's start: the vnode marked as being reclaimed (VL_TERMINATE),
+/// and, with a call in it, TIOCREVOKE sent to wake its readers. None when
+/// nothing has the device in use, when a revoke of it is under way
+/// already, or when it has no terminal (its vnode is then reclaimed here).
+fn revoke_begin(dev: u32) -> Option<(Arc<TtyCell>, Revoking)> {
+    let (opens, vid, terminating) = peek_dev(dev)?;
+    if opens == 0 || terminating {
+        return None;
     }
     let cell = match ptmx::get_ioctl(dev, 0) {
         ptmx::Got::Tty(t) => t,
-        _ => return,
+        _ => {
+            reclaim(dev, None);
+            return None;
+        }
     };
-    d_close(&cell, dev, tty::FREAD | tty::FWRITE | tty::FNONBLOCK, true, procs, caller);
+    with_dev(dev, |d| d.terminating = true);
+    let v = (dev, vid);
+    let sent = cell.lock().revoke_begin(v);
+    Some((cell, Revoking { v, sent }))
+}
+
+/// `vnode_drain`: done when no other call is in the vnode, else the sleep
+/// until one leaves it (uninterruptible).
+fn revoke_drained(cell: &Arc<TtyCell>, r: &Revoking) -> Result<(), SleepReq> {
+    let tp = cell.lock();
+    if tp.vnode_busy(r.v) {
+        return Err(SleepReq { chan: tty::Chan::Drain, timo: 0, pcatch: false, gen: tp.gen });
+    }
+    Ok(())
+}
+
+/// A revoke's end: TIOCREVOKECLEAR, the device closed once (vclean's
+/// VNOP_CLOSE with IO_NDELAY and IO_REVOKE), and the vnode reclaimed.
+fn revoke_finish(cell: Arc<TtyCell>, r: Revoking, procs: Option<Arc<ProcTable>>, caller: i32) {
+    cell.lock().revoke_end(r.sent);
+    d_close(&cell, r.v.0, tty::FREAD | tty::FWRITE | tty::FNONBLOCK, true, procs, caller);
+    reclaim(r.v.0, Some(&cell));
+}
+
+/// `vnode_reclaim_internal`'s end: the vnode dead with a new `v_id`, its
+/// use count gone, and the calls that waited for it woken.
+fn reclaim(dev: u32, cell: Option<&Arc<TtyCell>>) {
+    with_dev(dev, |d| {
+        d.opens = 0;
+        d.vid += 1;
+        d.terminating = false;
+    });
+    if let Some(c) = cell {
+        c.lock().wakeup(tty::Chan::Reclaim);
+    }
+}
+
+/// `VNOP_REVOKE(vp, REVOKEALL)` of a terminal device, its drain waited for
+/// here and now (a process's exit).
+pub fn revoke(dev: u32, procs: Option<Arc<ProcTable>>, caller: i32) {
+    let Some((cell, r)) = revoke_begin(dev) else { return };
+    while let Err(req) = revoke_drained(&cell, &r) {
+        sync_sleep(&cell, &req);
+    }
+    revoke_finish(cell, r, procs, caller);
 }
 
 /// `fp_readv`'s and `fp_writev`'s rule: an interrupted or would-block

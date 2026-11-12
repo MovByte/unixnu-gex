@@ -35,6 +35,7 @@ pub fn error_select(a: u32, b: u32) -> u32 {
 /// Sandbox's operations (its `operation_names` table) the hooks here use.
 pub mod op {
     pub const DYNAMIC_CODE_GENERATION: usize = 9;
+    pub const FILE_REVOKE: usize = 25;
     pub const MACH_PRIV_TASK_PORT: usize = 99;
     pub const MACH_TASK_INSPECT: usize = 102;
     pub const MACH_TASK_NAME: usize = 103;
@@ -467,6 +468,13 @@ impl Kernel {
         }
         let a = SbArgs { kind: sandbox::kind::FSCTL, number: cmd as u32, ..Default::default() };
         self.darwin_sb_evaluate(op::SYSTEM_FSCTL, &a)
+    }
+
+    /// `mac_vnode_check_revoke` (Sandbox's hook, slot 273 of its ops:
+    /// file-revoke of the vnode; AMFI has none).
+    pub(crate) fn darwin_mac_check_vnode_revoke(&mut self, v: SbVnode) -> u32 {
+        let a = SbArgs { kind: sandbox::kind::VNODE, vnode: Some(v), ..Default::default() };
+        self.darwin_sb_evaluate(op::FILE_REVOKE, &a)
     }
 
     pub(crate) fn darwin_mac_check_fork(&mut self) -> u32 {

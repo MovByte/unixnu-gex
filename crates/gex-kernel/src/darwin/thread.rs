@@ -433,6 +433,7 @@ impl Kernel {
                 Some(SyscallOutcome::Continue)
             }
             sys::IOCTL => self.darwin_tty_ioctl(m, a),
+            sys::REVOKE => Some(self.darwin_revoke(m, a)),
             // A replica's last close may drain its output, as this call.
             sys::CLOSE | sys::CLOSE_NOCANCEL if self.darwin_tty_of(a[0]).is_some_and(|(_, d)| matches!(d.node, super::ttydev::Node::Pts(_) | super::ttydev::Node::Ptyp(_))) => Some(self.darwin_tty_close(m, a)),
             sys::KEVENT => Some(<Kq as KQueue>::kevent_legacy(self, m, a, false)),
