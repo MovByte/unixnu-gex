@@ -259,12 +259,20 @@ python3 tools/darwin-trust-cache.py -o <ipados-boot>/TrustCache \
 ```
 
 `--bundle <file>` takes an existing bundle's first module instead of
-`--static`. The repository has no tool to extract the Sandbox blobs from a
-kernelcache or to unwrap the device tree's IM4P. The kext's `policy_init`
-names each blob's address and size: in 21H461's iPad7,1 kernelcache the
-platform profile is 0x22111 bytes at 0xfffffff0056ca320, the builtin
-collection 0xd6d7b bytes at 0xfffffff0056ecab0 and the protobox collection
-0x75bd1 bytes at 0xfffffff0057c3840.
+`--static`. `tools/darwin-sandbox-blobs.py` writes the three Sandbox blobs
+from a decompressed kernelcache (a prelinked one or a fileset), finding them
+where the Sandbox kext's `policy_init` loads them and checking each as the
+kext's loader does, with each file's SHA-256:
+
+```sh
+python3 tools/darwin-sandbox-blobs.py <kernelcache> <ipados-boot>
+```
+
+In 21H461's iPad7,1 kernelcache the platform profile is 0x22111 bytes at
+0xfffffff0056ca320, the builtin collection 0xd6d7b bytes at
+0xfffffff0056ecab0 and the protobox collection 0x75bd1 bytes at
+0xfffffff0057c3840. The repository has no tool to unwrap the device tree's
+IM4P.
 
 AMFI treats code as platform code when its cdhash is in the static trust
 cache, and requires dyld to be platform code. The other path, a CMS
