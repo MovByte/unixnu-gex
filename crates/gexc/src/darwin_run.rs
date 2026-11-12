@@ -33,8 +33,10 @@ pub fn run(mut ra: RunArgs, bytes: &[u8]) -> Result<ExitCode> {
     ra.opts.darwin_platform = img.platform;
     ra.opts.darwin_code_signature = img.code_signature;
     ra.opts.darwin_stacksize = img.stacksize;
+    ra.opts.darwin_user_stack = img.user_stack;
     ra.opts.darwin_dylinker = img.dylinker;
     ra.opts.darwin_dyld_infos = img.dyld_infos;
+    ra.opts.darwin_dyld_infos_size = img.dyld_infos_size;
     if img.program.interp.is_some() {
         let root = root.as_ref().expect("a root for dyld");
         let cache = match std::env::var_os("GEX_DARWIN_CACHE") {
@@ -54,20 +56,15 @@ pub fn run(mut ra: RunArgs, bytes: &[u8]) -> Result<ExitCode> {
     if ra.opts.env.is_empty() {
         ra.opts.env = vec!["PATH=/usr/bin:/bin".into(), "HOME=/var/mobile".into()];
     }
-    // libmalloc's nano allocator claims a fixed region at 0x2_8000_0000,
-    // where gex places programs, and takes any pointer there for one of its
-    // own: off, unless asked for.
-    if !ra.opts.env.iter().any(|e| e.starts_with("MallocNanoZone=")) {
-        ra.opts.env.push("MallocNanoZone=0".into());
-    }
     ra.opts.darwin = true;
     // The boot payload: the trust caches and the Sandbox's platform
     // profile the system boots with.
     ra.opts.darwin_boot = std::env::var_os("GEX_DARWIN_BOOT").map(PathBuf::from);
     ra.opts.darwin_strict = std::env::var("GEX_DARWIN_STRICT").is_ok_and(|v| v == "1");
-    // Its commpage is folded below 4 GiB in everything translated for it,
-    // which needs the addresses its code builds in registers seen as the
-    // constants they are.
+    // Its commpage is folded to its alias at the top of the memory in
+    // everything translated for it, which needs the addresses its code
+    // builds in registers seen as the constants they are; and its tables
+    // are kept inside its page zero (gex_abi::tables64).
     gex_abi::set_commpage_fold(true);
     gex_ir::pass::set_forward_reg_consts(true);
     // dyld rebases and binds its data after its code is translated: no

@@ -24,6 +24,14 @@ pub const MAP_MAX: u64 = 0x1_8000_0000 + 0x1_8000_0000 + 0x2000_0000 + 0x1_3800_
 /// `MACH_VM_MAX_ADDRESS`.
 pub const JUMBO_MAX: u64 = 0xf_c000_0000;
 
+/// Where the part of a task's map gex's memory holds ends: the 64-bit
+/// memory's 16 GiB (`gex_abi::LIMIT64`, V8's memory64 cap) less the alias
+/// of the commpage at its top (`gex_abi::DARWIN_COMMPAGE_ALIAS`), against
+/// XNU's [`MAP_MAX`] (a jumbo map's [`JUMBO_MAX`]). What a program asks for
+/// past it is reported (`Kernel::darwin_past_memory`).
+pub const BACKED_END: u64 = gex_abi::DARWIN_COMMPAGE_ALIAS;
+const _: () = assert!(BACKED_END < MAP_MAX && MAP_MAX < JUMBO_MAX);
+
 /// `vm_inherit_t`.
 pub mod inherit {
     pub const SHARE: u8 = 0;
@@ -95,6 +103,8 @@ pub mod tag {
     pub const MALLOC_TINY: u8 = 7;
     pub const MALLOC_LARGE_REUSABLE: u8 = 8;
     pub const MALLOC_LARGE_REUSED: u8 = 9;
+    pub const SHARED_PMAP: u8 = 32;
+    pub const DYLD: u8 = 60;
 }
 
 /// One entry's attributes.

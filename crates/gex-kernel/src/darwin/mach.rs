@@ -875,9 +875,12 @@ impl Kernel {
             if start < self.dtask.map_min || start.checked_add(len).is_none_or(|e| e > self.darwin_map_max()) {
                 return kr::INVALID_ADDRESS;
             }
+            if self.darwin_past_memory("a fixed allocation", start, start + len) {
+                return kr::NO_SPACE;
+            }
             // Without VM_FLAGS_OVERWRITE a fixed request over anything
-            // mapped fails.
-            if flags & vmf::OVERWRITE == 0 && self.mem.lock().vmas().iter().any(|v| v.start < start + len && start < v.end) {
+            // mapped fails, the shared region's submap included.
+            if flags & vmf::OVERWRITE == 0 && (self.darwin_in_shared_region(start, start + len) || self.mem.lock().vmas().iter().any(|v| v.start < start + len && start < v.end)) {
                 return kr::NO_SPACE;
             }
             return match self.canonical(m, nr::MMAP, [start, len, linux_prot, mf::PRIVATE | mf::ANONYMOUS | mf::FIXED, u64::MAX, 0]) {
@@ -898,7 +901,10 @@ impl Kernel {
                 Err(k) => return k,
             };
             let (_, limit) = self.darwin_effective_range();
-            let Some(start) = self.darwin_find_space(hint, limit, len, mask) else { return kr::NO_SPACE };
+            let Some(start) = self.darwin_find_space(hint, limit, len, mask) else {
+                self.darwin_no_space_below_memory(len);
+                return kr::NO_SPACE;
+            };
             return match self.canonical(m, nr::MMAP, [start, len, linux_prot, mf::PRIVATE | mf::ANONYMOUS | mf::FIXED, u64::MAX, 0]) {
                 Ok(_) => {
                     self.darwin_vm_enter_anon(start, start + len, attrs, p);
@@ -928,21 +934,57 @@ impl Kernel {
     /// address: from `hint`, raised to the effective range's start, the
     /// first fit of `size` bytes aligned to `mask` below the range's end;
     /// KERN_NO_SPACE without one.
-    pub(crate) fn darwin_locate_space(&self, hint: u64, size: u64, mask: u64) -> Result<u64, u64> {
+    pub(crate) fn darwin_locate_space(&mut self, hint: u64, size: u64, mask: u64) -> Result<u64, u64> {
         let (min, max) = self.darwin_effective_range();
         let hint = hint.max(min);
-        if max <= hint {
-            return Err(kr::NO_SPACE);
-        }
-        self.darwin_find_space(hint, max, size, mask).ok_or(kr::NO_SPACE)
+        let found = if max <= hint { None } else { self.darwin_find_space(hint, max, size, mask) };
+        found.ok_or_else(|| {
+            self.darwin_no_space_below_memory(size);
+            kr::NO_SPACE
+        })
     }
 
     /// The range a map's anywhere allocations are made in
     /// (`vm_map_get_range` of a map without user ranges: from its minimum
-    /// or its first page to its end), within the memory gex backs, above
-    /// its tables ([`gex_abi::DARWIN_GUEST_FLOOR`]).
+    /// or its first page to its end), within the part of it gex's memory
+    /// holds ([`super::vm::BACKED_END`]).
     pub(crate) fn darwin_effective_range(&self) -> (u64, u64) {
-        (gex_abi::DARWIN_GUEST_FLOOR.max(self.dtask.map_min).max(PAGE_MASK + 1), self.darwin_map_max().min(gex_abi::LIMIT64))
+        (gex_abi::DARWIN_GUEST_FLOOR.max(self.dtask.map_min).max(PAGE_MASK + 1), self.darwin_map_max().min(super::vm::BACKED_END))
+    }
+
+    /// Whether `[start, end)` reaches past the part of the map gex's memory
+    /// holds, which XNU's map continues beyond to `vm_map_max`: reported as
+    /// what is not implemented, for the caller to fail.
+    pub(crate) fn darwin_past_memory(&mut self, what: &str, start: u64, end: u64) -> bool {
+        use super::vm::BACKED_END;
+        if end <= BACKED_END {
+            return false;
+        }
+        self.darwin_unimplemented(format!(
+            "{what} at {start:#x}..{end:#x}: the task's map runs to {:#x}, but gex's 64-bit memory holds it only to {BACKED_END:#x} (16 GiB, its top the commpage's alias)",
+            self.darwin_map_max()
+        ));
+        true
+    }
+
+    /// An anywhere request of `size` bytes that found no room in the part of
+    /// the map gex's memory holds: XNU's search goes on past it, to
+    /// `vm_map_max`. Reported as what is not implemented; the caller fails.
+    pub(crate) fn darwin_no_space_below_memory(&mut self, size: u64) {
+        use super::vm::BACKED_END;
+        if self.darwin_map_max() > BACKED_END {
+            self.darwin_unimplemented(format!(
+                "an anywhere allocation of {size:#x} bytes with no room below {BACKED_END:#x}, where gex's 64-bit memory ends: the task's map runs on to {:#x}",
+                self.darwin_map_max()
+            ));
+        }
+    }
+
+    /// Whether `[start, end)` meets the shared region the task's map nests
+    /// (`vm_shared_region_enter`'s one submap entry over all of it).
+    pub(crate) fn darwin_in_shared_region(&self, start: u64, end: u64) -> bool {
+        let (base, size) = self.darwin_region;
+        size != 0 && start < base + size && base < end
     }
 
     /// `vm_map_random_address_for_size`: up to 1000 random page-aligned
@@ -959,17 +1001,19 @@ impl Kernel {
         }
         let space = space - size;
         let map_max = self.darwin_map_max();
+        let (region, region_end) = (self.darwin_region.0, self.darwin_region.0 + self.darwin_region.1);
         let mm = self.mem.lock();
         let vmas = mm.vmas();
         for _ in 0..MAX_TRIES_TO_GET_RANDOM_ADDRESS {
-            let mut b = [0u8; 4];
-            crate::vfs::devfs::fill_random(&mut b);
-            let r = u64::from(u32::from_le_bytes(b) & 0x7fff_ffff) << VM_MAP_PAGE_SHIFT;
+            let r = u64::from(super::exec::random()) << VM_MAP_PAGE_SHIFT;
             let addr = (min + r % space) & !PAGE_MASK;
-            if mm.vma_at(addr).is_some() {
+            if mm.vma_at(addr).is_some() || self.darwin_in_shared_region(addr, addr + 1) {
                 continue;
             }
-            let hole_end = vmas.get(vmas.partition_point(|v| v.start <= addr)).map_or(map_max, |v| v.start);
+            let mut hole_end = vmas.get(vmas.partition_point(|v| v.start <= addr)).map_or(map_max, |v| v.start);
+            if region_end > region && addr < region {
+                hole_end = hole_end.min(region);
+            }
             if hole_end - addr >= size {
                 return Ok(addr);
             }
@@ -980,12 +1024,18 @@ impl Kernel {
     /// `vm_map_store_find_space` from `hint`: the first `size` bytes free
     /// at or after it, aligned to `mask`, ending by `limit`.
     pub(crate) fn darwin_find_space(&self, hint: u64, limit: u64, size: u64, mask: u64) -> Option<u64> {
+        let region_end = self.darwin_region.0 + self.darwin_region.1;
         let mm = self.mem.lock();
         let mut at = hint.checked_add(mask)? & !mask;
         loop {
             let end = at.checked_add(size)?;
             if end > limit {
                 return None;
+            }
+            // The shared region's submap is one entry, its holes included.
+            if self.darwin_in_shared_region(at, end) {
+                at = region_end.checked_add(mask)? & !mask;
+                continue;
             }
             match mm.vmas().iter().find(|v| v.start < end && at < v.end) {
                 Some(v) => at = v.end.checked_add(mask)? & !mask,
@@ -1185,6 +1235,17 @@ impl Kernel {
     pub(crate) fn darwin_vm_enter_anon(&mut self, start: u64, end: u64, attrs: super::vm::Attrs, cur: u64) {
         let below = self.mem.lock().vma_at(start.wrapping_sub(1)).map(|v| u64::from(v.prot)) == Some(cur);
         self.dtask.vm.enter_anon(start, end, attrs, below);
+    }
+
+    /// `vm_shared_region_remove`: the region's range, cache and holes
+    /// alike, overwritten with a reservation nothing may touch, tagged
+    /// `VM_MEMORY_DYLD`; the task keeps the address space.
+    pub(crate) fn darwin_shared_region_remove(&mut self, m: &mut GuestMem<'_>, start: u64, size: u64) {
+        use crate::mem::flags as mf;
+        self.dtask.vm.clear(start, start + size);
+        if self.canonical(m, nr::MMAP, [start, size, 0, mf::PRIVATE | mf::ANONYMOUS | mf::FIXED, u64::MAX, 0]).is_ok() {
+            self.darwin_vm_enter_anon(start, start + size, super::vm::Attrs { alias: super::vm::tag::DYLD, max: 0, ..Default::default() }, 0);
+        }
     }
 
     /// `mach_vm_deallocate`: unmapped parts of the range are skipped

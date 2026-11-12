@@ -580,7 +580,7 @@ impl FuncBody {
     }
 
     /// A load whose static offset may pass 4 GiB: a memory64 memarg's offset
-    /// is a u64, so an M64 module reaches its high tables (`DISPATCH_DIR64`)
+    /// is a u64, so an M64 module reaches its tables (`gex_abi::tables64`)
     /// with one load, as an M32 module reaches the low ones. An M32 offset must
     /// fit in 32 bits.
     pub fn load64(&mut self, opcode: u8, align_log2: u32, offset: u64) {

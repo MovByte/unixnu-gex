@@ -275,7 +275,13 @@ impl Kernel {
             }
             let hint = self.darwin_random_address_for_size(size).map_err(|_| Errno::ENOMEM)?;
             let (_, limit) = self.darwin_effective_range();
-            addr = self.darwin_find_space(hint, limit, size, 0).ok_or(Errno::ENOMEM)?;
+            addr = match self.darwin_find_space(hint, limit, size, 0) {
+                Some(a) => a,
+                None => {
+                    self.darwin_no_space_below_memory(size);
+                    return Err(Errno::ENOMEM);
+                }
+            };
             attrs.inherit = inherit::NONE;
             attrs.jit = true;
         } else if cur & prot::WRITE as u8 != 0 && cur & prot::EXECUTE as u8 != 0 {
@@ -284,6 +290,9 @@ impl Kernel {
         attrs.max = maxprot;
         // KERN_INVALID_ADDRESS, as mmap says it: the map has no such place.
         if flags & FIXED != 0 && (addr < self.dtask.map_min || addr.checked_add(size).is_none_or(|e| e > self.darwin_map_max())) {
+            return Err(Errno::ENOMEM);
+        }
+        if flags & FIXED != 0 && self.darwin_past_memory("a fixed mapping", addr, addr + size) {
             return Err(Errno::ENOMEM);
         }
         // Anywhere: vm_map_enter's search from the rounded hint; out of
@@ -533,9 +542,12 @@ impl Kernel {
     /// makes jumbo and a spawn's `psa_max_addr` may raise
     /// (`vm_map_set_max_addr`; the field holds the spawn's until now).
     pub(crate) fn darwin_vm_policies(&mut self) {
+        // vm_shared_region_enter: one pmap-nested entry over the whole
+        // region, read-only and shared with a fork's child.
         let (base, size) = self.darwin_region;
         if base != 0 {
-            self.dtask.vm.enter(base, base + size, Attrs { kind: kind::SUBMAP, ..Attrs::default() }, 0);
+            let attrs = Attrs { kind: kind::SUBMAP, max: prot::READ as u8, alias: vm::tag::SHARED_PMAP, inherit: inherit::SHARE, ..Attrs::default() };
+            self.dtask.vm.enter(base, base + size, attrs, 0);
         }
         // A JIT-entitled image (mac_proc_check_map_anon's MAP_JIT probe)
         // gets a jumbo map; vm_map_set_jit_entitled's pmap_set_jit_entitled

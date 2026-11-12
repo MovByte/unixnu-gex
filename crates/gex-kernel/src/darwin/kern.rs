@@ -453,7 +453,7 @@ impl Kernel {
             sys::SHARED_REGION_CHECK_NP => match self.darwin_region {
                 (0, _) => neg(Errno::EINVAL),
                 (start, size) if a[0] == 0 => {
-                    self.darwin_vm_deallocate(m, start, size);
+                    self.darwin_shared_region_remove(m, start, size);
                     self.darwin_region = (0, 0);
                     0
                 }

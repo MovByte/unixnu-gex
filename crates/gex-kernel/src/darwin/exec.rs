@@ -320,8 +320,56 @@ pub struct Loaded<'a> {
 }
 
 /// `USRSTACK64`: where an arm64 process's main stack starts, before the
-/// image's slide (none here) moves it down (`load_main`).
+/// image's slide moves it down ([`user_stack`]).
 pub const USRSTACK64: u64 = 0x1_6FE0_0000;
+
+/// `load_main`'s stack top for a main image slid by `slide`: "The stack
+/// slides down from the default location".
+pub fn user_stack(slide: u64) -> u64 {
+    trunc_page(USRSTACK64 - slide)
+}
+
+/// The kernel's `random()`: 31 bits of `read_random`.
+pub(crate) fn random() -> u32 {
+    let mut b = [0u8; 4];
+    crate::vfs::devfs::fill_random(&mut b);
+    u32::from_le_bytes(b) & 0x7fff_ffff
+}
+
+/// `load_machfile`'s random offsets for a new 64-bit map, whose page is
+/// 16 KiB (`vm_map_set_page_shift(map, SIXTEENK_PAGE_SHIFT)`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Slides {
+    /// A position-independent main image's: 1 to 1023 pages
+    /// (`vm_map_get_max_aslr_slide_pages`, 16 MiB) and 0, 1 or 2 of
+    /// `vm_map_get_max_aslr_slide_section`'s three sections, each
+    /// `ARM_TT_TWIG_SIZE` (32 MiB with 16 KiB translation pages).
+    pub main: u64,
+    /// dyld's own: 1 to 255 pages (`vm_map_get_max_loader_aslr_slide_pages`,
+    /// 4 MiB), from the main image's end when dyld is linked at 0.
+    pub dyld: u64,
+}
+
+impl Slides {
+    const PAGE_SHIFT: u32 = 14;
+    const MAX_SLIDE_PAGES: u64 = 1 << (24 - Self::PAGE_SHIFT);
+    const MAX_LOADER_SLIDE_PAGES: u64 = 1 << (22 - Self::PAGE_SHIFT);
+    const MAX_SECTIONS: u64 = 3;
+    const SECTION_SIZE: u64 = 32 << 20;
+
+    /// The offsets, drawn as `load_machfile` draws them: the section, the
+    /// main image's pages, then dyld's. A release kernel never leaves them
+    /// out (`IMGPF_DISABLE_ASLR` comes only from `P_DISABLE_ASLR`, which
+    /// `posix_spawn`'s `_POSIX_SPAWN_DISABLE_ASLR` sets only without
+    /// `SECURE_KERNEL`, and the kernel's own process only on a DEVELOPMENT
+    /// or DEBUG kernel).
+    pub fn draw() -> Slides {
+        let section = u64::from(random()) % Self::MAX_SECTIONS * Self::SECTION_SIZE;
+        let pages = u64::from(random()) % (Self::MAX_SLIDE_PAGES - 1) + 1;
+        let dyld = u64::from(random()) % (Self::MAX_LOADER_SLIDE_PAGES - 1) + 1;
+        Slides { main: (pages << Self::PAGE_SHIFT) + section, dyld: dyld << Self::PAGE_SHIFT }
+    }
+}
 
 /// The main thread's stack as `create_unix_stack` allocates it and the
 /// strings copied out onto it.
@@ -581,6 +629,18 @@ mod tests {
         assert_eq!(word(6), top - s.buf.len() as u64);
         assert_eq!(s.buf.len() % 8, 0);
         assert_eq!(sp % 8, 0);
+    }
+
+    #[test]
+    fn the_slides_are_load_machfile_s() {
+        for _ in 0..2000 {
+            let s = Slides::draw();
+            let (pages, section) = (s.main % (32 << 20), s.main / (32 << 20));
+            assert!(pages % PAGE_SIZE == 0 && (PAGE_SIZE..=1023 * PAGE_SIZE).contains(&pages), "{s:x?}");
+            assert!(section <= 2, "{s:x?}");
+            assert!(s.dyld % PAGE_SIZE == 0 && (PAGE_SIZE..=255 * PAGE_SIZE).contains(&s.dyld), "{s:x?}");
+        }
+        assert_eq!(user_stack(0x2c_c000), 0x1_6fb3_4000);
     }
 
     #[test]

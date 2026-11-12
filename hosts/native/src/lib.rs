@@ -235,6 +235,9 @@ pub struct RunOptions {
     pub darwin_code_signature: Option<Vec<u8>>,
     /// `LC_MAIN`'s stack size (0: the default stack).
     pub darwin_stacksize: u64,
+    /// The main thread's stack top (`load_result.user_stack`), which the
+    /// executable's slide moved down from `USRSTACK64`.
+    pub darwin_user_stack: u64,
     /// `LC_LOAD_DYLINKER`'s path, as the guest names it.
     pub darwin_dylinker: Option<String>,
     /// The boot payload's directory (`GEX_DARWIN_BOOT`): the trust cache
@@ -260,6 +263,7 @@ impl Default for RunOptions {
             darwin_platform: (0, 0),
             darwin_code_signature: None,
             darwin_stacksize: 0,
+            darwin_user_stack: 0,
             darwin_dylinker: None,
             darwin_boot: None,
             args: Vec::new(),
@@ -3180,7 +3184,8 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         let low = gex_abi::DISPATCH_DIR_END as usize;
         dst[..low].copy_from_slice(&src[..low]);
         // An M64 memory's directory and patched bits are its dense tables
-        // above 4 GiB instead (a Darwin process's protections with them).
+        // instead (at 8 GiB, or a Darwin process's in its page zero, its
+        // protections with them).
         if gex_abi::mem64() {
             let (a, b) = gex_abi::tables64();
             let (a, b) = (a as usize, b as usize);
@@ -4058,6 +4063,7 @@ fn run_darwin_image(
         darwin_platform: loaded.platform,
         darwin_code_signature: loaded.code_signature,
         darwin_stacksize: loaded.stacksize,
+        darwin_user_stack: loaded.user_stack,
         darwin_dylinker: loaded.dylinker,
         darwin_dyld_infos: loaded.dyld_infos,
         darwin_dyld_infos_size: loaded.dyld_infos_size,
@@ -5007,7 +5013,7 @@ fn place_image(
                     signature: exec.as_ref().map(|i| i.load.clone()),
                     nano: exec.as_ref().and_then(|i| i.spawn.as_ref()).is_some_and(|sp| sp.flags & gex_kernel::darwin::spawn::flag::NANO_ALLOCATOR != 0),
                 };
-                k.darwin_start(exec.map(|i| i.strings), &loaded, gex_kernel::darwin::exec::USRSTACK64)
+                k.darwin_start(exec.map(|i| i.strings), &loaded, opts.darwin_user_stack)
             })
             .map_err(|e| anyhow::Error::new(DarwinStartFailed(format!("starting {path}: errno {}", e.0))))?;
         let layout = gex_ld::stack::StackLayout { sp: st.sp, low: st.sp, bytes: st.bytes };
@@ -5077,7 +5083,9 @@ fn place_image(
 /// Map a dyld shared cache, its main file and every subcache it names, at
 /// the addresses it was linked for, rebased by its slide info at a zero
 /// slide, and record each mapping as the kernel would. Returns the shared
-/// region as `(start, size)`.
+/// region as `(start, size)`: arm64's (`SHARED_REGION_BASE_ARM64` and
+/// `SHARED_REGION_SIZE_ARM64`), which every mapping must be inside
+/// (`vm_shared_region_map_file`).
 fn map_shared_cache(store: &mut Store<HostState>, memory: &gex_mem::GuestMemory, main: &std::path::Path) -> Result<(u64, u64)> {
     use gex_ld::dsc;
     use std::io::{Read, Seek, SeekFrom};
@@ -5098,10 +5106,14 @@ fn map_shared_cache(store: &mut Store<HostState>, memory: &gex_mem::GuestMemory,
         }
         files.push((p, sh));
     }
+    let (region, region_size) = (gex_ld::macho::SHARED_REGION_BASE, gex_ld::macho::SHARED_REGION_SIZE);
     let data = memory.bytes();
     for (p, fh) in &files {
         let mut f = std::fs::File::open(p).with_context(|| format!("opening {}", p.display()))?;
         for m in &fh.mappings {
+            if m.address < region || m.address.checked_add(m.size).is_none_or(|e| e > region + region_size) {
+                bail!("{}'s mapping {:#x}+{:#x} is outside the shared region {region:#x}+{region_size:#x}", p.display(), m.address, m.size);
+            }
             let (start, end) = (m.address as usize, (m.address + m.size) as usize);
             if end > data.len() {
                 bail!("shared cache mapping {:#x}..{:#x} does not fit in guest memory", m.address, m.address + m.size);
@@ -5163,7 +5175,7 @@ fn map_shared_cache(store: &mut Store<HostState>, memory: &gex_mem::GuestMemory,
         data[start..start + hdr.len()].copy_from_slice(&hdr);
         store.data_mut().with_kernel(|k| k.mem.lock().insert(at, at + size, prot::READ | prot::WRITE, "[shared-cache-data]"));
     }
-    Ok((h.shared_region_start, h.shared_region_size))
+    Ok((region, region_size))
 }
 
 /// The file a shared cache mapping is kept in slid (at its linked
