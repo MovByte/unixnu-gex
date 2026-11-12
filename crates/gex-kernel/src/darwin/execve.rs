@@ -562,6 +562,14 @@ impl Kernel {
                 c.svgid = c.gid();
                 c
             },
+            // The credential's Sandbox label, the slot the new task's link
+            // shows too, for the exec's label update to take over; and what
+            // the exec in progress keeps for that update.
+            sandbox: old.sandbox,
+            exec_sandbox: old.exec_sandbox,
+            // task_create_internal: the new task has the old one's message
+            // filtering, until the label update sets it.
+            filter_msg: old.filter_msg,
             // Until the image's policies make it (`vm_map_set_max_addr`).
             map_max: spawn.map_or(0, |s| s.max_addr),
             crash_behavior: spawn.map_or(0, |s| s.crash_behavior),
