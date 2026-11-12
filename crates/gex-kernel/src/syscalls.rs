@@ -3690,6 +3690,11 @@ impl PathIo<'_> {
     /// open runs. The pair lives in the global kernel (`self.ptys`); with none
     /// there is no pty support and `/dev/ptmx` falls through to `ENOENT`.
     pub fn open_pty(&self, p: &str, flags: u64) -> Option<SysResult> {
+        // A Darwin process's terminals are XNU's: its devfs's `ptmx`,
+        // `ttysNNN` and `tty` ([`crate::darwin::ttydev`]), never these.
+        if self.darwin {
+            return None;
+        }
         let r = self.ptys?;
         // `/dev/tty` is the caller's *controlling terminal*. Inside a terminal
         // emulator that is a pty in the global kernel, not the page's own
