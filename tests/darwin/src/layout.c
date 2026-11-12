@@ -15,7 +15,10 @@
 //   main image's slide (kern.usrstack64).
 // - vm_shared_region_enter nests the whole shared region, from
 //   SHARED_REGION_BASE_ARM64 (0x180000000) for SHARED_REGION_SIZE_ARM64
-//   (0x180000000), as one read-only entry inherited by share.
+//   (0x180000000), as one read-only entry inherited by share. The cache in
+//   it is slid once a boot: dyld passes the cache's maxSlide and
+//   shared_region_map_and_slide_2_np picks the slide below it, on a 16 KiB
+//   boundary; every task of the boot sees the same.
 // - libmalloc's nano allocator follows the shared region: 512 MiB at
 //   0x300000000 (NANOZONE_BASE_REGION_ADDRESS). It is engaged when exec
 //   gives apple[] "MallocNanoZone=1" (a spawn with
@@ -83,6 +86,9 @@ static const char *apple_val(const char **apple, const char *key) {
 static int in_nano(const void *p) {
     return (uintptr_t)p >= NANO_BASE && (uintptr_t)p < NANO_BASE + NANO_SIZE;
 }
+
+// The shared cache's slide, which check_layout finds.
+static uint64_t cache_slide;
 
 // The layout every process has, whatever its spawn asked for. dyld is where
 // exec loaded it when `dyld_on_disk`, else its copy in the shared cache.
@@ -155,6 +161,13 @@ static int check_layout(int dyld_on_disk) {
     uint64_t start = 0;
     if (syscall(SYS_shared_region_check_np, &start) != 0) return bad("shared_region_check_np", errno);
     if (start < REGION_BASE || start >= REGION_BASE + REGION_SIZE || start != ai->sharedCacheBaseAddress) return bad("the shared cache's start", start);
+    // Its header, at its start: linked at sharedRegionStart (0xe0), slid
+    // below maxSlide (0xf0) on a 16 KiB boundary, as dyld says it is.
+    const uint8_t *hdr = (const uint8_t *)(uintptr_t)start;
+    uint64_t linked = *(const uint64_t *)(hdr + 0xe0), max_slide = *(const uint64_t *)(hdr + 0xf0);
+    if (memcmp(hdr, "dyld_v1", 7) || linked != REGION_BASE) return bad("the shared cache's header", linked);
+    cache_slide = start - linked;
+    if (cache_slide % PAGE || cache_slide >= max_slide || cache_slide != ai->sharedCacheSlide) return bad("the shared cache's slide", cache_slide);
     raddr = REGION_BASE + 0x1000;
     count = VM_REGION_BASIC_INFO_COUNT_64;
     kr = vm_region_64(mach_task_self(), &raddr, &rsize, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &obj);
@@ -249,9 +262,11 @@ static int check_nano(const char **apple) {
 
 int main(int argc, char **argv, char **envp, const char **apple) {
     (void)envp;
-    if (argc > 1 && !strcmp(argv[1], "nano")) {
+    if (argc > 2 && !strcmp(argv[1], "nano")) {
         who = "layout (nano)";
         if (check_layout(1) || check_nano(apple)) return 1;
+        // One slide a boot: the parent's.
+        if (cache_slide != strtoull(argv[2], NULL, 16)) return bad("the shared cache's slide differs from the parent's", cache_slide);
         return 0;
     }
     if (check_layout(0) || check_nano_off(apple)) return 1;
@@ -262,7 +277,9 @@ int main(int argc, char **argv, char **envp, const char **apple) {
     posix_spawnattr_t attr;
     posix_spawnattr_init(&attr);
     posix_spawnattr_setflags(&attr, _POSIX_SPAWN_NANO_ALLOCATOR | _POSIX_SPAWN_DISABLE_ASLR);
-    char *args[] = {path, "nano", NULL};
+    char slide[32];
+    snprintf(slide, sizeof slide, "%llx", (unsigned long long)cache_slide);
+    char *args[] = {path, "nano", slide, NULL};
     int envc = 0;
     while (environ[envc]) envc++;
     char **env = calloc((size_t)envc + 2, sizeof *env);
