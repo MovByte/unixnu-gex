@@ -1,7 +1,8 @@
-//! A Darwin (Mach-O) program's image as exec loads it: the executable at
-//! its slide, dyld above it when it names one, and what the kernel takes
-//! from them (the platform, the signature, `LC_MAIN`'s stack size, dyld's
-//! image list). For `gexc run`'s first program and for an `execve` alike.
+//! A Darwin (Mach-O) program's image as exec loads it (`load_machfile`):
+//! the executable at its random slide, dyld right after it by a slide of its
+//! own when it names one, and what the kernel takes from them (the
+//! platform, the signature, `LC_MAIN`'s stack size, dyld's image list). For
+//! `gexc run`'s first program and for an `execve` alike.
 
 use anyhow::{bail, Context, Result};
 use gex_ld::Program;
@@ -22,18 +23,20 @@ pub struct DarwinImage {
     pub dyld_infos: u64,
     /// Its size (`load_result.all_image_info_size`).
     pub dyld_infos_size: u64,
-}
-
-/// dyld goes above the program, on a 16 MiB boundary.
-fn dyld_base(exe: &gex_ld::Image) -> u64 {
-    const ALIGN: u64 = 16 << 20;
-    (exe.brk + ALIGN + ALIGN - 1) & !(ALIGN - 1)
+    /// The main thread's stack top (`load_result.user_stack`): `USRSTACK64`
+    /// less the executable's slide.
+    pub user_stack: u64,
 }
 
 /// Load the Mach-O executable `bytes` (one slice), with its dyld read by
-/// `read` (a guest path).
+/// `read` (a guest path), at the slides `load_machfile` draws.
 pub fn load(bytes: &[u8], name: &str, read: &dyn Fn(&str) -> Result<Vec<u8>>) -> Result<DarwinImage> {
-    let (m, exe) = gex_ld::macho::load(bytes, gex_ld::macho::PIE_BASE).with_context(|| format!("loading {name}"))?;
+    use gex_kernel::darwin::exec;
+    let slides = exec::Slides::draw();
+    let (m, exe) = gex_ld::macho::load(bytes, slides.main).with_context(|| format!("loading {name}"))?;
+    // load_main and load_unixthread: the stack slides down by the image's
+    // slide (none for an image that is not position independent).
+    let user_stack = exec::user_stack(exe.bias);
     let code_signature = m.code_signature.and_then(|(o, n)| bytes.get(o as usize..(o as usize).checked_add(n as usize)?)).map(<[u8]>::to_vec);
     let stacksize = match &m.entry {
         Some(gex_ld::macho::Entry::Main { stacksize, .. }) => *stacksize,
@@ -47,7 +50,9 @@ pub fn load(bytes: &[u8], name: &str, read: &dyn Fn(&str) -> Result<Vec<u8>>) ->
             if !gex_ld::macho::is_macho(&dbytes) {
                 bail!("{dyld} is not a Mach-O file");
             }
-            let (dm, di) = gex_ld::macho::load(&dbytes, dyld_base(&exe)).with_context(|| format!("loading {dyld}"))?;
+            let dm = gex_ld::macho::parse(&dbytes).with_context(|| format!("loading {dyld}"))?;
+            let slide = gex_ld::macho::dylinker_slide(&dm, slides.dyld, gex_ld::macho::max_vm_addr(&exe));
+            let (dm, di) = gex_ld::macho::load_parsed(dm, &dbytes, slide).with_context(|| format!("loading {dyld}"))?;
             if let Some(s) = dm.section("__DATA_DIRTY", "__all_image_info").or_else(|| dm.section("__DATA", "__all_image_info")) {
                 dyld_infos = s.addr.wrapping_add(di.bias);
                 dyld_infos_size = s.size;
@@ -63,5 +68,6 @@ pub fn load(bytes: &[u8], name: &str, read: &dyn Fn(&str) -> Result<Vec<u8>>) ->
         dylinker: m.dylinker.clone(),
         dyld_infos,
         dyld_infos_size,
+        user_stack,
     })
 }

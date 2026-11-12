@@ -233,6 +233,9 @@ pub struct RunOptions {
     pub darwin_code_signature: Option<Vec<u8>>,
     /// `LC_MAIN`'s stack size (0: the default stack).
     pub darwin_stacksize: u64,
+    /// The main thread's stack top (`load_result.user_stack`), which the
+    /// executable's slide moved down from `USRSTACK64`.
+    pub darwin_user_stack: u64,
     /// `LC_LOAD_DYLINKER`'s path, as the guest names it.
     pub darwin_dylinker: Option<String>,
     /// The boot payload's directory (`GEX_DARWIN_BOOT`): the trust cache
@@ -256,6 +259,7 @@ impl Default for RunOptions {
             darwin_platform: (0, 0),
             darwin_code_signature: None,
             darwin_stacksize: 0,
+            darwin_user_stack: 0,
             darwin_dylinker: None,
             darwin_boot: None,
             args: Vec::new(),
@@ -3740,6 +3744,7 @@ fn run_darwin_image(
         darwin_platform: loaded.platform,
         darwin_code_signature: loaded.code_signature,
         darwin_stacksize: loaded.stacksize,
+        darwin_user_stack: loaded.user_stack,
         darwin_dylinker: loaded.dylinker,
         darwin_dyld_infos: loaded.dyld_infos,
         darwin_dyld_infos_size: loaded.dyld_infos_size,
@@ -4616,7 +4621,7 @@ fn place_image(
                     signature: exec.as_ref().map(|i| i.load.clone()),
                     nano: exec.as_ref().and_then(|i| i.spawn.as_ref()).is_some_and(|sp| sp.flags & gex_kernel::darwin::spawn::flag::NANO_ALLOCATOR != 0),
                 };
-                k.darwin_start(exec.map(|i| i.strings), &loaded, gex_kernel::darwin::exec::USRSTACK64)
+                k.darwin_start(exec.map(|i| i.strings), &loaded, opts.darwin_user_stack)
             })
             .map_err(|e| anyhow::Error::new(DarwinStartFailed(format!("starting {path}: errno {}", e.0))))?;
         let layout = gex_ld::stack::StackLayout { sp: st.sp, low: st.sp, bytes: st.bytes };
