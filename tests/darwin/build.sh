@@ -27,6 +27,9 @@ done
 cc -O2 -framework CoreFoundation -o "$OUT/cfrunloop" "$HERE/src/cfrunloop.c"
 cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/iokit" "$HERE/src/iokit.c"
 cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/ioreg" "$HERE/src/ioreg.c"
+cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/accel" "$HERE/src/accel.c"
+# accelr: accel in a task entitled to be a restricted GPU client.
+cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/accelr" "$HERE/src/accel.c"
 # amfi's: a program in no trust cache, and one holding get-task-allow.
 cc -O2 -o "$OUT/untrusted" "$HERE/src/hello.c"
 cc -O2 -o "$OUT/gta" "$HERE/src/hello.c"
@@ -67,6 +70,8 @@ codesign -s - -f -i com.apple.test.xnu.jitbox --entitlements "$HERE/src/jit.enti
 # workinterval creates work intervals, which PRIV_WORK_INTERVAL grants by
 # its entitlement.
 codesign -s - -f --entitlements "$HERE/src/workinterval.entitlements" "$OUT/workinterval" 2>/dev/null
+# accelr's IOGPU device client is restricted by its entitlement.
+codesign -s - -f --entitlements "$HERE/src/gpurestricted.entitlements" "$OUT/accelr" 2>/dev/null
 # atmflag sets the ATM diagnostic flag, which its entitlement allows.
 codesign -s - -f --entitlements "$HERE/src/atmflag.entitlements" "$OUT/atmflag" 2>/dev/null
 # sbxexec's seatbelt-profiles entitlement names the builtin profile its exec

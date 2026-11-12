@@ -563,9 +563,8 @@ impl Kernel {
             trap::MACH_VOUCHER_EXTRACT_ATTR_RECIPE => self.mach_voucher_extract_attr_recipe_trap(m, w(0), w(1), a[2], a[3]),
             trap::TASK_NAME_FOR_PID => self.task_name_for_pid(m, w(0), a[1] as i32, a[2]),
             trap::TASK_FOR_PID => self.task_for_pid(m, w(0), a[1] as i32, a[2]),
-            trap::CLOCK_SLEEP
-            | trap::DEBUG_CONTROL_PORT_FOR_PID
-            | trap::IOKIT_USER_CLIENT => {
+            trap::IOKIT_USER_CLIENT => self.darwin_iokit_user_client_trap(a) as u32 as u64,
+            trap::CLOCK_SLEEP | trap::DEBUG_CONTROL_PORT_FOR_PID => {
                 self.darwin_unimplemented(format!("Mach trap {t}"));
                 kr::FAILURE
             }
@@ -1055,6 +1054,27 @@ impl Kernel {
     pub(crate) fn darwin_vm_allocate_anywhere(&mut self, m: &mut GuestMem<'_>, len: u64) -> Result<u64, u64> {
         let mut addr = 0;
         match self.vm_allocate(m, &mut addr, len, 0, vmf::ANYWHERE, prot::READ | prot::WRITE) {
+            kr::SUCCESS => Ok(addr),
+            e => Err(e),
+        }
+    }
+
+    /// An IOKit mapping of kernel memory into the task
+    /// (`IOMemoryDescriptorMapAlloc`'s `vm_map_enter_mem_object` for a user
+    /// map): `len` bytes anywhere, tagged VM_MEMORY_IOKIT, with `cur` as
+    /// both its protection and its maximum, inherited by no child.
+    pub(crate) fn darwin_iokit_map(&mut self, m: &mut GuestMem<'_>, len: u64, cur: u64) -> Result<u64, u64> {
+        const VM_MEMORY_IOKIT: u64 = 21;
+        let mut addr = 0;
+        match self.vm_allocate(m, &mut addr, len, 0, vmf::ANYWHERE | VM_MEMORY_IOKIT << 24, cur) {
+            kr::SUCCESS => {}
+            e => return Err(e),
+        }
+        match self.vm_protect(m, addr, len, true, cur) {
+            kr::SUCCESS => {}
+            e => return Err(e),
+        }
+        match self.darwin_vm_inherit(addr, len, u32::from(super::vm::inherit::NONE)) {
             kr::SUCCESS => Ok(addr),
             e => Err(e),
         }

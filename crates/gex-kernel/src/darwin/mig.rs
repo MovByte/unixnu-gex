@@ -314,13 +314,9 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             const K_IO_RETURN_BAD_ARGUMENT: i32 = 0xe00002c2_u32 as i32;
             let Some(node) = super::iokit::tree().get(*i as usize) else { return bad() };
             let name = String::from_utf8_lossy(name);
-            // An OSString's bytes and its NUL, an OSBoolean's "Yes" or "No";
-            // a collection is not bytes.
-            let typed = node.service_props.iter().find(|(k, _)| *k == name).map(|(_, p)| match p {
-                super::iokit::Prop::Str(s) => Some([s.as_bytes(), b"\0"].concat()),
-                super::iokit::Prop::Bool(b) => Some(if *b { b"Yes\0".to_vec() } else { b"No\0".to_vec() }),
-                super::iokit::Prop::Strs(_) => None,
-            });
+            // An OSString's bytes and its NUL, an OSBoolean's "Yes" or "No",
+            // an OSNumber's or OSData's bytes; a collection is not bytes.
+            let typed = node.service_props.iter().find(|(k, _)| *k == name).map(|(_, p)| super::iokit::prop_bytes(p));
             let value = match (typed, node.props.iter().find(|(k, _)| *k == name)) {
                 (Some(Some(v)), _) => v,
                 (Some(None), _) => return Reply::err(K_IO_RETURN_BAD_ARGUMENT),
@@ -329,7 +325,7 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
                 (None, None) => {
                     let mut r = Reply::err(K_IO_RETURN_NO_RESOURCES);
                     let root = Some(*i) == super::iokit::root();
-                    if (!node.class.is_empty() || *i == 0) && !(root && !super::iokit::root_has(&name)) {
+                    if (!node.class.is_empty() || *i == 0) && !(root && !super::iokit::root_has(&name)) && super::accel::property_unknown(*i, &name) {
                         r.unimplemented = Some(format!("the {} property {name:?}", super::iokit::name(super::iokit::tree(), *i)));
                     }
                     return r;
@@ -369,7 +365,7 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
                 // besides the device tree's.
                 let mut r = Reply::err(K_IO_RETURN_NOT_FOUND);
                 let root = Some(*i) == super::iokit::root();
-                if (!node.class.is_empty() || *i == 0) && !(root && !super::iokit::root_has(&name)) {
+                if (!node.class.is_empty() || *i == 0) && !(root && !super::iokit::root_has(&name)) && super::accel::property_unknown(*i, &name) {
                     r.unimplemented = Some(format!("the {} property {name:?}", super::iokit::name(super::iokit::tree(), *i)));
                 }
                 return r;
@@ -421,7 +417,7 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         }
         // io_registry_entry_get_registry_entry_id(entry) -> id. The kernel's
         // ids are the entries' own; these name the same entries for as long.
-        (Kobject::IoEntry(i), 2871) => Reply::ok((0x1_0000_0000u64 + u64::from(*i)).to_le_bytes().to_vec()),
+        (Kobject::IoEntry(i), 2871) => Reply::ok(super::iokit::registry_id(*i).to_le_bytes().to_vec()),
         // io_registry_entry_get_parent_iterator(entry, plane) -> iterator.
         (Kobject::IoEntry(i), 2814) => link_iterator(k, req, *i, true),
         // io_service_get_matching_service_bin(main_port, matching) -> first
@@ -547,53 +543,11 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             }
         }
         // io_service_open_extended(service, owningTask, type, ndr,
-        // properties) -> connection, result: the user client, whose methods
-        // are reported when they are called.
-        (Kobject::IoEntry(i), 2862) => {
-            if super::iokit::conforms(super::iokit::tree(), *i, "IOService") != Ok(true) {
-                return Reply::err(0xe00002c2_u32 as i32);
-            }
-            let port = k.ipc().global_port(Kobject::IoConnect(*i));
-            k.ipc().copy_send(port);
-            let mut r = Reply::port(Carried::Port(port));
-            r.out = NDR_RECORD.to_vec();
-            r.out.extend_from_slice(&0i32.to_le_bytes());
-            r
-        }
-        // io_service_close(connection).
-        (Kobject::IoConnect(_), 2816) => Reply::ok(Vec::new()),
-        // io_connect_method(connection, selector, scalars, inband, ool...):
-        // a driver's own protocol. Of AppleAPFSContainer's, selector 9: a
-        // volume's information by its index, which APFSVolumeRoleFind reads
-        // the role from (the first two bytes).
-        (Kobject::IoConnect(i), 2865) => {
-            let Some(selector) = arg(req, 0) else { return bad() };
-            let scalars = arg(req, 1).unwrap_or(0) as u32 as usize;
-            let in_cnt_at = NDR + 8 + 8 * scalars;
-            let inband = i32_at(&req.body, in_cnt_at).unwrap_or(0) as u32 as usize;
-            let bytes = req.body.get(in_cnt_at + 4..in_cnt_at + 4 + inband).unwrap_or(&[]).to_vec();
-            let class = super::iokit::tree().get(*i as usize).map_or("?", |n| n.class);
-            // After the inband input (padded), the ool in address and size.
-            let after = in_cnt_at + 4 + ((inband + 3) & !3) + 16;
-            let out_cnt = i32_at(&req.body, after).unwrap_or(0) as u32 as usize;
-            if class == "AppleAPFSContainer" && selector == 9 && bytes.len() == 8 {
-                let index = u64::from_le_bytes(bytes[..8].try_into().unwrap());
-                let Some(role) = super::iokit::volume_role(index) else { return Reply::err(0xe00002f0_u32 as i32) };
-                let mut info = vec![0u8; out_cnt.min(4096)];
-                if info.len() >= 2 {
-                    info[..2].copy_from_slice(&role.to_le_bytes());
-                }
-                let mut o = (info.len() as u32).to_le_bytes().to_vec();
-                o.extend_from_slice(&info);
-                o.resize((o.len() + 3) & !3, 0);
-                o.extend_from_slice(&0u32.to_le_bytes());
-                o.extend_from_slice(&0u64.to_le_bytes());
-                return Reply::ok(o);
-            }
-            let mut r = Reply::err(0xe00002c7_u32 as i32);
-            r.unimplemented = Some(format!("IOConnectCallMethod on {class}: selector {selector}, {scalars} scalars, {inband} bytes in: {:x?}", &bytes[..bytes.len().min(64)]));
-            r
-        }
+        // properties) -> connection, result: a new user client of the
+        // service, made by its newUserClient.
+        (Kobject::IoEntry(i), 2862) => io_service_open(k, req, *i),
+        // The routines of a user client (io_connect_t).
+        (Kobject::IoConnect(id), n @ (2800 | 2801 | 2810 | 2812 | 2816 | 2817 | 2820 | 2821 | 2852 | 2863 | 2864 | 2865 | 2866 | 2867 | 2871 | 2872 | 2889)) => connect_routine(k, req, *id, n),
         // io_service_add_notification_bin(main_port, notification_type,
         // matching, wake_port, reference) -> notification: an
         // IOServiceUserNotification over what the dictionary matches now
@@ -1957,4 +1911,376 @@ fn restartable_register(k: &mut Kernel, req: &Kmsg) -> Reply {
     }
     k.dtask.kports.restartable = ranges.into_iter().map(|(l, n, r, f)| (l, n, r, f)).collect();
     Reply::ok(Vec::new())
+}
+
+/// `MIG_TYPE_ERROR`: a descriptor of the wrong kind or disposition.
+const MIG_TYPE_ERROR: i32 = -300;
+
+/// The task port `right` names, when it is the calling task's own (its
+/// control port or its self port): what `convert_port_to_task` and the
+/// routines' `owningTask == current_task()` checks take.
+fn is_own_task(k: &mut Kernel, right: Option<Carried>) -> bool {
+    let Some(Carried::Port(p)) = right else { return false };
+    let (task, me) = (k.darwin_task_port(), k.darwin_task_self_port());
+    p == task || p == me
+}
+
+/// `is_io_service_open_extended`: the caller's own task must own the
+/// client, and properties are not taken (kIOReturnUnsupported). A user
+/// client is made by the service's newUserClient; its failure is the
+/// `result` beside a null connection.
+fn io_service_open(k: &mut Kernel, req: &Kmsg, service: u32) -> Reply {
+    use super::iokit::ret;
+    if super::iokit::conforms(super::iokit::tree(), service, "IOService") != Ok(true) {
+        return Reply::err(ret::BAD_ARGUMENT);
+    }
+    // owningTask's port descriptor (12 bytes) and properties' out-of-line
+    // one (16), then the NDR record and connect_type.
+    let (Some((task, task_disp)), Some(super::ipc::msg::Desc::Ool { data, .. })) = (desc_port(req, 0), req.descs.get(1)) else {
+        return Reply::err(MIG_BAD_ARGUMENTS);
+    };
+    let Some(ty) = i32_at(&req.body, 4 + 12 + 16 + NDR) else { return Reply::err(MIG_BAD_ARGUMENTS) };
+    if !is_own_task(k, task) {
+        return Reply::err(ret::BAD_ARGUMENT);
+    }
+    if !data.is_empty() {
+        return Reply::err(ret::UNSUPPORTED);
+    }
+    // The task right was converted to the task, and is let go.
+    if let Some(t) = task {
+        k.ipc().object_destroy(t, task_disp);
+    }
+    let result = match super::iokit::open_user_client(k, service, ty as u32) {
+        Ok(id) => {
+            let port = k.ipc().kobject_port(Kobject::IoConnect(id));
+            k.ipc().port_mut(port).owner = 0;
+            k.ipc().make_send(port);
+            k.ipc().port_mut(port).nsrequest_kobject = true;
+            let mut r = Reply::port(Carried::Port(port));
+            r.out = NDR_RECORD.to_vec();
+            r.out.extend_from_slice(&0i32.to_le_bytes());
+            return r;
+        }
+        Err(e) => e,
+    };
+    let mut r = Reply { ret: KERN_SUCCESS, defer: None, out: NDR_RECORD.to_vec(), ports: Vec::new(), unimplemented: None }.with_null_port(0);
+    r.out.extend_from_slice(&result.to_le_bytes());
+    r
+}
+
+/// The arguments of io_connect_method, io_connect_async_method and
+/// io_connect_method_var_output from their variable-sized request: the
+/// fixed part (`fixed`, header included) before the scalars, their count
+/// (at most 16), the inband input (at most 4096, word aligned) and the
+/// fields after it, checked against the message's size as MIG checks it.
+/// `None`: MIG_BAD_ARGUMENTS.
+fn method_args(req: &Kmsg, at: usize, fixed: u32, tail: usize) -> Option<(super::iokit::MethodArgs, usize)> {
+    let b = &req.body;
+    let selector = i32_at(b, at)? as u32;
+    let nscalar = i32_at(b, at + 4)? as u32;
+    if nscalar > 16 || req.size < fixed + 8 * nscalar {
+        return None;
+    }
+    let scalars = (0..nscalar as usize).map(|n| u64::from_le_bytes(b[at + 8 + 8 * n..at + 16 + 8 * n].try_into().unwrap())).collect::<Vec<u64>>();
+    let at = at + 8 + 8 * nscalar as usize;
+    let ninband = i32_at(b, at)? as u32;
+    let padded = (ninband + 3) & !3;
+    if ninband > 4096 || req.size != fixed + 8 * nscalar + padded {
+        return None;
+    }
+    let inband = b.get(at + 4..at + 4 + ninband as usize)?.to_vec();
+    let rest = at + 4 + padded as usize;
+    b.get(rest..rest + tail)?;
+    Some((super::iokit::MethodArgs { selector, scalar_in: scalars, struct_in: inband, ..Default::default() }, rest))
+}
+
+fn u64_at(b: &[u8], o: usize) -> u64 {
+    u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
+}
+
+/// The reply of a method that ran: the inband output (its count, the
+/// bytes padded), the scalar output (count, values), then
+/// `ool_output_size`.
+fn method_reply(a: &super::iokit::MethodArgs, ool_size: Option<u64>) -> Reply {
+    let mut o = (a.struct_out.len() as u32).to_le_bytes().to_vec();
+    o.extend_from_slice(&a.struct_out);
+    o.resize((o.len() + 3) & !3, 0);
+    o.extend_from_slice(&(a.scalar_out.len() as u32).to_le_bytes());
+    for s in &a.scalar_out {
+        o.extend_from_slice(&s.to_le_bytes());
+    }
+    if let Some(n) = ool_size {
+        o.extend_from_slice(&n.to_le_bytes());
+    }
+    Reply::ok(o)
+}
+
+/// A routine sent to user client `id`.
+fn connect_routine(k: &mut Kernel, req: &Kmsg, id: u32, n: i32) -> Reply {
+    use super::iokit::ret;
+    let bad = || Reply::err(MIG_BAD_ARGUMENTS);
+    let Some(cell) = super::iokit::client(id) else {
+        // A connection whose client is gone converts to none (CHECK).
+        return Reply::err(ret::BAD_ARGUMENT);
+    };
+    let mut c = cell.lock().unwrap_or_else(|e| e.into_inner());
+    let r = match n {
+        // io_object_get_class, io_object_conforms_to, io_registry_entry_get_name
+        // and _get_registry_entry_id: the client is a registry entry, named
+        // by its class.
+        2800 | 2810 => Reply::ok(io_name_reply(c.class)),
+        2801 => match inline_cstr(req, 0, 128) {
+            Some((name, _)) => {
+                let chain = super::iokit::superclasses(c.class);
+                if chain.is_empty() {
+                    let mut r = Reply::err(ret::UNSUPPORTED);
+                    r.unimplemented = Some(format!("the superclasses of the user client class {}", c.class));
+                    r
+                } else {
+                    Reply::ok(u32::from(chain.contains(&String::from_utf8_lossy(name).as_ref())).to_le_bytes().to_vec())
+                }
+            }
+            None => bad(),
+        },
+        2871 => Reply::ok(c.id.to_le_bytes().to_vec()),
+        // io_registry_entry_get_property_bytes.
+        2812 => match inline_cstr(req, 0, 128) {
+            Some((name, next)) => {
+                let Some(cnt) = i32_at(&req.body, next) else { return bad() };
+                match super::iokit::client_property(&c, &String::from_utf8_lossy(name)).map(|p| p.map(|p| super::iokit::prop_bytes(&p))) {
+                    Err(what) => {
+                        let mut r = Reply::err(ret::NO_RESOURCES);
+                        r.unimplemented = Some(what);
+                        r
+                    }
+                    Ok(None) => Reply::err(ret::NO_RESOURCES),
+                    Ok(Some(p)) => match p {
+                        None => Reply::err(ret::BAD_ARGUMENT),
+                        Some(v) if (cnt as u32 as usize).min(super::iokit::STRUCT_INBAND_MAX) < v.len() => Reply::err(ret::IPC_ERROR),
+                        Some(v) => {
+                            let mut o = (v.len() as u32).to_le_bytes().to_vec();
+                            o.extend_from_slice(&v);
+                            o.resize((o.len() + 3) & !3, 0);
+                            Reply::ok(o)
+                        }
+                    },
+                }
+            }
+            None => bad(),
+        },
+        // io_registry_entry_get_property_bin_buf.
+        2889 => client_property_bin_buf(k, req, &c),
+        // io_service_close: clientClose, once (a shared instance aside);
+        // a second close is ignored. Always kIOReturnSuccess.
+        2816 => {
+            if !c.closed {
+                c.closed = true;
+                super::iokit::client_close(k, &mut c);
+            }
+            Reply::ok(Vec::new())
+        }
+        // io_connect_get_service: getService, which IOUserClient answers
+        // with none (kIOReturnUnsupported) unless the client says.
+        2817 => match super::iokit::client_service(&c) {
+            Some(s) => {
+                let port = k.ipc().global_port(Kobject::IoEntry(s));
+                k.ipc().copy_send(port);
+                Reply::port(Carried::Port(port))
+            }
+            None => Reply::err(ret::UNSUPPORTED),
+        },
+        // io_connect_add_client(connection, connect_to): IOUserClient's
+        // connectClient takes none (kIOReturnUnsupported); a connect_to that
+        // is no user client is kIOReturnBadArgument.
+        2820 => match desc_port(req, 0) {
+            Some((right, disp)) => {
+                let to = match right {
+                    Some(Carried::Port(p)) => matches!(k.ipc().port(p).kobject, Some(Kobject::IoConnect(_))),
+                    _ => false,
+                };
+                if to {
+                    if let Some(r) = right {
+                        k.ipc().object_destroy(r, disp);
+                    }
+                    Reply::err(ret::UNSUPPORTED)
+                } else {
+                    Reply::err(ret::BAD_ARGUMENT)
+                }
+            }
+            None => bad(),
+        },
+        // io_connect_set_properties: is_io_registry_entry_set_properties,
+        // which unserializes the properties (OSUnserializeXML) before the
+        // client's setProperties sees them.
+        2821 => {
+            let mut r = Reply::err(ret::UNSUPPORTED);
+            r.unimplemented = Some(format!("io_connect_set_properties on {} (OSUnserializeXML of the properties)", c.class));
+            r
+        }
+        // io_connect_get_notification_semaphore: IOUserClient's default.
+        2852 => Reply::err(ret::UNSUPPORTED),
+        // io_connect_map_memory_into_task(connection, memory_type, into_task,
+        // address, size, flags) and io_connect_unmap_memory_from_task
+        // (connection, memory_type, from_task, address): the client's
+        // clientMemoryForType for the type. A client with none maps nothing
+        // (kIOReturnBadArgument) and unmaps with clientMemoryForType's
+        // error. The task must be one (any task's control port).
+        2863 | 2864 => {
+            let Some((task, _)) = desc_port(req, 0) else { return bad() };
+            let Some(ty) = i32_at(&req.body, 4 + 12 + NDR) else { return bad() };
+            let is_task = match task {
+                Some(Carried::Port(p)) => k.ipc().port(p).kobject == Some(Kobject::Task),
+                _ => false,
+            };
+            if !is_task {
+                Reply::err(ret::BAD_ARGUMENT)
+            } else {
+                match super::iokit::client_memory_for_type(k, &mut c, ty as u32) {
+                    Ok(never) => match never {},
+                    Err(e) => Reply::err(if n == 2863 { ret::BAD_ARGUMENT } else { e }),
+                }
+            }
+        }
+        // io_connect_method and io_connect_method_var_output.
+        2865 | 2872 => {
+            // The fixed part: header, NDR, selector, the two counts, then
+            // ool_input and its size, the two output counts, and for
+            // io_connect_method ool_output and its size.
+            let tail = if n == 2865 { 8 + 8 + 4 + 4 + 8 + 8 } else { 8 + 8 + 4 + 4 };
+            let fixed = (HEADER + NDR + 4 + 4 + 4 + tail) as u32;
+            if req.bits & super::ipc::msg::bits::COMPLEX != 0 {
+                return bad();
+            }
+            match method_args(req, NDR, fixed, tail) {
+                Some((a, at)) => connect_method(k, &mut c, a, &req.body[at..], n == 2865),
+                None => bad(),
+            }
+        }
+        // io_connect_async_method(connection, wake_port, reference, ...).
+        2866 => {
+            if req.bits & super::ipc::msg::bits::COMPLEX == 0 || req.descs.len() != 1 {
+                return bad();
+            }
+            let Some((wake, disp)) = desc_port(req, 0) else { return Reply::err(MIG_TYPE_ERROR) };
+            if disp != super::ipc::right::msgt::PORT_SEND {
+                return Reply::err(MIG_TYPE_ERROR);
+            }
+            let at = 4 + 12 + NDR;
+            let Some(nref) = i32_at(&req.body, at) else { return bad() };
+            let nref = nref as u32;
+            let tail = 8 + 8 + 4 + 4 + 8 + 8;
+            let fixed = (HEADER + 4 + 12 + NDR + 4 + 4 + 4 + 4 + tail) as u32;
+            if nref > 8 || req.size < fixed + 8 * nref {
+                return bad();
+            }
+            let refs: Vec<u64> = (0..nref as usize).map(|i| u64_at(&req.body, at + 4 + 8 * i)).collect();
+            let fixed = fixed + 8 * nref;
+            match method_args(req, at + 4 + 8 * nref as usize, fixed, tail) {
+                Some((mut a, rest)) => {
+                    // referenceCnt < 1: kIOReturnBadArgument.
+                    if refs.is_empty() {
+                        Reply::err(ret::BAD_ARGUMENT)
+                    } else {
+                        a.is_async = true;
+                        a.reference = refs;
+                        a.wake = match wake {
+                            Some(Carried::Port(p)) => Some(p),
+                            _ => None,
+                        };
+                        connect_method(k, &mut c, a, &req.body[rest..], true)
+                    }
+                }
+                None => bad(),
+            }
+        }
+        // io_connect_set_notification_port(connection, notification_type,
+        // port, reference): registerNotificationPort. The client keeps the
+        // port's right when it succeeds; a failed request's goes with it.
+        2867 => {
+            let Some((port, _)) = desc_port(req, 0) else { return bad() };
+            let at = 4 + 12 + NDR;
+            let (Some(ty), Some(reference)) = (i32_at(&req.body, at), req.body.get(at + 4..at + 12).map(|s| u64::from_le_bytes(s.try_into().unwrap()))) else {
+                return bad();
+            };
+            let p = match port {
+                Some(Carried::Port(p)) => Some(p),
+                _ => None,
+            };
+            Reply::err(super::iokit::register_notification_port(k, &mut c, p, ty as u32, reference))
+        }
+        _ => unreachable!(),
+    };
+    r
+}
+
+/// is_io_connect_method's argument checks, the client's externalMethod,
+/// and its reply. `tail`: the request's fields after the inband input.
+fn connect_method(k: &mut Kernel, c: &mut super::iokit::UserClient, mut a: super::iokit::MethodArgs, tail: &[u8], ool_out_field: bool) -> Reply {
+    use super::iokit::ret;
+    let (ool_in, ool_in_size) = (u64_at(tail, 0), u64_at(tail, 8));
+    let inband_out = (i32_at(tail, 16).unwrap_or(0) as u32).min(4096);
+    let scalar_out = (i32_at(tail, 20).unwrap_or(0) as u32).min(16);
+    let (ool_out, ool_out_size) = if ool_out_field { (u64_at(tail, 24), u64_at(tail, 32)) } else { (0, 0) };
+    if ool_in != 0 && ool_in_size <= super::iokit::STRUCT_INBAND_MAX as u64 {
+        return Reply::err(ret::IPC_ERROR);
+    }
+    if ool_out != 0 && (ool_out_size <= super::iokit::STRUCT_INBAND_MAX as u64 || ool_out_size > u64::from(u32::MAX)) {
+        return Reply::err(ret::IPC_ERROR);
+    }
+    if ool_in != 0 {
+        a.ool_in = Some((ool_in, ool_in_size));
+    }
+    if ool_out != 0 {
+        a.ool_out = Some((ool_out, ool_out_size));
+    }
+    a.scalar_out = vec![0; scalar_out as usize];
+    a.struct_out = vec![0; inband_out as usize];
+    // The wake port's right is the routine's once it succeeds: a client
+    // keeps it in its async reference (and lets it go with
+    // releaseAsyncReference64); a failed request's goes with the request.
+    let r = super::iokit::external_method(k, c, &mut a);
+    if r != ret::SUCCESS {
+        return Reply::err(r);
+    }
+    if !ool_out_field {
+        // io_connect_method_var_output: no client here gives variable
+        // output, which is kIOReturnUnderrun.
+        return Reply::err(ret::UNDERRUN);
+    }
+    method_reply(&a, Some(a.ool_out.map_or(0, |(_, n)| n)))
+}
+
+/// io_registry_entry_get_property_bin_buf of a user client's property.
+fn client_property_bin_buf(k: &mut Kernel, req: &Kmsg, c: &super::iokit::UserClient) -> Reply {
+    let Some((_, next)) = inline_cstr(req, 0, 128) else { return Reply::err(MIG_BAD_ARGUMENTS) };
+    let Some((name, next)) = inline_cstr_at(req, next, 128) else { return Reply::err(MIG_BAD_ARGUMENTS) };
+    let (Some(_options), Some(buf), Some(bufsize)) = (i32_at(&req.body, next), req.body.get(next + 4..next + 12), req.body.get(next + 12..next + 20)) else { return Reply::err(MIG_BAD_ARGUMENTS) };
+    let (buf, bufsize) = (u64::from_le_bytes(buf.try_into().unwrap()), u64::from_le_bytes(bufsize.try_into().unwrap()));
+    let p = match super::iokit::client_property(c, &String::from_utf8_lossy(name)) {
+        Ok(Some(p)) => p,
+        Ok(None) => return Reply::err(super::iokit::ret::NOT_FOUND),
+        Err(what) => {
+            let mut r = Reply::err(super::iokit::ret::NOT_FOUND);
+            r.unimplemented = Some(what);
+            return r;
+        }
+    };
+    let bin = super::iokit::serialize_prop(&p);
+    let mut out = NDR_RECORD.to_vec();
+    if buf != 0 && bin.len() as u64 <= bufsize {
+        if let Err(r) = k.darwin_vm_copy_overwrite(buf, &bin) {
+            return r;
+        }
+        out.extend_from_slice(&(bin.len() as u64).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        let mut r = Reply::ok(out);
+        r.ports.push(PortOut::Ool(Vec::new()));
+        r
+    } else {
+        out.extend_from_slice(&0u64.to_le_bytes());
+        out.extend_from_slice(&(bin.len() as u32).to_le_bytes());
+        let mut r = Reply::ok(out);
+        r.ports.push(PortOut::Ool(bin));
+        r
+    }
 }

@@ -252,7 +252,8 @@ pub enum Kobject {
     /// An `io_iterator_t` that is a matching notification
     /// (`IOServiceUserNotification`), by its number.
     IoNotification(u32),
-    /// IKOT_IOKIT_CONNECT: a user client of service `0`.
+    /// IKOT_IOKIT_CONNECT: a user client, by its number
+    /// ([`super::iokit::client`]).
     IoConnect(u32),
     /// A thread's kernel reply port (`ith_rpc_reply`): the reply to an RPC
     /// the kernel made for it.
