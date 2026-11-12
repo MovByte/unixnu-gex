@@ -36,6 +36,7 @@ pub fn run(mut ra: RunArgs, bytes: &[u8]) -> Result<ExitCode> {
     ra.opts.darwin_user_stack = img.user_stack;
     ra.opts.darwin_dylinker = img.dylinker;
     ra.opts.darwin_dyld_infos = img.dyld_infos;
+    ra.opts.darwin_dyld_infos_size = img.dyld_infos_size;
     if img.program.interp.is_some() {
         let root = root.as_ref().expect("a root for dyld");
         let cache = match std::env::var_os("GEX_DARWIN_CACHE") {
