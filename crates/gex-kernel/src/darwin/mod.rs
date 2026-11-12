@@ -36,6 +36,7 @@ pub mod fileport;
 pub mod footprint;
 pub mod xattr;
 pub mod iokit;
+pub mod osserialize;
 pub mod accel;
 pub mod guarded;
 pub mod exit;
