@@ -7,7 +7,7 @@
 use super::{DirEntry, FileHandle, FileSystem, FileType, Metadata};
 use crate::errno::{Errno, SysResult};
 use crate::fs::oflags;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, LockResult, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -15,28 +15,17 @@ use std::sync::{Arc, LockResult, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuar
 /// buffer that grew geometrically keeps the larger allocation whatever its
 /// length says. For the memory census.
 pub static TMPFS_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The most file contents may take in this memory ([`TMPFS_BYTES`]), 0 for
+/// no limit: past it a write that needs more room is ENOSPC (the page's
+/// `MemoryFilesystem({ max })`).
+pub static TMPFS_MAX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// The directory a page keeps (its persist store's root, `watch`), without
-/// its leading `/`, and how many times the program has finished a change
-/// under it: a close after a write (or a create or truncation), a rename
-/// into or out of it, an unlink. The store snapshots soon after the count moves
-/// (web/src/persist-worker.js), so a save outlives the page without waiting
-/// for a timer. Unset, nothing is counted.
-static WATCHED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-pub static SAVES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Moves at every change of a tree or of a file's contents or times: the
+/// root's persistence (persist.rs) writes a generation only after it has.
+pub static META: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Count changes finished under `root` ([`SAVES`]); the first root set stays.
-pub fn watch(root: &str) {
-    let _ = WATCHED.set(root.trim_matches('/').to_string());
-}
-
-/// A change to `path` (a tmpfs path, no leading `/`) finished: counted when
-/// it is under the watched directory.
-fn saved(path: &str) {
-    let Some(w) = WATCHED.get() else { return };
-    if path.starts_with(w.as_str()) && (w.is_empty() || path.len() == w.len() || path.as_bytes()[w.len()] == b'/') {
-        SAVES.fetch_add(1, Ordering::Relaxed);
-    }
+fn moved() {
+    META.fetch_add(1, Ordering::Relaxed);
 }
 
 /// This filesystem's half of an [`inotify::Key`](crate::inotify::Key).
@@ -135,9 +124,6 @@ fn note_capacity(before: usize, after: usize) {
 /// A file's contents, held apart from any name so an open descriptor survives
 /// `unlink`: SQLite unlinks its temp files at once and keeps writing through
 /// the descriptor it still holds.
-/// The fixed part of one [`TmpFs::tree`] entry.
-pub const TREE_ENTRY: usize = 40;
-
 /// The time of a lazy file whose site recorded none ([`TmpFs::add_lazy`]).
 pub const LAZY_MTIME: i64 = 0;
 
@@ -148,6 +134,12 @@ static READ_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::
 #[derive(Debug, Default)]
 pub struct FileNode {
     data: Mutex<Vec<u8>>,
+    /// The contents as blocks in the host's store (`super::blocks`), once
+    /// the file is past what stays inline while the store is on; `data` is
+    /// then empty.
+    pg: Mutex<Option<super::blocks::PFile>>,
+    /// Whether its filesystem keeps contents in the store ([`TmpFs::use_store`]).
+    store: bool,
     /// Contents fetched on demand (`TmpFs::add_lazy`); `None` once the file
     /// is an ordinary one (never, or since a write made it one).
     lazy: Mutex<Option<Lazy>>,
@@ -172,18 +164,98 @@ pub struct FileNode {
     /// seeded ([`TmpFs::written`]): a write, a truncation, a create, a
     /// rename. Not a time set (`utimensat`, which a program can aim at any
     /// file), not a lazy file's contents arriving, not the seeding itself.
-    /// What a page's persist store snapshots (web/src/persist-worker.js),
-    /// so a snapshot never reads a file the program did not touch.
+    /// What the kept root records (persist.rs), so that a generation never
+    /// reads a file the program did not touch.
     written: core::sync::atomic::AtomicBool,
     /// [`FileHandle::changes`]: bumped with the contents' lock held, so a
     /// reader that saw the same count before and after its read read
     /// contents no change was halfway through. From 1, as 0 is no count.
     changes: core::sync::atomic::AtomicU64,
+    /// The mode its last name had when that name went, for `fstat` of a
+    /// descriptor that outlives every name. Modes are kept by name
+    /// (`Inner::modes`) while it has one.
+    gone_mode: core::sync::atomic::AtomicU32,
+    /// [`LAID`], [`PENDING`] (named by a bundle's index, its bytes still
+    /// coming: [`TmpFs::add_pending`]) or [`FAILED`] (they never will). A
+    /// use of the bytes waits on this word while it is [`PENDING`].
+    laid: core::sync::atomic::AtomicU32,
+    /// A pending file's size and the bytes come so far.
+    pend: Mutex<Option<Pend>>,
+}
+
+/// A file named by a bundle's index whose bytes have not all come.
+#[derive(Debug)]
+struct Pend {
+    size: u64,
+    buf: Vec<u8>,
+    got: u64,
+}
+
+/// [`FileNode::laid`]: an ordinary file.
+pub const LAID: u32 = 0;
+/// Its bytes are on their way in the bundle.
+pub const PENDING: u32 = 1;
+/// The bundle failed before its bytes came: every use is EIO.
+pub const FAILED: u32 = 2;
+
+/// How a use of a pending file's bytes waits: `(word, ino)` returns once
+/// the word is no longer [`PENDING`], or false at once when this thread may
+/// not block (the page's own kernel Worker, which lays the bytes). And how
+/// the bytes' arrival wakes the waiters.
+#[derive(Clone, Copy)]
+pub struct PendingHooks {
+    pub wait: fn(&core::sync::atomic::AtomicU32, u64) -> bool,
+    pub wake: fn(&core::sync::atomic::AtomicU32),
+}
+static PENDING_HOOKS: std::sync::OnceLock<PendingHooks> = std::sync::OnceLock::new();
+
+/// Set how pending files are waited for (the first call wins). Without
+/// hooks a wait yields until the word changes (native, the unit tests).
+pub fn set_pending_hooks(h: PendingHooks) {
+    let _ = PENDING_HOOKS.set(h);
+}
+
+fn pending_wait(word: &core::sync::atomic::AtomicU32, ino: u64) -> bool {
+    match PENDING_HOOKS.get() {
+        Some(h) => (h.wait)(word, ino),
+        None => {
+            while word.load(Ordering::Acquire) == PENDING {
+                std::thread::yield_now();
+            }
+            true
+        }
+    }
+}
+
+fn pending_wake(word: &core::sync::atomic::AtomicU32) {
+    if let Some(h) = PENDING_HOOKS.get() {
+        (h.wake)(word);
+    }
+}
+
+/// A file's contents go with its last name and descriptor: their room is
+/// free again ([`TMPFS_BYTES`], which a max is measured against).
+impl Drop for FileNode {
+    fn drop(&mut self) {
+        if let Ok(d) = self.data.get_mut() {
+            note_capacity(d.capacity(), 0);
+        }
+        if let Ok(Some(l)) = self.lazy.get_mut() {
+            TMPFS_BYTES.fetch_sub(l.held, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 impl FileNode {
-    fn new(data: Vec<u8>, ino: u64) -> FileNode {
+    /// A file with `data`: a seeded one's bytes (the image's, a bundle's),
+    /// kept here as they were laid, not written to the block store; the file
+    /// moves to the store when a program's write takes it past what stays
+    /// inline ([`FileNode::paged_for`]).
+    fn new(data: Vec<u8>, ino: u64, store: bool) -> FileNode {
+        note_capacity(0, data.capacity());
         FileNode {
+            pg: Mutex::new(None),
+            store,
             data: Mutex::new(data),
             lazy: Mutex::new(None),
             ino,
@@ -192,11 +264,50 @@ impl FileNode {
             read: core::sync::atomic::AtomicU64::new(0),
             written: core::sync::atomic::AtomicBool::new(false),
             changes: core::sync::atomic::AtomicU64::new(1),
+            gone_mode: core::sync::atomic::AtomicU32::new(0o644),
+            laid: core::sync::atomic::AtomicU32::new(LAID),
+            pend: Mutex::new(None),
         }
+    }
+    /// Its bytes here: at once for an ordinary file; for a pending one,
+    /// once they come (EIO if they never will, EAGAIN where this thread may
+    /// not wait). Before any use of the bytes.
+    fn ready(&self) -> Result<(), Errno> {
+        match self.laid.load(Ordering::Acquire) {
+            LAID => return Ok(()),
+            PENDING => {
+                if !pending_wait(&self.laid, self.ino) {
+                    return Err(Errno::EAGAIN);
+                }
+            }
+            _ => {}
+        }
+        match self.laid.load(Ordering::Acquire) {
+            LAID => Ok(()),
+            _ => Err(Errno::EIO),
+        }
+    }
+    /// The store's contents, made from `data` first when the file is to be
+    /// `end` bytes long and that is past what stays inline (blocks.rs).
+    fn paged_for(&self, end: u64) -> std::sync::MutexGuard<'_, Option<super::blocks::PFile>> {
+        let mut pg = self.pg.lock().unwrap();
+        if pg.is_none() && self.store && super::blocks::wants(end) {
+            let mut data = self.data.lock().unwrap();
+            let mut p = super::blocks::PFile::new();
+            if !data.is_empty() && p.write(0, &data).is_err() {
+                return pg;
+            }
+            let was = data.capacity();
+            *data = Vec::new();
+            note_capacity(was, 0);
+            *pg = Some(p);
+        }
+        pg
     }
     /// One more change of the contents; called with `data` locked (the
     /// count's reader pairs with this through that lock: [`FileNode::changes`]).
     fn changed(&self) {
+        moved();
         self.changes.fetch_add(1, Ordering::AcqRel);
     }
     fn touch(&self) {
@@ -218,6 +329,7 @@ impl FileNode {
     }
     /// Modified at `secs`: the change time with it, once the times are kept.
     fn stamp(&self, secs: i64) {
+        moved();
         self.mtime.store(secs, Ordering::Relaxed);
         let mut t = self.times.lock().unwrap();
         if *t != super::Times::default() {
@@ -229,6 +341,7 @@ impl FileNode {
     /// `utimensat`/`futimens`: either time (`None`: leave it), and the
     /// change time is `now`.
     fn set_times(&self, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>, now: i64) {
+        moved();
         let mut t = self.times.lock().unwrap();
         if *t == super::Times::default() {
             let m = self.mtime.load(Ordering::Relaxed);
@@ -250,10 +363,18 @@ impl FileNode {
         *self.times.lock().unwrap()
     }
 
-    /// The size, lazy or not.
+    /// The size, lazy or not, pending or not.
     fn size(&self) -> u64 {
+        if self.laid.load(Ordering::Acquire) != LAID {
+            if let Some(p) = self.pend.lock().unwrap().as_ref() {
+                return p.size;
+            }
+        }
         if let Some(l) = self.lazy.lock().unwrap().as_ref() {
             return l.size;
+        }
+        if let Some(p) = self.pg.lock().unwrap().as_ref() {
+            return p.size;
         }
         self.data.lock().unwrap().len() as u64
     }
@@ -271,7 +392,21 @@ impl FileNode {
         if lazy.is_some() {
             return;
         }
+        let mut pg = self.pg.lock().unwrap();
         let mut data = self.data.lock().unwrap();
+        if let Some(p) = pg.as_mut() {
+            if p.size == 0 || p.size >= size {
+                return;
+            }
+            let mut all = vec![0u8; p.size as usize];
+            if p.read(0, &mut all).is_err() {
+                return;
+            }
+            let was = data.capacity();
+            *data = all;
+            note_capacity(was, data.capacity());
+            *pg = None;
+        }
         let have = data.len() as u64;
         let last = size % LAZY_CHUNK;
         let head = if have % LAZY_CHUNK == 0 {
@@ -310,6 +445,13 @@ impl FileNode {
         let Some(l) = lazy.as_mut() else { return Ok(()) };
         let mut all = vec![0u8; l.size as usize];
         l.read(0, &mut all)?;
+        if let Some(p) = self.paged_for(l.size).as_mut() {
+            p.truncate(0)?;
+            p.write(0, &all)?;
+            TMPFS_BYTES.fetch_sub(l.held, core::sync::atomic::Ordering::Relaxed);
+            *lazy = None;
+            return Ok(());
+        }
         let mut data = self.data.lock().unwrap();
         let was = data.capacity();
         *data = all;
@@ -489,7 +631,26 @@ pub fn set_clock(clock: crate::syscalls::ClockFn) {
     let _ = CLOCK.set(clock);
 }
 
+thread_local! {
+    /// The time of the call this thread is serving for another module
+    /// ([`at_time`]), or `i64::MIN` when none.
+    static CALL_NOW: core::cell::Cell<i64> = const { core::cell::Cell::new(i64::MIN) };
+}
+
+/// Run `f` with `now` as the time every tmpfs stamps: a module with no clock
+/// of its own serving a call that brought the caller's.
+pub fn at_time<R>(now: i64, f: impl FnOnce() -> R) -> R {
+    let was = CALL_NOW.with(|c| c.replace(now));
+    let r = f();
+    CALL_NOW.with(|c| c.set(was));
+    r
+}
+
 pub(crate) fn now() -> i64 {
+    let call = CALL_NOW.try_with(|c| c.get()).unwrap_or(i64::MIN);
+    if call != i64::MIN {
+        return call;
+    }
     (CLOCK.get().copied().unwrap_or(crate::syscalls::system_clock))().0 as i64
 }
 
@@ -522,9 +683,14 @@ struct Inner {
     /// `/bin/sh` whose execute bit was silently dropped.
     modes: BTreeMap<String, u32>,
     /// Modification times of the nodes that are not files (a file keeps its
-    /// own, see `FileNode`), set by `utimensat`; sparse like `modes`, and a
-    /// path without one reports 0.
+    /// own, see `FileNode`), set by `utimensat`, a program's `mkdir` and
+    /// seeding; sparse like `modes`, and a path without one reports 0.
     mtimes: BTreeMap<String, i64>,
+    /// The directories whose time in `mtimes` is their newest entry's, not
+    /// their own: seeded without one (a tar that names no entry for a
+    /// directory, a lazy list's parents), dated by what seeding dates in
+    /// them ([`Inner::date_parents`]) until something dates them.
+    inferred: BTreeSet<String>,
     /// How many names each inode in `inos` has: a file's link count, kept
     /// as names come and go (counting `inos` at every `stat` scanned the
     /// whole tree, 16 us a call once a Python was installed).
@@ -638,10 +804,48 @@ impl Inner {
 
     /// Remove name `path` and what it keeps beside the node.
     fn forget(&mut self, path: &str) {
-        self.nodes.remove(path);
+        let mode = self.modes.remove(path);
+        if let Some(Node::File(f)) = self.nodes.remove(path) {
+            f.gone_mode.store(mode.unwrap_or(0o644), Ordering::Relaxed);
+        }
         self.drop_ino(path);
-        self.modes.remove(path);
         self.mtimes.remove(path);
+        self.inferred.remove(path);
+    }
+
+    /// Seeding dated `path` at `secs`: each directory above it with no time
+    /// of its own takes its newest entry's, the same on every load (never
+    /// the load's clock). Without this they read 0, January 1970.
+    fn date_parents(&mut self, path: &str, secs: i64) {
+        if secs <= 0 {
+            return;
+        }
+        let mut p = path;
+        while let Some((d, _)) = p.rsplit_once('/') {
+            p = d;
+            match self.mtimes.get(d) {
+                Some(&t) if !self.inferred.contains(d) || t >= secs => {}
+                _ => {
+                    self.mtimes.insert(d.to_string(), secs);
+                    self.inferred.insert(d.to_string());
+                }
+            }
+        }
+    }
+
+    /// An entry of `path`'s directory was made or removed by a program: the
+    /// directory's modification time is now, as Linux keeps it (KService
+    /// and make compare a directory's time with their own records).
+    ///
+    /// A change with no time (0: a module with no clock, seeding) leaves
+    /// it, so a seeded directory keeps the time its entries give it.
+    fn entries_changed(&mut self, path: &str, now: i64) {
+        if now <= 0 {
+            return;
+        }
+        let d = path.rfind('/').map_or("", |i| &path[..i]);
+        self.mtimes.insert(d.to_string(), now);
+        self.inferred.remove(d);
     }
 
     /// Move everything named under directory `from` to the same names under
@@ -674,11 +878,18 @@ impl Inner {
 struct Shared {
     m: RwLock<Inner>,
     gate: super::RenameGate,
+    /// Files made from now on keep their contents in the block store once
+    /// past what stays inline ([`TmpFs::use_store`]).
+    store: core::sync::atomic::AtomicBool,
+    /// The files a bundle's index named, by path as it named them, until
+    /// the bundle ends ([`TmpFs::add_pending`], [`TmpFs::fill_pending`]).
+    pending: Mutex<std::collections::HashMap<String, Arc<FileNode>>>,
 }
 
 impl Shared {
     /// The tree to change.
     fn lock(&self) -> LockResult<RwLockWriteGuard<'_, Inner>> {
+        moved();
         self.m.write()
     }
     /// The tree to look at.
@@ -687,12 +898,40 @@ impl Shared {
     }
 }
 
+#[path = "persist.rs"]
+pub mod persist;
+
 /// An in-memory filesystem.
 pub struct TmpFs {
     inner: Arc<Shared>,
 }
 
 impl TmpFs {
+    /// `mkdir`, the directory dated `now`, the caller's clock (a kernel
+    /// module with none takes its process's).
+    pub fn mkdir_now(&self, path: &str, mode: u32, now: i64) -> Result<(), Errno> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.nodes.contains_key(path) {
+            return Err(Errno::EEXIST);
+        }
+        inner.parent_ok(path)?;
+        let mode = mode & 0o7777;
+        if mode != Metadata::dir().mode {
+            inner.modes.insert(path.to_string(), mode);
+        }
+        let ino = inner.next_ino;
+        inner.next_ino += 1;
+        inner.set_ino(path.to_string(), ino);
+        inner.nodes.insert(path.to_string(), Node::Dir);
+        // A program's directory is made now, as a file is.
+        inner.mtimes.insert(path.to_string(), now);
+        inner.entries_changed(path, now);
+        note(&inner, fs_key(&self.inner), path, Some((ino, true)), crate::inotify::mask::CREATE, 0);
+        // VNOP_MKDIR: the directory NOTE_LINK|NOTE_WRITE.
+        vnote_parent(&inner, fs_key(&self.inner), path, crate::vnote::note::LINK | crate::vnote::note::WRITE);
+        Ok(())
+    }
+
     /// `utimensat` with the change time given (see
     /// [`FileHandle::set_times_now`]). A file keeps both times to the
     /// nanosecond; anything else keeps whole-second modification times.
@@ -704,6 +943,7 @@ impl TmpFs {
             Some(_) => {
                 if let Some((s, _)) = mtime {
                     inner.mtimes.insert(path.to_string(), s);
+                    inner.inferred.remove(path);
                 }
             }
         }
@@ -736,10 +976,6 @@ impl TmpFs {
             match self.inner.gate.rename(own, dir, || self.rename_locked(from, to, noreplace, dir)) {
                 Err(Errno::EAGAIN) => continue,
                 r => {
-                    if r.is_ok() {
-                        saved(from);
-                        saved(to);
-                    }
                     return r;
                 }
             }
@@ -804,6 +1040,9 @@ impl TmpFs {
         }
         inner.nodes.insert(to.to_string(), node);
         inner.inos.insert(to.to_string(), ino);
+        let t = now();
+        inner.entries_changed(from, t);
+        inner.entries_changed(to, t);
         if is_dir {
             inner.move_under(from, to);
             let lo = format!("{to}/");
@@ -883,8 +1122,20 @@ impl TmpFs {
         inner.nodes.insert(String::new(), Node::Dir);
         inner.set_ino(String::new(), 1);
         TmpFs {
-            inner: Arc::new(Shared { m: RwLock::new(inner), gate: Default::default() }),
+            inner: Arc::new(Shared { m: RwLock::new(inner), gate: Default::default(), store: Default::default(), pending: Default::default() }),
         }
+    }
+
+    /// Keep the contents of files made from now on in the block store
+    /// (`super::blocks`, once it is configured), as the root does. Any other
+    /// tmpfs (`/dev/shm`, one a program mounts) keeps them in memory, as
+    /// Linux's tmpfs does.
+    pub fn use_store(&self) {
+        self.inner.store.store(true, Ordering::Relaxed);
+    }
+
+    fn stored(&self) -> bool {
+        self.inner.store.load(Ordering::Relaxed)
     }
 
     /// Pre-populate a file, for seeding a root filesystem at startup.
@@ -896,9 +1147,10 @@ impl TmpFs {
         inner.next_ino += 1;
         inner.set_ino(path.clone(), ino);
         inner.nodes.insert(
-            path,
-            Node::File(Arc::new(FileNode::new(contents, ino))),
+            path.clone(),
+            Node::File(Arc::new(FileNode::new(contents, ino, self.stored()))),
         );
+        persist::late_laid(&mut inner, &path, ino);
     }
 
     /// Bytes of a seeded file ([`TmpFs::add_file`]) at `offset`, for a seeding
@@ -911,6 +1163,11 @@ impl TmpFs {
             Some(Node::File(f)) => Arc::clone(f),
             _ => return Err(Errno::ENOENT),
         };
+        // Seeding stays where it was laid: only a file a program already
+        // moved to the store takes its parts there.
+        if let Some(p) = f.pg.lock().unwrap().as_mut() {
+            return p.write(offset, bytes).map(|_| ());
+        }
         let mut data = f.data.lock().unwrap();
         let start = offset as usize;
         let end = start + bytes.len();
@@ -922,6 +1179,104 @@ impl TmpFs {
         }
         data[start..end].copy_from_slice(bytes);
         Ok(())
+    }
+
+    /// A file a bundle's index names, before its bytes: `size` bytes, its
+    /// mode and time as the bundle has them. It is there at once for every
+    /// lookup, `stat` and listing; a use of its bytes (a read, a mapping, a
+    /// write, a truncation) waits until [`TmpFs::fill_pending`] has them all,
+    /// or is EIO once [`TmpFs::end_pending`] says they never will come. A
+    /// file of no bytes is an ordinary one.
+    pub fn add_pending(&self, path: &str, size: u64, mode: u32, mtime: i64) {
+        let path = path.trim_start_matches('/').to_string();
+        let f = {
+            let mut inner = self.inner.lock().unwrap();
+            Self::ensure_parents(&mut inner, &path);
+            let ino = inner.next_ino;
+            inner.next_ino += 1;
+            inner.set_ino(path.clone(), ino);
+            let f = Arc::new(FileNode::new(Vec::new(), ino, self.stored()));
+            f.mtime.store(mtime, Ordering::Relaxed);
+            if size > 0 {
+                *f.pend.lock().unwrap() = Some(Pend { size, buf: Vec::new(), got: 0 });
+                f.laid.store(PENDING, Ordering::Release);
+            }
+            inner.nodes.insert(path.clone(), Node::File(Arc::clone(&f)));
+            let _ = inner.chmod(&path, mode);
+            persist::late_laid(&mut inner, &path, ino);
+            f
+        };
+        self.inner.pending.lock().unwrap().insert(path, f);
+    }
+
+    /// Bytes at `offset` of a file the index named ([`TmpFs::add_pending`]),
+    /// whatever its name is now: once all have come, it is an ordinary file
+    /// and its waiters go on. False when the index did not name `path` (the
+    /// caller lays it as a seeded file); true, doing nothing, when the file
+    /// is no longer waiting (truncated by the program meanwhile).
+    pub fn fill_pending(&self, path: &str, offset: u64, bytes: &[u8]) -> bool {
+        let path = path.trim_start_matches('/');
+        let Some(f) = self.inner.pending.lock().unwrap().get(path).cloned() else { return false };
+        let mut pend = f.pend.lock().unwrap();
+        let Some(p) = pend.as_mut() else { return true };
+        let end = (offset + bytes.len() as u64).min(p.size);
+        if offset < end {
+            if p.buf.len() < end as usize {
+                let was = p.buf.capacity();
+                if p.buf.capacity() == 0 {
+                    p.buf.reserve_exact(p.size as usize);
+                }
+                p.buf.resize(end as usize, 0);
+                note_capacity(was, p.buf.capacity());
+            }
+            p.buf[offset as usize..end as usize].copy_from_slice(&bytes[..(end - offset) as usize]);
+            p.got += end - offset;
+        }
+        if p.got >= p.size {
+            let p = pend.take().unwrap();
+            let mut data = f.data.lock().unwrap();
+            // the same bytes, accounted where they now are
+            let was = p.buf.capacity();
+            *data = p.buf;
+            debug_assert_eq!(was, data.capacity());
+            drop(data);
+            drop(pend);
+            f.laid.store(LAID, Ordering::Release);
+            pending_wake(&f.laid);
+        }
+        true
+    }
+
+    /// The bundle's end: every file the index named whose bytes have not
+    /// all come never will (a short archive, a failed fetch or decode).
+    /// Each is EIO to every use from now on, and those waiting wake with
+    /// it. Their count.
+    pub fn end_pending(&self) -> usize {
+        let all: Vec<_> = self.inner.pending.lock().unwrap().drain().map(|(_, f)| f).collect();
+        let mut n = 0;
+        for f in all {
+            let mut pend = f.pend.lock().unwrap();
+            // its size kept, for `stat`; the bytes come so far let go
+            if let Some(p) = pend.as_mut().filter(|_| f.laid.load(Ordering::Acquire) == PENDING) {
+                note_capacity(std::mem::take(&mut p.buf).capacity(), 0);
+                drop(pend);
+                f.laid.store(FAILED, Ordering::Release);
+                pending_wake(&f.laid);
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// How many files the index named are still waiting for their bytes.
+    pub fn pending_count(&self) -> usize {
+        self.inner.pending.lock().unwrap().values().filter(|f| f.laid.load(Ordering::Acquire) == PENDING).count()
+    }
+
+    /// A pending file's path by its inode (the first named), for a report
+    /// of a long wait.
+    pub fn pending_path(&self, ino: u64) -> Option<String> {
+        self.inner.pending.lock().unwrap().iter().find(|(_, f)| f.ino == ino).map(|(p, _)| format!("/{p}"))
     }
 
     /// A file of `size` bytes whose contents are fetched from `url` as they
@@ -945,10 +1300,11 @@ impl TmpFs {
         let ino = inner.next_ino;
         inner.next_ino += 1;
         inner.set_ino(path.clone(), ino);
-        let f = FileNode::new(Vec::new(), ino);
+        let f = FileNode::new(Vec::new(), ino, self.stored());
         f.mtime.store(LAZY_MTIME, Ordering::Relaxed);
         *f.lazy.lock().unwrap() = Some(Lazy { url: url.to_string(), size, chunks: Default::default(), held: 0, ahead: 0, reads: 0 });
-        inner.nodes.insert(path, Node::File(Arc::new(f)));
+        inner.nodes.insert(path.clone(), Node::File(Arc::new(f)));
+        persist::late_laid(&mut inner, &path, ino);
     }
 
     /// Every file the program has made or changed since the root was seeded
@@ -963,40 +1319,6 @@ impl TmpFs {
                 _ => None,
             })
             .collect()
-    }
-
-    /// Every node, for a persist store's diff of the tree (web/runtime
-    /// persist.js): no file's bytes, so nothing lazy is fetched. Each is
-    /// [`TREE_ENTRY`] bytes, little-endian -- kind (0 file, 1 directory, 2
-    /// symlink, 3 socket), written ([`FileNode::written`]), two spare, mode,
-    /// size, changes ([`FileNode::changes`], 0 for not a file), mtime, the
-    /// path's length and the target's -- then the path (no leading `/`) and
-    /// a symlink's target.
-    pub fn tree(&self) -> Vec<u8> {
-        let inner = self.inner.read().unwrap();
-        let mut out = Vec::with_capacity(inner.nodes.len() * (TREE_ENTRY + 32));
-        for (p, n) in inner.nodes.iter() {
-            let (kind, written, size, changes, mtime, target): (u8, bool, u64, u64, i64, &str) = match n {
-                Node::File(f) => (0, f.written.load(Ordering::Relaxed), f.size(), f.changes.load(Ordering::Acquire), f.mtime.load(Ordering::Relaxed), ""),
-                Node::Dir => (1, false, 0, 0, inner.mtimes.get(p).copied().unwrap_or(0), ""),
-                Node::Symlink(t) => (2, false, t.len() as u64, 0, inner.mtimes.get(p).copied().unwrap_or(0), t.as_str()),
-                Node::Socket => (3, false, 0, 0, 0, ""),
-            };
-            let default = if kind == 1 { Metadata::dir().mode } else if kind == 2 { 0o777 } else { 0o644 };
-            let mode = inner.modes.get(p).copied().unwrap_or(default);
-            out.push(kind);
-            out.push(written as u8);
-            out.extend_from_slice(&[0, 0]);
-            out.extend_from_slice(&mode.to_le_bytes());
-            out.extend_from_slice(&size.to_le_bytes());
-            out.extend_from_slice(&changes.to_le_bytes());
-            out.extend_from_slice(&mtime.to_le_bytes());
-            out.extend_from_slice(&(p.len() as u32).to_le_bytes());
-            out.extend_from_slice(&(target.len() as u32).to_le_bytes());
-            out.extend_from_slice(p.as_bytes());
-            out.extend_from_slice(target.as_bytes());
-        }
-        out
     }
 
     /// Where file contents lie in this address space, for a session
@@ -1223,28 +1545,12 @@ struct TmpHandle {
     /// through a rename of the directory or of one above it, as a Linux
     /// descriptor follows its dentry (`Inner::dir_now`).
     dir: Option<u64>,
-    /// Whether this handle wrote or truncated: its close is then a change
-    /// finished ([`saved`]).
-    wrote: core::sync::atomic::AtomicBool,
     /// Opened to write: its close is `IN_CLOSE_WRITE`, else `IN_CLOSE_NOWRITE`.
     for_write: bool,
 }
 
-impl TmpHandle {
-    fn note_write(&self) {
-        if !self.wrote.load(Ordering::Relaxed) {
-            self.wrote.store(true, Ordering::Relaxed);
-        }
-    }
-}
-
 impl Drop for TmpHandle {
     fn drop(&mut self) {
-        // By the name it was opened by: a drop takes no lock. A save is
-        // closed before it is renamed into place, and the rename is counted.
-        if self.wrote.load(Ordering::Relaxed) {
-            saved(&self.path);
-        }
         if crate::inotify::any() {
             use crate::inotify::mask;
             let ev = if self.for_write { mask::CLOSE_WRITE } else { mask::CLOSE_NOWRITE };
@@ -1313,8 +1619,12 @@ impl FileHandle for TmpHandle {
             return Err(Errno::EISDIR);
         };
         file.mark_read();
+        file.ready()?;
         if let Some(l) = file.lazy.lock().unwrap().as_mut() {
             return l.read(offset, buf);
+        }
+        if let Some(p) = file.pg.lock().unwrap().as_mut() {
+            return p.read(offset, buf);
         }
         let data = file.data.lock().unwrap();
         let start = (offset as usize).min(data.len());
@@ -1329,7 +1639,8 @@ impl FileHandle for TmpHandle {
 
     fn read_with(&self, offset: u64, len: usize, f: &mut dyn FnMut(&[u8])) -> Option<SysResult> {
         let file = self.file.as_ref()?;
-        if file.lazy.lock().unwrap().is_some() {
+        // (a pending file: by `read_at`, which waits)
+        if file.laid.load(Ordering::Acquire) != LAID || file.lazy.lock().unwrap().is_some() || file.pg.lock().unwrap().is_some() {
             return None;
         }
         file.mark_read();
@@ -1340,11 +1651,25 @@ impl FileHandle for TmpHandle {
         Some(Ok(n as u64))
     }
 
+    fn sync(&self, data_only: bool) -> Result<(), Errno> {
+        // With the root kept (persist.rs), `fsync` writes a generation: the
+        // file's blocks, and its name and size with the rest of the tree.
+        if !data_only && persist::on() {
+            return persist::sync();
+        }
+        let Some(file) = &self.file else { return Ok(()) };
+        match file.pg.lock().unwrap().as_ref() {
+            Some(p) => p.sync(),
+            None => Ok(()),
+        }
+    }
+
     fn advise(&self, offset: u64, len: u64, advice: u32) -> Result<(), Errno> {
         let Some(file) = &self.file else { return Ok(()) };
         // The advice that fetches: a range wanted, an image mapped.
         if advice == super::FADV_WILLNEED || advice == super::FADV_GEX_IMAGE {
             file.mark_read();
+            file.ready()?;
         }
         match file.lazy.lock().unwrap().as_mut() {
             Some(l) => l.advise(offset, len, advice),
@@ -1356,7 +1681,22 @@ impl FileHandle for TmpHandle {
         let Some(file) = &self.file else {
             return Err(Errno::EISDIR);
         };
+        file.ready()?;
         file.materialize()?;
+        // Held through the inline write too: a file that crosses the
+        // threshold meanwhile moves only after this write.
+        let mut pg = file.paged_for(offset + buf.len() as u64);
+        if let Some(p) = pg.as_mut() {
+            // ubc_setsize's NOTE_EXTEND, for a write past the end.
+            let grew = offset + buf.len() as u64 > p.size;
+            p.write(offset, buf)?;
+            file.changed();
+            drop(pg);
+            file.touch();
+            self.note_here(crate::inotify::mask::MODIFY);
+            self.vnote_here(crate::vnote::note::WRITE | if grew { crate::vnote::note::EXTEND } else { 0 });
+            return Ok(buf.len() as u64);
+        }
         let mut data = file.data.lock().unwrap();
         let start = offset as usize;
         // ubc_setsize's NOTE_EXTEND, for a write past the end.
@@ -1370,8 +1710,8 @@ impl FileHandle for TmpHandle {
         data[start..start + buf.len()].copy_from_slice(buf);
         file.changed();
         drop(data);
+        drop(pg);
         file.touch();
-        self.note_write();
         self.note_here(crate::inotify::mask::MODIFY);
         self.vnote_here(crate::vnote::note::WRITE | if grew { crate::vnote::note::EXTEND } else { 0 });
         Ok(buf.len() as u64)
@@ -1381,10 +1721,19 @@ impl FileHandle for TmpHandle {
         // An unlinked file still has a size and an inode number, so a handle
         // onto one answers from the contents rather than the tree.
         if let Some(file) = &self.file {
+            // Its mode by the name it was opened under while that still
+            // names it, else by any name it has now, else the last one's.
+            let mode = {
+                let inner = self.inner.read().unwrap();
+                match self.here(&inner) {
+                    Some(p) => inner.modes.get(&p).copied().unwrap_or(0o644),
+                    None => file.gone_mode.load(Ordering::Relaxed),
+                }
+            };
             return Ok(Metadata {
                 file_type: FileType::Regular,
                 size: file.size(),
-                mode: 0o644,
+                mode,
                 ino: file.ino,
                 mtime: file.mtime.load(Ordering::Relaxed),
                 nlink: 1,
@@ -1511,10 +1860,15 @@ impl FileHandle for TmpHandle {
         let Some(file) = &self.file else {
             return Err(Errno::EINVAL);
         };
+        file.ready()?;
         file.materialize()?;
-        self.note_write();
         let grew;
-        {
+        let mut pg = file.paged_for(len);
+        if let Some(p) = pg.as_mut() {
+            grew = len > p.size;
+            p.truncate(len)?;
+            file.changed();
+        } else {
             let mut data = file.data.lock().unwrap();
             grew = len as usize > data.len();
             let was = data.capacity();
@@ -1592,9 +1946,12 @@ impl FileHandle for TmpHandle {
     }
 }
 
-impl FileSystem for TmpFs {
-    fn open(&self, path: &str, flags: u64, mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+impl TmpFs {
+    /// [`FileSystem::open`], with the mode a file it creates takes: a
+    /// program's exact `mode` ([`FileSystem::open_mode`]), or the default.
+    fn open_as(&self, path: &str, flags: u64, mode: Option<u32>) -> Result<Arc<dyn FileHandle>, Errno> {
         let path = path.to_string();
+
         let mut dir = None;
         let mut wrote = false;
         let mut created = false;
@@ -1615,10 +1972,21 @@ impl FileSystem for TmpFs {
                     }
                     if flags & oflags::O_TRUNC != 0 {
                         if let Some(Node::File(f)) = inner.nodes.get(&path) {
+                            // A pending file emptied: its bytes are not
+                            // wanted, and it waits no longer.
+                            if let Some(p) = f.pend.lock().unwrap().take() {
+                                note_capacity(p.buf.capacity(), 0);
+                                f.laid.store(LAID, Ordering::Release);
+                                pending_wake(&f.laid);
+                            }
+                            let _ = f.laid.compare_exchange(FAILED, LAID, Ordering::AcqRel, Ordering::Acquire);
                             if let Some(l) = f.lazy.lock().unwrap().take() {
                                 TMPFS_BYTES.fetch_sub(l.held, core::sync::atomic::Ordering::Relaxed);
                             }
-                            {
+                            if let Some(p) = f.pg.lock().unwrap().as_mut() {
+                                let _ = p.truncate(0);
+                                f.changed();
+                            } else {
                                 let mut data = f.data.lock().unwrap();
                                 let was = data.capacity();
                                 data.clear();
@@ -1650,14 +2018,17 @@ impl FileSystem for TmpFs {
                     let ino = inner.next_ino;
                     inner.next_ino += 1;
                     inner.set_ino(path.clone(), ino);
-                    let f = Arc::new(FileNode::new(Vec::new(), ino));
+                    let f = Arc::new(FileNode::new(Vec::new(), ino, self.stored()));
                     f.mark_written();
                     wrote = true;
                     created = true;
                     inner.nodes.insert(path.clone(), Node::File(Arc::clone(&f)));
-                    // Created with the mode asked for (the umask applied by
-                    // the caller).
-                    let _ = inner.chmod(&path, mode);
+                    inner.entries_changed(&path, now());
+                    // A program's O_CREAT mode (its umask applied): exactly
+                    // that, 0 too. The kernel's own opens take the default.
+                    if let Some(mode) = mode {
+                        let _ = inner.chmod(&path, mode);
+                    }
                     Some(f)
                 }
             }
@@ -1668,7 +2039,6 @@ impl FileSystem for TmpFs {
             path,
             file,
             dir,
-            wrote: core::sync::atomic::AtomicBool::new(wrote),
             for_write: acc == oflags::O_WRONLY || acc == oflags::O_RDWR,
         };
         if crate::inotify::any() {
@@ -1690,6 +2060,16 @@ impl FileSystem for TmpFs {
             }
         }
         Ok(Arc::new(h))
+    }
+}
+
+impl FileSystem for TmpFs {
+    fn open(&self, path: &str, flags: u64, _mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+        self.open_as(path, flags, None)
+    }
+
+    fn open_mode(&self, path: &str, flags: u64, mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+        self.open_as(path, flags, Some(mode))
     }
 
     fn watch_key(&self, path: &str) -> Result<(Option<crate::inotify::Key>, bool), Errno> {
@@ -1742,8 +2122,10 @@ impl FileSystem for TmpFs {
             Some(Node::File(f)) => f.stamp(secs),
             Some(_) => {
                 inner.mtimes.insert(path.to_string(), secs);
+                inner.inferred.remove(path);
             }
         }
+        inner.date_parents(path, secs);
         note_path(&inner, fs_key(&self.inner), path, crate::inotify::mask::ATTRIB);
         Ok(())
     }
@@ -1818,10 +2200,9 @@ impl FileSystem for TmpFs {
             Some(Node::Dir) => Err(Errno::EISDIR),
             Some(_) => {
                 let own = node_ino(&inner, path);
-                inner.nodes.remove(path);
-                inner.drop_ino(path);
-                inner.mtimes.remove(path);
-                saved(path);
+                // Its mode too: a file made at the name later is a new one.
+                inner.forget(path);
+                inner.entries_changed(path, now());
                 if let Some(own) = own {
                     note_removed(&inner, fs_key(&self.inner), path, own);
                 }
@@ -1832,23 +2213,7 @@ impl FileSystem for TmpFs {
     }
 
     fn mkdir(&self, path: &str, mode: u32) -> Result<(), Errno> {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.nodes.contains_key(path) {
-            return Err(Errno::EEXIST);
-        }
-        inner.parent_ok(path)?;
-        let mode = mode & 0o7777;
-        if mode != Metadata::dir().mode {
-            inner.modes.insert(path.to_string(), mode);
-        }
-        let ino = inner.next_ino;
-        inner.next_ino += 1;
-        inner.set_ino(path.to_string(), ino);
-        inner.nodes.insert(path.to_string(), Node::Dir);
-        note(&inner, fs_key(&self.inner), path, Some((ino, true)), crate::inotify::mask::CREATE, 0);
-        // VNOP_MKDIR: the directory NOTE_LINK|NOTE_WRITE.
-        vnote_parent(&inner, fs_key(&self.inner), path, crate::vnote::note::LINK | crate::vnote::note::WRITE);
-        Ok(())
+        self.mkdir_now(path, mode, now())
     }
 
     fn rmdir(&self, path: &str) -> Result<(), Errno> {
@@ -1870,6 +2235,9 @@ impl FileSystem for TmpFs {
         inner.nodes.remove(path);
         inner.drop_ino(path);
         inner.modes.remove(path);
+        inner.mtimes.remove(path);
+        inner.inferred.remove(path);
+        inner.entries_changed(path, now());
         if let Some(own) = own {
             note_removed(&inner, fs_key(&self.inner), path, own);
         }
@@ -1919,6 +2287,7 @@ impl FileSystem for TmpFs {
         let mode = inner.modes.get(from).copied();
         inner.nodes.insert(to.to_string(), node);
         inner.set_ino(to.to_string(), ino);
+        inner.entries_changed(to, now());
         if let Some(m) = mode {
             inner.modes.insert(to.to_string(), m);
         }
@@ -1948,6 +2317,7 @@ impl FileSystem for TmpFs {
         inner.next_ino += 1;
         inner.set_ino(path.to_string(), ino);
         inner.nodes.insert(path.to_string(), Node::Socket);
+        inner.entries_changed(path, now());
         note(&inner, fs_key(&self.inner), path, Some((ino, false)), crate::inotify::mask::CREATE, 0);
         // VNOP_CREATE (a socket's name) and VNOP_SYMLINK: the directory
         // NOTE_WRITE.
@@ -1967,6 +2337,7 @@ impl FileSystem for TmpFs {
         inner
             .nodes
             .insert(path.to_string(), Node::Symlink(target.to_string()));
+        inner.entries_changed(path, now());
         note(&inner, fs_key(&self.inner), path, Some((ino, false)), crate::inotify::mask::CREATE, 0);
         // VNOP_CREATE (a socket's name) and VNOP_SYMLINK: the directory
         // NOTE_WRITE.
@@ -1984,12 +2355,58 @@ fn reserve(data: &mut Vec<u8>, len: usize) -> Result<(), Errno> {
     if more == 0 || data.capacity() >= len {
         return Ok(());
     }
+    let max = TMPFS_MAX.load(core::sync::atomic::Ordering::Relaxed);
+    if max != 0 {
+        // Under a max, the doubling only while it fits; then exactly `len`.
+        let held = TMPFS_BYTES.load(core::sync::atomic::Ordering::Relaxed);
+        let doubled = len.max(data.capacity().saturating_mul(2));
+        if held + (doubled - data.capacity()) as u64 <= max {
+            return data.try_reserve(more).or_else(|_| data.try_reserve_exact(more)).map_err(|_| Errno::ENOSPC);
+        }
+        if held + (len - data.capacity()) as u64 > max {
+            return Err(Errno::ENOSPC);
+        }
+        return data.try_reserve_exact(more).map_err(|_| Errno::ENOSPC);
+    }
     data.try_reserve(more).or_else(|_| data.try_reserve_exact(more)).map_err(|_| Errno::ENOSPC)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A program making or removing a name moves its directory's time, as on
+    /// Linux; seeding does not. A KService database built with the image
+    /// compares the time of /usr/share/applications with its own, so a
+    /// package's desktop entry was never found while the directory kept its
+    /// seeded time.
+    #[test]
+    fn a_name_made_or_removed_moves_its_directory_time() {
+        use crate::fs::oflags::{O_CREAT, O_RDWR};
+        let fs = TmpFs::new();
+        fs.add_dir("apps");
+        fs.add_file("apps/seeded.desktop", b"x".to_vec());
+        let dir = |fs: &TmpFs| FileSystem::metadata(fs, "apps").unwrap().mtime;
+        FileSystem::set_mtime(&fs, "apps", 1_000).unwrap();
+        fs.add_file("apps/also-seeded.desktop", b"x".to_vec());
+        assert_eq!(dir(&fs), 1_000, "seeding keeps the directory's time");
+        let steps: [(&str, &dyn Fn(&TmpFs)); 6] = [
+            ("create", &|fs| { fs.open("apps/new.desktop", O_RDWR | O_CREAT, 0o644).unwrap(); }),
+            ("rename in", &|fs| { fs.open("t", O_RDWR | O_CREAT, 0o644).unwrap(); fs.rename("t", "apps/moved.desktop").unwrap(); }),
+            ("unlink", &|fs| fs.unlink("apps/new.desktop").unwrap()),
+            ("mkdir", &|fs| fs.mkdir("apps/sub", 0o755).unwrap()),
+            ("rmdir", &|fs| fs.rmdir("apps/sub").unwrap()),
+            ("symlink", &|fs| fs.symlink("seeded.desktop", "apps/link.desktop").unwrap()),
+        ];
+        for (what, step) in steps {
+            FileSystem::set_mtime(&fs, "apps", 1_000).unwrap();
+            step(&fs);
+            assert!(dir(&fs) > 1_000, "{what} in the directory moves its time");
+        }
+        FileSystem::set_mtime(&fs, "apps", 1_000).unwrap();
+        fs.rename("apps/moved.desktop", "gone.desktop").unwrap();
+        assert!(dir(&fs) > 1_000, "a rename out of the directory moves its time");
+    }
 
     /// A lazy file's time does not come from the clock: two loads of the same
     /// site, a second apart, see the same time for it, and a recorded time
@@ -2326,6 +2743,36 @@ mod tests {
     }
 
     #[test]
+    fn a_file_created_takes_the_open_mode_and_an_existing_one_keeps_its_own() {
+        let fs = TmpFs::new();
+        let mode = |p: &str| fs.metadata(p).unwrap().mode & 0o7777;
+        fs.open_mode("x", oflags::O_CREAT | oflags::O_RDWR, 0o755).unwrap();
+        assert_eq!(mode("x"), 0o755);
+        fs.open_mode("x", oflags::O_CREAT | oflags::O_RDWR, 0o600).unwrap();
+        assert_eq!(mode("x"), 0o755);
+        // A program's 0 is 0000, as on Linux.
+        fs.open_mode("z", oflags::O_CREAT | oflags::O_RDWR, 0).unwrap();
+        assert_eq!(mode("z"), 0);
+        // The kernel's own open: the default.
+        fs.open("d", oflags::O_CREAT | oflags::O_RDWR, 0o700).unwrap();
+        assert_eq!(mode("d"), 0o644);
+    }
+
+    #[test]
+    fn fstat_says_the_mode_after_a_chmod_a_rename_and_an_unlink() {
+        let fs = TmpFs::new();
+        let h = fs.open_mode("f", oflags::O_CREAT | oflags::O_RDWR, 0o600).unwrap();
+        let fmode = || h.metadata().unwrap().mode & 0o7777;
+        assert_eq!(fmode(), 0o600);
+        fs.chmod("f", 0o751).unwrap();
+        assert_eq!(fmode(), 0o751);
+        fs.rename("f", "g").unwrap();
+        assert_eq!(fmode(), 0o751);
+        fs.unlink("g").unwrap();
+        assert_eq!(fmode(), 0o751);
+    }
+
+    #[test]
     fn writing_past_the_end_extends_with_zeros() {
         let fs = TmpFs::new();
         let f = fs.open("f", oflags::O_CREAT | oflags::O_RDWR, 0).unwrap();
@@ -2378,6 +2825,33 @@ mod tests {
         assert_eq!(fs.read_link("nothing-here"), Err(Errno::ENOENT));
         assert_eq!(fs.read_link("no-dir/x"), Err(Errno::ENOENT));
         assert_eq!(fs.read_link("f/x"), Err(Errno::ENOTDIR));
+    }
+
+    #[test]
+    fn a_seeded_directory_has_its_newest_entrys_time_and_its_own_wins() {
+        // A tar with no entry for `a` or `a/b` (or a lazy list's parents):
+        // they read 0, January 1970, in every file manager.
+        let fs = TmpFs::new();
+        fs.add_file("a/b/one", b"1".to_vec());
+        fs.set_mtime("a/b/one", 1_600_000_000).unwrap();
+        fs.add_file("a/b/two", b"2".to_vec());
+        fs.set_mtime("a/b/two", 1_700_000_000).unwrap();
+        fs.add_file("a/b/old", b"3".to_vec());
+        fs.set_mtime("a/b/old", 1_500_000_000).unwrap();
+        assert_eq!(fs.metadata("a/b").unwrap().mtime, 1_700_000_000, "its newest entry's");
+        assert_eq!(fs.metadata("a").unwrap().mtime, 1_700_000_000);
+        // A directory's own time (a tar's entry for it) wins over its
+        // entries', before or after them.
+        fs.set_mtime("a", 1_234_567_890).unwrap();
+        fs.add_file("a/c", b"4".to_vec());
+        fs.set_mtime("a/c", 1_800_000_000).unwrap();
+        assert_eq!(fs.metadata("a").unwrap().mtime, 1_234_567_890, "its own");
+        // A lazy file not dated yet dates nothing.
+        fs.add_lazy("z/lazy", 10, "/z");
+        assert_eq!(fs.metadata("z").unwrap().mtime, 0);
+        // A program's directory is made now.
+        fs.mkdir("made", 0o755).unwrap();
+        assert!(fs.metadata("made").unwrap().mtime > 0);
     }
 
     #[test]
@@ -2528,6 +3002,99 @@ mod lazy_tests {
     }
 
     #[test]
+    fn a_pending_file_is_there_before_its_bytes() {
+        let fs = TmpFs::new();
+        fs.add_pending("/usr/lib/libx.so", 5, 0o755, 1234);
+        let m = fs.metadata("usr/lib/libx.so").unwrap();
+        assert_eq!((m.size, m.mode & 0o7777, m.mtime), (5, 0o755, 1234));
+        assert!(fs.metadata("usr/lib").unwrap().file_type == FileType::Directory);
+        let names: Vec<_> = fs.open("usr/lib", oflags::O_DIRECTORY, 0).unwrap().read_dir().unwrap().into_iter().map(|e| e.name).collect();
+        assert!(names.iter().any(|n| n == "libx.so"));
+        // an open does not wait; its fstat answers from the index
+        let h = fs.open("usr/lib/libx.so", 0, 0).unwrap();
+        assert_eq!(h.metadata().unwrap().size, 5);
+        assert_eq!(fs.pending_count(), 1);
+        // no bytes: an ordinary file at once
+        fs.add_pending("/etc/empty", 0, 0o644, 0);
+        assert_eq!(read_all(&fs, "etc/empty"), b"");
+    }
+
+    #[test]
+    fn a_read_of_a_pending_file_waits_for_all_its_bytes() {
+        let fs = Arc::new(TmpFs::new());
+        fs.add_pending("/bin/prog", 6, 0o755, 0);
+        let h = fs.open("bin/prog", 0, 0).unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut b = [0u8; 6];
+            let n = h.read_at(0, &mut b).unwrap();
+            (n, b)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(fs.fill_pending("/bin/prog", 0, b"abc"));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(!reader.is_finished(), "a read waits for the last part");
+        assert!(fs.fill_pending("/bin/prog", 3, b"def"));
+        assert_eq!(reader.join().unwrap(), (6, *b"abcdef"));
+        assert_eq!(fs.pending_count(), 0);
+        // seeded, not written by the program
+        assert!(fs.written().is_empty());
+        // a file the index did not name is the caller's to lay
+        assert!(!fs.fill_pending("/bin/other", 0, b"x"));
+    }
+
+    #[test]
+    fn a_bundle_that_ends_short_is_eio_never_enoent() {
+        let fs = Arc::new(TmpFs::new());
+        fs.add_pending("/usr/share/a", 4, 0o644, 0);
+        fs.add_pending("/usr/share/b", 4, 0o644, 0);
+        assert!(fs.fill_pending("/usr/share/a", 0, b"aaaa"));
+        assert!(fs.fill_pending("/usr/share/b", 0, b"bb"));
+        let h = fs.open("usr/share/b", 0, 0).unwrap();
+        let waiter = std::thread::spawn(move || h.read_at(0, &mut [0u8; 4]));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // the fetch or the decode failed, or the archive was short
+        assert_eq!(fs.end_pending(), 1);
+        assert_eq!(waiter.join().unwrap(), Err(Errno::EIO));
+        // still there: stat and open answer, the bytes are EIO
+        assert_eq!(fs.metadata("usr/share/b").unwrap().size, 4);
+        let h = fs.open("usr/share/b", 0, 0).unwrap();
+        assert_eq!(h.read_at(0, &mut [0u8; 4]), Err(Errno::EIO));
+        assert_eq!(h.write_at(0, b"x"), Err(Errno::EIO));
+        assert_eq!(read_all(&fs, "usr/share/a"), b"aaaa");
+        // a program replacing it may
+        let h = fs.open("usr/share/b", oflags::O_WRONLY | oflags::O_TRUNC, 0).unwrap();
+        assert_eq!(h.write_at(0, b"new").unwrap(), 3);
+        assert_eq!(read_all(&fs, "usr/share/b"), b"new");
+    }
+
+    #[test]
+    fn a_pending_file_is_filled_by_its_inode_whatever_its_name() {
+        let fs = TmpFs::new();
+        fs.add_pending("/usr/lib/liby.so.1.2", 3, 0o644, 0);
+        fs.link("usr/lib/liby.so.1.2", "usr/lib/liby-hard.so").unwrap();
+        fs.rename("usr/lib/liby.so.1.2", "usr/lib/moved").unwrap();
+        assert!(fs.fill_pending("/usr/lib/liby.so.1.2", 0, b"xyz"));
+        assert_eq!(read_all(&fs, "usr/lib/moved"), b"xyz");
+        assert_eq!(read_all(&fs, "usr/lib/liby-hard.so"), b"xyz");
+        assert!(fs.metadata("usr/lib/liby.so.1.2").is_err());
+        // emptied by the program before its bytes came: they do not
+        // overwrite what it wrote
+        fs.add_pending("/etc/conf", 3, 0o644, 0);
+        let h = fs.open("etc/conf", oflags::O_WRONLY | oflags::O_TRUNC, 0).unwrap();
+        h.write_at(0, b"mine").unwrap();
+        assert!(fs.fill_pending("/etc/conf", 0, b"old"));
+        assert_eq!(read_all(&fs, "etc/conf"), b"mine");
+    }
+
+    fn read_all(fs: &TmpFs, path: &str) -> Vec<u8> {
+        let h = fs.open(path, 0, 0).unwrap();
+        let mut b = vec![0u8; h.metadata().unwrap().size as usize];
+        let n = h.read_at(0, &mut b).unwrap() as usize;
+        b.truncate(n);
+        b
+    }
+
+    #[test]
     fn read_set_lists_the_files_whose_bytes_were_used() {
         set_lazy_fetch(fake);
         let fs = TmpFs::new();
@@ -2608,45 +3175,6 @@ mod lazy_tests {
         assert_eq!(fs.add_file_part("p/none", 0, b"x"), Err(Errno::ENOENT));
         fs.open("p/big", oflags::O_RDWR, 0).unwrap().write_at(0, b"x").unwrap();
         assert_eq!(fs.written(), ["/p/big"].map(String::from).to_vec());
-    }
-
-    /// A change the program finishes under the watched directory moves
-    /// `SAVES`: a close after a write, a create or a truncation, a rename
-    /// into or out of it, an unlink. A read, an open alone, and anything
-    /// outside it do not. (The only test that sets the watch.)
-    #[test]
-    fn saves_count_finished_changes_under_the_watched_directory() {
-        watch("/watched-saves/");
-        let fs = TmpFs::new();
-        fs.mkdir("watched-saves", 0o755).unwrap();
-        fs.mkdir("watched-savesx", 0o755).unwrap();
-        fs.add_file("watched-saves/old", b"seed".to_vec());
-        fs.add_file("other", b"seed".to_vec());
-        let n = || SAVES.load(Ordering::Relaxed);
-        let mut buf = [0u8; 4];
-        let at = n();
-        fs.open("watched-saves/old", oflags::O_RDONLY, 0).unwrap().read_at(0, &mut buf).unwrap();
-        drop(fs.open("watched-saves/old", oflags::O_RDWR, 0).unwrap());
-        fs.open("other", oflags::O_RDWR, 0).unwrap().write_at(0, b"x").unwrap();
-        fs.open("watched-savesx/f", oflags::O_CREAT | oflags::O_RDWR, 0o644).unwrap().write_at(0, b"x").unwrap();
-        assert_eq!(n(), at);
-        let h = fs.open("watched-saves/old", oflags::O_RDWR, 0).unwrap();
-        h.write_at(0, b"x").unwrap();
-        assert_eq!(n(), at, "counted at the close, not the write");
-        drop(h);
-        assert_eq!(n(), at + 1);
-        drop(fs.open("watched-saves/tmp", oflags::O_CREAT | oflags::O_WRONLY, 0o644).unwrap());
-        assert_eq!(n(), at + 2);
-        drop(fs.open("watched-saves/old", oflags::O_WRONLY | oflags::O_TRUNC, 0).unwrap());
-        assert_eq!(n(), at + 3);
-        FileSystem::rename(&fs, "other", "watched-saves/in").unwrap();
-        assert_eq!(n(), at + 4);
-        FileSystem::rename(&fs, "watched-saves/tmp", "outside").unwrap();
-        assert_eq!(n(), at + 5);
-        FileSystem::unlink(&fs, "watched-saves/in").unwrap();
-        assert_eq!(n(), at + 6);
-        FileSystem::unlink(&fs, "outside").unwrap();
-        assert_eq!(n(), at + 6);
     }
 
     /// Requests of `/data/h`, each `(offset, len)`.

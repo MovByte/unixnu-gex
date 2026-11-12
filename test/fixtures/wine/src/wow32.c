@@ -26,6 +26,11 @@
  *             writes through each map reads back with glGetBufferSubData
  *             (the 64-bit GL driver's mappings, as wow64 hands them to
  *             32-bit code)
+ *   maskmov   maskmovdqu: the masked bytes only, to [edi]
+ *   bcd       fbstp and fbld (packed BCD, as Delphi's float formatting
+ *             uses them): 1234567.5 rounds to even, and back
+ *   sysarch   GetSystemInfo INTEL and GetNativeSystemInfo AMD64, as a
+ *             32-bit program sees a 64-bit system
  *   sysbench N   N calls of NtQueryPerformanceCounter, then of
  *             NtQueryVirtualMemory, system calls with no server request:
  *             wall time per call (a measurement, timed
@@ -469,6 +474,49 @@ static int glmap_check(const char *what, unsigned seed, int n)
     return bad < 0;
 }
 
+__attribute__((target("sse2"))) static int case_maskmov(void)
+{
+    static const unsigned char src[16] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    static const unsigned char mask[16] = { 0x80, 0, 0xff, 0x7f, 0, 0x81, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x90 };
+    unsigned char dst[24];
+    int k, bad = 0;
+
+    memset(dst, 0xee, sizeof(dst));
+    __asm__ volatile("movdqu (%0), %%xmm0\n\tmovdqu (%1), %%xmm1\n\tmaskmovdqu %%xmm1, %%xmm0"
+                     :: "r"(src), "r"(mask), "D"(dst + 4) : "xmm0", "xmm1", "memory");
+    for (k = 0; k < 24; k++)
+    {
+        int i = k - 4;
+        unsigned char want = i >= 0 && i < 16 && (mask[i] & 0x80) ? src[i] : 0xee;
+        if (dst[k] != want) bad++;
+    }
+    CHECK(!bad, "maskmov maskmovdqu %d wrong bytes", bad);
+    return 0;
+}
+
+static int case_bcd(void)
+{
+    static const unsigned char want[10] = { 0x68, 0x45, 0x23, 0x01, 0, 0, 0, 0, 0, 0x80 };
+    unsigned char bcd[10];
+    double in = -1234567.5, out = 0;
+
+    __asm__ volatile("fldl %2\n\tfbstp %0\n\tfbld %0\n\tfstpl %1" : "=m"(bcd), "=m"(out) : "m"(in));
+    CHECK(!memcmp(bcd, want, 10), "bcd fbstp %02x%02x%02x%02x..%02x", bcd[3], bcd[2], bcd[1], bcd[0], bcd[9]);
+    CHECK(out == -1234568.0, "bcd fbld %.1f", out);
+    return 0;
+}
+
+static int case_sysarch(void)
+{
+    SYSTEM_INFO si, ni;
+
+    GetSystemInfo(&si);
+    GetNativeSystemInfo(&ni);
+    CHECK(si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_INTEL, "sysarch GetSystemInfo %u", si.wProcessorArchitecture);
+    CHECK(ni.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64, "sysarch GetNativeSystemInfo %u", ni.wProcessorArchitecture);
+    return 0;
+}
+
 static int case_glmap(void)
 {
     enum { N = 1 << 18 };
@@ -578,6 +626,9 @@ int main(int argc, char **argv)
     else if (!strcmp(c, "cbnest")) case_cbnest(argc > 2 ? atoi(argv[2]) : 8);
     else if (!strcmp(c, "spawn64") && argc > 2) case_spawn64(argv[2]);
     else if (!strcmp(c, "glmap")) case_glmap();
+    else if (!strcmp(c, "sysarch")) case_sysarch();
+    else if (!strcmp(c, "bcd")) case_bcd();
+    else if (!strcmp(c, "maskmov")) case_maskmov();
     else if (!strcmp(c, "child")) return 32;
     else { printf("FAIL unknown case %s\n", c); return 1; }
     if (fails) return 1;

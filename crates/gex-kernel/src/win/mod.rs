@@ -12,6 +12,22 @@ pub const NTDLL_HANDLE: u64 = 1;
 /// gex-private system call numbers, issued only by gex's own trampolines.
 pub mod thunk;
 
+/// The TEB exception frames (`Tib.ExceptionList`, at the TEB's start, each
+/// frame's `Prev` its first word, -1 ending the list) a fault in 64-bit
+/// Wine's native PE code leaves dead: that code's fault is a trap, which
+/// ends every wasm frame it ran in, and the frames winecrt0's `__TRY`
+/// pushed are on the stack below the guest's RSP, where the exception frame
+/// is built next. Those below `rsp`: native code a guest call ran is above
+/// the guest's stack, and translated code's own frames are not on the list.
+/// The first live frame, for the list's head, when it is not `head` already.
+pub fn first_live_teb_frame(head: u64, rsp: u64, read: impl Fn(u64) -> Option<u64>) -> Option<u64> {
+    let mut frame = head;
+    while frame != u64::MAX && frame != 0 && frame < rsp {
+        frame = read(frame)?;
+    }
+    (frame != head).then_some(frame)
+}
+
 pub mod nr {
     /// `__wine_unix_call_dispatcher(handle, code, args)`.
     pub const UNIX_CALL: u32 = 0x7f00_0001;
@@ -84,6 +100,73 @@ pub mod tramp {
     /// rising past its arguments means the guest left them (a catch block
     /// continuing in an outer frame).
     pub const NATIVE_RETURN_PAD: u64 = super::TRAMPOLINES_END - 0xf;
+    /// WoW64's stops (wow64cpu built as native code, gexrt's `__gexw_run32`):
+    /// where 32-bit code reaches 64-bit code, filler no code has. Its system
+    /// call thunk (`BTCpuGetBopCode`) and its unix call one
+    /// (`__wine_get_unix_opcode`), which share a dispatch slot: a call-out
+    /// waiting for the first returns at either ([`returns_at`]), with the
+    /// stack wherever the 32-bit code has it.
+    pub const WOW64_STOP_SYSCALL: u64 = super::TRAMPOLINES_END - 0xc;
+    pub const WOW64_STOP_UNIX: u64 = super::TRAMPOLINES_END - 0x9;
+    /// The return address of a system call native 32-bit ntdll makes
+    /// (gexrt's `__gexw_syscall`), where 32-bit state wow64 set (an APC, a
+    /// context it continued) comes back to it.
+    pub const WOW64_RETURN_MARK: u64 = super::TRAMPOLINES_END - 0x6;
+
+    /// Whether a call-out waiting for `ret` returns when the guest reaches
+    /// `pc`.
+    pub const fn returns_at(ret: u64, pc: u64) -> bool {
+        pc == ret || (ret == WOW64_STOP_SYSCALL && pc == WOW64_STOP_UNIX)
+    }
+
+    /// Whether a call-out waiting for `ret` takes it with any stack pointer
+    /// (WoW64's stops: the 32-bit code reaches them from wherever it is,
+    /// never by a return), and never reads the stack as unwound past it.
+    pub const fn any_stack(ret: u64) -> bool {
+        ret == WOW64_STOP_SYSCALL || ret == WOW64_RETURN_MARK
+    }
+
+    /// Whether `pc` is in the page's tail of filler from the return pad on
+    /// (the pad, WoW64's stops, the return mark): addresses the guest
+    /// reaches but no code has, which a translator must leave to the miss
+    /// path that knows them, never decode.
+    pub const fn filler(pc: u64) -> bool {
+        pc >= NATIVE_RETURN_PAD && pc < super::TRAMPOLINES_END
+    }
+
+    /// What a guest call from native Wine must find left of its thread's
+    /// stack: native Wine's own frames run on that stack (below the guest's
+    /// stack pointer, as Windows' do), as wasm code whose stores no guard
+    /// page stops, so the stack's end is checked before each such call
+    /// instead, with room for the native frames until the next. Wine's own
+    /// minimum (ntdll's `min_kernel_stack`, 8 KiB): a user-mode callback
+    /// whose stack comes within it is refused by Wine first
+    /// (`KeUserModeCallback`'s STATUS_STACK_OVERFLOW, which the program goes
+    /// on from), so only a guest call Wine does not bound ends the process.
+    pub const NATIVE_CALL_ROOM: u64 = 8 << 10;
+
+    /// Whether a guest call from native Wine with the stack at `sp` finds
+    /// its thread's stack spent: less than [`NATIVE_CALL_ROOM`] above the
+    /// stack's reserved bottom (the TEB's `DeallocationStack`, the guard
+    /// pages included). `teb` is the thread's TEB (the FS base for 32-bit
+    /// code, the GS base for 64-bit), in the layout of `class32`; `read`
+    /// reads a guest word of that width. A stack the TEB does not describe
+    /// (no TEB yet, or `sp` outside it) is never spent.
+    pub fn native_call_stack_spent(class32: bool, teb: u64, sp: u64, read: impl Fn(u64) -> Option<u64>) -> bool {
+        if teb == 0 {
+            return false;
+        }
+        // NT_TIB's StackBase, and DeallocationStack
+        let (base, bottom) = if class32 { (teb + 4, teb + 0xe0c) } else { (teb + 8, teb + 0x1478) };
+        let (Some(base), Some(bottom)) = (read(base), read(bottom)) else { return false };
+        bottom != 0 && sp > bottom && sp <= base && sp - bottom < NATIVE_CALL_ROOM
+    }
+
+    /// Whether `pc` is one of WoW64's stops, which no code jumps to: reached
+    /// with no call-out of the thread waiting there, it is a stray arrival.
+    pub const fn wow64_stop(pc: u64) -> bool {
+        pc == WOW64_STOP_SYSCALL || pc == WOW64_STOP_UNIX || pc == WOW64_RETURN_MARK
+    }
 }
 
 /// Where the trampoline page's code continues after its system call
@@ -170,4 +253,100 @@ pub fn trampoline_input(class32: bool) -> (gex_ld::Image, Vec<u64>) {
         class32,
     };
     (image, starts)
+}
+
+/// The stubs of a native Wine DLL's PE skeleton (winebuild's
+/// `output_wasm_skeleton`), where gex binds the DLL's native exports.
+/// 32-bit Wine's are `ud2; ud2`. 64-bit Wine's are 16 bytes a hooking
+/// library can patch: `jmp [rip+0]`, the address after it (the stub's
+/// alias, [`skel::ALIAS`] bytes on) and the alias's `int3; int3`. A hook's
+/// trampoline copies the whole `jmp`, so the original it calls lands on the
+/// alias, which gex binds to the same native export once the stub is
+/// rewritten.
+pub mod skel {
+    /// The alias's offset from its stub.
+    pub const ALIAS: u64 = 14;
+
+    /// Memory a skeleton is read from: a slice addressed from 0 (a native
+    /// host's memory, a test's), or the guest's [`crate::GuestMem`].
+    pub trait Bytes {
+        fn bytes_at(&self, a: u64, n: usize) -> Option<&[u8]>;
+    }
+
+    impl Bytes for [u8] {
+        fn bytes_at(&self, a: u64, n: usize) -> Option<&[u8]> {
+            let a = usize::try_from(a).ok()?;
+            self.get(a..a.checked_add(n)?)
+        }
+    }
+
+    impl Bytes for crate::GuestMem<'_> {
+        fn bytes_at(&self, a: u64, n: usize) -> Option<&[u8]> {
+            self.read(a, n).ok()
+        }
+    }
+
+    fn at<const N: usize>(m: &(impl Bytes + ?Sized), a: u64) -> Option<[u8; N]> {
+        m.bytes_at(a, N)?.try_into().ok()
+    }
+
+    /// Whether the bytes at `a` are still an export's stub.
+    pub fn stub(m: &(impl Bytes + ?Sized), a: u64) -> bool {
+        match at::<4>(m, a) {
+            Some([0x0f, 0x0b, 0x0f, 0x0b]) => true,
+            Some([0xff, 0x25, 0, 0]) => at::<2>(m, a + 4) == Some([0, 0]) && alias_target(m, a) == Some(a + ALIAS),
+            _ => false,
+        }
+    }
+
+    /// The address the 64-bit stub at `a` jumps to (its alias, unless the
+    /// operand was rewritten).
+    pub fn alias_target(m: &(impl Bytes + ?Sized), a: u64) -> Option<u64> {
+        at::<8>(m, a + 6).map(u64::from_le_bytes)
+    }
+
+    /// Whether `a` is a 64-bit stub's alias: its `int3; int3`, [`ALIAS`]
+    /// bytes into a 16-byte stub. Not by the stub's operand: a 14-byte hook
+    /// (`jmp [rip+0]` and the detour's address) rewrote it, and the hook's
+    /// trampoline, which copied the original 14 bytes, still lands here.
+    pub fn alias(m: &(impl Bytes + ?Sized), a: u64) -> bool {
+        a % 16 == ALIAS && at::<2>(m, a) == Some([0xcc, 0xcc])
+    }
+
+    /// Whether the bytes at `a` are still the skeleton's: a stub or an alias.
+    pub fn intact(m: &(impl Bytes + ?Sized), a: u64) -> bool {
+        stub(m, a) || alias(m, a)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn stub64(m: &mut [u8], a: u64) {
+            let i = a as usize;
+            m[i..i + 6].copy_from_slice(&[0xff, 0x25, 0, 0, 0, 0]);
+            m[i + 6..i + 14].copy_from_slice(&(a + ALIAS).to_le_bytes());
+            m[i + 14..i + 16].copy_from_slice(&[0xcc, 0xcc]);
+        }
+
+        #[test]
+        fn stubs_and_aliases() {
+            let mut m = vec![0u8; 64];
+            m[0..4].copy_from_slice(&[0x0f, 0x0b, 0x0f, 0x0b]);
+            stub64(&mut m, 16);
+            stub64(&mut m, 32);
+            assert!(stub(&m[..], 0) && intact(&m[..], 0));
+            assert!(stub(&m[..], 16) && !alias(&m[..], 16));
+            assert!(alias(&m[..], 30) && !stub(&m[..], 30) && intact(&m[..], 30));
+            assert_eq!(alias_target(&m[..], 32), Some(46));
+            // a 5-byte hook at 16: the stub is gone, its operand and alias stay
+            m[16..21].copy_from_slice(&[0xe9, 1, 2, 3, 4]);
+            assert!(!intact(&m[..], 16) && alias(&m[..], 30) && alias_target(&m[..], 16) == Some(30));
+            // a 14-byte one at 32 over the operand: the stub is gone, its alias stays
+            m[32..38].copy_from_slice(&[0xff, 0x25, 0, 0, 0, 0]);
+            m[38..46].copy_from_slice(&0x1234u64.to_le_bytes());
+            assert!(!stub(&m[..], 32) && !intact(&m[..], 32) && alias(&m[..], 46) && intact(&m[..], 46));
+            assert!(!intact(&m[..], 60) && !intact(&m[..], 1000));
+        }
+    }
 }

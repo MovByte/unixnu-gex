@@ -1,4 +1,4 @@
-// web/runtime/README.md's "In a web desktop", run as written: its code
+// page/runtime/README.md's "In a web desktop", run as written: its code
 // blocks, read from the README at run time, in one module, with only the
 // changes SUBST lists (this test's tree is the busybox image, not Debian).
 // The page plays the desktop. Its terminal widget, browser window and frames
@@ -14,21 +14,20 @@ export const meta = {
 
 // The README's module specifiers, and the runtime's sources they are.
 const MODULES = {
-  '@gex/runtime': 'index.js',
-  '@gex/runtime/fs': 'fs.js',
-  '@gex/runtime/persist/idb': 'persist/idb.js',
-  '@gex/runtime/net/wisp': 'net/wisp.js',
-  '@gex/runtime/windows/host': 'windows/host.js',
+  '@gexemu/runtime': 'index.js',
+  '@gexemu/runtime/fs': 'fs.js',
+  '@gexemu/runtime/net/wisp': 'net/wisp.mjs',
+  '@gexemu/runtime/windows/host': 'windows/host.js',
 };
 // `--package`: the built entries instead (lib/package.mjs's names).
-const BUILT = { 'index.js': 'index.mjs', 'fs.js': 'fs.mjs', 'persist/idb.js': 'persist-idb.mjs', 'net/wisp.js': 'net-wisp.mjs', 'windows/host.js': 'windows-host.mjs' };
+const BUILT = { 'index.js': 'index.mjs', 'fs.js': 'fs.mjs', 'net/wisp.mjs': 'net-wisp.mjs', 'windows/host.js': 'windows-host.mjs' };
 
 // Not `new URL(..., import.meta.url)` written out: vite would rewrite that
 // as an asset's URL.
 const HERE = import.meta.url;
 
 export default async function (t) {
-  const readme = await (await fetch(new URL('../../web/runtime/README.md', HERE))).text();
+  const readme = await (await fetch(new URL('../../page/runtime/README.md', HERE))).text();
   const from = readme.indexOf('\n## In a web desktop\n');
   const section = readme.slice(from, readme.indexOf('\n## ', from + 5));
   if (from < 0) return t.check('the README has its "In a web desktop" section', false);
@@ -52,10 +51,10 @@ export default async function (t) {
     code = code.replace(a, b);
   }
   const base = t.baseUrl === '/' ? null : t.baseUrl;
-  code = code.replace(/from '(@gex\/runtime[^']*)'/g, (m, spec) => {
+  code = code.replace(/from '(@gexemu\/runtime[^']*)'/g, (m, spec) => {
     const src = MODULES[spec];
     if (!src) throw new Error(`the README imports ${spec}, which this test does not map`);
-    return `from ${JSON.stringify(base ? new URL(BUILT[src], new URL(base, location.href)).href : new URL(`../../web/runtime/src/${src}`, HERE).href)}`;
+    return `from ${JSON.stringify(base ? new URL(BUILT[src], new URL(base, location.href)).href : new URL(`../../page/runtime/src/${src}`, HERE).href)}`;
   });
 
   // The desktop's fakes, the names the README's blocks use.
@@ -70,6 +69,8 @@ export default async function (t) {
     closeTerminalWindow: () => { closedTerminal = true; },
     openBrowserWindow: (url) => opened.push(url),
   });
+  // The README's store keeps its root across loads: a run starts from the tree.
+  await (await navigator.storage.getDirectory()).removeEntry('gex-fs-debian', { recursive: true }).catch(() => {});
   const url = URL.createObjectURL(new Blob([`${code}\nexport { sys, fs, hw, sh };\n`], { type: 'text/javascript' }));
   const { sys, hw, sh } = await t.timeout(import(/* @vite-ignore */ url), 90000, 'the README\'s blocks');
   t.eq('the system runs', sys.state.phase, 'running');

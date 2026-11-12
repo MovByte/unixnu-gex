@@ -141,7 +141,9 @@ pub fn build_module(
         profile: None,
         page_bases: None,
         dense_global: None,
+        alt_dir: None,
         module_id: 0,
+        module_id_global: None,
         loop_heads: None,
             enter: None,
     };
@@ -374,9 +376,9 @@ fn bucket(a: u64, bits: u32) -> usize {
 /// host functions; one active element segment puts each function's body at
 /// `__table_base + k` in the order of `gex.funcs`, which lists their guest
 /// addresses. Calls inside the module are `call`s, anything else goes
-/// through the table. `pages` are the `PAGE_GEN` values each function
-/// checks on entry, by entry. Functions whose loops would not structure
-/// are left out (the caller gets the entries that are in).
+/// through the table. `pages` are the `PAGE_GEN` words (address, value)
+/// each function checks on entry, by entry. Functions whose loops would not
+/// structure are left out (the caller gets the entries that are in).
 pub fn build_runtime(
     funcs: &[Function],
     sums: &HashMap<u64, Summary>,
@@ -436,7 +438,9 @@ pub fn build_runtime(
             profile: None,
             page_bases: None,
             dense_global: None,
+            alt_dir: None,
             module_id: 0,
+            module_id_global: None,
             loop_heads: None,
             enter: None,
         };

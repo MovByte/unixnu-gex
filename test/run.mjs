@@ -12,13 +12,14 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
-import { Cdp, browserWsUrl } from '../web/test/cdp.mjs';
+import { Cdp, browserWsUrl } from '../test/lib/cdp.mjs';
 import { images, outputs } from './fixtures/images.mjs';
 import { packaged } from './lib/package.mjs';
+import { refuseStale } from '../page/build-inputs.mjs';
 
 const ROOT = join(import.meta.dirname, '..');
 const TESTS = import.meta.dirname;
-const WEB = join(ROOT, 'web');
+const WEB = join(ROOT, 'page');
 const ARCHES = { a64: 'aarch64', x86: 'x86' };
 const HOSTS = ['browser', 'node'];
 
@@ -40,14 +41,24 @@ const { values: o, positionals } = parseArgs({
     prebuilt: { type: 'boolean', default: false },
     prepare: { type: 'boolean', default: false },
     package: { type: 'string', default: process.env.GEX_TEST_PACKAGE },
+    single: { type: 'boolean', default: false },
   },
 });
 const log = (s) => process.stderr.write(`[test] ${s}\n`);
-// `--package DIR`: the runtime as web/runtime/build.sh built it into DIR, not
+// `--package DIR`: the runtime as page/runtime/build.sh built it into DIR, not
 // from source. The tests' imports of the runtime's entry modules go to the
-// built ones, and its assets come from DIR/gex.
+// built ones, which find their files themselves.
 const PACKAGE = o.package ? resolve(o.package) : null;
-if (PACKAGE && !existsSync(join(PACKAGE, 'index.mjs'))) throw new Error(`--package: no ${PACKAGE}/index.mjs (web/runtime/build.sh DIR)`);
+if (PACKAGE && !existsSync(join(PACKAGE, 'index.mjs'))) throw new Error(`--package: no ${PACKAGE}/index.mjs (page/runtime/build.sh DIR)`);
+// `--single`: the single-thread build. Its pages are served without
+// cross-origin isolation, so they have no SharedArrayBuffer: the runtime from
+// source runs that build, and so must a package (--package, as
+// `page/runtime/build.sh --single` builds @gexemu/runtime-single). Browser only.
+// A test the single-thread build cannot run yet says why in its meta
+// (`single: 'why'`) and is skipped; one that needs longer there says so
+// (`singleTimeout`, seconds, in place of `timeout`).
+if (o.single && o.host === 'node') throw new Error('--single: the browser host only');
+if (o.single && o.host === 'both') o.host = 'browser';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** The /proc status (VmData, VmRSS, VmHWM; KiB) of the one Chromium
@@ -112,7 +123,7 @@ for (const name of new Set(jobs.flatMap((j) => j.test.meta.images))) {
   if (!images[name]) throw new Error(`no image ${name} (test/fixtures/images.mjs)`);
   const why = o.prebuilt
     ? (outputs[name] ?? []).every((f) => existsSync(join(WORK, f))) ? null : 'not in the work directory (--prebuilt)'
-    : await images[name](WORK).catch((e) => String(e?.message ?? e));
+    : await images[name](WORK, { single: o.single }).catch((e) => String(e?.message ?? e));
   if (why) {
     missing.set(name, why);
     log(`image ${name}: ${why}`);
@@ -121,6 +132,15 @@ for (const name of new Set(jobs.flatMap((j) => j.test.meta.images))) {
 // `--prepare`: the images the tests need, made in the work directory and no
 // test run (another host then runs them with --prebuilt).
 if (o.prepare) process.exit(missing.size ? 1 : 0);
+
+// -- the build ---------------------------------------------------------------
+// Both hosts run page/public's kernel and shim (the page's JavaScript comes from
+// source), which run the old code without a word when they are older than it.
+{
+  const infix = (a) => (a === 'x86' ? '.x86' : '');
+  const names = [...new Set(jobs.flatMap((j) => [`gex_kernel${infix(j.arch)}`, `gex_browser${infix(j.arch)}`]))];
+  if (names.length) refuseStale('test', join(resolve(WEB, process.env.GEX_PUBLIC_DIR || 'public'), 'gex'), names, 'hosts/browser/build.sh (GEX_ARCH=x86 for .x86)');
+}
 
 // -- the browser -------------------------------------------------------------
 let server = null;
@@ -131,8 +151,8 @@ if (jobs.some((j) => j.host === 'browser')) ({ server, chrome, cdp } = await sta
 // -- the run -----------------------------------------------------------------
 let bad = 0;
 // `meta.alone`: a test that reads its process's memory from /proc (the
-// renderer's is told from others only when it is the one running) goes after
-// the rest, one at a time.
+// renderer's is told from others only when it is the one running), or one
+// too big to share a renderer, goes after the rest, one at a time.
 const lone = (j) => j.test.meta.alone;
 for (const [queue, width] of [[jobs.filter((j) => !lone(j)), Math.max(1, Number(o.jobs))], [jobs.filter(lone), 1]]) {
   await Promise.all(Array.from({ length: width }, async () => {
@@ -157,12 +177,13 @@ async function runJob({ test, host, arch }) {
   // The package is built for the browser: its Workers are bundled for a
   // page, and under Node it would reach for its sources.
   if (PACKAGE && host === 'node') return { ...out, result: 'skip', skip: '--package runs on the browser host only' };
+  if (o.single && test.meta.single) return { ...out, result: 'skip', skip: `single-thread build: ${test.meta.single}` };
   const why = test.meta.images.map((n) => missing.get(n)).find(Boolean);
   if (why) return { ...out, result: 'skip', skip: why };
   const say = (line) => {
     if (o.verbose || /^FAIL/.test(line)) process.stderr.write(`${test.name} ${host} ${arch}: ${line}\n`);
   };
-  const r = await (host === 'browser' ? runPage : runNode)(test, ARCHES[arch], say, test.meta.timeout * 1000);
+  const r = await (host === 'browser' ? runPage : runNode)(test, ARCHES[arch], say, (o.single && test.meta.singleTimeout || test.meta.timeout) * 1000);
   return { ...out, ...r, ms: Date.now() - t0 };
 }
 
@@ -177,31 +198,50 @@ async function runNode(test, arch, say, timeout) {
     // What the runtime says, for `t.logs`: its Workers write to the process's
     // own descriptors, not through anything the test could catch.
     const logs = [];
-    const keep = (d, part) => {
+    // `t.logs`' marks (node.mjs), by stream, once read.
+    const marks = new Set();
+    const keep = (d, part, stream) => {
       const lines = (part + d).split('\n');
       const rest = lines.pop();
-      if (logs.length < 100000) logs.push(...lines);
+      for (const l of lines) {
+        if (l.startsWith('\u0001gex-logs ')) marks.add(`${stream} ${l}`);
+        else if (logs.length < 100000) logs.push(l);
+      }
       return rest;
     };
     let outPart = '';
     let errPart = '';
     child.stdout.on('data', (d) => {
-      outPart = keep(d, outPart);
+      outPart = keep(d, outPart, 'out');
       if (o.verbose) process.stdout.write(d);
     });
     child.stderr.on('data', (d) => {
       err = (err + d).slice(-4000);
-      errPart = keep(d, errPart);
+      errPart = keep(d, errPart, 'err');
     });
     const m = await new Promise((resolve) => {
       const timer = setTimeout(() => resolve({ timeout: true }), Math.max(0, until - Date.now()));
       child.on('message', (msg) => {
         if (msg.line !== undefined) return say(msg.line);
-        if (msg.logs) return child.send({ logs: logs.filter((l) => new RegExp(msg.logs.re, msg.logs.flags).test(l)) });
+        if (msg.logs) {
+          // Once both pipes have brought the mark: all written before it.
+          const { re, flags, mark } = msg.logs;
+          const answer = () => child.send({ logs: logs.filter((l) => new RegExp(re, flags).test(l)) });
+          if (!mark) return answer();
+          const t1 = Date.now() + 10000;
+          const look = () => (marks.has(`out ${mark}`) && marks.has(`err ${mark}`)) || Date.now() > t1 ? answer() : setTimeout(look, 10);
+          return look();
+        }
         clearTimeout(timer);
         resolve(msg);
       });
-      child.on('exit', (code, sig) => { clearTimeout(timer); resolve({ exited: sig ?? code }); });
+      // 'exit' can come before the last messages: those are in once the
+      // channel has closed ('disconnect') too.
+      let exited = null;
+      let gone = false;
+      const end = () => { if (exited !== null && gone) { clearTimeout(timer); resolve({ exited }); } };
+      child.on('exit', (code, sig) => { exited = sig ?? code; end(); });
+      child.on('disconnect', () => { gone = true; end(); });
       child.send({ arch, phase, state, res, work: WORK, gpu, timed: o.timed });
     });
     child.kill('SIGKILL');
@@ -226,6 +266,8 @@ async function startBrowser() {
   const { createServer } = await import(join(WEB, 'node_modules/vite/dist/node/index.js'));
   const base = (await import(join(WEB, 'vite.config.js'))).default;
   const hits = new Map();
+  /** Name parts whose next request fails (`/__t/drop`). */
+  const drops = [];
   const server = await createServer({
     ...base,
     configFile: false,
@@ -234,7 +276,7 @@ async function startBrowser() {
     appType: 'mpa',
     root: WEB,
     logLevel: 'warn',
-    server: { ...base.server, port: PORT, strictPort: true, host: '127.0.0.1', ...(PACKAGE && { fs: { ...base.server?.fs, allow: [...(base.server?.fs?.allow ?? []), PACKAGE] } }) },
+    server: { ...base.server, ...(o.single && { headers: {} }), port: PORT, strictPort: true, host: '127.0.0.1', ...(PACKAGE && { fs: { ...base.server?.fs, allow: [...(base.server?.fs?.allow ?? []), PACKAGE] } }) },
     plugins: [...(PACKAGE ? [{
       name: 'gex-test-package',
       enforce: 'pre',
@@ -247,8 +289,10 @@ async function startBrowser() {
         if (PACKAGE) s.middlewares.use(`/@fs${PACKAGE}/`, (req, res, next) => {
           const f = join(PACKAGE, decodeURIComponent(req.url.split('?')[0]));
           if (!f.startsWith(PACKAGE) || !existsSync(f) || !statSync(f).isFile()) return next();
-          res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
-          res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+          if (!o.single) {
+            res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+            res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+          }
           const type = { '.mjs': 'text/javascript', '.js': 'text/javascript', '.wasm': 'application/wasm', '.json': 'application/json', '.css': 'text/css' }[f.slice(f.lastIndexOf('.'))];
           if (type) res.setHeader('Content-Type', type);
           res.end(readFileSync(f));
@@ -256,6 +300,7 @@ async function startBrowser() {
         s.middlewares.use('/__t/', (req, res, next) => {
           const [path, query = ''] = req.url.split('?');
           const iso = () => {
+            if (o.single) return;
             res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
             res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
             res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
@@ -271,9 +316,30 @@ async function startBrowser() {
             res.setHeader('Content-Type', 'application/json');
             return res.end(JSON.stringify(hits.get(decodeURIComponent(query)) ?? 0));
           }
+          // The work files asked for whose names hold a string, summed.
+          if (path === '/asked') {
+            const part = decodeURIComponent(query);
+            let n = 0;
+            for (const [k, v] of hits) if (k.includes(part)) n += v;
+            res.setHeader('Content-Type', 'application/json');
+            return res.end(JSON.stringify(n));
+          }
+          // The next request for a work file whose name holds a string fails,
+          // as a dropped connection would (503), wherever in the page's
+          // realms it is made.
+          if (path === '/drop') {
+            drops.push(decodeURIComponent(query));
+            return res.end('ok');
+          }
           if (!path.startsWith('/work/')) return next();
           const name = decodeURIComponent(path.slice(6));
           hits.set(name, (hits.get(name) ?? 0) + 1);
+          const drop = drops.findIndex((part) => name.includes(part));
+          if (drop >= 0) {
+            drops.splice(drop, 1);
+            res.statusCode = 503;
+            return res.end('dropped by the test');
+          }
           const f = join(WORK, name);
           if (!f.startsWith(WORK) || !existsSync(f) || !statSync(f).isFile()) return next();
           const all = readFileSync(f);
@@ -322,8 +388,14 @@ async function startBrowser() {
 /** The test in a page of its own (a fresh browser context, so its storage
  *  is its own too), every Worker's console relayed. */
 async function runPage(test, arch, say, timeout) {
-  const { browserContextId } = await cdp.send('Target.createBrowserContext', {});
-  const { targetId } = await cdp.send('Target.createTarget', { url: 'about:blank', browserContextId });
+  // `meta.profile` (or GEX_TEST_PROFILE_CONTEXT=1): the profile's own
+  // context, its storage on disk as a user's is. A fresh context's is in
+  // memory, and its origin private file system has limits of its own (a
+  // file stops near 2 GiB; growing one past 1 GiB by truncate ends the
+  // browser).
+  const own = test.meta.profile || process.env.GEX_TEST_PROFILE_CONTEXT === '1';
+  const { browserContextId } = own ? {} : await cdp.send('Target.createBrowserContext', {});
+  const { targetId } = await cdp.send('Target.createTarget', { url: 'about:blank', ...(browserContextId ? { browserContextId } : {}) });
   const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
   const names = new Map([[sessionId, 'page']]);
   const mine = new Set([sessionId]);
@@ -362,7 +434,9 @@ async function runPage(test, arch, say, timeout) {
   await cdp.send('Inspector.enable', {}, sessionId).catch(() => {});
   await cdp.send('Target.setDiscoverTargets', { discover: true }).catch(() => {});
   await cdp.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }, sessionId);
-  const q = new URLSearchParams({ test: test.name, src: `/@fs${test.file}`, arch, ...(gpu ? { gpu: 1 } : {}), ...(o.timed ? { timed: 1 } : {}), ...(PACKAGE ? { base: `/@fs${PACKAGE}/` } : {}) });
+  const q = new URLSearchParams({ test: test.name, src: `/@fs${test.file}`, arch, ...(gpu ? { gpu: 1 } : {}), ...(o.timed ? { timed: 1 } : {}), ...(PACKAGE ? { pkg: 1 } : {}) });
+  // GEX_TEST_QUERY: more of the page's query (a measurement's switches).
+  for (const [k, v] of new URLSearchParams(process.env.GEX_TEST_QUERY ?? '')) q.set(k, v);
   const t0 = Date.now();
   await cdp.send('Page.navigate', { url: `http://127.0.0.1:${o.port}/__t/page?${q}` }, sessionId);
   let shown = 0;
@@ -395,7 +469,9 @@ async function runPage(test, arch, say, timeout) {
       const { method, save: name, ...params } = v.asks[sent];
       // Not CDP: the console lines that match (`t.logs`).
       const reply = method === '__logs' ? { result: { lines: logs.map((l, i) => (params.levels ? `${levels[i]} ${l}` : l)).filter((l) => new RegExp(params.re, params.flags).test(l)) } }
-        : method === '__status' ? { result: { status: await rendererStatus() } } : await Promise.race([cdp.send(method, params, sessionId).then(
+        : method === '__status' ? { result: { status: await rendererStatus() } }
+        // Not CDP: a file of the page's among the artefacts (`t.saveFile`).
+        : method === '__save' ? { result: { path: save(name, params.data) } } : await Promise.race([cdp.send(method, params, sessionId).then(
         (result) => ({ result: name && result?.data ? { path: save(name, result.data) } : result }),
         (e) => ({ error: String(e?.message ?? e) }),
       ), crash.then(() => ({ error: crashed }))]);
@@ -411,7 +487,7 @@ async function runPage(test, arch, say, timeout) {
   }
   for (const f of off) f();
   await cdp.send('Target.closeTarget', { targetId }).catch(() => {});
-  await cdp.send('Target.disposeBrowserContext', { browserContextId }).catch(() => {});
+  if (browserContextId) await cdp.send('Target.disposeBrowserContext', { browserContextId }).catch(() => {});
   const res = v?.res ?? { checks: 0, fail: [], times: {} };
   if (!v?.done) {
     const what = crashed ?? `timed out after ${timeout / 1000} s`;

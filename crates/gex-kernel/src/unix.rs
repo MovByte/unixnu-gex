@@ -238,8 +238,16 @@ pub struct UnixSocket {
     /// (`SO_PEERCRED`): None for a peer this kernel did not see made (a
     /// host's end).
     peer_cred: Mutex<Option<Cred>>,
+    /// The IPv4 address and port the connecting process gave for this end
+    /// (a page's loopback TCP connection, made through a name here): what
+    /// the accepted end's `getpeername` reports.
+    addr: Mutex<Option<(u32, u16)>>,
+    /// The far end's `addr`, taken when the two were joined.
+    peer_addr: Mutex<Option<(u32, u16)>>,
     /// Its last descriptor has closed ([`Self::release`]).
     gone: AtomicBool,
+    /// `SO_PASSCRED`: each `recvmsg` says who sent it (`SCM_CREDENTIALS`).
+    passcred: AtomicBool,
 }
 
 /// A process's credentials as `struct ucred` has them: pid, uid, gid.
@@ -261,8 +269,20 @@ impl UnixSocket {
             queue: crate::wait::Queue::new(),
             cred: Mutex::new(None),
             peer_cred: Mutex::new(None),
+            addr: Mutex::new(None),
+            peer_addr: Mutex::new(None),
             gone: AtomicBool::new(false),
+            passcred: AtomicBool::new(false),
         }
+    }
+
+    /// `SO_PASSCRED`, set and read.
+    pub fn set_passcred(&self, on: bool) {
+        self.passcred.store(on, Ordering::Relaxed);
+    }
+
+    pub fn passcred(&self) -> bool {
+        self.passcred.load(Ordering::Relaxed)
     }
 
     /// Record the credentials of the process making this end (before its
@@ -274,6 +294,17 @@ impl UnixSocket {
     /// The far end's credentials (`SO_PEERCRED`), when they are known.
     pub fn peer_cred(&self) -> Option<Cred> {
         *self.peer_cred.lock().unwrap()
+    }
+
+    /// Record the IPv4 address and port this end connects from (before its
+    /// `connect`), for the accepted end's `peer_addr`.
+    pub fn set_addr(&self, addr: (u32, u16)) {
+        *self.addr.lock().unwrap() = Some(addr);
+    }
+
+    /// The far end's IPv4 address and port, when its process gave one.
+    pub fn peer_addr(&self) -> Option<(u32, u16)> {
+        *self.peer_addr.lock().unwrap()
     }
 
     /// Both ends of a `socketpair` made by `cred`: each end's peer is that
@@ -456,6 +487,7 @@ impl UnixSocket {
             *theirs.cred.lock().unwrap() = server;
             *theirs.peer_cred.lock().unwrap() = client;
             *self.peer_cred.lock().unwrap() = server;
+            *theirs.peer_addr.lock().unwrap() = *self.addr.lock().unwrap();
             backlog.lock().unwrap().push_back(theirs);
         }
         // A connection is waiting for `accept`.
@@ -1370,10 +1402,18 @@ mod tests {
 /// A `MAP_SHARED` mapping is recorded in the kernel's shared-map list so the
 /// compositor can read the pixels out of guest memory with no copy. The `Vec`
 /// is what `read`/`write`/`ftruncate` see before such a mapping exists.
+///
+/// Its bytes are this module's until another process must share them: a
+/// host whose processes have separate kernels (the page's) moves them into
+/// a file of the global kernel first ([`MemFd::back_with`]), and from then
+/// on every process holding it reads and writes that file, and their
+/// shared mappings of it meet as any shared file's do.
 #[derive(Debug, Default)]
 pub struct MemFd {
     pub name: String,
     data: Mutex<Vec<u8>>,
+    /// The file holding the bytes once they are shared, else unset.
+    backing: std::sync::OnceLock<Arc<dyn FileHandle>>,
     /// Seals applied with `F_ADD_SEALS`, enforced rather than recorded:
     /// Xwayland seals shared memory against shrinking so the compositor cannot
     /// read off the end, and an ignored seal hands back the guarantee without
@@ -1397,8 +1437,43 @@ impl MemFd {
         MemFd {
             name: name.to_string(),
             data: Mutex::new(Vec::new()),
+            backing: std::sync::OnceLock::new(),
             seals: Mutex::new(0),
         }
+    }
+
+    /// A memfd whose bytes are `file`'s (one another process shared): what
+    /// a child rebuilds its parent's from.
+    pub fn backed(name: &str, file: Arc<dyn FileHandle>) -> MemFd {
+        let m = MemFd::new(name);
+        let _ = m.backing.set(file);
+        m
+    }
+
+    /// The file holding the bytes, once they are shared.
+    pub fn backing(&self) -> Option<&Arc<dyn FileHandle>> {
+        self.backing.get()
+    }
+
+    /// Move the bytes into `file` (empty, writable), which holds them from
+    /// now on. Once only: a memfd already shared keeps its file.
+    pub fn back_with(&self, file: Arc<dyn FileHandle>) -> Result<(), Errno> {
+        let mut data = self.data.lock().unwrap();
+        if self.backing.get().is_some() {
+            return Ok(());
+        }
+        file.truncate(data.len() as u64)?;
+        let mut at = 0;
+        while at < data.len() {
+            let n = file.write_at(at as u64, &data[at..])? as usize;
+            if n == 0 {
+                return Err(Errno::EIO);
+            }
+            at += n;
+        }
+        let _ = self.backing.set(file);
+        *data = Vec::new();
+        Ok(())
     }
 
     pub fn seals(&self) -> u32 {
@@ -1423,6 +1498,16 @@ impl MemFd {
     pub fn reserve(&self, upto: u64) -> SysResult {
         let seals = self.seals();
         let mut data = self.data.lock().unwrap();
+        if let Some(b) = self.backing.get() {
+            drop(data);
+            if upto <= b.metadata()?.size {
+                return Ok(0);
+            }
+            if seals & seal::GROW != 0 {
+                return Err(Errno::EPERM);
+            }
+            return b.truncate(upto).map(|_| 0);
+        }
         if (upto as usize) <= data.len() {
             return Ok(0);
         }
@@ -1434,7 +1519,14 @@ impl MemFd {
     }
 
     pub fn len(&self) -> u64 {
-        self.data.lock().unwrap().len() as u64
+        let data = self.data.lock().unwrap();
+        match self.backing.get() {
+            Some(b) => {
+                drop(data);
+                b.metadata().map_or(0, |m| m.size)
+            }
+            None => data.len() as u64,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1449,6 +1541,10 @@ impl FileHandle for MemFd {
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult {
         let data = self.data.lock().unwrap();
+        if let Some(b) = self.backing.get() {
+            drop(data);
+            return b.read_at(offset, buf);
+        }
         let start = (offset as usize).min(data.len());
         let n = buf.len().min(data.len() - start);
         buf[..n].copy_from_slice(&data[start..start + n]);
@@ -1461,6 +1557,13 @@ impl FileHandle for MemFd {
             return Err(Errno::EPERM);
         }
         let mut data = self.data.lock().unwrap();
+        if let Some(b) = self.backing.get() {
+            drop(data);
+            if seals & seal::GROW != 0 && offset + buf.len() as u64 > b.metadata()?.size {
+                return Err(Errno::EPERM);
+            }
+            return b.write_at(offset, buf);
+        }
         let start = offset as usize;
         if start + buf.len() > data.len() {
             if seals & seal::GROW != 0 {
@@ -1475,6 +1578,14 @@ impl FileHandle for MemFd {
     fn truncate(&self, len: u64) -> Result<(), Errno> {
         let seals = self.seals();
         let mut data = self.data.lock().unwrap();
+        if let Some(b) = self.backing.get() {
+            drop(data);
+            let had = b.metadata()?.size;
+            if (len < had && seals & seal::SHRINK != 0) || (len > had && seals & seal::GROW != 0) {
+                return Err(Errno::EPERM);
+            }
+            return b.truncate(len);
+        }
         let len = len as usize;
         if len < data.len() && seals & seal::SHRINK != 0 {
             return Err(Errno::EPERM);
@@ -1486,7 +1597,26 @@ impl FileHandle for MemFd {
         Ok(())
     }
 
+    /// Once shared, the file's: its count is what other processes'
+    /// mappings of it catch up by.
+    fn changes(&self) -> u64 {
+        self.backing.get().map_or(0, |b| b.changes())
+    }
+
+    fn metadata_changes(&self) -> Result<(Metadata, u64), Errno> {
+        Ok((self.metadata()?, self.changes()))
+    }
+
+    fn remote_id(&self) -> Option<i32> {
+        self.backing.get().and_then(|b| b.remote_id())
+    }
+
     fn metadata(&self) -> Result<Metadata, Errno> {
+        // once shared, the file's (its inode is what tells two processes'
+        // descriptions of it for one file)
+        if let Some(b) = self.backing.get() {
+            return Ok(Metadata { mode: 0o600, ..b.metadata()? });
+        }
         Ok(Metadata {
             file_type: FileType::Regular,
             size: self.len(),
@@ -1500,142 +1630,8 @@ impl FileHandle for MemFd {
     }
 }
 
-/// Whole-file advisory locks: `flock`.
-///
-/// A lock belongs to the *open file description*, so `dup`/`fork` share one and
-/// two separate `open`s of a path contend -- the rule that makes `flock` a
-/// parent/child mutex.
-///
-/// Deliberate deviation: a blocking request that cannot be granted returns
-/// `EWOULDBLOCK` rather than waiting (nothing here contends in practice), since
-/// granting it anyway would let two writers believe they are alone.
-#[derive(Debug, Default)]
-pub struct FileLocks {
-    held: Mutex<Vec<Held>>,
-}
-
-#[derive(Debug)]
-struct Held {
-    /// What is locked. Two `open`s of one path contend; two paths do not.
-    file: String,
-    /// Who holds it: the open file description, not the process.
-    key: usize,
-    exclusive: bool,
-}
-
-/// `flock`'s operations.
-pub mod lock_op {
-    pub const SH: u64 = 1;
-    pub const EX: u64 = 2;
-    pub const NB: u64 = 4;
-    pub const UN: u64 = 8;
-}
-
-impl FileLocks {
-    pub fn new() -> FileLocks {
-        FileLocks::default()
-    }
-
-    /// Apply an operation for one open file description. `file` names the
-    /// resource, `key` the owner -- both matter, or a lock on one file wrongly
-    /// conflicts with every other.
-    pub fn flock(&self, file: &str, key: usize, op: u64) -> SysResult {
-        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
-        if op & lock_op::UN != 0 {
-            held.retain(|h| h.key != key);
-            return Ok(0);
-        }
-        let exclusive = op & lock_op::EX != 0;
-        if !exclusive && op & lock_op::SH == 0 {
-            return Err(Errno::EINVAL);
-        }
-        let conflict = held
-            .iter()
-            .any(|h| h.file == file && h.key != key && (exclusive || h.exclusive));
-        if conflict {
-            return Err(Errno::EWOULDBLOCK);
-        }
-        // Re-locking the same description converts the mode, not stacks a lock.
-        held.retain(|h| !(h.file == file && h.key == key));
-        held.push(Held {
-            file: file.to_string(),
-            key,
-            exclusive,
-        });
-        Ok(0)
-    }
-
-    /// Drop everything a description held, when it is closed.
-    pub fn release(&self, key: usize) {
-        self.held
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|h| h.key != key);
-    }
-}
-
-#[cfg(test)]
-mod lock_tests {
-    use super::*;
-
-    #[test]
-    fn an_exclusive_lock_excludes_another_description() {
-        let l = FileLocks::new();
-        assert_eq!(l.flock("/a", 1, lock_op::EX), Ok(0));
-        assert_eq!(
-            l.flock("/a", 2, lock_op::EX | lock_op::NB),
-            Err(Errno::EWOULDBLOCK)
-        );
-        assert_eq!(
-            l.flock("/a", 2, lock_op::SH | lock_op::NB),
-            Err(Errno::EWOULDBLOCK)
-        );
-        l.flock("/a", 1, lock_op::UN).unwrap();
-        assert_eq!(l.flock("/a", 2, lock_op::EX), Ok(0));
-    }
-
-    #[test]
-    fn a_lock_on_one_file_says_nothing_about_another() {
-        let l = FileLocks::new();
-        assert_eq!(l.flock("/a", 1, lock_op::EX), Ok(0));
-        assert_eq!(l.flock("/b", 2, lock_op::EX), Ok(0));
-        assert_eq!(l.flock("/c", 3, lock_op::EX), Ok(0));
-    }
-
-    #[test]
-    fn shared_locks_coexist() {
-        let l = FileLocks::new();
-        assert_eq!(l.flock("/a", 1, lock_op::SH), Ok(0));
-        assert_eq!(l.flock("/a", 2, lock_op::SH), Ok(0));
-        assert_eq!(
-            l.flock("/a", 3, lock_op::EX | lock_op::NB),
-            Err(Errno::EWOULDBLOCK)
-        );
-    }
-
-    #[test]
-    fn the_same_description_may_relock_and_convert() {
-        let l = FileLocks::new();
-        assert_eq!(l.flock("/a", 1, lock_op::SH), Ok(0));
-        assert_eq!(
-            l.flock("/a", 1, lock_op::EX),
-            Ok(0),
-            "converting is not contention"
-        );
-        assert_eq!(
-            l.flock("/a", 2, lock_op::SH | lock_op::NB),
-            Err(Errno::EWOULDBLOCK)
-        );
-    }
-
-    #[test]
-    fn closing_releases() {
-        let l = FileLocks::new();
-        l.flock("/a", 1, lock_op::EX).unwrap();
-        l.release(1);
-        assert_eq!(l.flock("/a", 2, lock_op::EX), Ok(0));
-    }
-}
+/// Advisory locks, `flock`'s and `fcntl`'s ([`crate::locks`]).
+pub use crate::locks::{lock_op, FileLocks};
 
 /// An `epoll` set: the descriptors a program watches and what it wants told
 /// about each. `epoll_wait` turns the registrations back into the list `poll`
@@ -1650,6 +1646,12 @@ mod lock_tests {
 #[derive(Debug, Default)]
 pub struct EpollSet {
     watched: Mutex<Vec<Watch>>,
+    /// The open file each watch is of (and whether it was opened for
+    /// writing): the one `epoll_ctl` added, or for a set that came without
+    /// them (a fork's copy), the one a waiter first found under the number.
+    /// A watch is of that file and not of its number, as on Linux: it goes
+    /// once the file is closed, and a new file given the number is not it.
+    files: Mutex<Vec<(i32, Weak<dyn FileHandle>, bool)>>,
     queue: crate::wait::Queue,
     generation: AtomicU32,
 }
@@ -1730,6 +1732,7 @@ impl EpollSet {
                     crate::wait::unchain(x.source, me);
                 }
                 w.retain(|x| x.fd != fd);
+                self.files.lock().unwrap_or_else(|e| e.into_inner()).retain(|x| x.0 != fd);
                 if w.len() == before {
                     return Err(Errno::ENOENT);
                 }
@@ -1741,6 +1744,57 @@ impl EpollSet {
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.queue.notify();
         r
+    }
+
+    /// `epoll_ctl` on `fd`, which is `file` now (`None`: not open). A
+    /// watch under the number that is of another file, or of one since
+    /// closed, is gone first: adding the number again is a new watch, and
+    /// changing or deleting it finds none.
+    pub fn ctl_file(&self, op: u64, fd: i32, events: u32, data: u64, file: Option<(&Arc<dyn FileHandle>, bool)>) -> SysResult {
+        if let Some((now, _)) = file {
+            if let Some(Some(was)) = self.owner_weak(fd) {
+                let same = was.upgrade().is_some_and(|h| core::ptr::eq(Arc::as_ptr(&h) as *const (), Arc::as_ptr(now) as *const ()));
+                if !same {
+                    self.forget(fd);
+                }
+            }
+        }
+        let source = file.map_or(0, |(f, _)| f.wait_queue());
+        let r = self.ctl_queue(op, fd, events, data, source)?;
+        if let (epoll_op::ADD, Some((f, writable))) = (op, file) {
+            let mut files = self.files.lock().unwrap_or_else(|e| e.into_inner());
+            files.retain(|x| x.0 != fd);
+            files.push((fd, Arc::downgrade(f), writable));
+        }
+        Ok(r)
+    }
+
+    /// The file `fd`'s watch is of: `None` when the set has not been told
+    /// one, `Some(None)` when it was closed.
+    fn owner_weak(&self, fd: i32) -> Option<Option<Weak<dyn FileHandle>>> {
+        let files = self.files.lock().unwrap_or_else(|e| e.into_inner());
+        files.iter().find(|x| x.0 == fd).map(|x| Some(x.1.clone()))
+    }
+
+    /// The open file `fd`'s watch is of and whether it is writable: `None`
+    /// when the set has not been told one, `Some(None)` once it is closed.
+    pub fn owner(&self, fd: i32) -> Option<Option<(Arc<dyn FileHandle>, bool)>> {
+        let files = self.files.lock().unwrap_or_else(|e| e.into_inner());
+        files.iter().find(|x| x.0 == fd).map(|x| x.1.upgrade().map(|h| (h, x.2)))
+    }
+
+    /// Drop `fd`'s watch: its file is closed, or the number is another's.
+    pub fn forget(&self, fd: i32) {
+        let mut w = self.watched.lock().unwrap_or_else(|e| e.into_inner());
+        let me = self.queue.id();
+        for x in w.iter().filter(|x| x.fd == fd) {
+            crate::wait::unchain(x.source, me);
+        }
+        w.retain(|x| x.fd != fd);
+        drop(w);
+        self.files.lock().unwrap_or_else(|e| e.into_inner()).retain(|x| x.0 != fd);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.queue.notify();
     }
 
     /// Make sure this set is chained onto `source`, the queue descriptor
@@ -1755,6 +1809,19 @@ impl EpollSet {
                 x.source = source;
             }
         }
+    }
+
+    /// `fd`'s open file, for a watch the set was not told the file of (a
+    /// fork's copy); chains the set onto its queue as [`EpollSet::rechain`]
+    /// does. A watch that has a file keeps it.
+    pub fn note_file(&self, fd: i32, file: &Arc<dyn FileHandle>, writable: bool) {
+        let mut f = self.files.lock().unwrap_or_else(|e| e.into_inner());
+        if f.iter().any(|x| x.0 == fd) {
+            return;
+        }
+        f.push((fd, Arc::downgrade(file), writable));
+        drop(f);
+        self.rechain(fd, file.wait_queue());
     }
 
     /// A set already holding `watches`: a fork's child's copy of its
@@ -1868,6 +1935,40 @@ impl FileHandle for EpollSet {
         self.queue.id()
     }
 
+    /// Readable when a watch has something to report, as `epoll_wait` would
+    /// return it, not always: a set in a `poll` loop (GLib's main loop
+    /// polling an epoll descriptor, nested sets) otherwise spins a core.
+    /// The poll path tells the set its files before it asks
+    /// (`note_epoll_sets`), so a watch with none is one whose descriptor is
+    /// not open, and it reports nothing.
+    fn poll_readable(&self) -> bool {
+        let files = self.files.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        self.watches().iter().any(|x| {
+            let Some((_, file, writable)) = files.iter().find(|f| f.0 == x.fd) else {
+                return false;
+            };
+            let Some(h) = file.upgrade() else {
+                return false;
+            };
+            let wakes = if x.events & epoll_flag::ET != 0 { h.wakes() } else { None };
+            let p = crate::syscalls::PollFd {
+                addr: 0,
+                fd: x.fd,
+                events: (x.events & 0xffff) as u16,
+                handle: Some(h),
+                writable: *writable,
+                epoll: None,
+                edge: false,
+            };
+            crate::syscalls::poll_revents(&p) != 0 && self.may_report(x.fd, wakes)
+        })
+    }
+
+    /// Never writable, as on Linux.
+    fn poll_writable(&self) -> bool {
+        false
+    }
+
     fn wakes(&self) -> Option<u64> {
         Some(self.queue.wakes())
     }
@@ -1926,10 +2027,24 @@ mod epoll_tests {
 /// kernel and each end is just an id; only the id and the bytes cross.
 #[derive(Clone, Copy, Debug)]
 pub struct Remote {
-    /// Bind and listen in one. Returns a listener id or a negated errno.
-    pub bind: extern "C" fn(path: crate::PAddr, path_len: u32) -> i32,
-    /// Connect to a name. Returns this end's id, or a negated errno.
-    pub connect: extern "C" fn(path: crate::PAddr, path_len: u32) -> i32,
+    /// Bind and listen in one, as the process `pid` with ids `uid` and
+    /// `gid` (what a client's `SO_PEERCRED` reports). Returns a listener id
+    /// or a negated errno.
+    pub bind: extern "C" fn(path: crate::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32) -> i32,
+    /// Connect to a name, as `pid`, `uid` and `gid` (what the server's
+    /// `SO_PEERCRED` reports), from IPv4 address `addr` and port `port` (a
+    /// loopback TCP connection's own end, what the accepted end's
+    /// `peer_addr` reports; both 0 for none). Returns this end's id, or a
+    /// negated errno.
+    pub connect: extern "C" fn(path: crate::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32, addr: u32, port: u32) -> i32,
+    /// The far end's `struct ucred` as it was when the two were joined:
+    /// pid, uid and gid as three little-endian words at `out`. Zero, or a
+    /// negated errno (`ENOTCONN`: no peer, or none known).
+    pub peer_cred: extern "C" fn(id: i32, out: crate::PAddr) -> i32,
+    /// The far end's IPv4 address and port as its `connect` gave them: two
+    /// little-endian words at `out`. Zero, or a negated errno (`ENOTCONN`:
+    /// none given).
+    pub peer_addr: extern "C" fn(id: i32, out: crate::PAddr) -> i32,
     /// Take a waiting connection. Returns the server end's id, or -EAGAIN.
     pub accept: extern "C" fn(listener: i32) -> i32,
     pub pending: extern "C" fn(listener: i32) -> i32,
@@ -1945,9 +2060,10 @@ pub struct Remote {
     /// `shutdown(2)`'s `how` on a connected socket: 0 or a negative errno.
     pub shutdown: extern "C" fn(id: i32, how: u32) -> i32,
     pub exists: extern "C" fn(path: crate::PAddr, path_len: u32) -> i32,
-    /// A connected pair, as `socketpair` makes: both ids written as two
-    /// little-endian `u32`s at `out`. Zero or a negated errno.
-    pub pair: extern "C" fn(out: crate::PAddr) -> i32,
+    /// A connected pair, as `socketpair` makes, by `pid`, `uid` and `gid`
+    /// (each end's peer): both ids written as two little-endian `u32`s at
+    /// `out`. Zero or a negated errno.
+    pub pair: extern "C" fn(out: crate::PAddr, pid: i32, uid: u32, gid: u32) -> i32,
     /// Another id on the same end, for a descriptor that is going to another
     /// process (a fork, or `SCM_RIGHTS`) and must outlive this one closing.
     pub dup: extern "C" fn(id: i32) -> i32,
@@ -1995,6 +2111,8 @@ pub struct RemoteUnix {
     pub peer: Option<String>,
     pub remote: Remote,
     nonblocking: AtomicBool,
+    /// `SO_PASSCRED` (this process's, as the option is the descriptor's).
+    passcred: AtomicBool,
 }
 
 impl std::fmt::Debug for RemoteUnix {
@@ -2009,6 +2127,16 @@ impl std::fmt::Debug for RemoteUnix {
 }
 
 impl RemoteUnix {
+    /// The far end's credentials ([`Remote::peer_cred`]), when known.
+    pub fn peer_cred(&self) -> Option<Cred> {
+        let mut b = [0u8; 12];
+        if (self.remote.peer_cred)(self.id, b.as_mut_ptr() as crate::PAddr) != 0 {
+            return None;
+        }
+        let w = |i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
+        Some(Cred { pid: w(0) as i32, uid: w(1), gid: w(2) })
+    }
+
     pub fn new(id: i32, listening: bool, peer: Option<String>, remote: Remote) -> RemoteUnix {
         RemoteUnix {
             id,
@@ -2016,7 +2144,16 @@ impl RemoteUnix {
             peer,
             remote,
             nonblocking: AtomicBool::new(false),
+            passcred: AtomicBool::new(false),
         }
+    }
+
+    pub fn set_passcred(&self, on: bool) {
+        self.passcred.store(on, Ordering::Relaxed);
+    }
+
+    pub fn passcred(&self) -> bool {
+        self.passcred.load(Ordering::Relaxed)
     }
 
     pub fn set_nonblocking(&self, on: bool) {

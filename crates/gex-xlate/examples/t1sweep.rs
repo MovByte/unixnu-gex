@@ -123,7 +123,9 @@ fn main() {
                 profile: None,
                 page_bases: pages.then_some(&page_bases),
                 dense_global: None,
+                alt_dir: None,
                 module_id: 0,
+                module_id_global: None,
                 loop_heads: Some(&heads),
                 enter: Some(10),
             };

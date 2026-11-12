@@ -1,7 +1,7 @@
 // HostWindows: each guest window handed to the page, framed and placed by it.
-import { System } from '../../web/runtime/src/index.js';
-import { Filesystem } from '../../web/runtime/src/fs.js';
-import { HostWindows } from '../../web/runtime/src/windows/host.js';
+import { System } from '../../page/runtime/src/index.js';
+import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { HostWindows } from '../../page/runtime/src/windows/host.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 120, html: `<style>html, body { margin: 0; } #desk { position: relative; width: 800px; height: 600px; }</style>
 <div id="desk"></div>` };
@@ -9,7 +9,7 @@ export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 120, htm
 export default async function (t) {
   const { say, check, eq, timeout, until, lines } = t;
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
-  const fs = new Filesystem(sys);
+  const fs = new MemoryFilesystem(sys);
   fs.addTar(t.work('bb.tar.zst'));
   const hw = new HostWindows(sys, { width: 800, height: 600, scale: 1 });
   check('a second windows part throws', (() => { try { new HostWindows(sys); return false; } catch { return true; } })());

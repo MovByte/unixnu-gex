@@ -10,13 +10,18 @@ pub const USAGE: &str = "  gexc eject <record-dir> --out <project> [--build] [--
                                    `gexc run --record` recorded: the closure,
                                    the files it read, the runtime, a build step
                                    and a launcher (crates/gex-eject/README.md)
-  gexc eject <wine32-record-dir> --out <project> --web-src <gex>/web [--unit-cache DIR]... [--features -compositor,...] [--build]
+  gexc eject <wine32-record-dir> --out <project> --web-src <gex>/page [--unit-cache DIR]... [--features -compositor,...] [--build]
                                    the same for a Wine page (wine32, or wine64)
-                                   recorded by tools/eject/record-wine32.mjs: its
+                                   recorded by site/record-wine32.mjs: its
                                    bundle, units and runtime, and the features
                                    the build keeps (crates/gex-eject/README.md, \"32-bit Wine pages\")
   gexc eject build <project>       translate it ahead of time and bind the
                                    user's replacements (the project's build.sh)
+  gexc eject prepare <user/eject.json> <bundle.tar> <out.tar> [--prefix /pfx]
+                                   a Wine bundle with the config's prefix
+                                   settings (services, helpers, desktop), to
+                                   record so the bundle split matches the site
+                                   (crates/gex-eject/README.md, \"Services\")
   gexc eject override <project> <object> <symbol|0xoffset> [--size N]
                                    print a user/eject.json replacement entry
                                    for a function, with the object's hash and
@@ -40,6 +45,27 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
                 bail!("gexc eject build takes only the project directory");
             }
             build(&dir)?;
+            Ok(None)
+        }
+        Some("prepare") => {
+            // A Wine bundle as the site of a user/eject.json starts it (its
+            // services, helpers and desktop settings in the prefix), for
+            // the recording the eject then takes.
+            let usage = "gexc eject prepare <user/eject.json> <bundle.tar> <out.tar> [--prefix /pfx]";
+            let mut pos = Vec::new();
+            let mut prefix = "/pfx".to_string();
+            let mut i = 1;
+            while i < args.len() {
+                if args[i] == "--prefix" {
+                    i += 1;
+                    prefix = args.get(i).context(usage)?.clone();
+                } else {
+                    pos.push(PathBuf::from(&args[i]));
+                }
+                i += 1;
+            }
+            let [config, input, out] = &pos[..] else { bail!("{usage}") };
+            gex_eject::wine32::prepare_bundle(config, input, out, &prefix)?;
             Ok(None)
         }
         Some("prune") => {
@@ -173,7 +199,7 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
                     }
                     "--web-src" => {
                         i += 1;
-                        web_src = Some(PathBuf::from(args.get(i).context("--web-src needs gex's web/ directory")?));
+                        web_src = Some(PathBuf::from(args.get(i).context("--web-src needs gex's page/ directory")?));
                     }
                     "--unit-cache" => {
                         i += 1;
@@ -201,7 +227,7 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
             let out = out.context("gexc eject: where to? (--out <project>)")?;
             let runtime = std::env::current_exe().context("finding this gexc to copy into the project")?;
             if gex_eject::wine32::is_recording(&record) {
-                let web_src = web_src.context("a wine32 recording needs --web-src <gex>/web (the page's source and the built runtime)")?;
+                let web_src = web_src.context("a wine32 recording needs --web-src <gex>/page (the page's source and the built runtime)")?;
                 let s = gex_eject::wine32::eject(
                     &record,
                     &out,

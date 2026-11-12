@@ -226,16 +226,18 @@ pub fn tick(mem: &mut [u8], abstime: u64) {
 /// time `tbr`, what `__commpage_gettimeofday` extrapolates from. A reader
 /// retries while `TimeStamp_tick` changes under it, and calls the kernel
 /// while it is zero. The kernel's own lock has one writer here at a time.
-pub fn set_timestamp(mem: &mut [u8], tbr: u64, sec: u64, frac: u64) {
-    let d = off::NEWTIMEOFDAY_DATA;
-    set_word(mem, d, 0);
+pub fn set_timestamp(m: &mut crate::GuestMem<'_>, tbr: u64, sec: u64, frac: u64) {
+    let mut k = m.kernel();
+    let d = placements()[1] + off::NEWTIMEOFDAY_DATA as u64;
+    let mut set = |o: u64, v: u64| k.write_u64(d + o, v).expect("the commpage's read-write page");
+    set(0, 0);
     fence(Ordering::SeqCst);
-    set_word(mem, d + 8, sec);
-    set_word(mem, d + 16, frac);
-    set_word(mem, d + 24, TICK_SCALE);
-    set_word(mem, d + 32, TICKS_PER_SEC);
+    set(8, sec);
+    set(16, frac);
+    set(24, TICK_SCALE);
+    set(32, TICKS_PER_SEC);
     fence(Ordering::SeqCst);
-    set_word(mem, d, tbr);
+    set(0, tbr);
 }
 
 /// Where each page goes in a Darwin process's memory: the read-only page

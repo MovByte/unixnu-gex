@@ -215,9 +215,7 @@ impl Kernel {
             let arg_addr = user_stack - arg_size;
             let mut copy = vec![0u8; arg_size as usize];
             if pid == self.pid {
-                let bytes = m.kernel();
-                let at = arg_addr as usize;
-                copy.copy_from_slice(bytes.bytes.get(at..at + arg_size as usize).ok_or(Errno::EIO)?);
+                copy.copy_from_slice(m.kernel().read(arg_addr, arg_size as usize).map_err(|_| Errno::EIO)?);
             } else {
                 let peer = self.procs.vm(pid).map_err(|_| Errno::EINVAL)?;
                 if !peer.mem.read(arg_addr, &mut copy) {

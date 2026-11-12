@@ -25,13 +25,15 @@ for debugging and for building what a page loads ahead of time.
   passthrough, `/proc`, `/dev`). Each guest process gets its own address
   space. The kernel's shared state is one module that every process's
   Workers share.
-- **wasm32 Linux programs.** `tools/gexcc` is a C/C++ compiler for gex's
+- **wasm32 Linux programs.** `toolchain/gexcc` is a C/C++ compiler for gex's
   wasm32 Linux target. It is used like `gcc`. The debdemo repository
   builds Debian packages with it and assembles a Debian rootfs around them.
-- **Windows programs, through Wine.** `tools/wine-wasm` builds Wine's own
+- **Windows programs, through Wine.** `wine` builds Wine's own
   Unix side as wasm32 for gex, plus a ready-to-run prefix. The Windows code
-  itself is translated like any other x86 code. 32-bit Wine is the main
-  path; 64-bit Wine (`wine64.pins`) is newer and has seen fewer programs.
+  itself is translated like any other x86 code. The build is 64-bit Wine
+  with WoW64, which runs 64-bit and 32-bit Windows programs in one prefix.
+  The older 32-bit-only Wine build is still there, marked legacy, until it
+  is removed.
 - **Graphics.** `gex-wayland` is a Wayland compositor, and `gex-xwm` the X
   window manager that a rootless Xwayland needs. Wayland and X11 programs
   share one desktop. Xwayland can run as native WebAssembly in the page,
@@ -40,7 +42,7 @@ for debugging and for building what a page loads ahead of time.
   with the browser's WebGPU (`third_party/mesa`, Gallium's `gex_wgpu`).
   Desktop GL is supported up to 4.6.
 - **In the page, or ahead of time.** The same programs run in the browser
-  page (`web/`) and natively under `gexc`. An ejected project (below) runs
+  page (`page/`) and natively under `gexc`. An ejected project (below) runs
   only what was built for it ahead of time, as a static site whose
   JavaScript library a page of your own imports.
 
@@ -53,7 +55,7 @@ for debugging and for building what a page loads ahead of time.
                                               ├─▶ gex-fjit   function JIT (GIR → wasm)
                                               └─▶ gex-cgen   function tier (GIR → C → clang → wasm)
 
- page: shims/browser (gex-kernel per process) + shims/kernel (shared kernel) + Mesa + Xwayland
+ page: hosts/browser (gex-kernel per process) + hosts/kernel (shared kernel) + Mesa + Xwayland
 ```
 
 - **Guest virtual address equals linear-memory offset.** gex is the
@@ -71,7 +73,7 @@ for debugging and for building what a page loads ahead of time.
 - **Ahead-of-time builds.** `gexc run --record` records what a run loaded
   and executed. `gexc eject` turns a recording into a project that builds
   everything ahead of time, and runs only what that build made.
-  `web/eject-site.mjs` makes the web build of an
+  `site/eject-site.mjs` makes the web build of an
   ejected project into a static site. The site is a JavaScript library that
   your own page imports.
 
@@ -96,32 +98,40 @@ for debugging and for building what a page loads ahead of time.
 | `crates/gex-wayland`, `gex-xwm`, `gex-gpu` | the compositor, the X window manager, WebGPU compositing |
 | `crates/gex-gl` | OpenGL ES passthrough for the native host |
 | `crates/gex-eject` | ejected projects, built and run ahead of time |
-| `shims/browser` | the browser host: the kernel compiled to wasm, beside each guest |
-| `shims/kernel` | the shared kernel module: process table, filesystem, pipes, sockets |
-| `shims/hostwl` | the compositor for an X server that runs in the page |
-| `shims/native` | the native host, on wasmtime |
+| `hosts/browser` | the browser host: the kernel compiled to wasm, beside each guest |
+| `hosts/kernel` | the shared kernel module: process table, filesystem, pipes, sockets |
+| `hosts/hostwl` | the compositor for an X server that runs in the page |
+| `hosts/native` | the native host, on wasmtime |
 | `guest/` | libraries installed into the guest: GL and EGL, GLX setup, `libsteam_api` |
-| `web/` | the page, its build, and the Mesa and Xwayland builds |
-| `tools/gexcc` | the wasm32 C/C++ compiler and its sysroot |
-| `tools/wine-wasm` | Wine for gex: dist, prefix, runner |
-| `tools/eject` | recording a Windows program for eject |
-| `tools/` (the rest) | generators for the GL transport and compatibility tables, staging the host's Wine PE files, profile and unit helpers |
-| `tests/` | the lifters' differential fuzzers, and page and eject tests that run under Node |
+| `page/` | the page: its source, runtime assets and build (`make page`) |
+| `ports/` | the Mesa, Xwayland and Tint builds the page ships |
+| `site/` | eject and demo sites built from the page, and recording a Windows program for eject |
+| `toolchain/` | gexcc, the wasm32 C/C++ compiler, its sysroots, busybox, and `pins`, the version of every fetched toolchain |
+| `wine/` | Wine for gex: dist, prefix, runner |
+| `scripts/` | generators for the GL transport and compatibility tables, source fetching, the script lint, profile and unit helpers |
+| `test/` | the runtime's tests and their runner, `test/run.mjs`, on two hosts: a headless browser page and Node |
 | `third_party/` | wasmtime (with local changes), Mesa, the Khronos GL registry and CTS |
 
 ## Building
 
-You need the Rust toolchain from `rust-toolchain.toml` (it installs the
-`wasm32-unknown-unknown` target), clang and `wasm-ld`, and Node.js. Building
-Mesa for the page also needs Emscripten. Running AArch64 tests needs an
-`aarch64-linux-musl` cross toolchain, with `qemu-aarch64` as the reference.
+`make help` lists the targets. Every one of them builds from this tree and
+the pins in it, and prints what it made on its last line.
+
+### Run a Linux program
 
 ```console
-$ cargo build --release -p gexc                      # AArch64 guests
-$ cargo build --release -p gexc --features x86 --target-dir target/x86
-                                                     # x86-64 and i386 guests
+$ make gexc
+...
+target/release/gexc target/x86/release/gexc
 
-$ gexc run <elf> [args...]          # translate and run
+$ target/release/gexc run hello
+hello from aarch64
+```
+
+`target/release/gexc` runs AArch64 guests, and `target/x86/release/gexc`
+runs x86-64 and i386 guests. Some other `gexc` commands:
+
+```console
 $ gexc run --wayland SOCKET <elf>   # with the compositor, at SOCKET
 $ gexc build <elf> -o out.wasm      # translate only
 $ gexc disasm <elf>                 # disassemble
@@ -129,35 +139,59 @@ $ gexc ir <elf> --at 0x400abc       # the GIR for one block
 $ gexc run --strace <elf>           # syscall trace
 ```
 
-The page:
+### Build the page
 
 ```console
-$ git submodule update --init third_party/mesa
-$ web/build-all.sh                  # multi-process build, web/dist
-$ web/build-all.sh --sp             # single-thread build, web/dist-sp
-$ node web/serve-dist.mjs 8088 --sp-port 8089
+$ make page                         # the multi-process build, page/dist
+$ make serve                        # http://localhost:8088/
 ```
 
-The multi-process build gives each guest thread its own Worker on shared
-memory. It needs SharedArrayBuffer, so the page must be served with
-COOP/COEP headers. The single-thread build runs every thread as a fiber in
-one Worker, and works on any static host. See `web/README.md` for the
-builds and `web/src/README.md` for the page's JavaScript API.
+`page/README.md` describes the two builds (`make page-sp` is the
+single-thread one), the runtime package (`make runtime`) and ejected
+programs' sites.
 
-Wine needs the x86 `gexc` at `target/x86/release/gexc`, as built above
-(or `GEXC=` naming another):
+### Run a Windows program
 
 ```console
-$ make -C tools/wine-wasm           # the Wine dist and a prefix
-$ tools/wine-wasm/run.sh app.exe    # run a Windows program
+$ make wine
+...
+WINE64_DIST=...
+WINE64_PREFIX=...
 ```
+
+`wine/README.md` covers running a program on it.
+
+### Build a program with gexcc
+
+```console
+$ make gexcc
+...
+out/gexcc/bin/gexcc
+$ out/gexcc/bin/gexcc -O2 -o hello hello.c && target/x86/release/gexc run hello
+```
+
+### What the build needs
+
+- the Rust toolchain from `rust-toolchain.toml` (it installs the
+  `wasm32-unknown-unknown` target);
+- clang and `wasm-ld` (LLVM 22), and Node.js 22;
+- for the page: Emscripten (`emsdk`) and `wasm-tools`
+  (`cargo install wasm-tools`);
+- for Wine: the host's MinGW-w64 GCC 12 (`x86_64-w64-mingw32-gcc`, and
+  `i686-w64-mingw32-gcc` for WoW64); it is a prerequisite, not a pin;
+- for AArch64 tests: `qemu-aarch64` as the reference. The musl cross
+  toolchains are fetched by `make toolchains` at the versions in
+  `toolchain/pins`.
+
+Fetched sources (musl, LLVM, Wine) are kept in bare mirrors under
+`~/.cache/gex` (`CACHE=`). A rerun fetches nothing it already has. The
+Makefile's header lists the settings.
 
 ## Tests
 
-Each crate's own tests run with `cargo test -p <crate>`. `tests/diff-fuzz`
-and `tests/diff-fuzz-x86` fuzz the lifters instruction by instruction against
-QEMU. The `check-*.mjs` scripts in `shims/browser/js` and the scripts in
-`tests/browser` and `tests/eject` run with `node`.
+`make test` runs the runtime's tests (`node test/run.mjs`; `test/README.md`
+gives its options, passed as `ARGS="..."`). `make check` runs each crate's
+own tests (`cargo test`). Every other test lives in the gexdev repository.
 
 ## Licence
 
