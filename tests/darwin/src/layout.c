@@ -179,6 +179,41 @@ static int check_layout(int dyld_on_disk) {
     return 0;
 }
 
+// The region's submap entry is permanent: a range of it may be replaced or
+// removed only where the region holds no permanent mapping (vm_map_delete,
+// shared_region_make_permanent: one neither writable nor executable, as its
+// dynamic data page is), else KERN_PROTECTION_FAILURE (EACCES from
+// mmap(MAP_FIXED), EINVAL from munmap). Its holes may go.
+static int check_region_permanence(void) {
+    uint64_t start = 0;
+    if (syscall(SYS_shared_region_check_np, &start) != 0) return bad("shared_region_check_np", errno);
+    uint64_t dyn = start + *(const uint64_t *)(uintptr_t)(start + 0x1f0);
+    if (memcmp((const void *)(uintptr_t)dyn, "dyld_data    v0", 16)) return bad("the shared cache's dynamic data page", dyn);
+    void *p = mmap((void *)(uintptr_t)dyn, PAGE, PROT_READ, MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0);
+    if (p != MAP_FAILED || errno != EACCES) return bad("a fixed mapping over the dynamic data page", errno);
+    vm_address_t at = dyn;
+    kern_return_t kr = vm_allocate(mach_task_self(), &at, PAGE, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE);
+    if (kr != KERN_PROTECTION_FAILURE) return bad("an overwriting allocation over the dynamic data page", kr);
+    if ((kr = vm_deallocate(mach_task_self(), dyn, PAGE)) != KERN_PROTECTION_FAILURE) return bad("vm_deallocate of the dynamic data page", kr);
+    if (munmap((void *)(uintptr_t)dyn, PAGE) != -1 || errno != EINVAL) return bad("munmap of the dynamic data page", errno);
+    if (memcmp((const void *)(uintptr_t)dyn, "dyld_data    v0", 16)) return bad("the dynamic data page after", dyn);
+
+    vm_address_t hole = REGION_BASE + REGION_SIZE - PAGE, raddr = hole;
+    p = mmap((void *)hole, PAGE, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0);
+    if (p != (void *)hole) return bad("a fixed mapping over a hole of the region", errno);
+    vm_size_t rsize = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t obj = MACH_PORT_NULL;
+    kr = vm_region_64(mach_task_self(), &raddr, &rsize, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &obj);
+    if (kr != KERN_SUCCESS || raddr != hole || rsize != PAGE || info.reserved) return bad("the mapping that replaced part of the region", raddr);
+    if (munmap(p, PAGE) != 0) return bad("munmap of that mapping", errno);
+    at = hole;
+    if ((kr = vm_allocate(mach_task_self(), &at, PAGE, VM_FLAGS_FIXED)) != KERN_SUCCESS) return bad("a fixed allocation where the region was", kr);
+    vm_deallocate(mach_task_self(), at, PAGE);
+    return 0;
+}
+
 static int check_nano_off(const char **apple) {
     if (getenv("MallocNanoZone")) return bad("MallocNanoZone is in the environment", 0);
     if (apple_val(apple, "MallocNanoZone")) return bad("exec gave MallocNanoZone without the spawn flag", 0);
@@ -269,7 +304,7 @@ int main(int argc, char **argv, char **envp, const char **apple) {
         if (cache_slide != strtoull(argv[2], NULL, 16)) return bad("the shared cache's slide differs from the parent's", cache_slide);
         return 0;
     }
-    if (check_layout(0) || check_nano_off(apple)) return 1;
+    if (check_layout(0) || check_nano_off(apple) || check_region_permanence()) return 1;
 
     char path[1024];
     uint32_t n = sizeof path;
