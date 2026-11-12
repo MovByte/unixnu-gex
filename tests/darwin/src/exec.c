@@ -1,15 +1,19 @@
 // execve by kern_exec.c's rules. What fails comes back: ENOENT, EACCES for
 // a file without an execute bit and for a directory, ENOEXEC for an empty
-// file, for one no activator claims and for a script whose interpreter is a
-// script, E2BIG past ARG_MAX, ENAMETOOLONG past MAXPATHLEN. Then a #! script
-// runs its interpreter (this program) with the line's words and the
-// script's path before the arguments, and the new image keeps what exec
-// keeps: the pid, the signal mask and what is pending, ignored signals
-// ignored, caught ones back to their default (an ignored-by-default one's
-// pending copy dropped), descriptors without close-on-exec (and their flock
-// locks), the environment; the close-on-exec ones, the kqueue, the signal
-// stack and the old IPC space's names are gone. Last, a fat file runs its
-// arm64 slice, where an arm64e-only one fails with EBADARCH.
+// file and for one no activator claims, E2BIG past ARG_MAX, ENAMETOOLONG
+// past MAXPATHLEN. A #! script's interpreter is refused (EPERM), a nested
+// one's before its own activation would refuse it: the platform profile's
+// process-exec-interpreter (operation 121) starts at system-attribute 3,
+// kern.osreleasetype naming "Internal", which a customer build's does not.
+// So the new image is this program exec'd with the arguments its
+// interpreter would have had (the line's words and the script's path before
+// the script's), and it keeps what exec keeps: the pid, the signal mask and
+// what is pending, ignored signals ignored, caught ones back to their
+// default (an ignored-by-default one's pending copy dropped), descriptors
+// without close-on-exec (and their flock locks), the environment; the
+// close-on-exec ones, the kqueue, the signal stack and the old IPC space's
+// names are gone. Last, a fat file runs its arm64 slice, where an
+// arm64e-only one fails with EBADARCH.
 
 #include <errno.h>
 #include <fcntl.h>
@@ -51,8 +55,9 @@ static int fails(const char *path, char **argv, int want) {
 #define KEEP "/tmp/gex-exec-keep"
 #define GONE "/tmp/gex-exec-gone"
 
-// The new image: argv is the interpreter, the line's words, the script,
-// then what the script was run with.
+// The new image: argv is what the script's interpreter would have had: the
+// interpreter, the line's words, the script, then what the script was run
+// with.
 static int second(int argc, char **argv) {
     char self[PATH_MAX];
     uint32_t n = sizeof self;
@@ -119,12 +124,15 @@ int main(int argc, char **argv) {
     if (!fails("/tmp/gex-exec-junk", none, ENOEXEC)) return bad("ENOEXEC for junk", errno);
     put("/tmp/gex-exec-bang", "#!\n", 0755);
     if (!fails("/tmp/gex-exec-bang", none, ENOEXEC)) return bad("ENOEXEC for an empty #! line", errno);
-    // A script whose interpreter is a script: one level only.
+    // A script whose interpreter is a script: the interpreter's
+    // process-exec-interpreter refuses it first (operation 121's first node,
+    // system-attribute 3: kern.osreleasetype must name "Internal"), where an
+    // Internal build's activator would answer ENOEXEC (one level only).
     put(S2, "#!/tmp/gex-exec-junk\n", 0755);
     char line[PATH_MAX + 64];
     snprintf(line, sizeof line, "#!" S2 "\n");
     put("/tmp/gex-exec-nest", line, 0755);
-    if (!fails("/tmp/gex-exec-nest", none, ENOEXEC)) return bad("ENOEXEC for a nested interpreter", errno);
+    if (!fails("/tmp/gex-exec-nest", none, EPERM)) return bad("EPERM for a nested interpreter", errno);
     char *big = malloc(300 * 1024);
     memset(big, 'a', 300 * 1024 - 1);
     big[300 * 1024 - 1] = 0;
@@ -171,6 +179,11 @@ int main(int argc, char **argv) {
     snprintf(q, sizeof q, "%d", kq);
     char *args[] = {"ignored", "a", pid, k, g, q, NULL};
     char *env[] = {"GEX_EXEC=1", portenv, "MallocNanoZone=0", NULL};
-    execve(S, args, env);
-    return bad("execve of the script", errno);
+    // The script's interpreter is refused as above (operation 121, system-
+    // attribute 3: kern.osreleasetype must name "Internal"); then this
+    // program with the arguments it would have had.
+    if (!fails(S, args, EPERM)) return bad("EPERM for the script's interpreter", errno);
+    char *interp[] = {self, "-s", "word", S, "a", pid, k, g, q, NULL};
+    execve(self, interp, env);
+    return bad("execve of this program", errno);
 }
