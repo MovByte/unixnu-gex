@@ -1906,9 +1906,12 @@ impl FdIo<'_> {
     /// The park for a `read`/`readv` or `write`/`writev` that returned
     /// `EAGAIN` on a stream descriptor that should block.
     fn eagain_park(&self, m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> Option<BlockOp> {
+        const MSG_NOSIGNAL: u64 = 0x4000;
         let file = self.fds.get(a[0] as i32).ok()?;
         let (buf, len) = match n {
             nr::READ | nr::WRITE => (a[1], a[2]),
+            // A send to the peer with no flag but MSG_NOSIGNAL is a write.
+            nr::SENDTO if a[4] == 0 && a[3] & !MSG_NOSIGNAL == 0 => (a[1], a[2]),
             nr::READV | nr::WRITEV => self.first_iovec(m, a)?,
             _ => return None,
         };
@@ -1929,9 +1932,22 @@ impl FdIo<'_> {
                 let len = gathered.as_ref().map_or(len, |g| g.len());
                 Some(BlockOp::WriteStream { handle, buf, len, gathered, xnu: None })
             }
-            nr::WRITE if file.write_is_atomic() => Some(BlockOp::WriteStream { handle, buf, len, gathered: None, xnu: None }),
+            nr::WRITE | nr::SENDTO if file.write_is_atomic() => Some(BlockOp::WriteStream { handle, buf, len, gathered: None, xnu: None }),
             _ => None,
         }
+    }
+
+    /// A blocking send on a stream socket that has no room, which
+    /// [`Self::eagain_park`] does not park: a `sendmsg`, or a `sendto` with
+    /// an address or a flag past MSG_NOSIGNAL (but not MSG_DONTWAIT).
+    fn send_unparked(&self, n: u64, a: &[u64; 6]) -> bool {
+        const MSG_DONTWAIT: u64 = 0x40;
+        let flags = match n {
+            nr::SENDTO => a[3],
+            nr::SENDMSG => a[2],
+            _ => return false,
+        };
+        flags & MSG_DONTWAIT == 0 && self.fds.get(a[0] as i32).is_ok_and(|f| f.write_is_atomic())
     }
 
     /// A `struct cmsghdr` is a length (a `size_t`), a level, a type, then
@@ -10370,6 +10386,9 @@ impl Kernel {
             if let Some(op) = self.eagain_park(m, n, a) {
                 self.write_blocked = matches!(op, BlockOp::WriteStream { .. });
                 return SyscallOutcome::Blocking(op);
+            }
+            if self.darwin && self.fd_io().send_unparked(n, &a) {
+                self.darwin_unimplemented(format!("a blocking {} that must wait for room (sosend's sbwait)", syscall_name(n)));
             }
         }
         if let Ok(Err(Errno::EPIPE)) = &outcome {
