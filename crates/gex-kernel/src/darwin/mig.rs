@@ -1812,12 +1812,15 @@ fn host_get_special_port(k: &mut Kernel, obj: &Kobject, port: super::ipc::ObjId,
     Reply::port(Carried::Port(p))
 }
 
-/// `host_set_special_port_from_user`, then `host_set_special_port`: a user
-/// port, not an immovable right, and only launchd may. Its Sandbox check is
-/// no check for launchd, which has no profile.
+/// `host_set_special_port_from_user`, then `host_set_special_port`
+/// (host.c): a user port, set by no driver task, not an immovable right;
+/// only launchd may set one, but for the telemetry port, which a task
+/// entitled to monitor launchd's events may (iOS has no CSR); then the MAC
+/// policies' `mac_task_check_set_host_special_port`.
 fn host_set_special_port(k: &mut Kernel, obj: &Kobject, _port: super::ipc::ObjId, id: i32, right: Option<Carried>) -> Reply {
     const HOST_MAX_SPECIAL_KERNEL_PORT: i32 = 7;
     const HOST_MAX_SPECIAL_PORT: i32 = 7 + 27;
+    const HOST_TELEMETRY_PORT: i32 = 7 + 13;
     const KERN_NO_ACCESS: i32 = 8;
     const KERN_INVALID_RIGHT: i32 = 17;
     let port = match right {
@@ -1827,13 +1830,20 @@ fn host_set_special_port(k: &mut Kernel, obj: &Kobject, _port: super::ipc::ObjId
     if !matches!(obj, Kobject::HostPriv) || id <= HOST_MAX_SPECIAL_KERNEL_PORT || id > HOST_MAX_SPECIAL_PORT {
         return Reply::err(KERN_INVALID_ARGUMENT);
     }
+    // task_is_driver.
+    if k.darwin_policy().requested.apptype == super::taskpolicy::apptype::DRIVER {
+        return Reply::err(KERN_NO_ACCESS);
+    }
     if let Some(p) = port {
         let port = k.ipc().port(p);
         if port.immovable_receive || port.immovable_send {
             return Reply::err(KERN_INVALID_RIGHT);
         }
     }
-    if k.pid != crate::proc::INIT_PID {
+    if k.pid != crate::proc::INIT_PID && !(id == HOST_TELEMETRY_PORT && k.darwin_task_entitled("com.apple.private.xpc.launchd.event-monitor")) {
+        return Reply::err(KERN_NO_ACCESS);
+    }
+    if k.darwin_mac_check_set_host_special_port(id) != 0 {
         return Reply::err(KERN_NO_ACCESS);
     }
     let ipc = k.ipc();

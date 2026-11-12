@@ -29,6 +29,7 @@ mod e {
     pub const EDEADLK: u32 = 11;
     pub const EACCES: u32 = 13;
     pub const EINVAL: u32 = 22;
+    pub const ENOTSUP: u32 = 45;
 }
 
 /// `mac_error_select`.
@@ -45,6 +46,7 @@ pub fn error_select(a: u32, b: u32) -> u32 {
 pub mod op {
     pub const DYNAMIC_CODE_GENERATION: usize = 9;
     pub const FILE_REVOKE: usize = 25;
+    pub const MACH_HOST_SPECIAL_PORT_SET: usize = 93;
     pub const MACH_PRIV_HOST_PORT: usize = 98;
     pub const MACH_PRIV_TASK_PORT: usize = 99;
     pub const MACH_TASK_INSPECT: usize = 102;
@@ -610,6 +612,17 @@ impl Kernel {
     pub(crate) fn darwin_mac_check_vnode_revoke(&mut self, v: SbVnode) -> u32 {
         let a = SbArgs { kind: sandbox::kind::VNODE, vnode: Some(v), ..Default::default() };
         self.darwin_sb_evaluate(op::FILE_REVOKE, &a)
+    }
+
+    /// `mac_task_check_set_host_special_port` (Sandbox's hook, slot 126:
+    /// mach-host-special-port-set of the port's id, which must fit 16 bits;
+    /// AMFI has none).
+    pub(crate) fn darwin_mac_check_set_host_special_port(&mut self, id: i32) -> u32 {
+        if (id as u32) >> 16 != 0 {
+            return e::ENOTSUP;
+        }
+        let a = SbArgs { kind: sandbox::kind::HOST_SPECIAL_PORT, number: id as u32 & 0xffff, ..Default::default() };
+        self.darwin_sb_evaluate(op::MACH_HOST_SPECIAL_PORT_SET, &a)
     }
 
     pub(crate) fn darwin_mac_check_fork(&mut self) -> u32 {

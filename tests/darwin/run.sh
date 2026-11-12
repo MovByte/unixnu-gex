@@ -41,6 +41,7 @@ done
 export GEX_DARWIN_BOOT="$BOOT"
 
 fail=0
+as=
 named=$#
 
 report() {
@@ -75,8 +76,18 @@ check_root() {
     fi
     mkdir -p "$GEX_DARWIN_ROOT/var/tmp"
     cp "$HERE/bin/$name" "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$name"
-    out=$("$GEXC" run --sysroot "$GEX_DARWIN_ROOT" "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$name" "$@" 2>/dev/null)
+    # shellcheck disable=SC2086
+    out=$("$GEXC" run --sysroot "$GEX_DARWIN_ROOT" ${as:+--uid "$as"} "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$name" "$@" 2>/dev/null)
     report "$name" "$out" $? "$want_out" "$want_status"
+}
+
+# check_root_as UID:GID NAME WANT_OUT WANT_STATUS [ARGS...]: check_root, the
+# program run as that user and group.
+check_root_as() {
+    as=$1
+    shift
+    check_root "$@"
+    as=
 }
 
 run() {
@@ -260,6 +271,7 @@ hello from /var/tmp/gex-exec-fat with 1 argument" 0
         fi
         check_root sbxkill "sbxkill ok" 0
         ;;
+    hostspecial) check_root_as 0:0 hostspecial "hostspecial ok" 0 ;;
     cfrunloop) check_root cfrunloop "cfrunloop 3 1" 0 ;;
     xpc-anon) check_root xpc-anon "xpc-anon 42" 0 ;;
     *)
@@ -274,7 +286,7 @@ if [ "$named" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl iokit ioreg xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit sbxinit sbxexec sbxkill cfrunloop xpc-anon; do
+    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl iokit ioreg xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit sbxinit sbxexec sbxkill hostspecial cfrunloop xpc-anon; do
         run "$p"
     done
 fi
