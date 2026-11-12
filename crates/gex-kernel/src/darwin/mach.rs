@@ -987,6 +987,17 @@ impl Kernel {
         }
     }
 
+    /// Whether a fixed allocation of `size` bytes at `start` would be had
+    /// (`vm_map_enter` with VM_FLAGS_FIXED and no overwrite): inside the map,
+    /// and over nothing, the shared region's submap included.
+    pub(crate) fn darwin_fixed_fits(&self, start: u64, size: u64) -> bool {
+        let Some(end) = start.checked_add(size) else { return false };
+        start >= self.dtask.map_min
+            && end <= self.darwin_map_max().min(super::vm::BACKED_END)
+            && !self.darwin_in_shared_region(start, end)
+            && !self.mem.lock().vmas().iter().any(|v| v.start < end && start < v.end)
+    }
+
     /// Whether `[start, end)` meets the shared region the task's map nests
     /// (`vm_shared_region_enter`'s one submap entry over all of it, less
     /// what has since replaced or removed part of it).

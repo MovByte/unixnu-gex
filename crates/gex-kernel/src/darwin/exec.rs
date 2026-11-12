@@ -566,7 +566,17 @@ impl Kernel {
             (0, MAXSSIZ, false)
         };
         let size = round_page(alloc_size).ok_or(Errno::ENOMEM)?;
-        let alloc = trunc_page(user_stack.checked_sub(size).ok_or(Errno::ENOMEM)?);
+        // create_unix_stack: the allocation right below the stack's top,
+        // fixed; where that cannot be had, anywhere, the top then its end
+        // (the load result's user_stack and p_user_stack follow it). Exec
+        // fails without either.
+        let (alloc, user_stack) = match user_stack.checked_sub(size).map(trunc_page).filter(|&a| self.darwin_fixed_fits(a, size)) {
+            Some(a) => (a, user_stack),
+            None => {
+                let a = self.darwin_locate_space(0, size, 0).map_err(|_| Errno::ENOMEM)?;
+                (a, a + size)
+            }
+        };
         let guard = if stack_size == 0 {
             stack_size = self.dtask.rlimits.cur(rlimit::res::STACK);
             trunc_page(size.checked_sub(stack_size).ok_or(Errno::ENOMEM)?)
@@ -588,9 +598,11 @@ impl Kernel {
             b.extend_from_slice(&bytes);
             bytes = b;
         }
-        // create_unix_stack's mach_vm_allocate_kernel(VM_MEMORY_STACK).
+        // create_unix_stack's mach_vm_allocate_kernel(VM_MEMORY_STACK), and
+        // its mach_vm_protect of the guard, which clips the entry there.
         const VM_MEMORY_STACK: u8 = 30;
         self.dtask.vm.enter_anon(alloc, alloc + size, super::vm::Attrs { alias: VM_MEMORY_STACK, ..Default::default() }, false);
+        self.dtask.vm.clip_range(alloc, alloc + guard);
         Ok(MainStack { sp, bytes, alloc, size, guard })
     }
 }
