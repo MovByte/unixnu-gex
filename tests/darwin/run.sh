@@ -20,8 +20,9 @@ GEXC=${GEXC:-$ROOT/target/release/gexc}
 
 BOOT=$HERE/bin/boot
 mkdir -p "$BOOT"
-# (untrusted is the one left out.)
-progs=$(find "$HERE/bin" -maxdepth 1 -type f ! -name untrusted | sort)
+# (untrusted is the one left out. bin may be a link to where the build
+# keeps them, which find follows with -H.)
+progs=$(find -H "$HERE/bin" -maxdepth 1 -type f ! -name untrusted | sort)
 if [ -n "${GEX_DARWIN_BOOT:-}" ]; then
     # shellcheck disable=SC2086
     python3 -I "$ROOT/tools/darwin-trust-cache.py" -o "$BOOT/TrustCache" --bundle "$GEX_DARWIN_BOOT/TrustCache" $progs || exit 1
