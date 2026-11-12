@@ -751,6 +751,38 @@ impl FdTable {
         self.insert_at(file, 0, cloexec)
     }
 
+    /// Install each description at the lowest free descriptor, all of them
+    /// or (no room for them all under the limit) none: EMFILE.
+    pub fn insert_all(&self, files: Vec<Arc<OpenFile>>) -> Result<Vec<i32>, Errno> {
+        let limit = self.limit();
+        self.update(|t| {
+            let free = t.entries.iter().take(limit).filter(|e| e.is_none()).count() + limit.saturating_sub(t.entries.len());
+            if free < files.len() {
+                return Err(Errno::EMFILE);
+            }
+            let mut fds = Vec::with_capacity(files.len());
+            for file in files {
+                let idx = match t.entries.iter().position(|e| e.is_none()) {
+                    Some(i) => i,
+                    None => {
+                        t.entries.push(None);
+                        t.cloexec.push(false);
+                        t.clofork.push(false);
+                        t.guards.push(None);
+                        t.entries.len() - 1
+                    }
+                };
+                t.entries[idx] = Some(file);
+                t.cloexec[idx] = false;
+                t.clofork[idx] = false;
+                t.guards[idx] = None;
+                t.grow_to(idx, limit);
+                fds.push(idx as i32);
+            }
+            Ok(fds)
+        })
+    }
+
     /// Force a description into a specific descriptor, closing what was there.
     pub fn install(&self, fd: i32, file: Arc<OpenFile>, cloexec: bool) -> SysResult {
         // dup2/dup3 to a descriptor past RLIMIT_NOFILE: EBADF, as Linux

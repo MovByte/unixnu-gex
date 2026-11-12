@@ -1425,7 +1425,8 @@ impl Kernel {
             retval = qlen != 0;
             data = qlen as i64;
         } else {
-            data = so.rcv as i64;
+            // The bytes of data: the buffer's less its address and control.
+            data = (so.rcv - so.ctl) as i64;
             if so.cantrcv {
                 let k = self.knote(n);
                 k.flags |= ev::EOF;
@@ -1456,13 +1457,23 @@ impl Kernel {
     }
 
     /// `filt_sowrite_common`: `sbspace` of the send buffer, which for a unix
-    /// stream is the room left in the peer's receive buffer.
+    /// stream is the room left in the peer's receive buffer; a connected
+    /// unix socket's no more than its peer's receive space.
     fn filt_sowrite_common(&mut self, n: KnId, kev: Option<&mut Kev>) -> u32 {
         const NOTE_LOWAT: u32 = 0x1;
         let so = self.knote_so(n);
         let opts = self.knote_sockopts(n, &so);
         let hiwat = i64::from(opts.snd_hiwat);
-        let data = (hiwat - so.snd_used as i64).max(0);
+        // sbspace: (int)(sb_hiwat - sb_cc), and (int)(sb_mbmax - sb_mbcnt)
+        // for a socket that keeps it.
+        let mut data = i64::from(opts.snd_hiwat.wrapping_sub(so.snd_used as u32) as i32);
+        if let Some(mbmax) = so.snd_mbmax {
+            data = data.min(i64::from(mbmax as u32 as i32));
+        }
+        data = data.max(0);
+        if let Some(peer) = so.peer_space {
+            data = data.min(peer as i64);
+        }
         let ret = if so.cantsend {
             let k = self.knote(n);
             k.flags |= ev::EOF;

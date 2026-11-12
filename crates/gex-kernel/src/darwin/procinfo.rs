@@ -1231,6 +1231,12 @@ mod dtype {
     pub const PIPE: u32 = 6;
 }
 
+/// `fg_sendable`: a vnode, socket, pipe or shared memory object, which a
+/// unix socket's message may carry (none is `FG_CONFINED` here).
+pub(crate) fn fg_sendable(f: &Arc<crate::file::OpenFile>) -> bool {
+    matches!(fdtype(f), dtype::VNODE | dtype::SOCKET | dtype::PIPE | dtype::PSXSHM)
+}
+
 fn fdtype(f: &Arc<crate::file::OpenFile>) -> u32 {
     if f.handle.pipe_end().is_some() {
         dtype::PIPE

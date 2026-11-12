@@ -73,6 +73,8 @@ pub mod reason;
 pub mod rlimit;
 pub mod sandbox;
 pub mod sched;
+pub mod sockbuf;
+pub mod unixsock;
 pub mod sema;
 pub mod select;
 pub mod shm;

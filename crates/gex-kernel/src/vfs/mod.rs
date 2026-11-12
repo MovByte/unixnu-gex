@@ -55,6 +55,28 @@ pub struct SoState {
     /// A unix stream socket, whose send space is its peer's receive buffer
     /// (`SB_UNIX`; `unp_cc`, the bytes there, is `snd_used`).
     pub unix_stream: bool,
+    /// `sb_ctl`: of `rcv`, the bytes in address and control mbufs.
+    pub ctl: u64,
+    /// An atomic protocol's receive queue: the records in it and the first
+    /// one's data bytes. `None` for a stream's.
+    pub records: Option<(u64, u64)>,
+    /// Whether `rcv`, `ctl` and `records` are the receive buffer's own
+    /// counts as its protocol keeps them; a socket modelled by its bytes
+    /// alone says not.
+    pub exact: bool,
+    /// A connected unix socket's peer's receive space
+    /// (`sbspace(&so2->so_rcv)`), which bounds what it may send.
+    pub peer_space: Option<u64>,
+    /// The send buffer's `sb_mbmax`, for a socket that keeps it (a unix
+    /// stream's, lowered as `sb_hiwat` is).
+    pub snd_mbmax: Option<u64>,
+    /// A unix stream's peer's `unp_cc`: what this socket's sends left in
+    /// the peer's receive buffer as last counted, which `SO_SNDBUF` adds to
+    /// the send buffer's `sb_hiwat`.
+    pub unp_cc: u64,
+    /// Whether `hiwat` is the socket's own, which its options' copy goes
+    /// by (a socket that keeps its buffers as XNU does).
+    pub live_hiwat: bool,
 }
 
 /// What a kqueue's pipe filters read of an anonymous pipe end
@@ -592,6 +614,32 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn vn_close(&self) {}
 
     /// The Darwin devfs node this is an open of, if it is one.
+    /// `sbreserve` of a Darwin socket's send (`snd`) or receive buffer
+    /// (`SO_SNDBUF`, `SO_RCVBUF`), for a socket that keeps its buffers as
+    /// XNU does.
+    fn xnu_reserve(&self, _snd: bool, _cc: usize) {}
+
+    /// The options of a socket that keeps them itself (a Darwin unix
+    /// socket, whose connections' accepted ends inherit them from their
+    /// listener: `sonewconn`), once any is set.
+    fn xnu_sockopts(&self) -> Option<crate::darwin::sockopt::SockOpts> {
+        None
+    }
+
+    /// Keep `o` as such a socket's options; false for a socket that does
+    /// not keep its own.
+    fn set_xnu_sockopts(&self, _o: crate::darwin::sockopt::SockOpts) -> bool {
+        false
+    }
+
+    /// Whether a send of `resid` bytes with `clen` bytes of control would
+    /// go on now (`sosendcheck`'s wait not needed, or an error to report):
+    /// for a handle whose sends wait by its own rules.
+    fn send_ready(&self, resid: usize, clen: usize) -> bool {
+        let _ = (resid, clen);
+        self.poll_writable()
+    }
+
     fn darwin_devnode(&self) -> Option<&'static crate::darwin::devfs::Node> {
         None
     }

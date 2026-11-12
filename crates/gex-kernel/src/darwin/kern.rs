@@ -698,6 +698,10 @@ impl Kernel {
             sys::PWRITEV | sys::PWRITEV_NOCANCEL => res(self.darwin_prwv(m, true, a)),
             // A family or an option this kernel has no Linux counterpart for
             // is refused where the caller is told, and said.
+            // The unix domain's protocols are a stream and a datagram one,
+            // of protocol 0 (socreate_internal's EPROTONOSUPPORT for any
+            // other).
+            sys::SOCKET | sys::SOCKETPAIR if a[0] == 1 && (!matches!(a[1], 1 | 2) || a[2] != 0) => neg(Errno::EPROTONOSUPPORT),
             sys::SOCKET | sys::SOCKETPAIR if !matches!(a[0], 0..=2) => {
                 if super::sockaddr::family_exists(a[0]) {
                     self.darwin_unimplemented(format!("socket domain {} (AF_* of Darwin's bsd/sys/socket.h)", a[0]));
@@ -728,6 +732,12 @@ impl Kernel {
             sys::SENDTO | sys::SENDTO_NOCANCEL if super::sockopt::is_broadcast(m, a[4], a[5]) => {
                 self.darwin_unimplemented("a datagram to the broadcast address (INADDR_BROADCAST)".into());
                 neg(Errno::EACCES)
+            }
+            // Control on a unix datagram socket: its descriptors are not
+            // carried (unp_internalize for SOCK_DGRAM).
+            sys::SENDMSG | sys::SENDMSG_NOCANCEL if self.darwin_dgram_control(m, a[0], a[1]) => {
+                self.darwin_unimplemented("a control message on a unix datagram socket (its descriptors, unp_internalize)".into());
+                neg(Errno::EOPNOTSUPP)
             }
             sys::SENDTO | sys::SENDTO_NOCANCEL | sys::RECVFROM | sys::RECVFROM_NOCANCEL | sys::SENDMSG | sys::SENDMSG_NOCANCEL | sys::RECVMSG | sys::RECVMSG_NOCANCEL
                 if super::sockaddr::msg_flags_unported(if matches!(raw, sys::SENDMSG | sys::SENDMSG_NOCANCEL | sys::RECVMSG | sys::RECVMSG_NOCANCEL) { a[2] } else { a[3] }).is_some() =>
@@ -1374,6 +1384,17 @@ impl Kernel {
                 }
             },
         }
+    }
+
+    /// Whether a `sendmsg` on `fd` with the `struct msghdr` at `msg` carries
+    /// control to a unix datagram socket (`msg_control`, `msg_controllen`).
+    fn darwin_dgram_control(&self, m: &GuestMem<'_>, fd: u64, msg: u64) -> bool {
+        if self.fd_io().dgram_of(fd as i32).is_err() {
+            return false;
+        }
+        let control = m.read_u64(msg + 32).unwrap_or(0);
+        let controllen = m.read_u32(msg + 40).unwrap_or(0);
+        control != 0 && controllen != 0
     }
 
     /// `sysctl_loadavg`: `averunnable` as a 64-bit process's `struct

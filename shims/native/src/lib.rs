@@ -2157,6 +2157,17 @@ fn perform_block(
                 ready::wait(seen, left.min(std::time::Duration::from_millis(1)));
             }
         }
+        // A Darwin socket's send with no room before its first byte: only
+        // the wait, for the call to be made again by the kernel, which has
+        // the descriptor table its control's descriptors come from.
+        BlockOp::WriteWait { handle, resid, clen } => loop {
+            let seen = ready::seq();
+            service(data);
+            if handle.send_ready(resid, clen) {
+                return Ok(0);
+            }
+            turn!(seen);
+        },
         BlockOp::AcceptWait { socket } => {
             // Only the wait: the descriptor is made by the kernel afterwards,
             // which is the one place that has a descriptor table.

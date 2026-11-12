@@ -13,6 +13,8 @@
 use crate::errno::{Errno, SysResult};
 use crate::file::{InFlight, OpenFile};
 use crate::vfs::{FileHandle, FileType, Metadata};
+use crate::darwin::sockbuf::{self, SockBuf};
+use crate::darwin::sockopt::SockOpts;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -36,6 +38,107 @@ struct Stream {
     read: u64,
     /// Set when the writing end is gone, so a reader sees end-of-file.
     closed: bool,
+    /// Between two Darwin sockets: the buffers as XNU keeps them, which
+    /// then decide what is sent and read.
+    xnu: Option<XnuDir>,
+}
+
+/// A direction between two Darwin sockets as XNU accounts for it
+/// (`uipc_send`, `uipc_rcvd`): the sending socket's `so_snd` limits, which
+/// each send lowers by what it put in the receiver's buffer and each
+/// receive gives back; the receiving socket's `so_rcv`, its records'
+/// mbufs; and the receiver's `unp_cc` and `unp_mbcnt`, that buffer's
+/// counts as the last send or receive left them. The counters are XNU's
+/// widths, with its wrapping.
+#[derive(Debug)]
+struct XnuDir {
+    snd_hiwat: u32,
+    snd_mbmax: u32,
+    rcv: SockBuf,
+    unp_cc: u32,
+    unp_mbcnt: u32,
+    /// Each control record's message, in order: its length and the
+    /// descriptors it carries.
+    rights: VecDeque<(usize, Vec<InFlight>)>,
+    /// `SB_DROP` and `SS_CANTRCVMORE`: the receiver shut down its reading
+    /// (`sorflush`), so what comes is dropped and a read is at its end.
+    dropping: bool,
+    /// `unp_disconnect`: an end has gone, and neither is the other's
+    /// `unp_conn` any more.
+    disconnected: bool,
+}
+
+/// `unpst_sendspace` and `unpst_recvspace`.
+pub const UNPST_SPACE: u32 = 8192;
+
+impl XnuDir {
+    fn new(snd_hiwat: u32, rcv_hiwat: u32) -> XnuDir {
+        XnuDir {
+            snd_hiwat,
+            snd_mbmax: snd_hiwat.wrapping_mul(sockbuf::SB_EFFICIENCY as u32),
+            rcv: SockBuf::new(rcv_hiwat as usize),
+            unp_cc: 0,
+            unp_mbcnt: 0,
+            rights: VecDeque::new(),
+            dropping: false,
+            disconnected: false,
+        }
+    }
+
+    /// `sbspace(&so->so_snd)`: a unix socket's send buffer holds nothing
+    /// itself, so its room is its lowered limits.
+    fn snd_space(&self) -> i64 {
+        i64::from((self.snd_hiwat as i32).min(self.snd_mbmax as i32).max(0))
+    }
+
+    /// `uipc_send`'s backpressure: the sender's limits lowered by what the
+    /// receiver's buffer gained.
+    fn sent(&mut self) {
+        let (cc, mbcnt) = (self.rcv.cc as u32, self.rcv.mbcnt as u32);
+        self.snd_mbmax = self.snd_mbmax.wrapping_sub(mbcnt.wrapping_sub(self.unp_mbcnt));
+        self.unp_mbcnt = mbcnt;
+        let d = cc.wrapping_sub(self.unp_cc);
+        self.snd_hiwat = if self.snd_hiwat as i32 >= d as i32 { self.snd_hiwat.wrapping_sub(d) } else { 0 };
+        self.unp_cc = cc;
+    }
+
+    /// `uipc_rcvd`: the sender's limits given back what the receiver read.
+    fn received(&mut self) {
+        let (cc, mbcnt) = (self.rcv.cc as u32, self.rcv.mbcnt as u32);
+        self.snd_mbmax = self.snd_mbmax.wrapping_add(self.unp_mbcnt.wrapping_sub(mbcnt));
+        self.unp_mbcnt = mbcnt;
+        self.snd_hiwat = self.snd_hiwat.wrapping_add(self.unp_cc.wrapping_sub(cc));
+        self.unp_cc = cc;
+    }
+}
+
+/// What a receive from a Darwin stream gives (`soreceive`): its bytes, and
+/// the length of the control at the head of the record it read (taken, its
+/// descriptors handed over; or, for `MSG_PEEK`, copied).
+#[derive(Debug, Default)]
+pub struct XnuRecvd {
+    pub data: Vec<u8>,
+    pub control: Option<usize>,
+}
+
+/// Where a receive's descriptors go (`unp_externalize`): the reading
+/// process's table, all of them or none (its error ends the receive).
+pub type Externalize<'a> = &'a mut dyn FnMut(Vec<InFlight>) -> Result<(), Errno>;
+
+/// `sosendcheck` for a direction: EPIPE once its sending is over; EMSGSIZE
+/// for control past the send buffer; whether `resid` bytes with `clen` of
+/// control go now (`false`: the sender waits for room).
+fn xnu_sendcheck(s: &Stream, resid: usize, clen: usize, lowat: u32) -> Result<bool, Errno> {
+    if s.closed {
+        return Err(Errno::EPIPE);
+    }
+    let x = s.xnu.as_ref().expect("a Darwin direction");
+    let space = x.snd_space();
+    if clen as u32 > x.snd_hiwat {
+        return Err(Errno::EMSGSIZE);
+    }
+    let (resid, clen) = (resid as i64, clen as i64);
+    Ok(!(space < resid + clen && (space < i64::from(lowat as i32) || space < clen)))
 }
 
 
@@ -189,6 +292,149 @@ impl Pipe {
     fn is_closed(&self) -> bool {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).closed
     }
+
+    fn has_fds(&self) -> bool {
+        !self.state.lock().unwrap_or_else(|e| e.into_inner()).fds.is_empty()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Stream> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Make it a direction between two Darwin sockets, its sender's send
+    /// buffer and its receiver's receive buffer reserved as given.
+    fn xnu_init(&self, snd_hiwat: u32, rcv_hiwat: u32) {
+        self.lock().xnu = Some(XnuDir::new(snd_hiwat, rcv_hiwat));
+    }
+
+    fn is_xnu(&self) -> bool {
+        self.lock().xnu.is_some()
+    }
+
+    /// Run `f` on its XNU accounting.
+    fn with_xnu<R>(&self, f: impl FnOnce(&mut XnuDir, bool) -> R) -> R {
+        let mut s = self.lock();
+        let closed = s.closed;
+        f(s.xnu.as_mut().expect("a Darwin direction"), closed)
+    }
+
+    /// Whether a send of `resid` bytes and `clen` of control would go on
+    /// now: room for it, or an error to report.
+    fn xnu_send_ready(&self, resid: usize, clen: usize, lowat: u32) -> bool {
+        xnu_sendcheck(&self.lock(), resid, clen, lowat) != Ok(false)
+    }
+
+    /// One round of `sosend` for a stream: `sosendcheck` (EAGAIN where it
+    /// would wait), then passes of as much as the space takes, each handed
+    /// to the receiver as `uipc_send` does (the control, if any, with the
+    /// first, in a record of its own) and the sender's limits lowered by
+    /// it, until all is sent or the space is used. The bytes sent.
+    fn xnu_send(&self, data: &[u8], control: Option<(usize, Vec<InFlight>)>, lowat: u32) -> Result<usize, Errno> {
+        let mut s = self.lock();
+        let clen = control.as_ref().map_or(0, |c| c.0);
+        if !xnu_sendcheck(&s, data.len(), clen, lowat)? {
+            return Err(Errno::EAGAIN);
+        }
+        let st = &mut *s;
+        let x = st.xnu.as_mut().expect("a Darwin direction");
+        let mut space = (x.snd_space() - clen as i64).max(0) as usize;
+        let mut so = sockbuf::Sosend::default();
+        let mut control = control;
+        let mut sent = 0;
+        loop {
+            let (chain, n) = so.pass(data.len() - sent, space, false);
+            space -= n;
+            if x.dropping {
+                // sbappend refuses it; the control's descriptors are let go
+                // (unp_dispose).
+                drop(control.take());
+            } else {
+                match control.take() {
+                    Some((len, files)) => {
+                        x.rcv.append_control(&[sockbuf::Mbuf::control(len)], &chain);
+                        x.rights.push_back((len, files));
+                    }
+                    None => x.rcv.append_stream(&chain),
+                }
+                st.bytes.extend(&data[sent..sent + n]);
+                st.written += n as u64;
+            }
+            x.sent();
+            sent += n;
+            if sent == data.len() || space == 0 {
+                break;
+            }
+        }
+        // What a pass took and did not fill would carry over a wait; a
+        // pass sized by the space fills it.
+        debug_assert!(sent == data.len() || !so.holding());
+        drop(s);
+        self.notify_reader();
+        self.note_host();
+        Ok(sent)
+    }
+
+    /// `soreceive` of a stream, as far as the first record goes: its
+    /// control first (taken, its descriptors handed to `externalize`; or for
+    /// `MSG_PEEK` copied), then its data up to `resid` bytes, the sender's
+    /// limits given back (`uipc_rcvd`). A record left with nothing to read
+    /// is passed over. EAGAIN when there is nothing; end-of-file once the
+    /// sending is over or the reading shut down.
+    /// With no `externalize` (a reader with no descriptor table), a
+    /// record that starts with control is refused, EOPNOTSUPP, untouched.
+    fn xnu_recv(&self, resid: usize, peek: bool, mut externalize: Option<Externalize<'_>>) -> Result<XnuRecvd, Errno> {
+        let mut s = self.lock();
+        loop {
+            let st = &mut *s;
+            let x = st.xnu.as_mut().expect("a Darwin direction");
+            if x.rcv.is_empty() {
+                return if st.closed || x.dropping { Ok(XnuRecvd::default()) } else { Err(Errno::EAGAIN) };
+            }
+            let mut out = XnuRecvd::default();
+            if let Some(len) = x.rcv.head_control() {
+                out.control = Some(len);
+                if !peek {
+                    let Some(externalize) = externalize.as_mut() else { return Err(Errno::EOPNOTSUPP) };
+                    x.rcv.take_head_control();
+                    let (_, files) = x.rights.pop_front().expect("a control record's descriptors");
+                    // The control is gone either way; an error leaves the
+                    // data for the next receive.
+                    externalize(files)?;
+                }
+            }
+            let n = if peek { resid.min(x.rcv.head_data()) } else { x.rcv.take(resid) };
+            out.data = st.bytes.range(..n).copied().collect();
+            if peek {
+                return Ok(out);
+            }
+            st.bytes.drain(..n);
+            st.read += n as u64;
+            x.received();
+            // Nothing read and no control: the record was spent (its empty
+            // mbuf), and soreceive starts again.
+            let again = n == 0 && out.control.is_none() && resid > 0 && !st.closed;
+            if !again {
+                drop(s);
+                self.notify_writer();
+                return Ok(out);
+            }
+        }
+    }
+
+    /// `sorflush`: what waits to be read goes (its descriptors let go),
+    /// later sends are dropped, and a read is at its end.
+    fn xnu_flush(&self) {
+        let mut s = self.lock();
+        let st = &mut *s;
+        let x = st.xnu.as_mut().expect("a Darwin direction");
+        x.dropping = true;
+        x.rcv.flush();
+        x.rights.clear();
+        st.bytes.clear();
+        drop(s);
+        self.notify_reader();
+        self.notify_writer();
+    }
 }
 
 /// What a socket is at the moment.
@@ -240,6 +486,30 @@ pub struct UnixSocket {
     peer_cred: Mutex<Option<Cred>>,
     /// Its last descriptor has closed ([`Self::release`]).
     gone: AtomicBool,
+    /// A Darwin process's socket: what XNU keeps with it.
+    xnu: Mutex<Option<XnuSock>>,
+}
+
+/// What XNU keeps with a Darwin unix socket: its buffers' `sb_hiwat` while
+/// it has no connection (`soreserve`'s, then `SO_SNDBUF`'s and
+/// `SO_RCVBUF`'s), which a connection's directions start from, and its
+/// options once any is set (which a listener's connections inherit).
+#[derive(Clone, Copy, Debug)]
+struct XnuSock {
+    snd_hiwat: u32,
+    rcv_hiwat: u32,
+    opts: Option<SockOpts>,
+}
+
+impl XnuSock {
+    /// `sonewconn`: a connection's new socket, from its listener's.
+    fn accepted(head: &XnuSock) -> XnuSock {
+        XnuSock { snd_hiwat: head.snd_hiwat, rcv_hiwat: head.rcv_hiwat, opts: head.opts.map(|o| SockOpts::inherited(&o, head.snd_hiwat, head.rcv_hiwat)) }
+    }
+
+    fn opts(&self) -> SockOpts {
+        self.opts.unwrap_or_else(|| SockOpts::reserved(self.snd_hiwat, self.rcv_hiwat))
+    }
 }
 
 /// A process's credentials as `struct ucred` has them: pid, uid, gid.
@@ -262,7 +532,82 @@ impl UnixSocket {
             cred: Mutex::new(None),
             peer_cred: Mutex::new(None),
             gone: AtomicBool::new(false),
+            xnu: Mutex::new(None),
         }
+    }
+
+    /// A Darwin process's socket (`unp_attach`'s `soreserve`): its buffers
+    /// and options kept as XNU keeps them.
+    pub fn use_xnu(&self) {
+        *self.xnu.lock().unwrap() = Some(XnuSock { snd_hiwat: UNPST_SPACE, rcv_hiwat: UNPST_SPACE, opts: None });
+    }
+
+    pub fn is_xnu(&self) -> bool {
+        self.xnu.lock().unwrap().is_some()
+    }
+
+    /// `socketpair` for a Darwin process: both ends its, and the two
+    /// directions between them kept as XNU keeps them.
+    pub fn xnu_pair(a: &UnixSocket, b: &UnixSocket) {
+        a.use_xnu();
+        b.use_xnu();
+        if let Role::Connected { rx, tx, .. } = &*a.role.lock().unwrap() {
+            tx.xnu_init(UNPST_SPACE, UNPST_SPACE);
+            rx.xnu_init(UNPST_SPACE, UNPST_SPACE);
+        }
+    }
+
+    /// Its connection's directions when both ends are Darwin sockets: the
+    /// one it reads and the one it writes.
+    fn xnu_dirs(&self) -> Option<(Arc<Pipe>, Arc<Pipe>)> {
+        match &*self.role.lock().unwrap() {
+            Role::Connected { rx, tx, .. } if rx.is_xnu() => Some((Arc::clone(rx), Arc::clone(tx))),
+            _ => None,
+        }
+    }
+
+    /// Its options, as kept with it.
+    fn xnu_opts(&self) -> SockOpts {
+        self.xnu.lock().unwrap().as_ref().expect("a Darwin socket").opts()
+    }
+
+    /// `sosend`'s round for a Darwin stream ([`Pipe::xnu_send`]): ENOTCONN
+    /// unconnected.
+    pub fn xnu_send(&self, data: &[u8], control: Option<(usize, Vec<InFlight>)>) -> Result<usize, Errno> {
+        let lowat = self.xnu_opts().snd_lowat;
+        let (_, tx) = self.xnu_dirs().ok_or(Errno::ENOTCONN)?;
+        tx.xnu_send(data, control, lowat)
+    }
+
+    /// `soreceive` for a Darwin stream ([`Pipe::xnu_recv`]): ENOTCONN
+    /// unconnected.
+    pub fn xnu_recv(&self, resid: usize, peek: bool, externalize: Externalize<'_>) -> Result<XnuRecvd, Errno> {
+        let (rx, _) = self.xnu_dirs().ok_or(Errno::ENOTCONN)?;
+        rx.xnu_recv(resid, peek, Some(externalize))
+    }
+
+    /// `sosendcheck` for a Darwin stream: EPIPE, ENOTCONN or EMSGSIZE, or
+    /// whether `resid` bytes and `clen` of control go now.
+    pub fn xnu_sendcheck(&self, resid: usize, clen: usize) -> Result<bool, Errno> {
+        let lowat = self.xnu_opts().snd_lowat;
+        let (_, tx) = self.xnu_dirs().ok_or(Errno::ENOTCONN)?;
+        let s = tx.lock();
+        xnu_sendcheck(&s, resid, clen, lowat)
+    }
+
+    /// Whether `MSG_WAITALL` would wait (`so_should_wait`, and the loop
+    /// after the copy): less than `resid` of data in the one record there
+    /// is, and more could come.
+    pub fn xnu_would_wait_all(&self, resid: usize) -> bool {
+        let Some((rx, _)) = self.xnu_dirs() else { return false };
+        rx.with_xnu(|x, closed| !closed && !x.dropping && x.rcv.records() <= 1 && x.rcv.head_data() < resid)
+    }
+
+    /// Whether a Darwin stream's send of `resid` bytes and `clen` of
+    /// control would go on now (unconnected, it would fail at once).
+    pub fn xnu_send_ready(&self, resid: usize, clen: usize) -> bool {
+        let lowat = self.xnu_opts().snd_lowat;
+        self.xnu_dirs().is_none_or(|(_, tx)| tx.xnu_send_ready(resid, clen, lowat))
     }
 
     /// Record the credentials of the process making this end (before its
@@ -440,6 +785,18 @@ impl UnixSocket {
     /// Returns the far end, which the listener will hand to `accept`.
     fn connect_to(&self, listener: &UnixSocket, path: &str) -> SysResult {
         let (mine, theirs) = UnixSocket::pair();
+        // Two Darwin sockets: the new one is its listener's (sonewconn),
+        // and each direction starts from its ends' buffers.
+        let me = *self.xnu.lock().unwrap();
+        let head = *listener.xnu.lock().unwrap();
+        if let (Some(me), Some(head)) = (me, head) {
+            let them = XnuSock::accepted(&head);
+            *theirs.xnu.lock().unwrap() = Some(them);
+            if let Role::Connected { rx, tx, .. } = &*mine.role.lock().unwrap() {
+                tx.xnu_init(me.snd_hiwat, them.rcv_hiwat);
+                rx.xnu_init(them.snd_hiwat, me.rcv_hiwat);
+            }
+        }
         {
             let role = listener.role.lock().unwrap();
             let Role::Listening { backlog, .. } = &*role else {
@@ -578,6 +935,23 @@ impl UnixSocket {
         let Role::Connected { rx, tx, .. } = &*self.role.lock().unwrap() else {
             return Err(Errno::ENOTCONN);
         };
+        // A Darwin stream (soshutdown): its reading shut down is sorflush,
+        // which leaves the peer's sends to be dropped, and its receive
+        // buffer's low-water mark at 0 with the rest.
+        if rx.is_xnu() {
+            if how != 1 {
+                rx.xnu_flush();
+                if let Some(x) = self.xnu.lock().unwrap().as_mut() {
+                    let mut o = x.opts();
+                    o.rcv_lowat = 0;
+                    x.opts = Some(o);
+                }
+            }
+            if how != 0 {
+                tx.close();
+            }
+            return Ok(0);
+        }
         if how != 1 {
             rx.close();
         }
@@ -590,6 +964,17 @@ impl UnixSocket {
 
 impl Drop for UnixSocket {
     fn drop(&mut self) {
+        // A Darwin socket's last reference (sofreelastref): its receive
+        // buffer flushed, the descriptors in messages it never read let go.
+        if let Ok(role) = self.role.lock() {
+            if let Role::Connected { rx, tx, .. } = &*role {
+                if rx.is_xnu() {
+                    rx.xnu_flush();
+                    rx.with_xnu(|d, _| d.disconnected = true);
+                    tx.with_xnu(|d, _| d.disconnected = true);
+                }
+            }
+        }
         // The far end must see end-of-file, or a reader waits forever; and
         // nobody reads what it sends any more, so its writes fail with EPIPE
         // rather than filling a buffer and then blocking for good. Both
@@ -608,12 +993,72 @@ impl FileHandle for UnixSocket {
         Some(self)
     }
 
+    /// A Darwin stream's: `soreceive` of data alone. Its descriptors go to
+    /// the reading process's table, which the Darwin calls that read it
+    /// have and this does not: a record that starts with control is
+    /// refused rather than its descriptors lost.
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
+        if let Some((rx, _)) = self.xnu_dirs() {
+            let r = rx.xnu_recv(buf.len(), false, None)?;
+            buf[..r.data.len()].copy_from_slice(&r.data);
+            return Ok(r.data.len() as u64);
+        }
         self.recv(buf, 0, false)
     }
 
+    /// A Darwin stream's: one round of `sosend`.
     fn write_at(&self, _offset: u64, buf: &[u8]) -> SysResult {
+        if self.is_xnu() {
+            return self.xnu_send(buf, None).map(|n| n as u64);
+        }
         self.send(buf)
+    }
+
+    /// A Darwin stream's parked send goes by `sosendcheck`.
+    fn write_ready(&self, left: usize, _orig: usize) -> bool {
+        if self.is_xnu() {
+            return self.xnu_send_ready(left, 0);
+        }
+        self.poll_writable()
+    }
+
+    fn send_ready(&self, resid: usize, clen: usize) -> bool {
+        if self.is_xnu() {
+            return self.xnu_send_ready(resid, clen);
+        }
+        self.poll_writable()
+    }
+
+    fn xnu_reserve(&self, snd: bool, cc: usize) {
+        // The connection first: the role is taken before the socket's own
+        // record wherever both are.
+        let dirs = self.xnu_dirs();
+        let mut g = self.xnu.lock().unwrap();
+        let Some(x) = g.as_mut() else { return };
+        match (dirs, snd) {
+            (Some((_, tx)), true) => tx.with_xnu(|d, _| {
+                d.snd_hiwat = cc as u32;
+                d.snd_mbmax = (cc * sockbuf::SB_EFFICIENCY) as u32;
+            }),
+            (Some((rx, _)), false) => rx.with_xnu(|d, _| d.rcv.reserve(cc)),
+            (None, true) => x.snd_hiwat = cc as u32,
+            (None, false) => x.rcv_hiwat = cc as u32,
+        }
+    }
+
+    /// A Darwin socket's options, `soreserve`'s until one is set.
+    fn xnu_sockopts(&self) -> Option<SockOpts> {
+        self.xnu.lock().unwrap().as_ref().map(XnuSock::opts)
+    }
+
+    fn set_xnu_sockopts(&self, o: SockOpts) -> bool {
+        match self.xnu.lock().unwrap().as_mut() {
+            Some(x) => {
+                x.opts = Some(o);
+                true
+            }
+            None => false,
+        }
     }
 
     fn metadata(&self) -> Result<Metadata, Errno> {
@@ -633,7 +1078,13 @@ impl FileHandle for UnixSocket {
         true
     }
 
+    /// A Darwin stream's is `soreadable`: its receive low-water mark's
+    /// worth, or its reading over.
     fn poll_readable(&self) -> bool {
+        if let Some((rx, _)) = self.xnu_dirs() {
+            let lowat = self.xnu_opts().rcv_lowat;
+            return rx.with_xnu(|x, closed| x.rcv.cc >= lowat as usize || closed || x.dropping);
+        }
         match &*self.role.lock().unwrap() {
             // A listener is "readable" when a connection is waiting.
             Role::Listening { backlog, .. } => !backlog.lock().unwrap().is_empty(),
@@ -697,22 +1148,68 @@ impl FileHandle for UnixSocket {
     /// `PIPSIZ` both ways, and a connected stream's send space is what the
     /// peer's receive buffer has left.
     fn so_state(&self) -> Option<crate::vfs::SoState> {
-        let mut st = crate::vfs::SoState { qlen: None, rcv: 0, cantrcv: false, cantsend: false, error: 0, can_write: false, snd_used: 0, hiwat: (PIPSIZ, PIPSIZ), snd_lowat: 2048, unix_stream: true };
+        let mut st = crate::vfs::SoState { qlen: None, rcv: 0, cantrcv: false, cantsend: false, error: 0, can_write: false, snd_used: 0, hiwat: (PIPSIZ, PIPSIZ), snd_lowat: 2048, unix_stream: true, ctl: 0, records: None, exact: true, peer_space: None, snd_mbmax: None, unp_cc: 0, live_hiwat: false };
+        // A Darwin socket's buffers are its own counts: its receive
+        // buffer's, and its send buffer's limits lowered by what waits in
+        // its peer's (whose room also bounds it).
+        let xnu = *self.xnu.lock().unwrap();
+        if let Some(x) = xnu {
+            st.hiwat = (u64::from(x.rcv_hiwat), u64::from(x.snd_hiwat));
+            st.live_hiwat = true;
+            if let Some((rx, tx)) = self.xnu_dirs() {
+                rx.with_xnu(|d, closed| {
+                    st.rcv = d.rcv.cc as u64;
+                    st.ctl = d.rcv.ctl as u64;
+                    st.cantrcv = closed || d.dropping;
+                    st.hiwat.0 = d.rcv.hiwat as u64;
+                });
+                tx.with_xnu(|d, closed| {
+                    st.cantsend = closed;
+                    st.hiwat.1 = u64::from(d.snd_hiwat);
+                    st.snd_mbmax = Some(u64::from(d.snd_mbmax));
+                    // Its peer's, while it has one.
+                    if !d.disconnected {
+                        st.unp_cc = u64::from(d.unp_cc);
+                        st.peer_space = Some(d.rcv.space().max(0) as u64);
+                    }
+                });
+                st.can_write = true;
+                return Some(st);
+            }
+            if let Role::Listening { backlog, .. } = &*self.role.lock().unwrap() {
+                st.qlen = Some(backlog.lock().unwrap().len() as u64);
+            }
+            return Some(st);
+        }
         match &*self.role.lock().unwrap() {
             Role::Listening { backlog, .. } => st.qlen = Some(backlog.lock().unwrap().len() as u64),
             Role::Connected { rx, tx, .. } => {
                 st.rcv = rx.available();
+                // Descriptors in flight are control the bytes alone do not
+                // count.
+                st.exact = !rx.has_fds();
                 st.cantrcv = rx.is_closed();
                 st.cantsend = tx.is_closed();
                 st.can_write = true;
                 st.snd_used = tx.available();
+                st.unp_cc = st.snd_used;
             }
             _ => {}
         }
         Some(st)
     }
 
+    /// A Darwin stream's is `sowriteable`: its sending over, or connected
+    /// with room (its own, and its peer's) of its send low-water mark.
     fn poll_writable(&self) -> bool {
+        if self.is_xnu() {
+            let Some((_, tx)) = self.xnu_dirs() else { return false };
+            let lowat = self.xnu_opts().snd_lowat;
+            return tx.with_xnu(|d, closed| {
+                let peer = if d.disconnected { i64::MAX } else { d.rcv.space().max(0) as i64 };
+                closed || d.snd_space().min(peer) >= i64::from(lowat as i32)
+            });
+        }
         match &*self.role.lock().unwrap() {
             Role::Connected { tx, .. } => tx.writable(),
             // Not-connected has no buffer to block on, and a non-blocking
@@ -885,6 +1382,22 @@ impl SocketNames {
     }
 }
 
+/// `unpdg_sendspace` and `unpdg_recvspace`.
+const UNPDG_SENDSPACE: usize = 2048;
+const UNPDG_RECVSPACE: usize = 4096;
+/// `sun_noname`'s `sa_len`: the address an unbound socket's datagrams carry.
+const SUN_NONAME_LEN: usize = 16;
+
+/// A Darwin datagram socket's buffers: the most it sends at once, its
+/// receive buffer's accounting, and the length of the address its
+/// datagrams carry.
+#[derive(Debug)]
+struct XnuDgram {
+    snd_hiwat: usize,
+    rcv: SockBuf,
+    name_len: usize,
+}
+
 /// The most a datagram socket holds unread: datagrams, and bytes. A send
 /// past either is `EAGAIN` (Linux would block a blocking sender; nothing here
 /// fills one that fast).
@@ -912,6 +1425,8 @@ pub struct UnixDgram {
     peer: Mutex<Option<(Weak<UnixDgram>, Option<String>)>>,
     /// Datagrams waiting to be read, each with its sender's name.
     inbox: Mutex<VecDeque<(Vec<u8>, Option<String>)>>,
+    /// A Darwin process's socket: its buffers as XNU keeps them.
+    xnu: Mutex<Option<XnuDgram>>,
     nonblocking: AtomicBool,
     /// Who waits on it (`crate::wait`): readers.
     queue: crate::wait::Queue,
@@ -925,6 +1440,7 @@ impl UnixDgram {
             name: Mutex::new(None),
             peer: Mutex::new(None),
             inbox: Mutex::new(VecDeque::new()),
+            xnu: Mutex::new(None),
             nonblocking: AtomicBool::new(false),
             queue: crate::wait::Queue::new(),
         })
@@ -940,6 +1456,20 @@ impl UnixDgram {
 
     pub fn set_nonblocking(&self, on: bool) {
         self.nonblocking.store(on, Ordering::Relaxed);
+    }
+
+    /// A Darwin process's socket (`unp_attach`): `unpdg_sendspace` and
+    /// `unpdg_recvspace`, unnamed.
+    pub fn use_xnu(&self) {
+        *self.xnu.lock().unwrap() = Some(XnuDgram { snd_hiwat: UNPDG_SENDSPACE, rcv: SockBuf::new(UNPDG_RECVSPACE), name_len: SUN_NONAME_LEN });
+    }
+
+    /// A Darwin socket bound with an address of `len` bytes (`unp_addr`'s
+    /// `sa_len`, which its datagrams carry).
+    pub fn set_xnu_name_len(&self, len: usize) {
+        if let Some(x) = self.xnu.lock().unwrap().as_mut() {
+            x.name_len = len;
+        }
     }
 
     pub fn name(&self) -> Option<String> {
@@ -977,8 +1507,18 @@ impl UnixDgram {
         Ok(0)
     }
 
-    /// Queue `data` for this socket from `from`.
-    fn deliver(&self, data: &[u8], from: Option<String>) -> SysResult {
+    /// Queue `data` for this socket from `from`, whose address is
+    /// `name_len` bytes: on a Darwin socket as `sbappendaddr` does, ENOBUFS
+    /// for a record its receive buffer has no space for.
+    fn deliver(&self, data: &[u8], from: Option<String>, name_len: usize) -> SysResult {
+        if let Some(x) = self.xnu.lock().unwrap().as_mut() {
+            if !x.rcv.append_addr(name_len, &[], &sockbuf::sosend_chain(data.len())) {
+                return Err(Errno::ENOBUFS);
+            }
+            self.inbox.lock().unwrap().push_back((data.to_vec(), from));
+            self.queue.notify();
+            return Ok(data.len() as u64);
+        }
         let mut inbox = self.inbox.lock().unwrap();
         let held: usize = inbox.iter().map(|(d, _)| d.len()).sum();
         if inbox.len() >= DGRAM_QUEUE || held + data.len() > DGRAM_BYTES {
@@ -990,11 +1530,20 @@ impl UnixDgram {
         Ok(data.len() as u64)
     }
 
+    /// A send's size checked (`sosendcheck`: past a Darwin socket's send
+    /// buffer, EMSGSIZE), and the length of the address it carries.
+    fn send_check(&self, len: usize) -> Result<usize, Errno> {
+        match self.xnu.lock().unwrap().as_ref() {
+            Some(x) if len > x.snd_hiwat => Err(Errno::EMSGSIZE),
+            Some(x) => Ok(x.name_len),
+            None if len > DGRAM_BYTES => Err(Errno::EMSGSIZE),
+            None => Ok(SUN_NONAME_LEN),
+        }
+    }
+
     /// `sendto`: to the socket bound to `to`, or (`None`) to the connected one.
     pub fn send_to(&self, data: &[u8], to: Option<&str>) -> SysResult {
-        if data.len() > DGRAM_BYTES {
-            return Err(Errno::EMSGSIZE);
-        }
+        let name_len = self.send_check(data.len())?;
         let target = match to {
             Some(path) => self.names.dgram_target(path)?,
             None => match &*self.peer.lock().unwrap() {
@@ -1002,18 +1551,26 @@ impl UnixDgram {
                 None => return Err(Errno::ENOTCONN),
             },
         };
-        target.deliver(data, self.name())
+        target.deliver(data, self.name(), name_len)
     }
 
     /// `recvfrom`: the next datagram (what does not fit in `buf` is lost) and
     /// who sent it; its whole length too, for `MSG_TRUNC`.
     pub fn recv_from(&self, buf: &mut [u8], peek: bool) -> Result<(usize, usize, Option<String>), Errno> {
+        // The buffer's accounting, then its datagrams, as `deliver` takes
+        // them.
+        let mut xnu = self.xnu.lock().unwrap();
         let mut inbox = self.inbox.lock().unwrap();
         let (data, from) = if peek {
             inbox.front().cloned().ok_or(Errno::EAGAIN)?
         } else {
-            inbox.pop_front().ok_or(Errno::EAGAIN)?
+            let d = inbox.pop_front().ok_or(Errno::EAGAIN)?;
+            if let Some(x) = xnu.as_mut() {
+                x.rcv.drop_record();
+            }
+            d
         };
+        drop(xnu);
         let n = data.len().min(buf.len());
         buf[..n].copy_from_slice(&data[..n]);
         Ok((n, data.len(), from))
@@ -1044,14 +1601,23 @@ impl FileHandle for UnixDgram {
     /// `write` and `send` with no address: to the connected socket. The
     /// syscalls that carry a name call [`UnixDgram::send_to`] themselves.
     fn write_at(&self, _offset: u64, buf: &[u8]) -> SysResult {
-        if buf.len() > DGRAM_BYTES {
-            return Err(Errno::EMSGSIZE);
-        }
+        let name_len = self.send_check(buf.len())?;
         let target = match &*self.peer.lock().unwrap() {
             Some((w, _)) => w.upgrade().ok_or(Errno::ECONNREFUSED)?,
             None => return Err(Errno::ENOTCONN),
         };
-        target.deliver(buf, self.name())
+        target.deliver(buf, self.name(), name_len)
+    }
+
+    /// A Darwin socket's `SO_SNDBUF` and `SO_RCVBUF` (`sbreserve`).
+    fn xnu_reserve(&self, snd: bool, cc: usize) {
+        if let Some(x) = self.xnu.lock().unwrap().as_mut() {
+            if snd {
+                x.snd_hiwat = cc;
+            } else {
+                x.rcv.reserve(cc);
+            }
+        }
     }
 
     fn metadata(&self) -> Result<Metadata, Errno> {
@@ -1092,10 +1658,35 @@ impl FileHandle for UnixDgram {
     }
 
     /// `unpdg_recvspace` and `unpdg_sendspace`; a datagram waits in no send
-    /// buffer.
+    /// buffer. A Darwin socket's receive buffer is counted as XNU counts
+    /// it, and while it is connected its peer's room is what it may send.
     fn so_state(&self) -> Option<crate::vfs::SoState> {
-        let rcv = self.inbox.lock().unwrap().iter().map(|(d, _)| d.len() as u64).sum();
-        Some(crate::vfs::SoState { qlen: None, rcv, cantrcv: false, cantsend: false, error: 0, can_write: true, snd_used: 0, hiwat: (4096, 2048), snd_lowat: 1, unix_stream: false })
+        let mut st = crate::vfs::SoState { qlen: None, rcv: 0, cantrcv: false, cantsend: false, error: 0, can_write: true, snd_used: 0, hiwat: (4096, 2048), snd_lowat: 1, unix_stream: false, ctl: 0, records: None, exact: false, peer_space: None, snd_mbmax: None, unp_cc: 0, live_hiwat: false };
+        let xnu = self.xnu.lock().unwrap();
+        match xnu.as_ref() {
+            Some(x) => {
+                st.rcv = x.rcv.cc as u64;
+                st.ctl = x.rcv.ctl as u64;
+                st.records = Some((x.rcv.records() as u64, x.rcv.first_record_data() as u64));
+                st.hiwat = (x.rcv.hiwat as u64, x.snd_hiwat as u64);
+                st.exact = true;
+                st.live_hiwat = true;
+            }
+            None => {
+                let inbox = self.inbox.lock().unwrap();
+                st.rcv = inbox.iter().map(|(d, _)| d.len() as u64).sum();
+                st.records = Some((inbox.len() as u64, inbox.front().map_or(0, |(d, _)| d.len() as u64)));
+            }
+        }
+        let darwin = xnu.is_some();
+        drop(xnu);
+        if darwin {
+            let peer = self.peer.lock().unwrap().as_ref().and_then(|(w, _)| w.upgrade());
+            if let Some(p) = peer {
+                st.peer_space = p.xnu.lock().unwrap().as_ref().map(|x| x.rcv.space().max(0) as u64);
+            }
+        }
+        Some(st)
     }
 
     fn as_unix_dgram(self: Arc<Self>) -> Option<Arc<UnixDgram>> {
@@ -2195,11 +2786,11 @@ impl crate::vfs::FileHandle for RemoteUnix {
     /// writable or not.
     fn so_state(&self) -> Option<crate::vfs::SoState> {
         if self.listening {
-            return Some(crate::vfs::SoState { qlen: Some(self.has_pending().into()), rcv: 0, cantrcv: false, cantsend: false, error: 0, can_write: false, snd_used: 0, hiwat: (PIPSIZ, PIPSIZ), snd_lowat: 2048, unix_stream: true });
+            return Some(crate::vfs::SoState { qlen: Some(self.has_pending().into()), rcv: 0, cantrcv: false, cantsend: false, error: 0, can_write: false, snd_used: 0, hiwat: (PIPSIZ, PIPSIZ), snd_lowat: 2048, unix_stream: true, ctl: 0, records: None, exact: false, peer_space: None, snd_mbmax: None, unp_cc: 0, live_hiwat: false });
         }
         let hup = (self.remote.hup)(self.id);
         let full = (self.remote.writable)(self.id) == 0;
-        Some(crate::vfs::SoState { qlen: None, rcv: (self.remote.available)(self.id).max(0) as u64, cantrcv: hup & 2 != 0, cantsend: hup & 1 != 0, error: 0, can_write: true, snd_used: if full { PIPSIZ } else { 0 }, hiwat: (PIPSIZ, PIPSIZ), snd_lowat: 2048, unix_stream: true })
+        Some(crate::vfs::SoState { qlen: None, rcv: (self.remote.available)(self.id).max(0) as u64, cantrcv: hup & 2 != 0, cantsend: hup & 1 != 0, error: 0, can_write: true, snd_used: if full { PIPSIZ } else { 0 }, hiwat: (PIPSIZ, PIPSIZ), snd_lowat: 2048, unix_stream: true, ctl: 0, records: None, exact: false, peer_space: None, snd_mbmax: None, unp_cc: if full { PIPSIZ } else { 0 }, live_hiwat: false })
     }
 
     fn available(&self) -> Option<u64> {

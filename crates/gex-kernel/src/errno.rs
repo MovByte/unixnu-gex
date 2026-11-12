@@ -67,6 +67,7 @@ impl Errno {
     pub const EPROTOTYPE: Errno = Errno(91);
     pub const ENOPROTOOPT: Errno = Errno(92);
     pub const ECONNRESET: Errno = Errno(104);
+    pub const ENOBUFS: Errno = Errno(105);
     pub const EISCONN: Errno = Errno(106);
     /// Only between a process and the global kernel, never a guest's: a
     /// moved socket another holder connected out (`net::op::WENT_OUT`).

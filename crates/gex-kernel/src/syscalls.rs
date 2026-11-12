@@ -391,6 +391,15 @@ pub enum BlockOp {
     AcceptWait {
         socket: Arc<dyn crate::vfs::FileHandle>,
     },
+    /// A Darwin socket's send with no room before its first byte: until
+    /// [`crate::vfs::FileHandle::send_ready`] says a send of `resid` bytes
+    /// and `clen` of control would go on, when the call is made again
+    /// (`Kernel::darwin_retry`), its control taken with its first bytes.
+    WriteWait {
+        handle: Arc<dyn crate::vfs::FileHandle>,
+        resid: usize,
+        clen: usize,
+    },
     /// A `poll` with nothing ready yet. The descriptors travel with it so the
     /// host can ask again without going back through the kernel.
     Poll {
@@ -558,7 +567,7 @@ impl BlockOp {
             // `connect` is not in signal(7)'s list: an interrupted connect
             // goes on in the background and says `EINTR`.
             BlockOp::Connect { .. } => Restart::Never,
-            BlockOp::ReadStream { .. } | BlockOp::WriteStream { .. } | BlockOp::AcceptWait { .. } | BlockOp::WaitChild { .. } => {
+            BlockOp::ReadStream { .. } | BlockOp::WriteStream { .. } | BlockOp::AcceptWait { .. } | BlockOp::WriteWait { .. } | BlockOp::WaitChild { .. } => {
                 Restart::SaRestart
             }
         }
@@ -735,6 +744,11 @@ pub struct Kernel {
     /// A parked Darwin `wait4`'s status address, for its status in Darwin's
     /// encoding ([`crate::darwin::exit`]).
     pub darwin_wait4: Option<u64>,
+    /// A Darwin call that waited for its socket (a receive with nothing to
+    /// read, a send with no room before its first byte): its number and
+    /// arguments, made again once the wait is over, when the kernel has the
+    /// descriptor table its descriptors go to or come from.
+    pub darwin_retry: Option<(u64, [u64; 6])>,
     /// An exec's activated image, for the host to load
     /// ([`crate::darwin::execve`]).
     pub darwin_exec: Option<Box<crate::darwin::execve::Image>>,
@@ -5150,6 +5164,9 @@ impl NetIo<'_> {
             let kind = ty & !(SOCK_NONBLOCK | SOCK_CLOEXEC);
             if kind == SOCK_DGRAM {
                 let sock = unix::UnixDgram::new(self.socket_names);
+                if io.darwin {
+                    sock.use_xnu();
+                }
                 let nonblock = ty & SOCK_NONBLOCK != 0;
                 sock.set_nonblocking(nonblock);
                 let flags = if nonblock { oflags::O_NONBLOCK } else { 0 };
@@ -5162,6 +5179,9 @@ impl NetIo<'_> {
                 return Err(Errno::EPROTONOSUPPORT);
             }
             let sock = Arc::new(unix::UnixSocket::new(true));
+            if io.darwin {
+                sock.use_xnu();
+            }
             let nonblock = ty & SOCK_NONBLOCK != 0;
             sock.set_nonblocking(nonblock);
             let flags = if nonblock { oflags::O_NONBLOCK } else { 0 };
@@ -5254,6 +5274,9 @@ impl NetIo<'_> {
             let cloexec = ty & SOCK_CLOEXEC != 0;
             let mut fds = [0i32; 2];
             for (fd, s) in fds.iter_mut().zip([a, b]) {
+                if io.darwin {
+                    s.use_xnu();
+                }
                 s.set_nonblocking(nonblock);
                 *fd = io.fds.insert(OpenFile::new(s, "socket".to_string(), flags, true, true), cloexec)? as i32;
             }
@@ -5263,6 +5286,9 @@ impl NetIo<'_> {
         }
         let (a, b) = unix::UnixSocket::pair();
         unix::UnixSocket::set_pair_cred(&a, &b, io.cred());
+        if io.darwin {
+            unix::UnixSocket::xnu_pair(&a, &b);
+        }
         a.set_nonblocking(nonblock);
         b.set_nonblocking(nonblock);
         let flags = if nonblock { oflags::O_NONBLOCK } else { 0 };
@@ -5279,6 +5305,10 @@ impl NetIo<'_> {
             let path = io.unix_path(m, addr, len)?;
             let path = if path.starts_with('\0') { path } else { crate::vfs::normalize(&path, cwd) };
             d.bind(&path)?;
+            if io.darwin {
+                // SOCK_MAXADDRLEN bounds it.
+                d.set_xnu_name_len(len.min(255) as usize);
+            }
             if !path.starts_with('\0') {
                 let _ = io.ns.mksocket(&path);
             }
@@ -5422,6 +5452,9 @@ fn accept(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, addr: u64, len_out: u64,
     if io.darwin && addr != 0 {
         m.read_u32(len_out)?;
     }
+    // And its new descriptor has the listener's FNONBLOCK (accept_nocancel
+    // gives it the listener's file flags).
+    let flags = if io.darwin && io.fds.get(fd)?.flags() & oflags::O_NONBLOCK != 0 { flags | SOCK_NONBLOCK } else { flags };
     match unix_accept(io, m, fd, addr, len_out, flags) {
         Err(Errno::ENOTSOCK) => inet_accept(io, m, fd, addr, len_out, flags),
         other => other,
@@ -9042,6 +9075,8 @@ pub struct PendingCall {
     pub darwin_pipe_sigpipe: Option<bool>,
     /// A parked Darwin `wait4`: where its status goes.
     pub darwin_wait4: Option<u64>,
+    /// A Darwin socket call made again after its wait.
+    pub darwin_retry: Option<(u64, [u64; 6])>,
 }
 
 /// A thread the kernel has prepared and the host must start.
@@ -9115,6 +9150,7 @@ impl Kernel {
             darwin_finish: self.darwin_finish.take(),
             darwin_pipe_sigpipe: self.darwin_pipe_sigpipe.take(),
             darwin_wait4: self.darwin_wait4.take(),
+            darwin_retry: self.darwin_retry.take(),
         };
         if call != PendingCall::default() {
             self.thread_calls.insert(self.sig_tid, call);
@@ -9131,6 +9167,7 @@ impl Kernel {
         self.darwin_finish = call.darwin_finish;
         self.darwin_pipe_sigpipe = call.darwin_pipe_sigpipe;
         self.darwin_wait4 = call.darwin_wait4;
+        self.darwin_retry = call.darwin_retry;
         let blocked = self.signals.blocked();
         let next = self
             .thread_signals
@@ -9290,6 +9327,7 @@ impl Kernel {
             darwin_pipe_sigpipe: None,
             darwin_stat_ino32: false,
             darwin_wait4: None,
+            darwin_retry: None,
             darwin_exec: None,
             darwin_spawned: None,
             fd_activity: false,
@@ -9723,6 +9761,7 @@ impl Kernel {
             darwin_pipe_sigpipe: None,
             darwin_stat_ino32: false,
             darwin_wait4: None,
+            darwin_retry: None,
             darwin_exec: None,
             darwin_spawned: None,
             fd_activity: false,
@@ -10728,6 +10767,15 @@ impl Kernel {
                 }
             }
         }
+        // A Darwin socket call whose wait is over is made again: it is
+        // done, or (what woke it taken by another) waits again.
+        let r = match self.darwin_retry.take() {
+            Some((raw, a)) if r.is_ok() => match self.darwin_socket_again(m, raw, a) {
+                Ok(done) => done,
+                Err(op) => return SyscallOutcome::Blocking(op),
+            },
+            _ => r,
+        };
         // An `accept` that waited does its real work here, now that the
         // kernel is locked again and there is a descriptor table to put the
         // new socket in.
