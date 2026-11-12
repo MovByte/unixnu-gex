@@ -24,11 +24,11 @@
 //!                       units/, wine32.json
 //! ```
 //!
-//! Recording: `tools/eject/record-wine32.mjs` (headless Chromium) runs a 32-bit Wine page
+//! Recording: `site/record-wine32.mjs` (headless Chromium) runs a 32-bit Wine page
 //! to a window title and writes `wine32-session.json`. The page is built by the
-//! gex checkout the project names (`page_source`, `web/build-eject-page.sh`),
+//! gex checkout the project names (`page_source`, `site/build-eject-page.sh`),
 //! since it is the features that decide what goes into it; the runtime's
-//! wasm is the project's own copy. `web/eject-site.mjs PROJECT OUT` makes
+//! wasm is the project's own copy. `site/eject-site.mjs PROJECT OUT` makes
 //! the static site.
 
 use crate::config::Config;
@@ -51,9 +51,9 @@ pub const KIND_OLD: &str = "w3";
 pub const FORMAT: &str = "gex-wine32-session";
 pub const FORMAT_OLD: &str = "gex-w3-session";
 
-/// The runtime's wasm the page loads from `gex/` (web/build-eject-page.sh).
+/// The runtime's wasm the page loads from `gex/` (site/build-eject-page.sh).
 const RUNTIME_WASM: &[&str] = &["gex_browser.x86.shared.wasm", "gex_kernel.x86.wasm", "seed.x86.shared.wasm"];
-/// The memory64 runtime (`GEX_MEM64=1 shims/browser/build.sh`) a 64-bit Wine
+/// The memory64 runtime (`GEX_MEM64=1 hosts/browser/build.sh`) a 64-bit Wine
 /// page runs a program marked for memory64 on.
 const RUNTIME_WASM_M64: &[&str] = &["gex_browser.x86.m64.shared.wasm", "seed.x86.m64.shared.wasm"];
 
@@ -86,8 +86,8 @@ pub fn is_project(dir: &Path) -> bool {
 }
 
 pub struct Wine32Options {
-    /// The gex checkout's `web/` directory: the page's source and
-    /// `build-eject-page.sh`, and the built runtime under `public/gex/`.
+    /// The gex checkout's `page/` directory: the page's source, and the
+    /// built runtime under `public/gex/` (`../site/build-eject-page.sh` beside it).
     pub web_src: PathBuf,
     /// Where the units the recording names are (a unit cache: KEY/c.wasm).
     pub unit_cache: Vec<PathBuf>,
@@ -109,8 +109,11 @@ pub struct Wine32Summary {
 /// The provider modules (`providers/NAME-FINGERPRINT.wasm`, a unit cache's
 /// layout) that `units` (key, guest path) bind in `bundle`: each image's
 /// export providers that bind one of its exports, and the trampoline
-/// page's when any image is 32-bit.
-fn provider_files(bundle: &[u8], units: &[(String, String)]) -> Result<Vec<String>> {
+/// page's when any image is 32-bit on 32-bit Wine. A 64-bit Wine page's
+/// trampoline page is the 64-bit one in every process, its WoW64 ones too
+/// (their 32-bit code reaches the system through wow64cpu.dll), which binds
+/// none of those providers.
+fn provider_files(bundle: &[u8], units: &[(String, String)], wine64: bool) -> Result<Vec<String>> {
     use gex_cgen::provider;
     let tar = crate::reach::Tar::parse(bundle)?;
     let file = provider_file;
@@ -133,7 +136,7 @@ fn provider_files(bundle: &[u8], units: &[(String, String)]) -> Result<Vec<Strin
             }
         }
     }
-    if class32 {
+    if class32 && !wine64 {
         out.extend(provider::for_dll(provider::TRAMPOLINES_DLL, true).iter().filter(|p| !p.binds.is_empty()).map(file));
     }
     Ok(out.into_iter().collect())
@@ -214,7 +217,7 @@ fn add_trampolines(units: &mut Vec<(String, String)>, caches: &[PathBuf]) -> Res
 /// `base`. The trampolines' unit, added by the eject (no recorded entry),
 /// is used by every 32-bit process from its first system call: `at` 0, so
 /// the page compiles it with the boot's units and packs it in the boot
-/// archive (web/eject-site.mjs), never as a unit compiled when first mapped,
+/// archive (site/eject-site.mjs), never as a unit compiled when first mapped,
 /// which no process maps.
 fn units_json(recorded: &[Json], units: &[(String, String)]) -> Json {
     Json::Arr(units.iter().enumerate().map(|(i, (k, p))| {
@@ -243,6 +246,30 @@ fn provider_file(p: &gex_cgen::provider::Provider) -> String {
     let f = gex_cgen::provider::fingerprint(std::slice::from_ref(p));
     gex_abi::set_kuser_fold(was);
     format!("providers/{}-{f}.wasm", p.name)
+}
+
+/// A release page's runtime wasm without its names and DWARF, as
+/// build-eject-page.sh strips the copies it makes (user 10-30: every release
+/// build); `GEX_KEEP_NAMES=1` keeps them, for a debug page. Written to a new
+/// file and renamed over `path`, which may be a hard link to the project's
+/// runtime copy.
+fn strip_release(path: &Path) -> Result<()> {
+    if std::env::var_os("GEX_KEEP_NAMES").is_some_and(|v| !v.is_empty()) {
+        return Ok(());
+    }
+    let tmp = path.with_extension("wasm.strip");
+    let st = std::process::Command::new("wasm-tools")
+        .args(["strip", "-d", "^name$", "-d", "^\\.debug_.*", "-d", "^external_debug_info$", "-d", "^sourceMappingURL$"])
+        .arg(path)
+        .arg("-o")
+        .arg(&tmp)
+        .status()
+        .with_context(|| format!("running wasm-tools strip on {} (or GEX_KEEP_NAMES=1)", path.display()))?;
+    if !st.success() {
+        bail!("wasm-tools strip {} failed ({st})", path.display());
+    }
+    std::fs::rename(&tmp, path).with_context(|| format!("renaming {} over {}", tmp.display(), path.display()))?;
+    Ok(())
 }
 
 fn link_or_copy(from: &Path, to: &Path) -> Result<u64> {
@@ -292,11 +319,11 @@ pub fn eject(record: &Path, out: &Path, runtime: &Path, o: &Wine32Options) -> Re
     }
     for f in runtime_wasm(wine64) {
         if !o.web_src.join("public/gex").join(f).is_file() {
-            bail!("{}: no public/gex/{f}: build the shim and kernel first (shims/browser/build.sh, shims/kernel/build.sh)", o.web_src.display());
+            bail!("{}: no public/gex/{f}: build the shim and kernel first (hosts/browser/build.sh, hosts/kernel/build.sh)", o.web_src.display());
         }
     }
-    if !o.web_src.join("build-eject-page.sh").is_file() {
-        bail!("{} is not gex's web/ directory (no build-eject-page.sh)", o.web_src.display());
+    if !o.web_src.join("../site/build-eject-page.sh").is_file() {
+        bail!("{} is not gex's page/ directory (no ../site/build-eject-page.sh)", o.web_src.display());
     }
     crate::features::check(&o.features_off)?;
 
@@ -331,7 +358,7 @@ pub fn eject(record: &Path, out: &Path, runtime: &Path, o: &Wine32Options) -> Re
     // The provider modules the units bind (as the page picks them, cgen.rs
     // `unit_key`), and the trampolines' for a 32-bit program: an AOT-only
     // page has no other code for them.
-    for file in provider_files(&bundle_bytes, &units)? {
+    for file in provider_files(&bundle_bytes, &units, wine64)? {
         let src = o.unit_cache.iter().map(|c| c.join(&file)).find(|p| p.is_file());
         // A 64-bit page runs without a provider it is not given (the image's
         // own code, translated): said, not refused.
@@ -367,7 +394,7 @@ pub fn eject(record: &Path, out: &Path, runtime: &Path, o: &Wine32Options) -> Re
         ("processes", Json::Arr(processes.to_vec())),
         // Each with `at`, when the recording first used it (seconds; none
         // from an older recorder): a unit first used after the title is
-        // compiled when a process maps it (web/eject-site.mjs, `demand`).
+        // compiled when a process maps it (site/eject-site.mjs, `demand`).
         ("units", units_json(list(&v, "units"), &units)),
         ("title_seconds", v.get("title_seconds").cloned().unwrap_or(Json::Null)),
         ("unit_misses", Json::Arr(list(&v, "unit_misses").to_vec())),
@@ -413,7 +440,7 @@ pub fn eject(record: &Path, out: &Path, runtime: &Path, o: &Wine32Options) -> Re
 const BUILD_SH: &str = "#!/bin/sh
 # Generated by `gexc eject`: build this wine32 page's site inputs into build/web
 # (the page with user/eject.json's features, the bundle, the units).
-# Then: node <gex>/web/eject-site.mjs . SITE
+# Then: node <gex>/site/eject-site.mjs . SITE
 set -e
 cd \"$(dirname \"$0\")\"
 exec runtime/gexc eject build .
@@ -444,7 +471,7 @@ fn template(off: &[String], wine64: bool, strip: bool) -> String {
                without wineboot, from a recording made with WINEGEX_RECORD_HARDWARE=1 (\"run\": \
                Wine's); see crates/gex-eject/README.md, \"Wineboot\". \
                \"start\": defaults for the app library's start() \
-               (args, env, cwd, size, mtimes, strace, trapstack, persist, ready), over the \
+               (args, env, cwd, size, mtimes, strace, trapstack, filesystem, ready), over the \
                recording's; the page's own options win (crates/gex-eject/README.md, \"The web build\")."),
         ),
         (
@@ -462,8 +489,32 @@ fn template(off: &[String], wine64: bool, strip: bool) -> String {
         ("helpers", s(if strip { "strip" } else { "keep" })),
         ("desktop", s(if strip { "none" } else { "explorer" })),
         ("wineboot", s("run")),
-        ("start", obj(vec![])),
+        // Where the guest's files are kept: a choice the project makes.
+        ("start", obj(vec![("filesystem", s("memory"))])),
     ]))
+}
+
+/// user/eject.json "start", as the launch carries it: with the project's
+/// `"filesystem"`, which the page's start() needs and has no default for.
+fn start_of(text: &str) -> Result<Json> {
+    let start = Json::parse(text).map_err(|e| anyhow!("user/eject.json \"start\": {e}"))?;
+    let ok = match start.get("filesystem") {
+        None => bail!(
+            "user/eject.json \"start\": no \"filesystem\": choose where the guest's files are kept, \
+             \"memory\" or {{\"kind\": \"opfs\", \"name\": \"...\"}} (crates/gex-eject/README.md, \"Build or start\")"
+        ),
+        Some(Json::Str(k)) => k == "memory",
+        Some(f @ Json::Obj(_)) => match json::opt_str(f, "kind").as_deref() {
+            Some("memory") => true,
+            Some("opfs") => json::opt_str(f, "name").is_some_and(|n| !n.is_empty()),
+            _ => false,
+        },
+        Some(_) => false,
+    };
+    if !ok {
+        bail!("user/eject.json \"start\": \"filesystem\" is \"memory\", {{\"kind\": \"memory\", \"max\": BYTES}} or {{\"kind\": \"opfs\", \"name\": \"...\", \"cache\": MIB}}");
+    }
+    Ok(start)
 }
 
 /// Whether the page runs ahead-of-time code only: `"translation"` off, the
@@ -497,15 +548,26 @@ fn identity_line(image: &gex_ld::Image, base: u64, key: &str, identity: &str, pa
 /// own, so the page never takes a key its own hashing would not give. A
 /// 64-bit memory's and a compact process's are marked (`gex_key::IdentityLine`,
 /// the shim's `KNOWN`).
+/// An image the recording used more than one unit for (a WoW64 page's
+/// 64-bit win32u.dll, whose unit's key differs between a 64-bit process
+/// and a 32-bit one) gets no line: the page hashes it per process.
 fn unit_identities(dir: &Path, web: &Path, units: &[Json], site_key: &dyn Fn(&str) -> String) -> Result<String> {
     let what = crate::project::PROJECT_FILE;
     let bytes = std::fs::read(web.join("rootfs.tar"))?;
     let tar = crate::reach::Tar::parse(&bytes)?;
+    let mut per_path = std::collections::HashMap::<String, usize>::new();
+    for u in units {
+        *per_path.entry(json::str_field(u, "path", what)?).or_default() += 1;
+    }
     let mut lines = Vec::new();
     let mut skipped = 0;
     for u in units {
         let key = json::str_field(u, "key", what)?;
         let path = json::str_field(u, "path", what)?;
+        if per_path[&path] > 1 {
+            skipped += 1;
+            continue;
+        }
         let site = site_key(&key);
         let found = (|| -> Option<String> {
             let data = tar.read(&path)?;
@@ -651,12 +713,8 @@ const STRIP_PROGRAMS: &[&str] = &["winemenubuilder.exe"];
 
 /// `services`, each `(name, start, required)`: a required service the prefix
 /// has no key for fails the build, another is passed over.
-fn set_services(v: &Json, web: &Path, services: &[(String, u32, bool)]) -> Result<()> {
-    let what = crate::project::PROJECT_FILE;
-    let path = web.join("rootfs.tar");
-    let mut bytes = std::fs::read(&path)?;
-    let env = json::str_list(json::field(v, "page", what)?, "env", what)?;
-    let prefix = env.iter().find_map(|e| e.strip_prefix("WINEPREFIX=")).unwrap_or("/pfx").trim_matches('/').to_string();
+fn set_services(path: &Path, prefix: &str, services: &[(String, u32, bool)], say: &str) -> Result<()> {
+    let mut bytes = std::fs::read(path)?;
     let want = format!("{prefix}/system.reg");
     let (o, n) = {
         let tar = crate::reach::Tar::parse(&bytes)?;
@@ -689,9 +747,9 @@ fn set_services(v: &Json, web: &Path, services: &[(String, u32, bool)]) -> Resul
         said.push(format!("{name} {}", ["boot", "system", "auto", "demand", "disabled"][*start as usize]));
     }
     // A new file: the one there may be a hard link to the project's bundle.
-    std::fs::remove_file(&path)?;
-    write_file(&path, &bytes, false)?;
-    eprintln!("gexc eject build: \"services\": {}", said.join(", "));
+    std::fs::remove_file(path)?;
+    write_file(path, &bytes, false)?;
+    eprintln!("{say}: \"services\": {}", said.join(", "));
     Ok(())
 }
 
@@ -727,12 +785,8 @@ fn run_services_without(text: &str, names: &[&str]) -> (String, Vec<String>) {
 /// Takes `names` out of the prefix's `RunServices` (the programs
 /// `wineboot --init` starts each session) in web/rootfs.tar's `system.reg`.
 /// A name the key does not have is passed over. Returns the ones taken out.
-fn drop_run_services(v: &Json, web: &Path, names: &[&str]) -> Result<Vec<String>> {
-    let what = crate::project::PROJECT_FILE;
-    let path = web.join("rootfs.tar");
-    let bytes = std::fs::read(&path)?;
-    let env = json::str_list(json::field(v, "page", what)?, "env", what)?;
-    let prefix = env.iter().find_map(|e| e.strip_prefix("WINEPREFIX=")).unwrap_or("/pfx").trim_matches('/').to_string();
+fn drop_run_services(path: &Path, prefix: &str, names: &[&str], say: &str) -> Result<Vec<String>> {
+    let bytes = std::fs::read(path)?;
     let want = format!("{prefix}/system.reg");
     let text = {
         let tar = crate::reach::Tar::parse(&bytes)?;
@@ -745,9 +799,9 @@ fn drop_run_services(v: &Json, web: &Path, names: &[&str]) -> Result<Vec<String>
     }
     let new = crate::reach::tar_put(&bytes, &want, out.as_bytes())?;
     // web/rootfs.tar may be a hard link to the project's bundle.
-    std::fs::remove_file(&path)?;
-    write_file(&path, &new, false)?;
-    eprintln!("gexc eject build: RunServices without {}", gone.join(", "));
+    std::fs::remove_file(path)?;
+    write_file(path, &new, false)?;
+    eprintln!("{say}: RunServices without {}", gone.join(", "));
     Ok(gone)
 }
 
@@ -851,7 +905,7 @@ fn title_read_set(v: &Json, after: u32, wineboot_skip: bool) -> Result<Option<(V
                 .collect(),
             _ => bail!(
                 "user/eject.json says \"title_after\": {after}, but the recording has no files_read_at \
-                 (record with a tools/eject/record-wine32.mjs that has the read times)"
+                 (record with a site/record-wine32.mjs that has the read times)"
             ),
         }
     } else {
@@ -920,6 +974,60 @@ fn strip_dir(p: &str) -> &str {
     p.rsplit(['/', '\\']).next().unwrap_or(p)
 }
 
+const BUILD_SAYS: &str = "gexc eject build";
+
+/// What the config changes in the bundle's prefix itself, in the tar at
+/// PATH (the prefix at PREFIX in it): the services' start types
+/// (`"services"`, and the ones `"helpers": "strip"` disables) and the
+/// programs taken out of `RunServices` (`"helpers": "strip"`'s
+/// winemenubuilder, `"desktop": "none"`'s desktop). Setting them again is a
+/// no-op, so a bundle already prepared (`prepare_bundle`) builds the same.
+fn prefix_settings(config: &Config, path: &Path, prefix: &str, say: &str) -> Result<()> {
+    let mut services: Vec<(String, u32, bool)> = Vec::new();
+    if config.helpers_strip {
+        for n in STRIP_SERVICES {
+            if !config.services.iter().any(|(k, _)| k.eq_ignore_ascii_case(n)) {
+                services.push((n.to_string(), 4, false));
+            }
+        }
+    }
+    services.extend(config.services.iter().map(|(k, s)| (k.clone(), *s, true)));
+    if !services.is_empty() {
+        set_services(path, prefix, &services, say)?;
+    }
+    let mut run_off = Vec::new();
+    if config.helpers_strip {
+        run_off.push("winemenubuilder");
+    }
+    if config.desktop_none {
+        run_off.push("desktop");
+    }
+    if !run_off.is_empty() {
+        drop_run_services(path, prefix, &run_off, say)?;
+    }
+    Ok(())
+}
+
+/// `gexc eject prepare`: the bundle at IN as a site of CONFIG (a
+/// `user/eject.json`) starts, written to OUT, for the recording: the
+/// prefix's settings (`prefix_settings`) and, with `"helpers": "strip"`,
+/// no helper programs. A recording of it reads what the site's own start
+/// reads, so the bundle split ships that and not what a helper the site
+/// never starts read. The prefix is at PREFIX in the bundle ("/pfx").
+pub fn prepare_bundle(config: &Path, input: &Path, out: &Path, prefix: &str) -> Result<()> {
+    let text = std::fs::read_to_string(config)?;
+    let config = Config::from_json(&text)?;
+    let say = "gexc eject prepare";
+    if out.exists() {
+        std::fs::remove_file(out)?;
+    }
+    std::fs::copy(input, out)?;
+    if config.helpers_strip {
+        strip_programs(out, say)?;
+    }
+    prefix_settings(&config, out, prefix.trim_matches('/'), say)
+}
+
 /// Whether `p` (a bundle or guest path) is one of STRIP_PROGRAMS.
 fn strip_program(p: &str) -> bool {
     STRIP_PROGRAMS.iter().any(|n| strip_dir(p).eq_ignore_ascii_case(n))
@@ -928,17 +1036,16 @@ fn strip_program(p: &str) -> bool {
 /// `"helpers": "strip"`: web/rootfs.tar without STRIP_PROGRAMS, wherever
 /// the bundle has them (the prefix's system32 and Wine's own directories).
 /// Returns the paths left out.
-fn strip_programs(web: &Path) -> Result<Vec<String>> {
-    let path = web.join("rootfs.tar");
-    let bytes = std::fs::read(&path)?;
+fn strip_programs(path: &Path, say: &str) -> Result<Vec<String>> {
+    let bytes = std::fs::read(path)?;
     let (out, gone) = crate::reach::tar_drop(&bytes, &strip_program)?;
     if gone.is_empty() {
         return Ok(gone);
     }
     // web/rootfs.tar may be a hard link to the project's bundle.
-    std::fs::remove_file(&path)?;
-    write_file(&path, &out, false)?;
-    eprintln!("gexc eject build: \"helpers\": left out {}", gone.join(", "));
+    std::fs::remove_file(path)?;
+    write_file(path, &out, false)?;
+    eprintln!("{say}: \"helpers\": left out {}", gone.join(", "));
     Ok(gone)
 }
 
@@ -1088,7 +1195,7 @@ pub struct Wine32Report {
 }
 
 /// A new 32-bit Wine project's `"cold"`: none. Every unit ships whole, in the site's
-/// one units archive (web/eject-site.mjs), and nothing is fetched on a call.
+/// one units archive (site/eject-site.mjs), and nothing is fetched on a call.
 /// A split (`"chunk:256"` and the other clusterings) is opt-in: it cuts the
 /// download and costs a fetch per cluster at first call (crates/gex-eject/README.md,
 /// "Cold code").
@@ -1124,26 +1231,27 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
     let src = PathBuf::from(json::str_field(&v, "page_source", what)?);
     let page = web.join("page");
     let st = std::process::Command::new("sh")
-        .arg(src.join("build-eject-page.sh"))
+        .arg(src.join("../site/build-eject-page.sh"))
         .arg(&page)
         .env("GEX_FEATURES_OFF", off.join(","))
         .status()
-        .with_context(|| format!("running {}/build-eject-page.sh", src.display()))?;
+        .with_context(|| format!("running {}/../site/build-eject-page.sh", src.display()))?;
     if !st.success() {
-        bail!("{}/build-eject-page.sh failed ({st})", src.display());
+        bail!("{}/../site/build-eject-page.sh failed ({st})", src.display());
     }
     // The runtime is the project's, not whatever the checkout has built since.
     for f in runtime_wasm(wine64) {
         let to = page.join("gex").join(f);
         let _ = std::fs::remove_file(&to);
         link_or_copy(&dir.join("runtime/web/gex").join(f), &to)?;
+        strip_release(&to)?;
     }
-    // GL kept, but the checkout has no Mesa built (web/build-mesa-wasm.sh):
+    // GL kept, but the checkout has no Mesa built (ports/mesa/build.sh):
     // the page would answer the guest's first GL request with a device that
     // cannot start. The build is one without GL instead, which the guest
     // sees as no /dev/gex-gl at all.
     if !off.iter().any(|x| x == "gl") && !page.join("gex/gex-wgpu-replay.js").is_file() {
-        eprintln!("gexc eject build: {} has no Mesa (web/build-mesa-wasm.sh): the page is built without GL", src.display());
+        eprintln!("gexc eject build: {} has no Mesa (ports/mesa/build.sh): the page is built without GL", src.display());
         off.push("gl".to_string());
     }
     let has = |f: &str| !off.iter().any(|x| x == f);
@@ -1165,7 +1273,7 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
         }
     }
     if !page.join("app.mjs").is_file() {
-        bail!("{}/build-eject-page.sh made no app.mjs (an older gex checkout? the page is the app library now)", src.display());
+        bail!("{}/../site/build-eject-page.sh made no app.mjs (an older gex checkout? the page is the app library now)", src.display());
     }
     crate::web::check_no_test_page(&page)?;
     let mut page_files = 0;
@@ -1183,7 +1291,7 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
 
     // The bundle and the units: as they are, or with `"cold"` each unit's
     // primary (the functions the run called, a stub for every other) and
-    // its cold clusters, `cold/N.wasm` (web/eject-site.mjs packs them).
+    // its cold clusters, `cold/N.wasm` (site/eject-site.mjs packs them).
     let units = list(&v, "units");
     // `"resources": "trim"`: the bundle with the resources no lookup returns
     // zeroed, and each trimmed image's unit under the key the page computes
@@ -1198,7 +1306,7 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
     // units without theirs.
     let kept_units: Vec<Json>;
     let units = if config.helpers_strip {
-        strip_programs(&web)?;
+        strip_programs(&web.join("rootfs.tar"), BUILD_SAYS)?;
         kept_units = units
             .iter()
             .filter(|u| !u.get("path").and_then(|x| x.as_str()).is_some_and(strip_program))
@@ -1209,28 +1317,11 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
         units
     };
     let pins = pin_bases(&v, units, &web)?;
-    let mut services: Vec<(String, u32, bool)> = Vec::new();
-    if config.helpers_strip {
-        for n in STRIP_SERVICES {
-            if !config.services.iter().any(|(k, _)| k.eq_ignore_ascii_case(n)) {
-                services.push((n.to_string(), 4, false));
-            }
-        }
-    }
-    services.extend(config.services.iter().map(|(k, s)| (k.clone(), *s, true)));
-    if !services.is_empty() {
-        set_services(&v, &web, &services)?;
-    }
-    let mut run_off = Vec::new();
-    if config.helpers_strip {
-        run_off.push("winemenubuilder");
-    }
-    if config.desktop_none {
-        run_off.push("desktop");
-    }
-    if !run_off.is_empty() {
-        drop_run_services(&v, &web, &run_off)?;
-    }
+    let prefix = {
+        let env = json::str_list(json::field(&v, "page", crate::project::PROJECT_FILE)?, "env", crate::project::PROJECT_FILE)?;
+        env.iter().find_map(|e| e.strip_prefix("WINEPREFIX=")).unwrap_or("/pfx").trim_matches('/').to_string()
+    };
+    prefix_settings(&config, &web.join("rootfs.tar"), &prefix, BUILD_SAYS)?;
     if config.wineboot_skip {
         put_volatile_keys(&v, &web)?;
     }
@@ -1453,7 +1544,7 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
         params.push(("fjit".to_string(), s("1")));
     }
     // `"bundle": "split"`: the files the recorded run opened, which the site
-    // keeps in its bundle (web/eject-site.mjs); `"title"`: those it opened up
+    // keeps in its bundle (site/eject-site.mjs); `"title"`: those it opened up
     // to its title window.
     let bundle = if config.bundle_split {
         let (read, read_set) = bundle_read_set(&v, &config)?;
@@ -1467,7 +1558,7 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
             }
             _ => bail!(
                 "user/eject.json says \"bundle\": \"{}\", but the recording has no {read_set} \
-                 (record with a tools/eject/record-wine32.mjs and page that have the read set, or set \"bundle\": \"whole\")",
+                 (record with a site/record-wine32.mjs and page that have the read set, or set \"bundle\": \"whole\")",
                 if config.bundle_title { "title" } else { "split" }
             ),
         }
@@ -1531,7 +1622,7 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
         ("bundle", bundle),
         // user/eject.json "start": the app library's start() defaults, over
         // the recording's (crates/gex-eject/README.md, "The web build").
-        ("start", Json::parse(&config.start).map_err(|e| anyhow!("user/eject.json \"start\": {e}"))?),
+        ("start", start_of(&config.start)?),
     ]);
     write_file(&web.join("wine32.json"), json::write(&launch).as_bytes(), false)?;
     write_file(
@@ -1551,6 +1642,22 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
         false,
     )?;
     Ok(Wine32Report { features_off: off, page_files, units: units.len() })
+}
+
+#[cfg(test)]
+mod start_tests {
+    use super::start_of;
+
+    #[test]
+    fn a_build_names_where_the_guests_files_are_kept() {
+        assert!(start_of(r#"{"filesystem": "memory", "args": ["a"]}"#).is_ok());
+        assert!(start_of(r#"{"filesystem": {"kind": "opfs", "name": "th07"}}"#).is_ok());
+        assert!(start_of(r#"{"filesystem": {"kind": "memory", "max": 1073741824}}"#).is_ok());
+        let none = start_of("{}").unwrap_err().to_string();
+        assert!(none.contains("no \"filesystem\""), "{none}");
+        assert!(start_of(r#"{"filesystem": "opfs"}"#).is_err());
+        assert!(start_of(r#"{"filesystem": {"kind": "opfs"}}"#).is_err());
+    }
 }
 
 #[cfg(test)]

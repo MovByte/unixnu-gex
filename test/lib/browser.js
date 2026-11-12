@@ -21,9 +21,9 @@ const emit = (s) => {
 const t = makeT({ host: 'browser', arch: q.get('arch'), gpu: q.has('gpu'), timed: q.has('timed'), phase: kept?.phase ?? 1, state: kept?.state ?? null, res, emit });
 
 Object.assign(t, {
-  /** The runtime's assets, as a System's `baseUrl` (`--package`: the
-   *  package's). */
-  baseUrl: q.get('base') ?? '/',
+  /** The runtime's assets, as a System's `baseUrl` (`--package`: none, the
+   *  package's own). */
+  baseUrl: q.has('pkg') ? undefined : (q.get('base') ?? '/'),
   /** The runtime's debug switches for this run: vite dev's Workers need
    *  workergraph=0; `arch` the runner's. */
   debug: (more = {}) => ({ workergraph: '0', ...(t.arch ? { arch: t.arch } : {}), ...more }),
@@ -94,6 +94,14 @@ Object.assign(t, {
    *  run's artefacts: its path. `clip`: `{ x, y, width, height }` only. */
   async screenshot(name, clip) {
     const [r] = await t.cdp({ method: 'Page.captureScreenshot', format: 'png', save: `${name}.png`, ...(clip ? { clip: { ...clip, scale: 1 } } : {}) });
+    return r.path;
+  },
+  /** `text` saved as `NAME` among the run's artefacts: its path. */
+  async saveFile(name, text) {
+    const bytes = new TextEncoder().encode(text);
+    let bin = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+    const [r] = await t.cdp({ method: '__save', save: name, data: btoa(bin) });
     return r.path;
   },
   /** The page's pixels in `clip` (`{ x, y, width, height }`, CSS pixels), as

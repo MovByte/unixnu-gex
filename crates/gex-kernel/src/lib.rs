@@ -40,6 +40,7 @@ pub mod eventfd;
 pub mod inotify;
 pub mod vnote;
 pub mod procnote;
+pub mod locks;
 pub mod netlink;
 pub mod file;
 pub mod fs;
@@ -83,8 +84,13 @@ pub use proclive::{KernelProcSource, ProcCell};
 /// Guest virtual address equals byte offset, so the kernel needs
 /// no translation layer — just bounds checks, which are also the syscall
 /// ABI's `EFAULT` checks.
+///
+/// Held as a [`gex_atomic::mem::Span`], never as a slice of the whole: in
+/// the browser the memory starts at address 0, where a Rust reference may
+/// not point, and every accessor makes a slice of only the range it was
+/// asked for (see the span's module).
 pub struct GuestMem<'a> {
-    pub bytes: &'a mut [u8],
+    span: gex_atomic::mem::Span<'a>,
     /// A Darwin process's call, its copies to and from the program checked
     /// as `copyin` and `copyout` check them ([`Self::set_user`]): the
     /// calling thread's context, which the kernel keeps in the runtime's
@@ -94,7 +100,7 @@ pub struct GuestMem<'a> {
 
 impl<'a> GuestMem<'a> {
     pub fn new(bytes: &'a mut [u8]) -> GuestMem<'a> {
-        GuestMem { bytes, user: None }
+        GuestMem { span: gex_atomic::mem::Span::new(bytes), user: None }
     }
 
     /// Check what is read and written from now on against the pages'
@@ -109,7 +115,17 @@ impl<'a> GuestMem<'a> {
     /// The same memory, unchecked: the kernel's own reads and writes in a
     /// call ([`Self::set_user`]), not the program's buffers.
     pub fn kernel(&mut self) -> GuestMem<'_> {
-        GuestMem { bytes: &mut *self.bytes, user: None }
+        GuestMem { span: self.span.reborrow(), user: None }
+    }
+
+    /// The protection byte of permission page `p` (`gex_abi::PERM_TABLE64`):
+    /// `None` past the table or where memory does not reach.
+    fn perm_byte(&self, p: u64) -> Option<u8> {
+        if p >= gex_abi::PERM_TABLE_BYTES {
+            return None;
+        }
+        let r = self.range(gex_abi::PERM_TABLE64 + p, 1).ok()?;
+        self.slice(r).ok().map(|b| b[0])
     }
 
     /// Whether `[addr, addr + len)` may be read (`need` the read bit) or
@@ -127,8 +143,7 @@ impl<'a> GuestMem<'a> {
         if last >= gex_abi::PERM_TABLE_BYTES {
             return false;
         }
-        let view = self.view();
-        (first..=last).all(|p| view.get((gex_abi::PERM_TABLE64 + p) as usize).is_some_and(|b| b & need == need))
+        (first..=last).all(|p| self.perm_byte(p).is_some_and(|b| b & need == need))
     }
 
     /// Where a checked call's string read from `start` must stop before
@@ -143,8 +158,7 @@ impl<'a> GuestMem<'a> {
         let mut at = start;
         while at < end {
             let p = at as u64 >> gex_abi::PERM_PAGE_SHIFT;
-            let ok = p < gex_abi::PERM_TABLE_BYTES && self.view().get((gex_abi::PERM_TABLE64 + p) as usize).is_some_and(|b| b & gex_abi::perm::READ != 0);
-            if !ok {
+            if !self.perm_byte(p).is_some_and(|b| b & gex_abi::perm::READ != 0) {
                 return at;
             }
             at = (at & !(page - 1)) + page;
@@ -164,35 +178,29 @@ impl<'a> GuestMem<'a> {
         Ok(r)
     }
 
-    /// The backing bytes, hidden from the optimiser on wasm.
-    ///
-    /// In the browser this slice spans the guest's whole address space via a
-    /// pointer made from an integer. LLVM sees no provenance, assumes size zero,
-    /// and folds the bounds checks below to "always out of range" at some call
-    /// sites but not others. A barrier at each use leaves it nothing to fold;
-    /// native hosts get a real slice and need none of this.
+    /// Over a [`gex_atomic::mem::Span`] (the browser's, from address 0 of
+    /// its memory).
+    pub fn of_span(span: gex_atomic::mem::Span<'a>) -> GuestMem<'a> {
+        GuestMem { span, user: None }
+    }
+
+    /// The memory as one slice, where it is one (a native host's, a
+    /// buffer); `None` for the browser's.
+    pub fn as_slice_mut(&mut self) -> Option<&mut [u8]> {
+        self.span.as_slice_mut()
+    }
+
+    /// `r`, checked by [`Self::range`], as a slice: `EFAULT` at address 0
+    /// of the browser's memory, which no slice may start at (as for an
+    /// unmapped zero page).
     #[inline(always)]
-    fn view(&self) -> &[u8] {
-        #[cfg(target_family = "wasm")]
-        {
-            std::hint::black_box(&*self.bytes)
-        }
-        #[cfg(not(target_family = "wasm"))]
-        {
-            self.bytes
-        }
+    fn slice(&self, r: std::ops::Range<usize>) -> Result<&[u8], Errno> {
+        self.span.get(r.start, r.len()).ok_or(Errno::EFAULT)
     }
 
     #[inline(always)]
-    fn view_mut(&mut self) -> &mut [u8] {
-        #[cfg(target_family = "wasm")]
-        {
-            std::hint::black_box(&mut *self.bytes)
-        }
-        #[cfg(not(target_family = "wasm"))]
-        {
-            self.bytes
-        }
+    fn slice_mut(&mut self, r: std::ops::Range<usize>) -> Result<&mut [u8], Errno> {
+        self.span.get_mut(r.start, r.len()).ok_or(Errno::EFAULT)
     }
 
     fn range(&self, addr: u64, len: usize) -> Result<std::ops::Range<usize>, Errno> {
@@ -204,13 +212,23 @@ impl<'a> GuestMem<'a> {
         Ok(start..end)
     }
 
+    /// How far the memory may be addressed: the length it was made with,
+    /// whatever of it exists ([`Self::limit`] is what does).
+    pub fn len(&self) -> usize {
+        self.span.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.span.is_empty()
+    }
+
     /// The last address this memory really has, read live.
     ///
-    /// Not `view().len()`: in the browser the view spans the whole 2 GiB a
-    /// guest pointer may name, while the memory starts smaller and grows as the
-    /// guest maps, so a check against the view passed for unbacked addresses and
-    /// the access trapped. Live because it moves during a syscall -- an `mmap`
-    /// grows the memory then zeroes what it just mapped.
+    /// Not the length it was made with: in the browser that spans the whole
+    /// 2 GiB a guest pointer may name, while the memory starts smaller and
+    /// grows as the guest maps, so a check against it passed for unbacked
+    /// addresses and the access trapped. Live because it moves during a
+    /// syscall -- an `mmap` grows the memory then zeroes what it just mapped.
     #[inline(always)]
     fn limit(&self) -> usize {
         #[cfg(target_family = "wasm")]
@@ -220,17 +238,27 @@ impl<'a> GuestMem<'a> {
             #[cfg(target_arch = "wasm64")]
             let pages = core::arch::wasm64::memory_size(0);
             let live = (pages as u64) << 16;
-            (live as usize).min(self.view().len())
+            (live as usize).min(self.span.len())
         }
         #[cfg(not(target_family = "wasm"))]
         {
-            self.view().len()
+            self.span.len()
         }
+    }
+
+    /// The 4 bytes at `addr` for an atomic access ([`gex_atomic`]'s, at
+    /// offset 0 of them): `None` outside memory.
+    pub fn word_mut(&mut self, addr: u64) -> Option<&mut [u8]> {
+        if addr % 4 != 0 {
+            return None;
+        }
+        let r = self.range(addr, 4).ok()?;
+        self.slice_mut(r).ok()
     }
 
     pub fn read(&self, addr: u64, len: usize) -> Result<&[u8], Errno> {
         let r = self.range_for(addr, len, gex_abi::perm::READ)?;
-        Ok(&self.view()[r])
+        self.slice(r)
     }
 
     /// A writable slice of guest memory, for a caller that fills it itself.
@@ -240,12 +268,12 @@ impl<'a> GuestMem<'a> {
     /// claim 117 arena spans (1,872 MiB). See task 140.
     pub fn read_mut(&mut self, addr: u64, len: usize) -> Result<&mut [u8], Errno> {
         let r = self.range_for(addr, len, gex_abi::perm::WRITE)?;
-        Ok(&mut self.view_mut()[r])
+        self.slice_mut(r)
     }
 
     pub fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), Errno> {
         let r = self.range_for(addr, data.len(), gex_abi::perm::WRITE)?;
-        self.view_mut()[r].copy_from_slice(data);
+        self.slice_mut(r)?.copy_from_slice(data);
         Ok(())
     }
 
@@ -253,7 +281,7 @@ impl<'a> GuestMem<'a> {
     pub fn zero(&mut self, addr: u64, len: usize) -> Result<(), Errno> {
         big_op("zero", len);
         let r = self.range_for(addr, len, gex_abi::perm::WRITE)?;
-        self.view_mut()[r].fill(0);
+        self.slice_mut(r)?.fill(0);
         Ok(())
     }
 
@@ -265,7 +293,9 @@ impl<'a> GuestMem<'a> {
         big_op("copy_within", len);
         let s = self.range_for(src, len, gex_abi::perm::READ)?;
         let d = self.range_for(dst, len, gex_abi::perm::WRITE)?;
-        self.view_mut().copy_within(s, d.start);
+        if !self.span.copy_within(s.start, d.start, len) {
+            return Err(Errno::EFAULT);
+        }
         Ok(())
     }
 
@@ -278,8 +308,15 @@ impl<'a> GuestMem<'a> {
     pub fn zero_dirty(&mut self, addr: u64, len: usize) -> Result<(), Errno> {
         big_op("zero_dirty", len);
         let r = self.range(addr, len)?;
-        zero_dirty_bytes(&mut self.view_mut()[r]);
+        zero_dirty_bytes(self.slice_mut(r)?);
         Ok(())
+    }
+
+    /// The host address of guest address 0, where the memory is a host
+    /// allocation (a native host's); `None` for the browser's, which no
+    /// host page call reaches.
+    fn host_base(&mut self) -> Option<usize> {
+        self.span.as_slice_mut().map(|s| s.as_mut_ptr() as usize)
     }
 
     /// Ask the host to do `a` with `len` bytes of guest pages at `addr`
@@ -288,7 +325,7 @@ impl<'a> GuestMem<'a> {
     /// are.
     pub fn advise(&mut self, addr: u64, len: u64, a: HostAdvice) -> Result<bool, Errno> {
         let r = self.range(addr, usize::try_from(len).map_err(|_| Errno::EFAULT)?)?;
-        let base = self.view_mut().as_mut_ptr() as usize;
+        let Some(base) = self.host_base() else { return Ok(false) };
         Ok(HOST_VM.get().is_some_and(|f| f(base + r.start, r.len(), a)))
     }
 
@@ -298,7 +335,7 @@ impl<'a> GuestMem<'a> {
     /// file's until written, so they hold no memory of their own.
     pub fn map_file(&mut self, addr: u64, len: u64, fd: i32, offset: u64) -> Result<bool, Errno> {
         let r = self.range(addr, usize::try_from(len).map_err(|_| Errno::EFAULT)?)?;
-        let base = self.view_mut().as_mut_ptr() as usize;
+        let Some(base) = self.host_base() else { return Ok(false) };
         Ok(HOST_MAP_FILE.get().is_some_and(|f| f(base + r.start, r.len(), fd, offset)))
     }
 
@@ -307,7 +344,7 @@ impl<'a> GuestMem<'a> {
     /// could say ([`set_host_pages`]).
     pub fn page_states(&mut self, addr: u64, len: u64, page: u64, out: &mut [u8]) -> Result<bool, Errno> {
         let r = self.range(addr, usize::try_from(len).map_err(|_| Errno::EFAULT)?)?;
-        let base = self.view_mut().as_mut_ptr() as usize;
+        let Some(base) = self.host_base() else { return Ok(false) };
         Ok(HOST_PAGES.get().is_some_and(|f| f(base + r.start, r.len(), page as usize, out)))
     }
 
@@ -364,7 +401,7 @@ impl<'a> GuestMem<'a> {
         }
         let want = (start + buf.len()).min(limit);
         let end = self.user_readable_to(start, want);
-        let slice = &self.view()[start..end];
+        let slice = self.slice(start..end)?;
         match slice.iter().position(|b| *b == 0) {
             Some(n) => {
                 buf[..n].copy_from_slice(&slice[..n]);
@@ -387,7 +424,7 @@ impl<'a> GuestMem<'a> {
         // bytes ran off into pages never mapped.
         let want = (start + max).min(limit);
         let end = self.user_readable_to(start, want);
-        let slice = &self.view()[start..end];
+        let slice = self.slice(start..end)?;
         match slice.iter().position(|b| *b == 0) {
             Some(n) => Ok(slice[..n].to_vec()),
             None if end < want => Err(Errno::EFAULT),

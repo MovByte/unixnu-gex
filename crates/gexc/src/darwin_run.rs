@@ -76,7 +76,7 @@ pub fn run(mut ra: RunArgs, bytes: &[u8]) -> Result<ExitCode> {
         bail!("--mem32: a Darwin program's images are above 4 GiB");
     }
     ra.mem64 = Some(true);
-    choose_mem(&mut ra, bytes, true)?;
+    choose_mem(&mut ra, true)?;
     set_wasm_libs()?;
     let (exit, _stats) = gex_native::run_program(&program, &ra.opts, &ra.xlate)?;
     Ok(report_exit(&exit, ra.opts.verbose))

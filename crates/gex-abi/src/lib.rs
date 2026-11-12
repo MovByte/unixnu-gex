@@ -134,43 +134,61 @@ pub const LIMIT64_PAGES: u64 = LIMIT64 / WASM_PAGE;
 /// An M64 process's dense per-page tables: its dispatch
 /// directory, one `u32` for every page of `[0, LIMIT64)`, so code can live
 /// anywhere in the memory (a W^X JIT's high pages made executable), and its
-/// [`PATCHED_PAGES`] bits after it. At the bottom of the high region, below
-/// the arena. An M32 process uses the low region's directory instead, and a
-/// Darwin process the same tables at [`DARWIN_TABLES64`]; see
-/// [`dispatch_dir`].
-pub const DISPATCH_DIR64: u64 = 1 << 32;
+/// [`PATCHED_PAGES`] bits after it. At 8 GiB, so that `[4 GiB, 8 GiB)`
+/// holds nothing of gex's when a process starts (the high arena's data
+/// comes later, and in 64-bit Wine from the top down), and a Windows
+/// image keeps the base it was linked at there -- Free Pascal's x86-64
+/// exe at 0x100000000 (no relocations: at 4 GiB, where these tables were,
+/// such an exe could not start), MSVC's and MinGW's at 0x140000000, a
+/// DLL's at 0x180000000. An M32 process uses the low region's directory
+/// instead; see [`dispatch_dir`].
+pub const DISPATCH_DIR64: u64 = 8 << 30;
+
+/// The bottom of an M64 memory's high arena: the guest's data above
+/// everything a wasm32 process has, filled bottom-up to [`LIMIT64`] around
+/// the M64 tables, and in 64-bit Wine top-down from its top
+/// ([`DISPATCH_DIR64`] by default), so that its images at their own low
+/// bases (0x100000000, 0x140000000) are reached by the data last.
+pub const IMAGE_ZONE64: u64 = 1 << 32;
 
 /// Pages [`DISPATCH_DIR64`] covers: all of [`LIMIT64`].
 pub const DISPATCH_MAX_PAGES64: u64 = LIMIT64 / DISPATCH_PAGE;
 
-/// Where in the M64 tables the [`PATCHED_PAGES`] bits start, and where a
-/// Darwin process's protection table ([`PERM_TABLE64`]) does.
-const TABLES64_PATCHED: u64 = DISPATCH_MAX_PAGES64 * 4;
-const TABLES64_PERM: u64 = TABLES64_PATCHED + DISPATCH_MAX_PAGES64 / 8;
-
 /// The M64 [`PATCHED_PAGES`]: one bit per page of [`DISPATCH_MAX_PAGES64`].
-pub const PATCHED_PAGES64: u64 = DISPATCH_DIR64 + TABLES64_PATCHED;
+pub const PATCHED_PAGES64: u64 = DISPATCH_DIR64 + DISPATCH_MAX_PAGES64 * 4;
 
-/// Where a Darwin process keeps its M64 tables: inside the 4 GiB
+/// End of the M64 tables, rounded to 1 MiB.
+pub const HIGH_TABLES_END: u64 = (PATCHED_PAGES64 + DISPATCH_MAX_PAGES64 / 8 + 0xf_ffff) & !0xf_ffff;
+
+/// The bottom of the part of an M64 process's high arena ([`IMAGE_ZONE64`])
+/// above the M64 tables: what the memory grows over as that part is used.
+pub const HIGH_ARENA_BASE: u64 = HIGH_TABLES_END;
+
+/// A Darwin process's M64 tables ([`tables64`]): the same directory and
+/// patched-page bits, then its [`PERM_TABLE64`], inside the 4 GiB
 /// `__PAGEZERO` every arm64 program has, which its map never reaches
 /// (`load_machfile` refuses a program without it and raises the map's
 /// minimum past it), so that its address space starts at 4 GiB, as XNU's
-/// does, with its image slid from there. Above every table and context the
-/// runtime keeps low ([`DISPATCH_DIR_END`]) and the low arena
-/// ([`MMAP_TOP`]); laid out as the high region's tables are, with the
-/// protection table ([`PERM_TABLE64`]) after them.
-pub const DARWIN_TABLES64: u64 = 0xc000_0000;
+/// does, with its image slid from there. Not at [`DISPATCH_DIR64`]:
+/// Darwin's shared region starts at 0x1_8000_0000
+/// (`SHARED_REGION_BASE_ARM64`) and iOS's cache runs past 8 GiB in it.
+/// Above every table and context the runtime keeps low
+/// ([`DISPATCH_DIR_END`]) and the low arena ([`MMAP_TOP`]).
+pub const DARWIN_DISPATCH_DIR64: u64 = 0xc000_0000;
+
+/// A Darwin process's [`PATCHED_PAGES64`].
+pub const DARWIN_PATCHED_PAGES64: u64 = DARWIN_DISPATCH_DIR64 + DISPATCH_MAX_PAGES64 * 4;
 
 /// A Darwin process's page protections, as its translated code and its
 /// kernel's copies check them: one byte per [`PERM_PAGE`] of [`LIMIT64`],
-/// after its patched bits in [`DARWIN_TABLES64`]. A byte's low four bits are
-/// 0 where nothing is mapped, else [`perm::MAPPED`] with the mapping's
-/// protection bits; its high four ([`perm::BOTH_SHIFT`]) are what this page
-/// and the next both allow, so an access that may reach the next page is let
+/// after [`DARWIN_PATCHED_PAGES64`]. A byte's low four bits are 0 where
+/// nothing is mapped, else [`perm::MAPPED`] with the mapping's protection
+/// bits; its high four ([`perm::BOTH_SHIFT`]) are what this page and the
+/// next both allow, so an access that may reach the next page is let
 /// through with one look. Every page below [`DARWIN_GUEST_FLOOR`] reads 0.
 /// Kept by the process's kernel as its map changes, before the change
 /// returns to the program.
-pub const PERM_TABLE64: u64 = DARWIN_TABLES64 + TABLES64_PERM;
+pub const PERM_TABLE64: u64 = DARWIN_PATCHED_PAGES64 + DISPATCH_MAX_PAGES64 / 8;
 
 /// The page [`PERM_TABLE64`] has a byte for: a Darwin process's 16 KiB.
 pub const PERM_PAGE_SHIFT: u32 = 14;
@@ -190,39 +208,24 @@ pub mod perm {
     pub const BOTH_SHIFT: u32 = 4;
 }
 
-/// The M64 tables' size, rounded to 1 MiB: room for the protection table
-/// whichever tables hold it, and the zero byte past it an access check may
-/// read.
-pub const TABLES64_BYTES: u64 = (TABLES64_PERM + PERM_TABLE_BYTES + 0xf_ffff) & !0xf_ffff;
+/// End of a Darwin process's M64 tables, rounded to 1 MiB: the zero byte
+/// past [`PERM_TABLE64`] an access check may read is in it.
+pub const DARWIN_TABLES_END: u64 = (PERM_TABLE64 + PERM_TABLE_BYTES + 0xf_ffff) & !0xf_ffff;
 
-/// End of the M64 tables.
-pub const HIGH_TABLES_END: u64 = DISPATCH_DIR64 + TABLES64_BYTES;
-
-/// The bottom of an M64 process's high arena: non-executable data (Linux
-/// `mmap` without `PROT_EXEC`, NT allocations without an executable
-/// protection) goes here, above everything a wasm32 process has and above
-/// the M64 tables.
-pub const HIGH_ARENA_BASE: u64 = HIGH_TABLES_END;
-
-/// Where this process's M64 tables are: [`DISPATCH_DIR64`], or a Darwin
-/// process's [`DARWIN_TABLES64`] ([`commpage_fold`] says which).
+/// This process's M64 tables, `[start, end)`: a Darwin process's (its
+/// runner folds the commpage, [`commpage_fold`]) at
+/// [`DARWIN_DISPATCH_DIR64`], every other's at [`DISPATCH_DIR64`].
 #[inline]
-pub fn tables64() -> u64 {
-    if commpage_fold() { DARWIN_TABLES64 } else { DISPATCH_DIR64 }
-}
-
-/// [`tables64`]'s byte range, `[start, end)`.
-#[inline]
-pub fn tables64_range() -> (u64, u64) {
-    (tables64(), tables64() + TABLES64_BYTES)
+pub fn tables64() -> (u64, u64) {
+    if commpage_fold() { (DARWIN_DISPATCH_DIR64, DARWIN_TABLES_END) } else { (DISPATCH_DIR64, HIGH_TABLES_END) }
 }
 
 /// The dispatch directory of this process's memory flavour: the low region's
-/// [`DISPATCH_DIR`] for M32, the M64 tables' ([`tables64`]) for M64. Also
+/// [`DISPATCH_DIR`] for M32, the start of its [`tables64`] for M64. Also
 /// [`page_gen`].
 #[inline]
 pub fn dispatch_dir() -> u64 {
-    if mem64() { tables64() } else { DISPATCH_DIR }
+    if mem64() { tables64().0 } else { DISPATCH_DIR }
 }
 
 /// Pages [`dispatch_dir`] covers.
@@ -237,10 +240,11 @@ pub fn page_gen() -> u64 {
     dispatch_dir()
 }
 
-/// The [`PATCHED_PAGES`] bits of this flavour.
+/// The [`PATCHED_PAGES`] bits of this flavour: for M64, after the
+/// directory in its [`tables64`].
 #[inline]
 pub fn patched_pages() -> u64 {
-    if mem64() { tables64() + TABLES64_PATCHED } else { PATCHED_PAGES }
+    if mem64() { tables64().0 + DISPATCH_MAX_PAGES64 * 4 } else { PATCHED_PAGES }
 }
 
 /// The directory's byte range `[dispatch_dir(), end)`.
@@ -485,7 +489,8 @@ pub mod ctx {
     /// thread's own, never guest-observable, and no address a guard on
     /// guest addresses (the null guard, a Darwin process's floor) faults.
     /// A pair's second doubleword lands here too, at `EXCL_SCRATCH - 8`
-    /// plus its offset of 8.
+    /// plus its offset of 8. AArch64 only: an x86 build keeps [`CS`] in
+    /// this slot.
     pub const EXCL_SCRATCH: usize = 47 * 8;
 
     /// The raw system-call number the guest last issued, saved by the kernel
@@ -493,6 +498,29 @@ pub mod ctx {
     /// register, so a host that wants to know which call just ran after the
     /// fact cannot read it back from there.
     pub const LAST_SYSCALL: usize = 45 * 8;
+
+    /// x86 only: the thread's code selector, a `u32`. 0 is the process's
+    /// own class (an x86-64 process's code is 64-bit, an i386 one's
+    /// 32-bit); a WoW64 process's threads switch with far transfers and
+    /// `iret` to [`CS_COMPAT`] (32-bit) and [`CS_LONG`] (64-bit), as
+    /// Windows' selectors name them. Code is translated in the mode it names.
+    /// An AArch64 build keeps [`EXCL_SCRATCH`] in this slot.
+    pub const CS: usize = 47 * 8;
+    /// 32-bit user code (Windows' WoW64 selector; i386 Windows' 0x1b is
+    /// taken as the same).
+    pub const CS_COMPAT: u32 = 0x23;
+    /// 64-bit user code.
+    pub const CS_LONG: u32 = 0x33;
+
+    /// Whether code under selector `cs` is 32-bit, `default` being the
+    /// process's own class (`cs` 0).
+    pub const fn cs_compat(cs: u32, default: bool) -> bool {
+        match cs {
+            0 => default,
+            0x23 | 0x1b => true,
+            _ => false,
+        }
+    }
 
     /// `v0`–`v31`, the SIMD/FP register file, 16 bytes each. On x86-64 the
     /// first sixteen are `xmm0`–`xmm15`.
@@ -668,6 +696,58 @@ pub const fn dispatch_entry_base(entry: u32) -> u32 {
     entry & DISPATCH_SLOT_MASK
 }
 
+/// The bit a page number carries in a page key (gex-emit's `PageTable`,
+/// a module's directory entries) for code translated in the mode the
+/// process's own class is not: a WoW64 process's 32-bit code (or a 32-bit
+/// process's 64-bit code). Such a page's entry is in a directory of its
+/// own, allocated when the process first runs code in that mode and named
+/// by [`imports::ALT_DIR`], so the same address reached in both modes never
+/// shares a block, a slot or an entry.
+pub const ALT_PAGE: u64 = 1 << 40;
+
+/// The bit an address carries in a set of translated addresses for code in
+/// the process's other mode ([`ALT_PAGE`]'s, for addresses).
+pub const ALT_ADDR: u64 = 1 << 63;
+
+/// `pc` as such a set keys it.
+#[inline]
+pub const fn addr_key(pc: u64, alt: bool) -> u64 {
+    pc | if alt { ALT_ADDR } else { 0 }
+}
+
+/// Where a page key's directory entry is: in the process's directory, or
+/// in the other one at `alt_dir` (`None` while there is none).
+#[inline]
+pub fn dir_entry_addr(key: u64, alt_dir: u64) -> Option<u64> {
+    let (page, alt) = key_page(key);
+    if page >= dispatch_max_pages() {
+        return None;
+    }
+    match (alt, alt_dir) {
+        (false, _) => Some(dispatch_dir() + page * 4),
+        (true, 0) => None,
+        (true, d) => Some(d + page * 4),
+    }
+}
+
+/// Bytes of the other directory: as many pages as the process's own.
+#[inline]
+pub fn alt_dir_bytes() -> u64 {
+    dispatch_max_pages() * 4
+}
+
+/// The page key for `pc` in its mode (`alt`: the process's other one).
+#[inline]
+pub const fn page_key(pc: u64, alt: bool) -> u64 {
+    dispatch_page(pc) | if alt { ALT_PAGE } else { 0 }
+}
+
+/// A page key's page number and whether it is the other mode's.
+#[inline]
+pub const fn key_page(key: u64) -> (u64, bool) {
+    (key & !ALT_PAGE, key & ALT_PAGE != 0)
+}
+
 /// Directory index for a guest address.
 #[inline]
 pub const fn dispatch_page(pc: u64) -> u64 {
@@ -835,6 +915,28 @@ pub mod ftab {
     /// Indices below this are the runtime's; modules' functions start here.
     pub const RESERVED: u32 = 16;
 
+    /// Native PE code's function pointers are table indices, and they stay
+    /// below this: the end of the dispatch directory ([`super::DISPATCH_DIR_END`]),
+    /// below which no Windows view lies (Wine's virtual memory floor on gex), so
+    /// a value below it is a function, never data. A Wine PE module whose slots
+    /// would reach it is refused. `gex.image_of` finds the DLL of either.
+    pub const NATIVE_FN_TOP: u64 = super::DISPATCH_DIR_END;
+    /// `gex.image_of(addr: i64) -> i64`: the base of the skeleton of the
+    /// native DLL whose function (a table index below [`NATIVE_FN_TOP`]) or
+    /// static data `addr` is, or 0. Indices are one space for both modes of a
+    /// WoW64 process, and each module's data is its own allocation.
+    pub const IMAGE_OF: &str = "image_of";
+    /// `gex.icall_limit64` (i64) and `gex.icall_limit` (i32): mutable globals,
+    /// one pair per thread, that native PE code's indirect calls compare a
+    /// function pointer with (the GexIcall pass): below it, a table index
+    /// the thread's table holds, called directly; at or above it, the exit
+    /// stub's guest call. The host keeps them at the slots the thread's
+    /// table holds (capped at [`NATIVE_FN_TOP`]), raised as it catches up,
+    /// so an index into a module another thread installed since reaches the
+    /// call-out, which catches the thread up first.
+    pub const ICALL_LIMIT64: &str = "icall_limit64";
+    pub const ICALL_LIMIT: &str = "icall_limit";
+
     /// `F_body`'s results.
     pub const RET_PREDICTED: i32 = 1;
     pub const RET_LEFT: i32 = 0;
@@ -884,7 +986,7 @@ pub mod ftab {
 
 /// A counter the browser glue takes bootstrap stacks by: a Worker calls
 /// `gex_worker_init` before it has a stack of its own, and wasm-ld's default
-/// one is the guest's low memory (shims/browser/js/gex.mjs `#workerStack`).
+/// one is the guest's low memory (hosts/browser/js/gex.mjs `#workerStack`).
 pub const BOOT_STACK_COUNTER: u64 = RESERVED_END - 192;
 
 /// Address of the context for thread slot `n`.
@@ -914,6 +1016,13 @@ pub mod imports {
     /// index to re-enter. With no translator this traps; with one it drives
     /// gex-jit.
     pub const DISPATCH_MISS: &str = "dispatch_miss";
+
+    /// An immutable global in the memory's index type (`i32`, `i64` under
+    /// memory64): the guest address of the process's other
+    /// directory ([`crate::ALT_PAGE`]). Imported only by a module of code
+    /// translated in the mode the process's own class is not (a WoW64
+    /// process's 32-bit code); every other module is as it was.
+    pub const ALT_DIR: &str = "alt_dir";
 
     /// The function tier calling code it does not hold. Signature `(ctx: i32, target: i64, ret: i64, sp_want: i64) ->
     /// i32`: everything is written back and `ctx::PC = target`; the host runs
@@ -976,6 +1085,12 @@ pub mod imports {
     /// violation (Wine's handler, through the fault hook); it does not
     /// return. The fix is a fold in the translator, not an emulation.
     pub const BRK_KUSER_UNFOLDED: i32 = -8;
+
+    /// [`BRK_KUSER_UNFOLDED`] from code that goes on after the import
+    /// returns (the function JIT's bodies, which leave for the context's PC):
+    /// the access violation is delivered in place where the host can, under
+    /// the native frames the code was called from, and the import returns.
+    pub const BRK_KUSER_UNFOLDED_RESUMABLE: i32 = -9;
 
     /// A system register read the compiler could not resolve statically.
     /// Signature `(ctx: i32, pc: i64, sysreg: i32) -> i64`.
@@ -1237,15 +1352,6 @@ pub fn kuser_fold_end() -> u64 {
     }
 }
 
-/// A 64-bit Wine process in the compact space (Wine's session programs in a
-/// wasm32 memory, with [`set_kuser_fold_entry`]): the window its native PE
-/// core's data goes in, the top of the DLL band [0x10000000, 0x20000000)
-/// below a 64 KiB guard. Wine places the space's images below it (a data
-/// export's RVA is its offset from the skeleton's base), and it is low, so
-/// that the memory need not be long and every guest access to it is under
-/// [`KUSER_GUARD`].
-pub const WINE64_COMPACT_PE_DATA: (u64, u64) = (0x1fdf_0000, 0x1fff_0000);
-
 /// Where this process has KUSER_SHARED_DATA: [`WINE32_KUSER`] when folding is on, else Windows' address.
 pub fn kuser_address() -> u64 {
     if kuser_fold() {
@@ -1284,8 +1390,8 @@ pub const DARWIN_COMMPAGE_ALIAS: u64 = DARWIN_COMMPAGE_RO & DARWIN_ADDR_MASK;
 /// The lowest address a Darwin process's code may reach: the end of the
 /// 4 GiB `__PAGEZERO` every arm64 program has (`load_machfile` refuses one
 /// without; the map's minimum is raised past it), inside which gex keeps
-/// the process's tables ([`DARWIN_TABLES64`]). Every translated access below
-/// it traps, as on the device the access would fault.
+/// the process's tables ([`DARWIN_DISPATCH_DIR64`]). Every translated
+/// access below it traps, as on the device the access would fault.
 pub const DARWIN_GUEST_FLOOR: u64 = 1 << 32;
 
 static COMMPAGE_FOLD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -1423,16 +1529,18 @@ mod tests {
         assert!(INTERP_BASE < STACK_TOP);
         assert!(STACK_TOP <= MMAP_BOTTOM);
         assert!(MMAP_TOP <= GUEST_LIMIT);
-        // The M64 tables sit above every M32 address, below the arena.
-        assert!(DISPATCH_DIR64 >= GUEST_LIMIT);
+        // The M64 tables sit above every M32 address and the image zone
+        // `[4 GiB, 8 GiB)`, below the arena.
+        assert!(DISPATCH_DIR64 >= GUEST_LIMIT && DISPATCH_DIR64 >= 8 << 30);
         assert!(DISPATCH_MAX_PAGES64 * DISPATCH_PAGE == LIMIT64);
-        assert!(PATCHED_PAGES64 + DISPATCH_MAX_PAGES64 / 8 <= DISPATCH_DIR64 + TABLES64_PERM);
-        assert!(TABLES64_PERM + PERM_TABLE_BYTES < TABLES64_BYTES);
-        // A Darwin process's tables are inside its page zero, above what
-        // the runtime keeps low and the low arena.
-        assert!(DARWIN_TABLES64 >= DISPATCH_DIR_END && DARWIN_TABLES64 >= MMAP_TOP);
-        assert!(PERM_TABLE64 + PERM_TABLE_BYTES < DARWIN_TABLES64 + TABLES64_BYTES);
-        assert!(DARWIN_TABLES64 + TABLES64_BYTES <= DARWIN_GUEST_FLOOR && DARWIN_GUEST_FLOOR == DISPATCH_DIR64);
+        assert!(PATCHED_PAGES64 + DISPATCH_MAX_PAGES64 / 8 <= HIGH_TABLES_END);
         assert!(HIGH_ARENA_BASE < LIMIT64 && HIGH_ARENA_BASE % WASM_PAGE == 0);
+        // A Darwin process's sit inside its 4 GiB `__PAGEZERO`, above what
+        // the runtime keeps low and the low arena, the perm table after the
+        // bits and a zero byte after it.
+        assert!(DARWIN_DISPATCH_DIR64 >= DISPATCH_DIR_END && DARWIN_DISPATCH_DIR64 >= MMAP_TOP && DARWIN_DISPATCH_DIR64 % (1 << 20) == 0);
+        assert!(DARWIN_PATCHED_PAGES64 + DISPATCH_MAX_PAGES64 / 8 <= PERM_TABLE64);
+        assert!(PERM_TABLE64 + PERM_TABLE_BYTES < DARWIN_TABLES_END && DARWIN_TABLES_END <= DARWIN_GUEST_FLOOR);
+        assert!(DARWIN_GUEST_FLOOR == 1 << 32);
     }
 }

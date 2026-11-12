@@ -23,7 +23,63 @@
 //! `f`, the same in every module, so function pointers compare equal across
 //! modules as C requires.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
+use std::hash::{BuildHasherDefault, Hasher};
+
+/// The crate's maps and sets, keyed by symbol names and indices: hashed
+/// with [`FxHasher`], not std's SipHash, which was most of the loader's time
+/// in a process binding a large C++ library's tens of thousands of symbols.
+pub type HashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
+pub type HashSet<K> = std::collections::HashSet<K, BuildHasherDefault<FxHasher>>;
+
+/// rustc's Fx hash: a rotate, xor and multiply per word. Not resistant to
+/// chosen keys, which only a process's own libraries give.
+#[derive(Clone, Copy, Default)]
+pub struct FxHasher(u64);
+
+impl FxHasher {
+    #[inline]
+    fn add(&mut self, w: u64) {
+        self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+impl Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, mut b: &[u8]) {
+        while b.len() >= 8 {
+            self.add(u64::from_le_bytes(b[..8].try_into().unwrap()));
+            b = &b[8..];
+        }
+        if b.len() >= 4 {
+            self.add(u32::from_le_bytes(b[..4].try_into().unwrap()) as u64);
+            b = &b[4..];
+        }
+        for &c in b {
+            self.add(c as u64);
+        }
+    }
+    #[inline]
+    fn write_u8(&mut self, v: u8) {
+        self.add(v as u64);
+    }
+    #[inline]
+    fn write_u32(&mut self, v: u32) {
+        self.add(v as u64);
+    }
+    #[inline]
+    fn write_u64(&mut self, v: u64) {
+        self.add(v);
+    }
+    #[inline]
+    fn write_usize(&mut self, v: usize) {
+        self.add(v as u64);
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
 
 pub use anyhow::{anyhow, bail, Context, Result};
 
@@ -71,6 +127,142 @@ pub struct Export {
     pub index: u32,
 }
 
+/// A module's exports by name: the names in one buffer, the exports in the
+/// section's order, and an open-addressed index of them by the name's hash.
+/// A map of a `String` each was a third of a library's parse at every load
+/// (Qt's and KDE's libraries export 8.4 MB of names, 225 thousand of them:
+/// one allocation and copy each, in every process).
+#[derive(Clone, Default)]
+pub struct Exports {
+    names: String,
+    /// (name start, name end, export)
+    ents: Vec<(u32, u32, Export)>,
+    /// `ents` indices, `u32::MAX` free; a power of two long, at most half full.
+    index: Vec<u32>,
+}
+
+impl Exports {
+    fn with_capacity(n: usize, name_bytes: usize) -> Exports {
+        Exports { names: String::with_capacity(name_bytes), ents: Vec::with_capacity(n), index: Vec::new() }
+    }
+
+    fn hash(name: &str) -> usize {
+        let mut h = FxHasher::default();
+        h.write(name.as_bytes());
+        h.finish() as usize
+    }
+
+    fn name(&self, i: usize) -> &str {
+        let (a, b, _) = self.ents[i];
+        &self.names[a as usize..b as usize]
+    }
+
+    /// Add `name` (last wins, as a map's insert): the index is made again
+    /// as it fills.
+    pub fn insert(&mut self, name: &str, e: Export) {
+        if let Some(i) = self.find(name) {
+            self.ents[i].2 = e;
+            return;
+        }
+        let a = self.names.len() as u32;
+        self.names.push_str(name);
+        self.ents.push((a, self.names.len() as u32, e));
+        if self.ents.len() * 2 > self.index.len() {
+            self.reindex((self.ents.len() * 2).next_power_of_two().max(16));
+        } else {
+            let i = self.ents.len() - 1;
+            self.place(i);
+        }
+    }
+
+    fn reindex(&mut self, size: usize) {
+        self.index.clear();
+        self.index.resize(size, u32::MAX);
+        for i in 0..self.ents.len() {
+            self.place(i);
+        }
+    }
+
+    fn place(&mut self, i: usize) {
+        let mask = self.index.len() - 1;
+        let mut at = Self::hash(self.name(i)) & mask;
+        while self.index[at] != u32::MAX {
+            at = (at + 1) & mask;
+        }
+        self.index[at] = i as u32;
+    }
+
+    fn find(&self, name: &str) -> Option<usize> {
+        if self.index.is_empty() {
+            return None;
+        }
+        let mask = self.index.len() - 1;
+        let mut at = Self::hash(name) & mask;
+        loop {
+            let i = self.index[at];
+            if i == u32::MAX {
+                return None;
+            }
+            if self.name(i as usize) == name {
+                return Some(i as usize);
+            }
+            at = (at + 1) & mask;
+        }
+    }
+
+    pub fn get(&self, name: &str) -> Option<&Export> {
+        self.find(name).map(|i| &self.ents[i].2)
+    }
+
+    pub fn contains_key(&self, name: &str) -> bool {
+        self.find(name).is_some()
+    }
+
+    pub fn len(&self) -> usize {
+        self.ents.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ents.is_empty()
+    }
+
+    /// (name, export), in the section's order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Export)> + '_ {
+        self.ents.iter().map(|(a, b, e)| (&self.names[*a as usize..*b as usize], e))
+    }
+}
+
+impl std::ops::Index<&str> for Exports {
+    type Output = Export;
+    fn index(&self, name: &str) -> &Export {
+        self.get(name).unwrap_or_else(|| panic!("no export {name}"))
+    }
+}
+
+impl<'a> IntoIterator for &'a Exports {
+    type Item = (&'a str, &'a Export);
+    type IntoIter = Box<dyn Iterator<Item = (&'a str, &'a Export)> + 'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        Box::new(self.iter())
+    }
+}
+
+impl<S: AsRef<str>> FromIterator<(S, Export)> for Exports {
+    fn from_iter<I: IntoIterator<Item = (S, Export)>>(it: I) -> Exports {
+        let mut x = Exports::default();
+        for (n, e) in it {
+            x.insert(n.as_ref(), e);
+        }
+        x
+    }
+}
+
+impl std::fmt::Debug for Exports {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map().entries(self.iter()).finish()
+    }
+}
+
 /// What the loader needs to know of a module.
 #[derive(Clone, Debug, Default)]
 pub struct Info {
@@ -84,7 +276,7 @@ pub struct Info {
     /// Whether the module has a `dylink.0` section at all.
     pub dylink: bool,
     pub imports: Vec<Import>,
-    pub exports: HashMap<String, Export>,
+    pub exports: Exports,
     /// Exports flagged TLS in `dylink.0`.
     pub tls_exports: HashSet<String>,
     pub func_imports: u32,
@@ -96,11 +288,39 @@ pub struct Info {
     /// imported globals), if it has one: a data export's address relative
     /// to `__memory_base`.
     pub global_init: Vec<Option<u32>>,
-    /// The fork summary (`gex.forkreach`), if the module has one.
-    pub forkreach: Option<ForkReach>,
+    /// Each type's signature as `params_results`, one letter a value
+    /// (`i` i32, `j` i64, `f` f32, `d` f64), as the page writes a function
+    /// that calls through the table (`L` in a binding list); `None` for a
+    /// type with any other value or a non-function type.
+    pub sigs: Vec<Option<String>>,
     /// [`Info::slots`], made once: the loader asks for it at every symbol it
     /// binds (a large C++ library binds tens of thousands).
     slots: std::sync::OnceLock<(u32, HashMap<u32, u32>)>,
+    /// Whether any export is an fpcast thunk ([`FPCAST_THUNK`]): only then
+    /// does a slot ask for one by name (most modules have none, and the
+    /// question made a string per exported function).
+    has_thunks: bool,
+}
+
+/// A function type as [`Info::sigs`] writes it.
+fn sig_text(params: &[wasmparser::ValType], results: &[wasmparser::ValType]) -> Option<String> {
+    use wasmparser::ValType;
+    let l = |v: &ValType| match v {
+        ValType::I32 => Some('i'),
+        ValType::I64 => Some('j'),
+        ValType::F32 => Some('f'),
+        ValType::F64 => Some('d'),
+        _ => None,
+    };
+    let mut out = String::new();
+    for v in params {
+        out.push(l(v)?);
+    }
+    out.push('_');
+    for v in results {
+        out.push(l(v)?);
+    }
+    Some(out)
 }
 
 /// A library's fork summary (`gex.forkreach`).
@@ -122,6 +342,20 @@ impl ForkReach {
             s.push('\n');
         }
         s.into_bytes()
+    }
+
+    /// `wasm`'s summary, if it has one. Only gexcc's link reads it (a
+    /// loader has no use for it: [`Info`] leaves it out, which was a third
+    /// of a library's parse, 7.6 MB of names across KDE's).
+    pub fn of(wasm: &[u8]) -> Result<Option<ForkReach>> {
+        for p in wasmparser::Parser::new(0).parse_all(wasm) {
+            if let wasmparser::Payload::CustomSection(c) = p? {
+                if c.name() == FORKREACH_SECTION {
+                    return Ok(Some(ForkReach::decode(c.data())?));
+                }
+            }
+        }
+        Ok(None)
     }
 
     pub fn decode(data: &[u8]) -> Result<ForkReach> {
@@ -150,10 +384,24 @@ fn kind_of(k: wasmparser::ExternalKind) -> Kind {
 }
 
 impl Info {
+    /// Whether [`Info::parse`] reads a section (by id, and a custom
+    /// section's name): a module of only these parses to the same `Info`.
+    /// A loader that has the module compiled already reads no more of the
+    /// file (its code and data are nineteen twentieths of a Qt library).
+    pub fn reads_section(id: u8, name: &[u8]) -> bool {
+        match id {
+            0 => name == b"dylink.0",
+            // types, imports, globals, exports, elements
+            1 | 2 | 6 | 7 | 9 => true,
+            _ => false,
+        }
+    }
+
     pub fn parse(wasm: &[u8]) -> Result<Info> {
         use wasmparser::{Payload, TypeRef};
         let mut info = Info::default();
-        let mut weak = HashSet::new();
+        // `module\x01field` of each weak import, looked up through one buffer
+        let mut weak: HashSet<String> = HashSet::default();
         for payload in wasmparser::Parser::new(0).parse_all(wasm) {
             match payload? {
                 Payload::CustomSection(c) if c.name() == "dylink.0" => {
@@ -195,11 +443,11 @@ impl Info {
                             4 => {
                                 let n = s.read_var_u32()?;
                                 for _ in 0..n {
-                                    let m = s.read_string()?.to_string();
-                                    let f = s.read_string()?.to_string();
+                                    let m = s.read_string()?;
+                                    let f = s.read_string()?;
                                     let flags = s.read_var_u32()?;
                                     if flags & SYM_BINDING_WEAK != 0 {
-                                        weak.insert((m, f));
+                                        weak.insert(format!("{m}\x01{f}"));
                                     }
                                 }
                             }
@@ -207,10 +455,18 @@ impl Info {
                         }
                     }
                 }
-                Payload::CustomSection(c) if c.name() == FORKREACH_SECTION => {
-                    info.forkreach = Some(ForkReach::decode(c.data())?);
+                Payload::TypeSection(r) => {
+                    for g in r {
+                        for t in g?.into_types() {
+                            info.sigs.push(match &t.composite_type.inner {
+                                wasmparser::CompositeInnerType::Func(f) => sig_text(f.params(), f.results()),
+                                _ => None,
+                            });
+                        }
+                    }
                 }
                 Payload::ImportSection(s) => {
+                    info.imports.reserve(s.count() as usize);
                     for imp in s {
                         let imp = imp?;
                         let wide = matches!(imp.ty, TypeRef::Global(g) if g.content_type == wasmparser::ValType::I64);
@@ -243,22 +499,27 @@ impl Info {
                         let mut ops = g.init_expr.get_operators_reader();
                         let v = match ops.read() {
                             Ok(wasmparser::Operator::I32Const { value }) => Some(value as u32),
+                            // a wasm64 program lowered to wasm32 (its addresses
+                            // below 4 GiB)
+                            Ok(wasmparser::Operator::I64Const { value }) => u32::try_from(value).ok(),
                             _ => None,
                         };
                         info.global_init.push(v);
                     }
                 }
                 Payload::ExportSection(s) => {
+                    // (the section's bytes bound its names')
+                    let mut x = Exports::with_capacity(s.count() as usize, s.range().len());
                     for e in s {
                         let e = e?;
-                        info.exports.insert(
-                            e.name.to_string(),
-                            Export {
-                                kind: kind_of(e.kind),
-                                index: e.index,
-                            },
-                        );
+                        info.has_thunks |= e.name.starts_with(FPCAST_THUNK);
+                        let a = x.names.len() as u32;
+                        x.names.push_str(e.name);
+                        x.ents.push((a, x.names.len() as u32, Export { kind: kind_of(e.kind), index: e.index }));
                     }
+                    // a module's export names are distinct (the format says so)
+                    x.reindex((x.ents.len() * 2).next_power_of_two().max(16));
+                    info.exports = x;
                 }
                 Payload::ElementSection(s) => {
                     for el in s {
@@ -276,10 +537,19 @@ impl Info {
                 _ => {}
             }
         }
-        for imp in &mut info.imports {
-            // `GOT.mem.x` / `GOT.func.x` carry `env.x`'s weakness
-            let key = (imp.module.clone(), imp.name.clone());
-            imp.weak = weak.contains(&key) || weak.contains(&("env".to_string(), imp.name.clone()));
+        if !weak.is_empty() {
+            let mut key = String::new();
+            let mut is_weak = |m: &str, f: &str| {
+                key.clear();
+                key.push_str(m);
+                key.push('\x01');
+                key.push_str(f);
+                weak.contains(&key)
+            };
+            for imp in &mut info.imports {
+                // `GOT.mem.x` / `GOT.func.x` carry `env.x`'s weakness
+                imp.weak = is_weak(&imp.module, &imp.name) || is_weak("env", &imp.name);
+            }
         }
         Ok(info)
     }
@@ -294,12 +564,12 @@ impl Info {
     }
 
     fn make_slots(&self) -> (u32, HashMap<u32, u32>) {
-        let mut at: HashMap<u32, u32> = HashMap::new();
+        let mut at: HashMap<u32, u32> = HashMap::default();
         for (k, &f) in self.elem.iter().enumerate() {
             at.entry(f).or_insert(k as u32);
         }
         let mut len = self.table_size.max(self.elem.len() as u32);
-        let mut names: Vec<(&String, &Export)> =
+        let mut names: Vec<(&str, &Export)> =
             self.exports.iter().filter(|(n, e)| e.kind == Kind::Func && !n.starts_with(FPCAST_THUNK)).collect();
         names.sort_by(|a, b| a.0.cmp(b.0));
         for (n, e) in names {
@@ -323,6 +593,9 @@ impl Info {
     /// when the module has one, else the function itself.
     pub fn table_target(&self, name: &str) -> Option<u32> {
         let e = self.exports.get(name)?;
+        if !self.has_thunks {
+            return Some(e.index);
+        }
         Some(self.exports.get(&format!("{FPCAST_THUNK}{name}")).map_or(e.index, |t| t.index))
     }
 
@@ -337,8 +610,8 @@ impl Info {
             .iter()
             .filter(|(n, e)| e.kind == Kind::Func && !n.starts_with(FPCAST_THUNK))
             .filter_map(|(n, e)| {
-                let thunk = format!("{FPCAST_THUNK}{n}");
-                let fill = if self.exports.contains_key(&thunk) { thunk } else { n.clone() };
+                let thunk = if self.has_thunks { format!("{FPCAST_THUNK}{n}") } else { String::new() };
+                let fill = if self.has_thunks && self.exports.contains_key(&thunk) { thunk } else { n.to_string() };
                 at.get(&e.index).filter(|&&s| s >= base).map(|&s| (s, fill))
             })
             .collect();
@@ -398,7 +671,7 @@ pub fn selfbind(wasm: &[u8]) -> Result<Vec<u8>> {
     use wasm_encoder::reencode::{Reencode, RoundtripReencoder};
     let info = Info::parse(wasm)?;
     // imported function index -> the defined function it becomes
-    let mut bound: HashMap<u32, u32> = HashMap::new();
+    let mut bound: HashMap<u32, u32> = HashMap::default();
     let mut fi = 0u32;
     for imp in &info.imports {
         if imp.kind != Kind::Func {
@@ -518,7 +791,7 @@ pub const FPCAST_THUNK: &str = "__fpcast$";
 pub fn fpcast_prep(wasm: &[u8]) -> Result<Vec<u8>> {
     use wasm_encoder::reencode::Reencode;
     let info = Info::parse(wasm)?;
-    let mut names: Vec<(&String, u32)> = info
+    let mut names: Vec<(&str, u32)> = info
         .exports
         .iter()
         .filter(|(n, e)| e.kind == Kind::Func && e.index >= info.func_imports && !n.starts_with(FPCAST_THUNK))
@@ -1029,9 +1302,9 @@ pub fn split_relocs(wasm: &[u8]) -> Result<Option<Vec<u8>>> {
     let mut nimp = 0u32;
     let mut functypes: Vec<u32> = Vec::new();
     let mut nparams: Vec<(usize, usize)> = Vec::new();
-    let mut targets: HashMap<u32, String> = HashMap::new();
+    let mut targets: HashMap<u32, String> = HashMap::default();
     // per function to split: its pieces' byte ranges in `wasm`, and its locals' bytes
-    let mut pieces: HashMap<u32, (Vec<std::ops::Range<usize>>, std::ops::Range<usize>)> = HashMap::new();
+    let mut pieces: HashMap<u32, (Vec<std::ops::Range<usize>>, std::ops::Range<usize>)> = HashMap::default();
     let mut fi = 0u32;
     for payload in wasmparser::Parser::new(0).parse_all(wasm) {
         match payload? {
@@ -1112,7 +1385,7 @@ pub fn split_relocs(wasm: &[u8]) -> Result<Option<Vec<u8>>> {
     let mut order: Vec<u32> = pieces.keys().copied().collect();
     order.sort();
     let mut next = nimp + functypes.len() as u32;
-    let mut first: HashMap<u32, u32> = HashMap::new();
+    let mut first: HashMap<u32, u32> = HashMap::default();
     for i in &order {
         first.insert(*i, next);
         next += pieces[i].0.len() as u32;
@@ -1302,7 +1575,68 @@ pub enum Bind {
 #[derive(Clone, Debug, Default)]
 pub struct Link {
     pub mods: Vec<Loaded>,
+    /// [`Link::lookup`]'s index, kept up with `mods` as they are added.
+    pub scope: Scope,
 }
+
+/// The first module in scope order defining each function and each data
+/// symbol, of the first `upto` modules: a lookup is one hash, not one per
+/// module until a definition (a library binding tens of thousands of
+/// symbols against a hundred others). Modules are only ever added to a
+/// link map, after the ones there.
+#[derive(Default)]
+pub struct Scope(std::sync::Mutex<ScopeIndex>);
+
+#[derive(Default)]
+struct ScopeIndex {
+    upto: usize,
+    /// The defining module of a function (`.0`) and a global (`.1`), by
+    /// the name's hash ([`name_hash`]): no copy of each of a hundred
+    /// thousand names per process. A lookup checks the module it finds
+    /// does define the name, and two names of one hash fall back to a scan.
+    first: std::collections::HashMap<u64, (u32, u32), std::hash::BuildHasherDefault<IdHasher>>,
+}
+
+/// A name's 64-bit hash, the scope index's key.
+fn name_hash(name: &str) -> u64 {
+    use std::hash::Hasher;
+    let mut h = FxHasher::default();
+    h.write(name.as_bytes());
+    h.finish()
+}
+
+/// The scope index's hasher: its keys are hashes already.
+#[derive(Default)]
+struct IdHasher(u64);
+
+impl std::hash::Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 << 8) ^ b as u64;
+        }
+    }
+    fn write_u64(&mut self, v: u64) {
+        self.0 = v;
+    }
+}
+
+impl Clone for Scope {
+    /// Empty: the clone's modules may change apart from these.
+    fn clone(&self) -> Scope {
+        Scope::default()
+    }
+}
+
+impl std::fmt::Debug for Scope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Scope")
+    }
+}
+
+const NONE: u32 = u32::MAX;
 
 /// Imports the shim provides.
 pub fn shim_import(m: &str, name: &str) -> bool {
@@ -1314,6 +1648,8 @@ pub fn shim_import(m: &str, name: &str) -> bool {
                 | "__stack_pointer"
                 | "__memory_base"
                 | "__table_base"
+                // a lowered wasm64 module's i32 copy of it (ftab.rs)
+                | "__table_base32"
                 | "__asyncify_state"
                 | "__asyncify_data"
         ),
@@ -1323,6 +1659,34 @@ pub fn shim_import(m: &str, name: &str) -> bool {
 }
 
 impl Link {
+    /// Back to its first `n` modules (a dlopen that failed part way): the
+    /// scope index forgets what it had of the rest.
+    pub fn truncate(&mut self, n: usize) {
+        if n >= self.mods.len() {
+            return;
+        }
+        self.mods.truncate(n);
+        let mut x = self.scope.0.lock().unwrap_or_else(|e| e.into_inner());
+        if x.upto > n {
+            *x = ScopeIndex::default();
+        }
+    }
+
+    /// Whether the program is a static one (it names no libraries): what a
+    /// library it `dlopen`s imports, its libc's included, is the program's
+    /// own exports (`-Wl,--export`), and no `libc.so` is loaded beside it.
+    pub fn static_program(&self) -> bool {
+        self.mods.first().is_some_and(|m| m.info.needed.is_empty())
+    }
+
+    /// The run path `dlopen` searches a bare soname in before
+    /// `LD_LIBRARY_PATH`: a static program's is its own directory
+    /// (`$ORIGIN`), where the side modules it may load lie beside it (it has
+    /// no `dylink.0` to name one); a dynamic one's is none.
+    pub fn dlopen_runpath(&self) -> Vec<String> {
+        if self.static_program() { vec!["$ORIGIN".to_string()] } else { Vec::new() }
+    }
+
     /// The program's libraries, breadth first from its `NEEDED`: for each,
     /// `find(soname, runpath)` gives its path and bytes (searching the run
     /// path, `LD_LIBRARY_PATH` and [`DEFAULT_DIRS`] is the caller's, through
@@ -1348,6 +1712,10 @@ impl Link {
         mut shed: impl FnMut(&str, Vec<u8>) -> Vec<u8>,
     ) -> Result<Vec<(String, String, Vec<u8>, Info)>> {
         let mut have: HashSet<String> = self.mods.iter().map(|m| m.name.clone()).collect();
+        // a static program is its own libc
+        if self.static_program() {
+            have.insert(LIBC_SONAME.to_string());
+        }
         let mut out = Vec::new();
         let mut q: VecDeque<(Vec<String>, Vec<String>)> = self.mods[first..]
             .iter()
@@ -1413,6 +1781,53 @@ impl Link {
 
     /// The first module in scope order defining `name` as `kind`.
     pub fn lookup(&self, name: &str, kind: Kind) -> Option<usize> {
+        if matches!(kind, Kind::Func | Kind::Global) {
+            let mut x = self.scope.0.lock().unwrap_or_else(|e| e.into_inner());
+            if x.upto > self.mods.len() {
+                *x = ScopeIndex::default();
+            }
+            let more: usize = self.mods[x.upto.min(self.mods.len())..].iter().map(|m| m.info.exports.len()).sum();
+            x.first.reserve(more);
+            for i in x.upto..self.mods.len() {
+                let m = &self.mods[i].info;
+                for (n, e) in &m.exports {
+                    let slot = match e.kind {
+                        Kind::Func if e.index >= m.func_imports => 0,
+                        Kind::Global if e.index >= m.global_imports => 1,
+                        _ => continue,
+                    };
+                    let f = x.first.entry(name_hash(n)).or_insert((NONE, NONE));
+                    let at = if slot == 0 { &mut f.0 } else { &mut f.1 };
+                    if *at == NONE {
+                        *at = i as u32;
+                    }
+                }
+            }
+            x.upto = self.mods.len();
+            let defines = |i: usize| {
+                let m = &self.mods[i].info;
+                m.exports.get(name).is_some_and(|e| {
+                    e.kind == kind
+                        && match kind {
+                            Kind::Func => e.index >= m.func_imports,
+                            _ => e.index >= m.global_imports,
+                        }
+                })
+            };
+            let at = x.first.get(&name_hash(name)).map_or(NONE, |f| if kind == Kind::Func { f.0 } else { f.1 });
+            drop(x);
+            if at == NONE {
+                return None;
+            }
+            // The first module of this hash defines the name, or another
+            // name of the same hash came first: the earliest definer then
+            // is found by a scan (no module before `at` defines a name of
+            // this hash, so none before it defines this one).
+            if defines(at as usize) {
+                return Some(at as usize);
+            }
+            return (at as usize + 1..self.mods.len()).find(|&i| defines(i));
+        }
         self.mods.iter().position(|m| {
             m.info.exports.get(name).is_some_and(|e| {
                 e.kind == kind
@@ -1445,7 +1860,7 @@ impl Link {
 
     /// What each import of module `i` is bound to, given which modules are
     /// instantiated before it (`done`).
-    pub fn bind(&self, i: usize, done: &HashSet<usize>) -> Result<Vec<Bind>> {
+    pub fn bind<S: std::hash::BuildHasher>(&self, i: usize, done: &std::collections::HashSet<usize, S>) -> Result<Vec<Bind>> {
         let m = &self.mods[i];
         let mut out = Vec::with_capacity(m.info.imports.len());
         for imp in &m.info.imports {
@@ -1495,6 +1910,9 @@ impl Link {
         Ok(out)
     }
 }
+
+/// The soname of gexcc's shared libc, which every library names.
+pub const LIBC_SONAME: &str = "libc.so";
 
 /// `dlopen` handles gex gives (libgex's dl.c): above everything a 32-bit
 /// process maps data at, one per link-map entry.
@@ -1580,26 +1998,38 @@ impl Link {
         0
     }
 
-    /// Fill libc's `__gex_dsos` (musl's gex_dso.h) in `mem`, the process's
-    /// memory: every module but libc (index `libc`), in init order
-    /// `order`, with its TLS image and functions (table indices), libc's
-    /// own constructors at the head; the program's constructors are
-    /// crt1's to run.
-    pub fn write_registry(&self, mem: &mut [u8], order: &[usize], libc: usize) -> Result<()> {
+    /// Where libc's `__gex_dsos` (musl's gex_dso.h) is in the process's
+    /// memory, libc being module `libc`.
+    pub fn dsos_at(&self, libc: usize) -> Result<usize> {
         let lc = &self.mods[libc];
         let Some(off) = lc.info.data_offset("__gex_dsos") else {
             bail!("{}: no __gex_dsos (a libc.so older than gex's loader)", lc.path);
         };
-        let at = (lc.memory_base + off) as usize;
+        Ok((lc.memory_base + off) as usize)
+    }
+
+    /// How many bytes `__gex_dsos` takes, from its first 12 (`head`).
+    pub fn dsos_len(head: &[u8]) -> Option<usize> {
+        Some(12 + u32::from_le_bytes(head.get(8..12)?.try_into().ok()?) as usize * 24)
+    }
+
+    /// Fill libc's `__gex_dsos` (musl's gex_dso.h), `dsos` being its bytes
+    /// in the process's memory (at [`Self::dsos_at`], [`Self::dsos_len`]
+    /// long): every module but libc (index `libc`), in init order `order`,
+    /// with its TLS image and functions (table indices), libc's own
+    /// constructors at the head; the program's constructors are crt1's to
+    /// run.
+    pub fn write_registry(&self, dsos: &mut [u8], order: &[usize], libc: usize) -> Result<()> {
+        let lc = &self.mods[libc];
         let rd = |b: &[u8], a: usize| u32::from_le_bytes(b[a..a + 4].try_into().unwrap());
-        if mem.len() < at + 12 {
+        if dsos.len() < 12 {
             bail!("{}: __gex_dsos outside memory", lc.path);
         }
-        let (version, max) = (rd(mem, at), rd(mem, at + 8));
+        let (version, max) = (rd(dsos, 0), rd(dsos, 8));
         if version != 1 {
             bail!("{}: __gex_dsos version {version} (want 1)", lc.path);
         }
-        if mem.len() < at + 12 + max as usize * 24 {
+        if dsos.len() < 12 + max as usize * 24 {
             bail!("{}: __gex_dsos outside memory", lc.path);
         }
         let mut entries: Vec<[u32; 6]> = Vec::new();
@@ -1633,11 +2063,11 @@ impl Link {
         }
         for (k, w) in entries.iter().enumerate() {
             for (j, x) in w.iter().enumerate() {
-                let a = at + 12 + k * 24 + j * 4;
-                mem[a..a + 4].copy_from_slice(&x.to_le_bytes());
+                let a = 12 + k * 24 + j * 4;
+                dsos[a..a + 4].copy_from_slice(&x.to_le_bytes());
             }
         }
-        mem[at + 4..at + 8].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+        dsos[4..8].copy_from_slice(&(entries.len() as u32).to_le_bytes());
         Ok(())
     }
 }
@@ -1686,6 +2116,163 @@ pub fn search(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn module(name: &str, func_imports: u32, exports: &[(&str, Kind, u32)]) -> Loaded {
+        let info = Info {
+            func_imports,
+            global_imports: 1,
+            exports: exports.iter().map(|&(n, kind, index)| (n.to_string(), Export { kind, index })).collect(),
+            ..Default::default()
+        };
+        Loaded { name: name.into(), path: name.into(), info, memory_base: 0, table_base: 0 }
+    }
+
+    #[test]
+    fn lookup_takes_the_first_definition_in_scope_order() {
+        let mut l = Link::default();
+        // an export of an import is no definition
+        l.mods.push(module("prog", 2, &[("f", Kind::Func, 1), ("g", Kind::Global, 0)]));
+        l.mods.push(module("liba", 0, &[("f", Kind::Func, 3), ("t", Kind::Table, 0)]));
+        l.mods.push(module("libb", 0, &[("f", Kind::Func, 4), ("g", Kind::Global, 2), ("h", Kind::Func, 0)]));
+        assert_eq!(l.lookup("f", Kind::Func), Some(1));
+        assert_eq!(l.lookup("g", Kind::Global), Some(2));
+        assert_eq!(l.lookup("g", Kind::Func), None);
+        assert_eq!(l.lookup("t", Kind::Table), Some(1));
+        assert_eq!(l.lookup("nope", Kind::Func), None);
+        // a module added later (dlopen) comes after the ones there
+        l.mods.push(module("libc", 0, &[("h", Kind::Func, 1), ("k", Kind::Func, 2)]));
+        assert_eq!(l.lookup("h", Kind::Func), Some(2));
+        assert_eq!(l.lookup("k", Kind::Func), Some(3));
+        // a clone keeps its own index
+        let mut c = l.clone();
+        c.mods.truncate(3);
+        assert_eq!(c.lookup("k", Kind::Func), None);
+        assert_eq!(l.lookup("k", Kind::Func), Some(3));
+    }
+
+    /// `wasm` with only the sections [`Info::reads_section`] names, as the
+    /// browser host reads a library it has compiled (`read_wasm_parts`).
+    fn info_parts(wasm: &[u8]) -> Vec<u8> {
+        let mut out = wasm[..8].to_vec();
+        for p in wasmparser::Parser::new(0).parse_all(wasm) {
+            let p = p.unwrap();
+            let (id, body) = match &p {
+                wasmparser::Payload::CodeSectionStart { range, .. } => (10, range.clone()),
+                wasmparser::Payload::CustomSection(c) => (0, c.range()),
+                _ => match p.as_section() {
+                    Some((id, r)) => (id, r),
+                    None => continue,
+                },
+            };
+            // the section's id and length come before its body
+            let mut at = body.start - 1;
+            while wasm[at - 1] & 0x80 != 0 {
+                at -= 1;
+            }
+            let start = at - 1;
+            assert_eq!(wasm[start], id);
+            let name: &[u8] = if id == 0 { let n = wasm[body.start] as usize; &wasm[body.start + 1..body.start + 1 + n] } else { &[] };
+            if Info::reads_section(id, name) {
+                out.extend_from_slice(&wasm[start..body.end]);
+            }
+        }
+        out
+    }
+
+    /// A library's Info from its sections that `Info::parse` reads is the
+    /// one from the whole file. `GEX_DYLINK_PARTS_DIR` names a directory
+    /// of libraries to check too (a sysroot's lib).
+    #[test]
+    fn info_from_its_sections() {
+        let mut libs: Vec<(String, Vec<u8>)> = Vec::new();
+        if let Ok(d) = std::env::var("GEX_DYLINK_PARTS_DIR") {
+            for e in std::fs::read_dir(&d).unwrap() {
+                let e = e.unwrap();
+                if e.file_type().unwrap().is_file() {
+                    let b = std::fs::read(e.path()).unwrap();
+                    if b.starts_with(b"\0asm") {
+                        libs.push((e.path().display().to_string(), b));
+                    }
+                }
+            }
+            assert!(!libs.is_empty(), "{d}: no wasm modules");
+        }
+        libs.push(("made here".into(), made_library()));
+        for (name, b) in &libs {
+            let full = Info::parse(b).unwrap();
+            let cut = Info::parse(&info_parts(b)).unwrap();
+            assert_eq!(format!("{full:?}"), format!("{cut:?}"), "{name}");
+        }
+    }
+
+    /// A side module with code, data, a table, a TLS export and a dylink.0.
+    fn made_library() -> Vec<u8> {
+        use wasm_encoder::*;
+        let mut m = Module::new();
+        let mut d = Vec::new();
+        // WASM_DYLINK_MEM_INFO: mem size 16, align 2, table 1, align 0
+        d.extend_from_slice(&[1, 4, 16, 2, 1, 0]);
+        // WASM_DYLINK_NEEDED: libc.so
+        d.extend_from_slice(&[2, 9, 1, 7]);
+        d.extend_from_slice(b"libc.so");
+        m.section(&CustomSection { name: "dylink.0".into(), data: d.into() });
+        let mut t = TypeSection::new();
+        t.ty().function([ValType::I32], [ValType::I32]);
+        m.section(&t);
+        let mut i = ImportSection::new();
+        i.import("env", "memory", MemoryType { minimum: 1, maximum: None, memory64: false, shared: false, page_size_log2: None });
+        i.import("env", "__indirect_function_table", TableType { element_type: RefType::FUNCREF, minimum: 1, maximum: None, table64: false, shared: false });
+        i.import("env", "__memory_base", GlobalType { val_type: ValType::I32, mutable: false, shared: false });
+        i.import("env", "__table_base", GlobalType { val_type: ValType::I32, mutable: false, shared: false });
+        i.import("env", "puts", EntityType::Function(0));
+        m.section(&i);
+        let mut f = FunctionSection::new();
+        f.function(0);
+        f.function(0);
+        m.section(&f);
+        let mut g = GlobalSection::new();
+        g.global(GlobalType { val_type: ValType::I32, mutable: false, shared: false }, &ConstExpr::i32_const(8));
+        m.section(&g);
+        let mut e = ExportSection::new();
+        e.export("f", ExportKind::Func, 1);
+        e.export("g", ExportKind::Func, 2);
+        e.export("puts_again", ExportKind::Func, 0);
+        e.export("data", ExportKind::Global, 2);
+        m.section(&e);
+        let mut el = ElementSection::new();
+        el.active(Some(0), &ConstExpr::global_get(1), Elements::Functions(std::borrow::Cow::Borrowed(&[2])));
+        m.section(&el);
+        let mut c = CodeSection::new();
+        for _ in 0..2 {
+            let mut b = Function::new([]);
+            b.instruction(&Instruction::LocalGet(0));
+            b.instruction(&Instruction::End);
+            c.function(&b);
+        }
+        m.section(&c);
+        let mut ds = DataSection::new();
+        ds.active(0, &ConstExpr::global_get(0), b"hello\0".iter().copied());
+        m.section(&ds);
+        m.section(&CustomSection { name: "producers".into(), data: b"\0".as_slice().into() });
+        m.finish()
+    }
+
+    #[test]
+    fn exports_by_name() {
+        let names: Vec<String> = (0..5000).map(|i| format!("sym{i}")).collect();
+        let mut x: Exports = names.iter().enumerate().map(|(i, n)| (n.as_str(), Export { kind: Kind::Func, index: i as u32 })).collect();
+        assert_eq!(x.len(), 5000);
+        for (i, n) in names.iter().enumerate() {
+            assert_eq!(x.get(n).map(|e| e.index), Some(i as u32));
+            assert_eq!(x[n.as_str()].index, i as u32);
+        }
+        assert!(!x.contains_key("sym5000") && x.get("").is_none());
+        // in the order added; an insert of a name there replaces its export
+        assert!(x.iter().map(|(n, _)| n).eq(names.iter().map(String::as_str)));
+        x.insert("sym7", Export { kind: Kind::Global, index: 1 });
+        assert_eq!((x.len(), x["sym7"].kind), (5000, Kind::Global));
+        assert!(Exports::default().get("a").is_none());
+    }
 
     #[test]
     fn forkreach_roundtrip() {

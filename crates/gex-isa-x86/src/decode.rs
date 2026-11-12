@@ -24,14 +24,20 @@ pub fn decode_in(mode: Mode, bytes: &[u8], pc: u64) -> Inst {
         op16: false,
         // In compatibility mode every address is 32 bits wide; the flag is
         // what makes the lifter wrap the arithmetic, so it is on from the
-        // start there and 0x67 (16-bit addressing) is refused.
+        // start there and 0x67 (16-bit addressing) is taken only for an
+        // absolute disp16 (see `addr16`).
         addr32: mode == Mode::Compat,
+        addr16: false,
+        addr16_used: false,
         seg: None,
         rep: Rep::None,
         lock: false,
         mand: Mand::None,
     };
     match d.run() {
+        // 16-bit addressing that is not an absolute disp16 (a register base,
+        // a string instruction's si/di, loop's cx): refused
+        Ok(_) if d.addr16 && !d.addr16_used => unknown(1),
         Ok(mut inst) => {
             inst.len = d.pos.min(MAX_INST_BYTES) as u8;
             // RIP-relative displacements are relative to the end of the
@@ -85,6 +91,12 @@ struct Decoder<'a> {
     has_rex: bool,
     op16: bool,
     addr32: bool,
+    /// 0x67 in 32-bit code: 16-bit addressing. Only the register-free form,
+    /// `[disp16]`, is decoded (C++Builder's and Delphi's `mov reg, fs:[0x2c]`,
+    /// the TLS array): its address needs no 16-bit wrap.
+    addr16: bool,
+    /// An operand took the 16-bit form.
+    addr16_used: bool,
     seg: Option<Seg>,
     rep: Rep,
     lock: bool,
@@ -251,6 +263,20 @@ impl<'a> Decoder<'a> {
             },
             addr32: self.addr32,
         };
+        if self.addr16 && md != 3 {
+            if md != 0 || rm3 != 6 {
+                return Err(());
+            }
+            mem.disp = self.u16()? as i64;
+            self.addr16_used = true;
+            return Ok(ModRm {
+                reg,
+                is_reg: false,
+                rm: 0,
+                mem,
+                raw,
+            });
+        }
         if md == 3 {
             return Ok(ModRm {
                 reg,
@@ -400,8 +426,8 @@ impl<'a> Decoder<'a> {
                         if matches!(self.peek(), Some(0xe8 | 0xe9)) {
                             continue;
                         }
-                        // 16-bit addressing: nothing gex runs uses it.
-                        return Err(());
+                        self.addr16 = true;
+                        continue;
                     }
                     self.addr32 = true;
                 }
@@ -637,7 +663,14 @@ impl<'a> Decoder<'a> {
             0xa0..=0xa3 => {
                 // mov al/eax <-> moffs64: a full 64-bit absolute address.
                 let w = if op & 1 == 0 { Width::B } else { self.wv() };
-                let addr = if self.addr32 { self.i32()? & 0xffff_ffff } else { self.u64()? };
+                let addr = if self.addr16 {
+                    self.addr16_used = true;
+                    self.u16()? as i64
+                } else if self.addr32 {
+                    self.i32()? & 0xffff_ffff
+                } else {
+                    self.u64()?
+                };
                 let mut mem = Mem::abs(addr);
                 // A 32-bit moffs with a segment is `seg_base + disp32` wrapped
                 // at 32 bits: TLS lives *below* %gs on i386, so the offset is
@@ -696,6 +729,21 @@ impl<'a> Decoder<'a> {
                 return Ok(self.i1(Op::Ret, self.wa(), Operand::Imm(imm)));
             }
             0xc3 => return Ok(self.i0(Op::Ret, self.wa())),
+            // retf: a 32-bit offset and selector by default, in 64-bit mode too
+            0xca => {
+                let imm = self.u16()? as i64;
+                return Ok(self.i1(Op::RetFar, self.wv(), Operand::Imm(imm)));
+            }
+            0xcb => return Ok(self.i0(Op::RetFar, self.wv())),
+            0xcf => return Ok(self.i0(Op::Iret, self.wv())),
+            // jmp/call far ptr16:16/32: 32-bit code only (#UD in 64-bit mode)
+            0x9a | 0xea if self.mode == Mode::Compat => {
+                let w = if self.op16 { Width::W } else { Width::D };
+                let off = if w == Width::W { self.u16()? as i64 } else { self.i32()? & 0xffff_ffff };
+                let sel = self.u16()? as i64;
+                let o = if op == 0x9a { Op::CallFar } else { Op::JmpFar };
+                return Ok(self.i2(o, w, Operand::Imm(off), Operand::Imm(sel)));
+            }
             0xc6 | 0xc7 => {
                 let w = if op == 0xc6 { Width::B } else { self.wv() };
                 let m = self.modrm()?;
@@ -811,7 +859,12 @@ impl<'a> Decoder<'a> {
                         let w = self.w64();
                         self.i1(Op::Push, w, self.e(&m, w))
                     }
-                    // far call/jmp
+                    // far call/jmp through memory: an m16:16/32/64 pointer
+                    3 | 5 if !m.is_reg => {
+                        let o = if (m.raw >> 3) & 7 == 3 { Op::CallFar } else { Op::JmpFar };
+                        let w = self.wv();
+                        self.i1(o, w, Operand::Mem(m.mem))
+                    }
                     _ => self.unk(),
                 });
             }
@@ -1787,9 +1840,11 @@ impl<'a> Decoder<'a> {
                 (0xdf, 1) => Op::Fist { mem: I16, pop: true, truncate: true },
                 (0xdf, 2) => Op::Fist { mem: I16, pop: false, truncate: false },
                 (0xdf, 3) => Op::Fist { mem: I16, pop: true, truncate: false },
+                (0xdf, 4) => Op::Fbld,
                 (0xdf, 5) => Op::Fild(I64),
+                (0xdf, 6) => Op::Fbstp,
                 (0xdf, 7) => Op::Fist { mem: I64, pop: true, truncate: false },
-                // fbld / fbstp (packed BCD) and the reserved slots.
+                // The reserved slots.
                 _ => return Ok(self.unk()),
             };
             // The environment's image has a 16-bit form (14 bytes, 94 for
@@ -1961,6 +2016,57 @@ mod tests {
 
     fn d(bytes: &[u8]) -> Inst {
         decode(bytes, 0x1000)
+    }
+
+    #[test]
+    fn far_transfers_decode_in_both_modes() {
+        let c = |b: &[u8]| decode_in(Mode::Compat, b, 0x1000);
+        let l = |b: &[u8]| decode_in(Mode::Long, b, 0x1000);
+        // jmp far 0x33:0x12345678 (32-bit code only)
+        let i = c(&[0xea, 0x78, 0x56, 0x34, 0x12, 0x33, 0x00]);
+        assert_eq!((i.op, i.len, i.width), (Op::JmpFar, 7, Width::D));
+        assert_eq!((i.op0(), i.op1()), (Operand::Imm(0x1234_5678), Operand::Imm(0x33)));
+        assert_eq!(l(&[0xea, 0x78, 0x56, 0x34, 0x12, 0x33, 0x00]).op, Op::Unknown);
+        // call far 0x23:0x401000
+        let i = c(&[0x9a, 0x00, 0x10, 0x40, 0x00, 0x23, 0x00]);
+        assert_eq!((i.op, i.op1()), (Op::CallFar, Operand::Imm(0x23)));
+        // ljmp *(%r14): m16:32 in 64-bit mode without REX.W (wow64cpu's way back)
+        let i = l(&[0x41, 0xff, 0x2e]);
+        assert_eq!((i.op, i.len, i.width), (Op::JmpFar, 3, Width::D));
+        assert!(matches!(i.op0(), Operand::Mem(m) if m.base == Some(14)));
+        // jmp far [disp32] in 32-bit code (wow64cpu's 32-to-64 thunk)
+        let i = c(&[0xff, 0x2d, 0x00, 0x20, 0x00, 0x00]);
+        assert_eq!((i.op, i.len), (Op::JmpFar, 6));
+        // lcall *(%rax) with REX.W: m16:64
+        assert_eq!(l(&[0x48, 0xff, 0x18]).width, Width::Q);
+        // the register forms are not far transfers
+        assert_eq!(l(&[0xff, 0xe8]).op, Op::Unknown);
+        // retf, retf 8, iretq, iretd
+        assert_eq!((c(&[0xcb]).op, c(&[0xcb]).width), (Op::RetFar, Width::D));
+        assert_eq!((l(&[0xcb]).op, l(&[0xcb]).width), (Op::RetFar, Width::D));
+        assert_eq!(c(&[0xca, 0x08, 0x00]).op0(), Operand::Imm(8));
+        assert_eq!((l(&[0x48, 0xcf]).op, l(&[0x48, 0xcf]).width), (Op::Iret, Width::Q));
+        assert_eq!(c(&[0xcf]).width, Width::D);
+    }
+
+    #[test]
+    fn addr16_absolute_only() {
+        let c = |b: &[u8]| decode_in(Mode::Compat, b, 0x1000);
+        // mov edx, fs:[0x2c] with 16-bit addressing (C++Builder's TLS array)
+        let i = c(&[0x64, 0x67, 0x8b, 0x16, 0x2c, 0x00]);
+        assert_eq!((i.op, i.len, i.width), (Op::Mov, 6, Width::D));
+        assert!(matches!(i.op1(), Operand::Mem(m) if m.disp == 0x2c && m.base.is_none() && m.index.is_none() && m.seg == Some(Seg::Fs)));
+        // mov eax, fs:[0x18] through moffs16
+        let i = c(&[0x64, 0x67, 0xa1, 0x18, 0x00]);
+        assert_eq!((i.op, i.len), (Op::Mov, 5));
+        assert!(matches!(i.op1(), Operand::Mem(m) if m.disp == 0x18 && m.seg == Some(Seg::Fs)));
+        // a register base ([bx+si]), a string instruction's si/di, a register
+        // operand: refused
+        assert_eq!(c(&[0x67, 0x8b, 0x00]).op, Op::Unknown);
+        assert_eq!(c(&[0x67, 0xa4]).op, Op::Unknown);
+        assert_eq!(c(&[0x67, 0x89, 0xc0]).op, Op::Unknown);
+        // the 32-bit form is unchanged
+        assert_eq!(c(&[0x64, 0x8b, 0x15, 0x2c, 0x00, 0x00, 0x00]).len, 7);
     }
 
     #[test]

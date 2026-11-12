@@ -3,8 +3,8 @@
 // the test programs at /progs/{x64,x86}. Then `run(exe, args)` copies a test
 // program into C:\ and runs it with Wine: `{ code, stdout, stderr }`, the
 // output's line ends Unix ones.
-import { System } from '../../web/runtime/src/index.js';
-import { Filesystem } from '../../web/runtime/src/fs.js';
+import { System } from '../../page/runtime/src/index.js';
+import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 
 export const WINE = '/wine64/lib/wine/x86_64-unix/wine';
 
@@ -15,13 +15,13 @@ export const WINE = '/wine64/lib/wine/x86_64-unix/wine';
  *  graphics driver; WoW64's default). */
 export async function bootWine(t, { env = {}, parts, wow64 = false, nullDriver = wow64, system = {}, debug = {} } = {}) {
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug(debug), ...system });
-  const fs = new Filesystem(sys);
+  const fs = new MemoryFilesystem(sys);
   fs.addTar(t.work('wine64.tar'), { lazy: t.work('wine64-lazy.json') });
   fs.addTar(t.work('win-progs.tar'), { at: '/progs' });
   const more = parts?.(sys, fs);
   await t.timeout(sys.boot(), 120000, 'boot');
   const failed = JSON.parse(await (await fetchWork(t, 'win-progs.json')).text()).failed;
-  const wineEnv = { WINEPREFIX: '/pfx', WINEDEBUG: 'err+all,fixme-all', WINEGEX_DOOR: '1', ...(wow64 && { WINEGEX_WOW64: '1', WINEGEX_DOOR: '0' }), ...env };
+  const wineEnv = { WINEPREFIX: '/pfx', WINEDEBUG: 'err+all,fixme-all', WINEGEX_DOOR: '1', ...(wow64 && { WINEGEX_WOW64: '1' }), ...env };
   if (wow64) {
     try { await fs.stat('/wine64/lib/wine/i386-windows'); } catch { t.skip('the Wine install has no lib/wine/i386-windows: not a WoW64 build'); }
   }
@@ -72,7 +72,8 @@ function fetchWork(t, name) {
  *  translated by object. A process may be said twice (its last thread). */
 export async function exitStats(t) {
   return (await t.logs(/\[gex\] pid [0-9:]+: lived /)).map((l) => ({
-    pid: /pid ([0-9:]+)/.exec(l)[1],
+    // `P`, or `P:T` for a thread T's line (no trailing colon).
+    pid: /pid (\d+(?::\d+)*): lived/.exec(l)[1],
     cmd: /\{([^}]*)\}/.exec(l)?.[1] ?? '',
     slotsLeftK: Number(/(\d+)k dispatch slots left/.exec(l)?.[1] ?? NaN),
     memoryMib: Number(/memory (\d+) MiB/.exec(l)?.[1] ?? NaN),
@@ -81,6 +82,19 @@ export async function exitStats(t) {
     // name=blocks@first..last
     objects: [...l.matchAll(/(\S*)=(\d+)@0x([0-9a-f]+)\.\.0x([0-9a-f]+)/g)].map((m) => ({ name: m[1], blocks: Number(m[2]), first: parseInt(m[3], 16) })),
   }));
+}
+
+/** Wait (up to `ms`) for the runtime's exit line of the process whose
+ *  command line matches `cmd`: the process's own (`pid P`), which comes
+ *  after its threads' (`pid P:T`). A program's exit reaches the page (its `run` ends)
+ *  before its Worker has saved the translation cache and sent the numbers
+ *  its exit line says; a shutdown before then ends the Worker without that
+ *  line. True once it is there. */
+export async function exitLineOf(t, cmd, ms = 60000) {
+  for (const t1 = Date.now() + ms; Date.now() < t1; await new Promise((r) => setTimeout(r, 200))) {
+    if ((await exitStats(t)).some((s) => !s.pid.includes(':') && cmd.test(s.cmd))) return true;
+  }
+  return false;
 }
 
 /** The blocks translated in the objects that start in any of `ranges`

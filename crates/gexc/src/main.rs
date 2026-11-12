@@ -124,6 +124,7 @@ fn real_main() -> Result<ExitCode> {
         "hotset" => cmd_hotset(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "cgen-image" => cmd_cgen_image(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "cgen-split" => cmd_cgen_split(&argv[2..]).map(|_| ExitCode::SUCCESS),
+        "cgen-flavour" => cmd_cgen_flavour(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "cgen-c" => cmd_cgen_c(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "-h" | "--help" | "help" => {
             usage();
@@ -131,6 +132,45 @@ fn real_main() -> Result<ExitCode> {
         }
         other => bail!("unknown subcommand `{other}` (try `gexc help`)"),
     }
+}
+
+/// `gexc cgen-flavour [--page] [--mem64] [--winesplit] [--max-insns N] LOADER`:
+/// the `gexc cgen-image` switches of the unit flavour a new process of
+/// LOADER (an install's wine, the program a run execs) looks up, with
+/// those run flags and this environment, as its "build it with" line names
+/// them (`gex_cgen::image::flavour_switches`). Nothing runs: the flavour is
+/// the process's own state, decided before any image is placed
+/// (`ProcessFlavour`, which the shims use). An empty line for none.
+fn cmd_cgen_flavour(args: &[String]) -> Result<()> {
+    let mut pf = gex_cgen::image::ProcessFlavour::default();
+    let mut loader = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            // in the page (the browser shim), natively otherwise
+            "--page" => pf.page = true,
+            "--mem64" => pf.mem64 = true,
+            // the page's ?winesplit=1
+            "--winesplit" => pf.split = true,
+            "--max-insns" => {
+                i += 1;
+                gex_cgen::image::set_max_insns(args.get(i).context("--max-insns needs a number")?.parse()?);
+            }
+            a if a.starts_with('-') => bail!("cgen-flavour: unknown switch {a}"),
+            a if loader.is_none() => loader = Some(a.to_string()),
+            a => bail!("cgen-flavour: one loader, not {a} as well"),
+        }
+        i += 1;
+    }
+    let loader = loader.context("usage: gexc cgen-flavour [--page] [--mem64] [--winesplit] [--max-insns N] LOADER")?;
+    let bytes = std::fs::read(&loader).with_context(|| format!("reading {loader}"))?;
+    let exe = gex_ld::elf::load(&bytes, 0).map_err(|e| anyhow::anyhow!("{loader}: {e:?}"))?;
+    pf.flags = gex_cgen::image::program_flags::of(&exe);
+    let full = std::fs::canonicalize(&loader).map(|p| p.display().to_string()).unwrap_or(loader);
+    pf.native_ntdll = gex_cgen::image::loader_has_native_ntdll(&full);
+    pf.apply();
+    println!("{}", gex_cgen::image::flavour_switches().join(" "));
+    Ok(())
 }
 
 fn usage() {
@@ -199,8 +239,16 @@ usage:
                                    the NT trampoline page's unit, which the
                                    native host builds at boot; the browser
                                    needs it built ahead (GEX_CGEN_GUARD=1)
-  gexc cgen-image --providers      every export provider's module, into
-                                   GEX_CGEN_CACHE (the browser cannot build them)
+  gexc cgen-flavour [--page] [--mem64] [--winesplit] [--max-insns N] <loader>
+                                   the cgen-image switches of the units a new
+                                   process of <loader> looks up with those run
+                                   flags (--page: in the browser), as its
+                                   'build it with' lines name them; runs nothing
+  gexc cgen-image --providers [--elf]
+                                   every export provider's module for this
+                                   gexc's guest (an x86 gexc's for x86-64),
+                                   into GEX_CGEN_CACHE (the browser cannot
+                                   build them); --elf: only ELF libraries'
   gexc cgen-image --inputs         a hash of everything a unit key takes besides
                                    its image: a cache of units built by a gexc
                                    that printed another one has no hits here
@@ -453,7 +501,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
     }
     let path = path.context("expected a program to run")?;
     // `--host-env`: the guest starts with gexc's own environment (a gexcc
-    // program's host launcher passes it on: tools/gexcc/hoststub.c), then
+    // program's host launcher passes it on: toolchain/gexcc/hoststub.c), then
     // the `--env` settings over it.
     if host_env {
         let set: std::collections::HashSet<String> =
@@ -623,42 +671,41 @@ fn set_wasm_libs() -> Result<()> {
     Ok(())
 }
 
-/// The guest memory for this run: `--mem64`/`--mem32`,
-/// else what an earlier run of the same image learned. `wide` is whether
-/// the guest is 64-bit; a 32-bit guest addresses at most 4 GiB, so it always
-/// has a wasm32 memory.
-fn choose_mem(ra: &mut RunArgs, bytes: &[u8], wide: bool) -> Result<()> {
+/// The guest memory for this run: `--mem64`/`--mem32`, else the program's
+/// own record, its `user.gex.mem64` attribute (`1` or `0`), which gex sets
+/// when a run of it fell short of a 32-bit memory's address space and ended
+/// for it (`outgrow_ending`). `wide` is whether the guest is 64-bit; a
+/// 32-bit guest addresses at most 4 GiB, so it always has a wasm32 memory.
+fn choose_mem(ra: &mut RunArgs, wide: bool) -> Result<()> {
     if ra.mem64 == Some(true) && !wide {
         bail!("--mem64: {} is a 32-bit program, which cannot address more than 4 GiB", ra.path);
     }
-    let m64 = wide && ra.mem64.unwrap_or_else(|| gex_cache::mem64_recorded(bytes));
+    // (for Wine's loader started on a program, the program's record)
+    let argv: Vec<String> = std::iter::once(ra.path.clone()).chain(ra.guest_args.iter().cloned()).collect();
+    let image = gex_kernel::syscalls::wine_program(&ra.path, &argv, &ra.opts.env).unwrap_or_else(|| ra.path.clone());
+    let recorded = || {
+        let path = std::fs::canonicalize(&image).ok()?;
+        let mut b = [0u8; 8];
+        let op = gex_kernel::vfs::XattrOp::Get { name: "user.gex.mem64", buf: &mut b };
+        let n = gex_kernel::vfs::hostfs::host_xattr::call(gex_kernel::vfs::hostfs::host_xattr::On::Path(&path), op).ok()?;
+        match &b[..n] {
+            b"1" | b"1\n" => Some(true),
+            b"0" | b"0\n" => Some(false),
+            _ => None,
+        }
+    };
+    let m64 = wide && ra.mem64.or_else(recorded).unwrap_or(false);
     if m64 && ra.mem64.is_none() {
-        eprintln!("gex: {} runs with a 64-bit memory (an earlier run needed more than 4 GiB)", ra.path);
+        eprintln!("gex: {image} runs with a 64-bit memory (its record says it needs one)");
     }
     ra.opts.mem = if m64 { gex_abi::MemFlavor::M64 } else { gex_abi::MemFlavor::M32 };
     // Everything translated in this process targets it.
     gex_abi::set_mem_flavor(ra.opts.mem);
+    // Its first program may be told later that it needs a 64-bit memory
+    // (an exec that asks for one): the run then starts again with one
+    // (`gex_native::restart_mem64`), unless the flavour was given.
+    gex_native::set_restart_ok(wide && !m64 && ra.mem64.is_none());
     Ok(())
-}
-
-/// After a 64-bit guest's wasm32 run: if it ran out of address space,
-/// record it so the next start has a 64-bit memory.
-fn learn_mem(ra: &RunArgs, bytes: &[u8], wide: bool) {
-    if !wide || ra.opts.mem.is_64() || ra.mem64 == Some(false) {
-        return;
-    }
-    let short = gex_kernel::mem::ADDRESS_SPACE_SHORT.load(std::sync::atomic::Ordering::Relaxed);
-    if short == 0 {
-        return;
-    }
-    if let Some(p) = gex_cache::record_mem64(bytes, &ra.path, short) {
-        eprintln!(
-            "gex: {} needs more than 4 GiB of address space (a request for {short:#x} bytes did not fit); \
-             it runs with --mem64 from the next start ({})",
-            ra.path,
-            p.display()
-        );
-    }
 }
 
 fn cmd_run(args: &[String]) -> Result<ExitCode> {
@@ -767,10 +814,12 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
         ra.opts.aot = Some(std::sync::Arc::new(aot));
         ra.opts.pins.extend(pins);
     }
-    choose_mem(&mut ra, &bytes, wide)?;
+    choose_mem(&mut ra, wide)?;
     set_wasm_libs()?;
     let (exit, _stats) = gex_native::run_program(&program, &ra.opts, &ra.xlate)?;
-    learn_mem(&ra, &bytes, wide);
+    if gex_native::restart_mem64() {
+        restart_mem64();
+    }
     if let Some(dir) = gex_native::profile::finish(&exit)? {
         if ra.opts.verbose {
             eprintln!("[gex] profile and session manifest written to {}", dir.display());
@@ -779,8 +828,22 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
     Ok(report_exit(&exit, ra.opts.verbose))
 }
 
-/// The exit status a shell sees for a guest's exit, with a message when gex
-/// itself failed.
+/// Start this run again with a 64-bit memory (`gex_native::restart_mem64`):
+/// the same command line with `--mem64`, in place of this process, which
+/// ends every guest process of the run.
+fn restart_mem64() -> ! {
+    use std::os::unix::process::CommandExt;
+    let mut args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let at = args.iter().position(|a| a == "run").map_or(1, |i| i + 1);
+    args.insert(at, "--mem64".into());
+    eprintln!("gex: needs 64-bit memory: re-running");
+    let exe = std::env::current_exe().unwrap_or_else(|_| args[0].clone().into());
+    let e = std::process::Command::new(exe).arg0(&args[0]).args(&args[1..]).exec();
+    eprintln!("gex: could not start again with a 64-bit memory: {e}");
+    std::process::exit(127);
+}
+
+/// The exit status a shell sees for a guest's exit.
 fn report_exit(exit: &Exit, verbose: bool) -> ExitCode {
     match exit {
         Exit::Status(c) => ExitCode::from((*c & 0xff) as u8),
@@ -790,14 +853,11 @@ fn report_exit(exit: &Exit, verbose: bool) -> ExitCode {
             detail,
             internal,
         } => {
-            // An ordinary signal says nothing itself, as on Linux. Only a gex
-            // limitation is worth a message.
-            if *internal {
-                // Not a guest crash: gex delivers its own failures as SIGSEGV
-                // (the only way to stop a running guest), so say which side
-                // failed rather than let it read as "terminated by signal 11".
-                eprintln!("gexc: gex failed at guest pc=0x{pc:x}: {detail}");
-            } else if verbose {
+            // An ordinary signal says nothing itself, as on Linux, and a
+            // crash is said by its report (gex_native's `crash_line`). So is
+            // gex's own failure (delivered as SIGSEGV, the only way to stop
+            // a running guest): as gex could not run it on.
+            if !*internal && verbose {
                 eprintln!("gexc: guest terminated by signal {signal} at pc=0x{pc:x}: {detail}");
             }
             ExitCode::from((exit.code() & 0xff) as u8)
@@ -2088,6 +2148,7 @@ mod tests {
             needed: Vec::new(),
             runpath: Vec::new(),
             bias: base,
+            page_zero: 0,
             entry: base,
             code: vec![(base, base + 0x1000)],
             segments: Vec::new(),
@@ -2418,17 +2479,15 @@ fn cmd_cgen_image(args: &[String]) -> Result<()> {
             }
             // A unit for a 64-bit guest memory: another
             // key, other code.
-            "--mem64" => gex_abi::set_mem_flavor(gex_abi::MemFlavor::M64),
             // A 32-bit Wine unit (Wine as wasm32, whose KUSER_SHARED_DATA is at
             // gex_abi::WINE32_KUSER): constant accesses to Windows' page folded
-            // there, every other address checked. Another key.
-            "--wine32-kuser" => gex_abi::set_kuser_fold(true),
-            // A 64-bit Wine unit for a process in the compact space (Wine's
-            // session programs in a wasm32 memory): KUSER_SHARED_DATA and the
-            // entry page after it folded as --wine32-kuser folds the first.
-            "--wine64-compact" => {
-                gex_abi::set_kuser_fold(true);
-                gex_abi::set_kuser_fold_entry(true);
+            // there, every other address checked. Or a 64-bit Wine unit for a
+            // process in the compact space (Wine's session programs in a
+            // wasm32 memory): KUSER_SHARED_DATA and the entry page after it
+            // folded the same way. Each another key, as a process's "build it
+            // with" line names it (`image::flavour_switches`).
+            s @ ("--mem64" | "--wine32-kuser" | "--wine64-compact") => {
+                gex_cgen::image::set_flavour_switch(s);
             }
             // The NT trampoline page (i386 with --nt-trampolines32): built
             // at boot natively, ahead of time for the browser.
@@ -2450,7 +2509,11 @@ fn cmd_cgen_image(args: &[String]) -> Result<()> {
     let path = path.context("expected a PE image")?;
     if path == "--providers" {
         let root = std::path::PathBuf::from(std::env::var("GEX_CGEN_CACHE").context("--providers needs GEX_CGEN_CACHE")?);
-        for p in gex_cgen::provider::all() {
+        // One gexc builds its own guest's providers: their ABI header
+        // (`gex_abi.h`, in every fingerprint) is this build's. An x86-64
+        // dist's come from a gexc built with `--features x86`.
+        // `--elf`: only those for ELF libraries (glibc's), none of Windows'.
+        for p in gex_cgen::provider::all().into_iter().filter(|p| !elf || p.dlls.iter().all(|d| d.contains(".so"))) {
             let (out, _) = gex_cgen::provider::build(&p, &root)?;
             eprintln!("provider {}: {}", p.name, out.display());
         }

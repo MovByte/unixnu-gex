@@ -100,9 +100,11 @@ enum Pressure {
     Critical,
 }
 
-/// `memorystatus_vm_pressure_level`. Nothing here measures the memory
-/// the guest has left, so the level stays normal and no pressure,
-/// low-swap or process-limit event is posted.
+/// `memorystatus_vm_pressure_level`. The VM's page accounting that moves
+/// it (`vm_pressure_response` over the available pages) is not modelled,
+/// so it never leaves normal and no pressure or low-swap event is posted;
+/// a knote asking for them is reported when it is attached. Process-limit
+/// events are posted ([`super::footprint`]).
 const MEMORYSTATUS_VM_PRESSURE_LEVEL: Pressure = Pressure::Normal;
 
 /// `NOTE_SIGNAL`, shared with EVFILT_PROC.
@@ -1265,7 +1267,11 @@ impl Kernel {
         k.sdata = 0;
         k.ext = [0; 4];
         if k.sfflags & ms::ALL_MASK == k.sfflags {
+            let unmodelled = k.sfflags & (ms::PRESSURE_NORMAL | ms::PRESSURE_WARN | ms::PRESSURE_CRITICAL | ms::LOW_SWAP);
             self.dtask.kevents.memorystatus_klist.insert(0, n);
+            if unmodelled != 0 {
+                self.darwin_unimplemented(format!("memory pressure or low-swap notification {unmodelled:#x} (the VM's page accounting that raises them)"));
+            }
         } else {
             self.knote(n).set_error(Errno::EOPNOTSUPP);
         }

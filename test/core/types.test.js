@@ -1,4 +1,4 @@
-// The package's declarations (web/runtime/types/*.d.ts) against the modules
+// The package's declarations (page/runtime/types/*.d.ts) against the modules
 // they describe: every value a module exports is declared and every declared
 // one exported; every public method and accessor of each exported class is
 // declared, and every declared one is there; System's options are the ones
@@ -9,7 +9,7 @@ import { PACKAGE_ENTRIES } from '../lib/package.mjs';
 
 export const meta = { hosts: ['node'], images: [], timeout: 60 };
 
-const ROOT = new URL('../../web/runtime/', import.meta.url);
+const ROOT = new URL('../../page/runtime/', import.meta.url);
 
 /** `{ values, classes: { Name: { methods, fields } }, interfaces: { Name: [keys] } }`
  *  from a d.ts: what is declared at its top level, and each class's members. */
@@ -17,7 +17,7 @@ function declarations(text) {
   const values = new Set();
   const classes = {};
   const interfaces = {};
-  for (const m of text.matchAll(/^export declare (?:const|function|class) (\w+)/gm)) values.add(m[1]);
+  for (const m of text.matchAll(/^export declare (?:const|function|class|abstract class) (\w+)/gm)) values.add(m[1]);
   for (const m of text.matchAll(/^export \{([^}]*)\}/gm)) for (const n of m[1].split(',')) if (n.trim()) values.add(n.trim().split(/\s+as\s+/).pop());
   const body = (start) => {
     let depth = 0;
@@ -41,7 +41,7 @@ function declarations(text) {
     out.push(line);
     return out.map((l) => l.replace(/\/\*\*.*?\*\/|\/\/.*$/g, '').trim()).filter((l) => l && !l.startsWith('*') && !l.startsWith('/*'));
   };
-  for (const m of text.matchAll(/^export declare class (\w+)[^{]*/gm)) {
+  for (const m of text.matchAll(/^export declare (?:abstract )?class (\w+)[^{]*/gm)) {
     const methods = new Set();
     const fields = new Set();
     for (const l of ownLines(body(m.index + m[0].length))) {
