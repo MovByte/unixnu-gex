@@ -19,6 +19,7 @@
 #include <sys/wait.h>
 
 extern int posix_spawnattr_set_registered_ports_np(posix_spawnattr_t *, mach_port_t[], uint32_t);
+extern char **environ;
 
 typedef struct {
     mach_msg_header_t h;
@@ -108,14 +109,13 @@ int main(int argc, char **argv) {
     _NSGetExecutablePath(self, &len);
     snprintf(idarg, sizeof idarg, "%u", IOSurfaceGetID(s));
     char *args[] = {self, "child", idarg, NULL};
-    char *env[] = {"MallocNanoZone=0", NULL};
     posix_spawnattr_t at;
     posix_spawnattr_init(&at);
     mach_port_t reg[2] = {port, back};
     posix_spawnattr_set_registered_ports_np(&at, reg, 2);
     pid_t pid;
     int e;
-    if ((e = posix_spawn(&pid, self, NULL, &at, args, env))) return bad("parent", "spawning", e, 0);
+    if ((e = posix_spawn(&pid, self, NULL, &at, args, environ))) return bad("parent", "spawning", e, 0);
     posix_spawnattr_destroy(&at);
     rcv_t m;
     kern_return_t kr = mach_msg(&m.h, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof m, back, 120000, MACH_PORT_NULL);
