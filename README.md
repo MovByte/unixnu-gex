@@ -424,10 +424,10 @@ is the reference (search `crates/gex-kernel/src/` for
   from its `seatbelt-profiles` entitlement, its spawn's Sandbox attributes,
   the platform profile's choice for apps, or its executable's protobox
   profile; or by `sandbox_init` with a builtin profile. The platform
-  profile, then the process's, decide the checks that are wired; Sandbox's
-  other hooks (the vnode checks among them, process-exec* with them) are
-  not called, and a process with a sandbox that execs is reported and
-  refused there. Not ported, and reported where the kext would act: the
+  profile, then the process's, decide the checks that are wired, an exec's
+  process-exec* and process-exec-interpreter among them; Sandbox's other
+  hooks (the other vnode checks among them) are not called. Not ported,
+  and reported where the kext would act: the
   profiles of the `com.apple.private.sandbox.profile` entitlements,
   containers and containermanagerd's upcall, the extensions of the
   `com.apple.security.exception.*` entitlements, matching an extension

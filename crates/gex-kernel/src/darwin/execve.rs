@@ -91,6 +91,8 @@ struct Imgp {
     size: u64,
     /// A spawn's `psa_binprefs` and `psa_subcpuprefs`.
     binprefs: Option<[(u32, u32); 4]>,
+    /// Sandbox's process-exec check of the last lookup marked the exec.
+    sandbox_mark: bool,
 }
 
 fn be32(b: &[u8], o: usize) -> u32 {
@@ -254,7 +256,7 @@ impl Kernel {
     pub(crate) fn darwin_exec_activate_with(&mut self, m: &GuestMem<'_>, fname: u64, argv: u64, envv: u64, binprefs: Option<[(u32, u32); 4]>) -> Result<Image, Errno> {
         let mut strings = Strings::new();
         strings.save_user_path(m, fname)?;
-        let mut img = Imgp { strings, vdata: Vec::new(), interpret: false, interp_buffer: Vec::new(), origcputype: 0, origcpusubtype: 0, arch_offset: 0, arch_size: 0, path: String::new(), size: 0, binprefs };
+        let mut img = Imgp { strings, vdata: Vec::new(), interpret: false, interp_buffer: Vec::new(), origcputype: 0, origcpusubtype: 0, arch_offset: 0, arch_size: 0, path: String::new(), size: 0, binprefs, sandbox_mark: false };
         let mut itercount = 0;
         // ip_scriptvp: the script an interpreter runs.
         let mut script = None;
@@ -289,7 +291,7 @@ impl Kernel {
         let size = if img.arch_size != 0 { img.arch_size } else { bytes.len() as u64 };
         let slice = bytes.get(img.arch_offset as usize..(img.arch_offset + size) as usize).ok_or(ebadmacho())?;
         let load = self.darwin_load_signatures(&img.path, img.arch_offset, slice)?;
-        let sandbox = super::sandboxes::Pending { script, spawnattrs: None };
+        let sandbox = super::sandboxes::Pending { script, spawnattrs: None, marked: img.sandbox_mark };
         Ok(Image { path: img.path, arch_offset: img.arch_offset, arch_size: img.arch_size, cputype: img.origcputype, cpusubtype: img.origcpusubtype, strings: img.strings, spawn: None, load, thread_id: 0, sandbox })
     }
 
@@ -311,20 +313,15 @@ impl Kernel {
         if md.size == 0 {
             return Err(Errno::ENOEXEC);
         }
+        // mac_vnode_check_exec, of the interpreter's for a script's.
+        let canonical = self.vfs.canonical(&abs);
+        img.sandbox_mark = self.darwin_mac_check_vnode_exec(&canonical, md.mode, img.interpret).map_err(|e| super::errno::errno_of(e as i32))?;
         // vnode_authorize(KAUTH_VNODE_EXECUTE): no mount here is noexec; the
         // superuser needs only an execute bit, which there is. Anyone else
         // by the owner's bit, the file being owned by whom its stat says,
         // the caller (gex's files have no owner of their own).
         if self.creds.uid() != 0 && md.mode & 0o100 == 0 {
             return Err(Errno::EACCES);
-        }
-        // mac_vnode_check_exec: Sandbox's process-exec* (its
-        // process-exec-interpreter for a script's interpreter) is not run,
-        // for the platform profile as for a sandbox's (mac.rs); a caller
-        // with a sandbox, whose profile would be asked, stops here.
-        if self.darwin_sandbox().is_some() {
-            self.darwin_unimplemented(format!("Sandbox's process-exec check (mpo_vnode_check_exec) of {abs} by a process with a sandbox"));
-            return Err(Errno::EPERM);
         }
         img.arch_offset = 0;
         img.arch_size = md.size;
@@ -729,7 +726,7 @@ mod tests {
     fn script(line: &[u8]) -> Imgp {
         let mut vdata = vec![0u8; PAGE_SIZE as usize];
         vdata[..line.len()].copy_from_slice(line);
-        Imgp { strings: Strings::new(), vdata, interpret: false, interp_buffer: Vec::new(), origcputype: 0, origcpusubtype: 0, arch_offset: 0, arch_size: 0, path: String::new(), size: 0, binprefs: None }
+        Imgp { strings: Strings::new(), vdata, interpret: false, interp_buffer: Vec::new(), origcputype: 0, origcpusubtype: 0, arch_offset: 0, arch_size: 0, path: String::new(), size: 0, binprefs: None, sandbox_mark: false }
     }
 
     #[test]

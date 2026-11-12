@@ -17,8 +17,10 @@
 //! `amfi_copy_seatbelt_profile_names`; two are refused), or the spawn's
 //! Sandbox attributes' name, or, for an exec with neither and no sandbox of
 //! its own, the profile the platform profile's process-exec-update-label
-//! names (modifier 11: `container` for apps); the protobox profile named by
-//! the executable's path is looked up for every exec. A builtin profile
+//! names (modifier 11: `container` for apps), or, for an exec its sandbox's
+//! process-exec check marked (flag 3), that sandbox's choice, a mark with
+//! none dropping a protobox sandbox; the protobox profile named by the
+//! executable's path is looked up for every exec. A builtin profile
 //! makes a new sandbox, with the executable's extension
 //! (`com.apple.sandbox.executable`, for its bundle's path); with none, the
 //! process keeps the sandbox it had, or gets its protobox profile alone.
@@ -40,8 +42,7 @@
 //! `com.apple.security.exception.*` entitlements issue, and a profile whose
 //! syscall operations give the process filter masks of its own. A process
 //! whose profile filters its Mach messages (flag bit 12) stops at its first
-//! message to a port that enforces filtering (`mach_msg.rs`), and one with
-//! a sandbox stops at its exec's process-exec* check (`execve.rs`). An
+//! message to a port that enforces filtering (`mach_msg.rs`). An
 //! extension is kept as its class and path; what it is bound to and what an
 //! extension filter matches it by are not ported, and such a filter stops
 //! its evaluation (see `sandbox.rs`).
@@ -432,6 +433,8 @@ fn spawnattrs(b: &[u8]) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>), ()> {
 pub struct Pending {
     pub script: Option<String>,
     pub spawnattrs: Option<Vec<u8>>,
+    /// The exec's last process-exec check marked it (flag 3).
+    pub marked: bool,
 }
 
 /// What an exec gives Sandbox's hook beyond its process: the path of the
@@ -440,6 +443,7 @@ pub struct Pending {
 pub struct Exec<'a> {
     pub path: &'a str,
     pub spawnattrs: Option<&'a [u8]>,
+    pub marked: bool,
 }
 
 /// What the exec's hook gathered (`sp+96` on): the profile chosen, its
@@ -522,17 +526,24 @@ impl Kernel {
             Ok(p) => p,
             Err(Missing(what)) => return Err(self.darwin_sb_unported(what.into())),
         };
-        // With no profile and no sandbox carried over, the platform profile
-        // may name one (process-exec-update-label of the vnode). A carried
-        // sandbox is asked only for a thread Sandbox's process-exec check
-        // marked; that check is not run (see mac.rs), and the platform
-        // profile's leaves no mark.
+        // With no profile, process-exec-update-label of the vnode may name
+        // one: with no sandbox carried over, the platform profile's; with
+        // one, the sandbox is asked only for an exec its process-exec check
+        // marked. A mark with no profile named leaves the exec to escape a
+        // protobox sandbox (`sp+96` being 1).
         let inherited = self.darwin_sandbox();
-        if s.profile.is_none() && inherited.is_none() {
-            let md = self.vfs.metadata(ex.path).map_err(|e| Kill(format!("failed to get executable path (err={})", e.0)))?;
-            let a = SbArgs { kind: sandbox::kind::VNODE, vnode: Some(SbVnode::at(ex.path, 1, false, md.mode, 0)), ..Default::default() };
-            if let (0, fx) = self.darwin_sb_evaluate_with(None, mac::op::PROCESS_EXEC_UPDATE_LABEL, &a) {
-                s.profile = fx.profile;
+        let mut escape = false;
+        if s.profile.is_none() {
+            escape = ex.marked;
+            if inherited.is_none() || escape {
+                let md = self.vfs.metadata(ex.path).map_err(|e| Kill(format!("failed to get executable path (err={})", e.0)))?;
+                let a = SbArgs { kind: sandbox::kind::VNODE, vnode: Some(SbVnode::at(ex.path, 1, false, md.mode, 0)), ..Default::default() };
+                if let (0, _, fx) = self.darwin_sb_evaluate_with(inherited.as_ref(), mac::op::PROCESS_EXEC_UPDATE_LABEL, &a) {
+                    if fx.profile.is_some() {
+                        s.profile = fx.profile;
+                        escape = false;
+                    }
+                }
             }
         }
         let (end, nested) = bundle_end(path);
@@ -551,6 +562,10 @@ impl Kernel {
                 _ => s.container_expected = true,
             }
         }
+        // Only a protobox sandbox is escaped.
+        if escape && !inherited.as_ref().is_some_and(|i| i.protoboxed()) {
+            escape = false;
+        }
         if let Some(p) = &s.profile {
             if EXTENSION_POINTS.contains(&p.as_slice()) {
                 s.extension_point = true;
@@ -561,6 +576,10 @@ impl Kernel {
         }
         if matches!(s.profile.as_deref(), Some(b"container2" | b"plugin")) {
             s.profile = Some(b"container".to_vec());
+        }
+        if escape {
+            s.container_expected = false;
+            s.container = None;
         }
         if s.profile.as_deref() == Some(b"container") {
             s.container_expected = true;
@@ -590,6 +609,14 @@ impl Kernel {
                     Err(Missing(what)) => return Err(self.darwin_sb_unported(what.into())),
                 };
                 Sandbox::new(prof, s.protobox).map_err(|Missing(what)| self.darwin_sb_unported(what.into()))?
+            }
+            // The escape: the platform profile's filtering and masks, and no
+            // sandbox.
+            None if escape => {
+                self.dtask.filter_msg = false;
+                self.darwin_sb_apply_masks(None).map_err(Kill)?;
+                self.darwin_set_sandbox(None);
+                return Ok(());
             }
             None => {
                 if let Some(inh) = inherited {

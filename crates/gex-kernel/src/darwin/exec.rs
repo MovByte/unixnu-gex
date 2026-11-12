@@ -472,7 +472,7 @@ impl Kernel {
         // none and its 1).
         let pending = self.dtask.exec_sandbox.take().unwrap_or_default();
         let vnode = self.vfs.canonical(&self.vfs.absolute(pending.script.as_deref().unwrap_or(l.exe_path)));
-        if let Err(super::sandboxes::Kill(why)) = self.darwin_sb_label_update_execve(&super::sandboxes::Exec { path: &vnode, spawnattrs: pending.spawnattrs.as_deref() }) {
+        if let Err(super::sandboxes::Kill(why)) = self.darwin_sb_label_update_execve(&super::sandboxes::Exec { path: &vnode, spawnattrs: pending.spawnattrs.as_deref(), marked: pending.marked }) {
             if self.trace {
                 eprintln!("[gex:{}] Sandbox: hook..execve() killing {}[pid={}, uid={}]: {why}", self.pid, vnode, self.pid, self.creds.uid());
             }

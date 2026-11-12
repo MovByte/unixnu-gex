@@ -10,11 +10,10 @@
 //! protobox profile stacked under it where that profile says (flag 10).
 //! How a process gets its sandbox is `sandboxes.rs`.
 //!
-//! Only the hooks below are wired; Sandbox's others (the vnode checks among
-//! them: file-read*, file-write*, process-exec*, ...) are not called, for
-//! the platform profile's rules as for a sandbox's. An exec by a process
-//! with a sandbox therefore stops loudly at its process-exec* check
-//! (`mpo_vnode_check_exec`).
+//! Only the hooks below are wired, process-exec* and
+//! process-exec-interpreter among them; Sandbox's others (the other vnode
+//! checks among them: file-read*, file-write*, ...) are not called, for the
+//! platform profile's rules as for a sandbox's.
 
 use std::sync::Arc;
 
@@ -52,6 +51,8 @@ pub mod op {
     pub const MACH_TASK_NAME: usize = 103;
     pub const MACH_TASK_READ: usize = 104;
     pub const PROCESS_CODESIGNING: usize = 119;
+    pub const PROCESS_EXEC: usize = 120;
+    pub const PROCESS_EXEC_INTERPRETER: usize = 121;
     pub const PROCESS_FORK: usize = 122;
     pub const PROCESS_INFO_PIDINFO: usize = 128;
     pub const PROCESS_INFO_CODESIGNATURE: usize = 124;
@@ -446,12 +447,12 @@ impl Kernel {
     /// `sb`: the platform profile (but for system-kas-info), then, unless it
     /// denied or its flags have bit 6, the sandbox's profile, whose flag 10
     /// defers to the protobox profile under it (a denial, EPERM, without
-    /// one). Its errno and what the terminals' modifiers left; a report goes
-    /// to the kernel's log unless quiet.
-    pub(crate) fn darwin_sb_evaluate_with(&mut self, sb: Option<&Arc<Sandbox>>, op: usize, a: &SbArgs) -> (u32, sandbox::Effects) {
+    /// one). Its errno, its flags and what the terminals' modifiers left; a
+    /// report goes to the kernel's log unless quiet.
+    pub(crate) fn darwin_sb_evaluate_with(&mut self, sb: Option<&Arc<Sandbox>>, op: usize, a: &SbArgs) -> (u32, u32, sandbox::Effects) {
         let Some(Some((blob, profile))) = PLATFORM.get() else {
             self.darwin_unimplemented("the Sandbox's platform profile (the boot payload's Sandbox/Platform)".into());
-            return (e::EPERM, sandbox::Effects::default());
+            return (e::EPERM, 5, sandbox::Effects::default());
         };
         let sb = sb.map(Arc::as_ref);
         let mut scratch = sandbox::Scratch::default();
@@ -466,7 +467,7 @@ impl Kernel {
                 }
                 Outcome::Unported(what) => {
                     self.darwin_unimplemented(format!("{what} (sandbox operation {op})"));
-                    return (e::EPERM, fx);
+                    return (e::EPERM, 5, fx);
                 }
             };
             if d.flags & 1 != 0 {
@@ -500,7 +501,7 @@ impl Kernel {
                 Ok(d) => d,
                 Err(what) => {
                     self.darwin_unimplemented(format!("{what} (sandbox operation {op}, profile {})", String::from_utf8_lossy(sb.profile.name())));
-                    return (e::EPERM, fx);
+                    return (e::EPERM, 5, fx);
                 }
             };
             // The two decisions' flags: an allowance adds the profile's to
@@ -527,7 +528,7 @@ impl Kernel {
             let object = a.string.as_deref().map(|s| format!(" {}", String::from_utf8_lossy(s))).unwrap_or_default();
             eprintln!("[gex:{}] Sandbox: {}({}) {}({errno}) {}{object}", self.pid, self.exe_path, self.pid, if errno != 0 { "deny" } else { "allow" }, OPERATION_NAMES.get(op).copied().unwrap_or("?"));
         }
-        (errno, fx)
+        (errno, flags, fx)
     }
 
     /// `mac_system_check_sysctlbyname` (Sandbox's hook; AMFI has none): a
@@ -562,6 +563,35 @@ impl Kernel {
             return e;
         }
         self.darwin_sb_evaluate(op::SYSCTL_WRITE, &a)
+    }
+
+    /// `mac_vnode_check_exec` of the regular file at canonical `path`, of
+    /// mode `mode` (AMFI's hook refuses nothing here): Sandbox's
+    /// (`0x...a0a348`), process-exec* of the file, or
+    /// process-exec-interpreter of a script's interpreter, for the caller's
+    /// credential. The kernel's first exec, the initial process's, is not
+    /// checked; here that is the run's first program, which the kernel
+    /// starts without this lookup. A caller with a sandbox may not exec a
+    /// set-id file its profiles allow unless their decision has flag 3
+    /// (forbidden-exec-sugid), which marks the exec instead: its label
+    /// update then asks its sandbox (or drops a protobox one). Whether the
+    /// exec is marked, or the errno.
+    pub(crate) fn darwin_mac_check_vnode_exec(&mut self, path: &str, mode: u32, interpreter: bool) -> Result<bool, u32> {
+        let sb = self.darwin_sandbox();
+        let op = if interpreter { op::PROCESS_EXEC_INTERPRETER } else { op::PROCESS_EXEC };
+        let a = SbArgs { kind: sandbox::kind::VNODE, vnode: Some(SbVnode::at(path, 1, false, mode, 0)), ..Default::default() };
+        let (errno, flags, _) = self.darwin_sb_evaluate_with(sb.as_ref(), op, &a);
+        if sb.is_none() || errno != 0 {
+            return if errno != 0 { Err(errno) } else { Ok(false) };
+        }
+        if flags & 8 != 0 {
+            return Ok(true);
+        }
+        if mode & 0o6000 != 0 {
+            self.darwin_sb_report("forbidden-exec-sugid");
+            return Err(e::EPERM);
+        }
+        Ok(false)
     }
 
     /// `mac_proc_check_fork` (Sandbox's process-fork).
