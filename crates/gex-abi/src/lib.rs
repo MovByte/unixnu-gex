@@ -165,12 +165,16 @@ pub const HIGH_TABLES_END: u64 = (PATCHED_PAGES64 + DISPATCH_MAX_PAGES64 / 8 + 0
 pub const HIGH_ARENA_BASE: u64 = HIGH_TABLES_END;
 
 /// A Darwin process's M64 tables ([`tables64`]): the same directory and
-/// patched-page bits, then its [`PERM_TABLE64`], at 4 GiB, right above the
-/// 4 GiB `__PAGEZERO` every arm64 program has. Not at [`DISPATCH_DIR64`]:
+/// patched-page bits, then its [`PERM_TABLE64`], inside the 4 GiB
+/// `__PAGEZERO` every arm64 program has, which its map never reaches
+/// (`load_machfile` refuses a program without it and raises the map's
+/// minimum past it), so that its address space starts at 4 GiB, as XNU's
+/// does, with its image slid from there. Not at [`DISPATCH_DIR64`]:
 /// Darwin's shared region starts at 0x1_8000_0000
-/// (`SHARED_REGION_BASE_ARM64`) and iOS's cache runs past 8 GiB in it, and
-/// a Darwin process has no Windows image to keep `[4 GiB, 8 GiB)` for.
-pub const DARWIN_DISPATCH_DIR64: u64 = 1 << 32;
+/// (`SHARED_REGION_BASE_ARM64`) and iOS's cache runs past 8 GiB in it.
+/// Above every table and context the runtime keeps low
+/// ([`DISPATCH_DIR_END`]) and the low arena ([`MMAP_TOP`]).
+pub const DARWIN_DISPATCH_DIR64: u64 = 0xc000_0000;
 
 /// A Darwin process's [`PATCHED_PAGES64`].
 pub const DARWIN_PATCHED_PAGES64: u64 = DARWIN_DISPATCH_DIR64 + DISPATCH_MAX_PAGES64 * 4;
@@ -204,7 +208,8 @@ pub mod perm {
     pub const BOTH_SHIFT: u32 = 4;
 }
 
-/// End of a Darwin process's M64 tables, rounded to 1 MiB.
+/// End of a Darwin process's M64 tables, rounded to 1 MiB: the zero byte
+/// past [`PERM_TABLE64`] an access check may read is in it.
 pub const DARWIN_TABLES_END: u64 = (PERM_TABLE64 + PERM_TABLE_BYTES + 0xf_ffff) & !0xf_ffff;
 
 /// This process's M64 tables, `[start, end)`: a Darwin process's (its
@@ -1382,12 +1387,12 @@ pub const DARWIN_ADDR_MASK: u64 = LIMIT64 - 1;
 /// at the top of the 64-bit memory, a range the kernel reserves for it.
 pub const DARWIN_COMMPAGE_ALIAS: u64 = DARWIN_COMMPAGE_RO & DARWIN_ADDR_MASK;
 
-/// The lowest address a Darwin process's code may reach: below it are the
+/// The lowest address a Darwin process's code may reach: the end of the
 /// 4 GiB `__PAGEZERO` every arm64 program has (`load_machfile` refuses one
-/// without; the map's minimum is raised past it) and the tables gex keeps
-/// above it, where the process has nothing mapped. Every translated access
-/// below it traps, as on the device the access would fault.
-pub const DARWIN_GUEST_FLOOR: u64 = DARWIN_TABLES_END;
+/// without; the map's minimum is raised past it), inside which gex keeps
+/// the process's tables ([`DARWIN_DISPATCH_DIR64`]). Every translated
+/// access below it traps, as on the device the access would fault.
+pub const DARWIN_GUEST_FLOOR: u64 = 1 << 32;
 
 static COMMPAGE_FOLD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -1530,11 +1535,12 @@ mod tests {
         assert!(DISPATCH_MAX_PAGES64 * DISPATCH_PAGE == LIMIT64);
         assert!(PATCHED_PAGES64 + DISPATCH_MAX_PAGES64 / 8 <= HIGH_TABLES_END);
         assert!(HIGH_ARENA_BASE < LIMIT64 && HIGH_ARENA_BASE % WASM_PAGE == 0);
-        // A Darwin process's sit above its 4 GiB `__PAGEZERO`, below its
-        // shared region (0x1_8000_0000), the perm table after the bits.
-        assert!(DARWIN_DISPATCH_DIR64 >= GUEST_LIMIT && DARWIN_DISPATCH_DIR64 % (1 << 20) == 0);
+        // A Darwin process's sit inside its 4 GiB `__PAGEZERO`, above what
+        // the runtime keeps low and the low arena, the perm table after the
+        // bits and a zero byte after it.
+        assert!(DARWIN_DISPATCH_DIR64 >= DISPATCH_DIR_END && DARWIN_DISPATCH_DIR64 >= MMAP_TOP && DARWIN_DISPATCH_DIR64 % (1 << 20) == 0);
         assert!(DARWIN_PATCHED_PAGES64 + DISPATCH_MAX_PAGES64 / 8 <= PERM_TABLE64);
-        assert!(PERM_TABLE64 + PERM_TABLE_BYTES <= DARWIN_TABLES_END && DARWIN_TABLES_END <= DARWIN_GUEST_FLOOR);
-        assert!(DARWIN_GUEST_FLOOR <= 0x1_8000_0000 && DARWIN_GUEST_FLOOR % WASM_PAGE == 0);
+        assert!(PERM_TABLE64 + PERM_TABLE_BYTES < DARWIN_TABLES_END && DARWIN_TABLES_END <= DARWIN_GUEST_FLOOR);
+        assert!(DARWIN_GUEST_FLOOR == 1 << 32);
     }
 }

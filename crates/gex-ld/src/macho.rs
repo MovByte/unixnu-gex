@@ -11,16 +11,12 @@
 use crate::elf::{headers_only, Image, LoadError, Segment, Symbol};
 use crate::stack::StackLayout;
 
-/// Where a position-independent Mach-O executable is placed. Its linked
-/// base, 0x1_0000_0000 past a 4 GiB `__PAGEZERO`, is where a Darwin
-/// process's gex memory keeps its tables (`gex_abi::DARWIN_DISPATCH_DIR64`),
-/// and the shared cache follows at
-/// [`SHARED_REGION_BASE`]; iOS 17's runs to 0x2_4c5f_0000. Programs and
-/// dyld go above both.
-pub const PIE_BASE: u64 = 0x2_8000_0000;
-
 /// Where arm64 Darwin maps the shared cache (`SHARED_REGION_BASE_ARM64`).
 pub const SHARED_REGION_BASE: u64 = 0x1_8000_0000;
+
+/// The shared region's size (`SHARED_REGION_SIZE_ARM64`): every task's map
+/// nests all of it, to 0x3_0000_0000, whatever the cache in it uses.
+pub const SHARED_REGION_SIZE: u64 = 0x1_8000_0000;
 
 pub const MH_MAGIC_64: u32 = 0xfeed_facf;
 pub const CPU_TYPE_ARM64: u32 = 0x0100_000c;
@@ -489,16 +485,43 @@ impl MachO {
     }
 }
 
-/// Load a Mach-O for running: a position-independent image moved so its
-/// base is `pie_base`, anything else where it was linked.
-pub fn load(d: &[u8], pie_base: u64) -> Result<(MachO, Image), LoadError> {
+/// Load a Mach-O for running as `parse_machfile` does: a
+/// position-independent image (and dyld) moved by `slide`, anything else
+/// where it was linked. The image's `bias` is the slide it took.
+pub fn load(d: &[u8], slide: u64) -> Result<(MachO, Image), LoadError> {
     let m = parse(d)?;
+    load_parsed(m, d, slide)
+}
+
+/// [`load`] of an image already parsed.
+pub fn load_parsed(m: MachO, d: &[u8], slide: u64) -> Result<(MachO, Image), LoadError> {
     if m.entry.is_none() && m.filetype == MH_EXECUTE {
         return Err(bad("an executable with neither LC_MAIN nor LC_UNIXTHREAD"));
     }
-    let slide = if m.is_pie() { pie_base.wrapping_sub(m.span().0) } else { 0 };
+    let slide = if m.is_pie() { slide } else { 0 };
     let img = m.to_image(d, slide)?;
     Ok((m, img))
+}
+
+/// The end of an image's mapped segments as `load_segment` records it
+/// (`max_vm_addr`): the highest segment's end, rounded to the map's 16 KiB
+/// page.
+pub fn max_vm_addr(img: &Image) -> u64 {
+    img.segments.iter().map(|s| (s.vaddr + s.mem_size + 0x3fff) & !0x3fff).max().unwrap_or(0)
+}
+
+/// The slide `parse_machfile` gives dyld from its own ASLR offset
+/// `dyld_slide`: a dyld whose header segment is linked at 0
+/// (`dyld_no_load_addr`) goes right after the main image, at
+/// `round_page(dyld_slide + max_vm_addr)` (`main_end`, [`max_vm_addr`]);
+/// one linked elsewhere is moved by the offset alone.
+pub fn dylinker_slide(dyld: &MachO, dyld_slide: u64, main_end: u64) -> u64 {
+    let no_load_addr = dyld.segments.iter().any(|s| s.vmaddr == 0 && s.fileoff == 0);
+    if no_load_addr {
+        (dyld_slide + main_end + 0x3fff) & !0x3fff
+    } else {
+        dyld_slide
+    }
 }
 
 /// Darwin's initial stack, laid out the way XNU's exec leaves it: for a
@@ -635,12 +658,24 @@ mod tests {
     }
 
     #[test]
-    fn a_pie_image_slides_to_the_base() {
+    fn a_pie_image_moves_by_its_slide() {
         let f = tiny(MH_PIE);
-        let (_, img) = load(&f, 0x2_0000_0000).unwrap();
-        assert_eq!(img.segments[0].vaddr, 0x2_0000_0000);
-        assert_eq!(img.entry, 0x2_0000_0400);
-        assert_eq!(img.code, vec![(0x2_0000_0400, 0x2_0000_0408)]);
+        let (_, img) = load(&f, 0x2c_c000).unwrap();
+        assert_eq!(img.bias, 0x2c_c000);
+        assert_eq!(img.segments[0].vaddr, 0x1_002c_c000);
+        assert_eq!(img.entry, 0x1_002c_c400);
+        assert_eq!(img.code, vec![(0x1_002c_c400, 0x1_002c_c408)]);
+        // The page zero is extended to the slid image, not moved.
+        assert_eq!(img.page_zero, 0x1_002c_c000);
+        assert_eq!(max_vm_addr(&img), 0x1_002d_0000);
+    }
+
+    #[test]
+    fn dyld_linked_at_zero_goes_after_the_main_image() {
+        let dyld = MachO { filetype: MH_DYLINKER, segments: vec![Seg { name: "__TEXT".into(), vmaddr: 0, vmsize: 0x8_0000, fileoff: 0, filesize: 0x8_0000, maxprot: 5, initprot: 5, sections: Vec::new() }], ..parse(&tiny(0)).unwrap() };
+        assert_eq!(dylinker_slide(&dyld, 0x8000, 0x1_002d_0000), 0x1_002d_8000);
+        let linked = MachO { segments: vec![Seg { vmaddr: 0x1_fe00_0000, ..dyld.segments[0].clone() }], ..dyld.clone() };
+        assert_eq!(dylinker_slide(&linked, 0x8000, 0x1_002d_0000), 0x8000);
     }
 
     #[test]
@@ -655,10 +690,9 @@ mod tests {
     }
 
     #[test]
-    fn the_layout_clears_the_tables_and_the_shared_region() {
+    fn the_shared_region_is_inside_a_darwin_process_s_memory() {
         assert!(SHARED_REGION_BASE >= gex_abi::DARWIN_GUEST_FLOOR);
-        assert!(PIE_BASE > SHARED_REGION_BASE + 0xcc5f_0000);
-        assert!(PIE_BASE < gex_abi::LIMIT64);
+        assert!(SHARED_REGION_BASE + SHARED_REGION_SIZE < gex_abi::DARWIN_COMMPAGE_ALIAS);
     }
 
     #[test]
@@ -667,7 +701,7 @@ mod tests {
         let args = ["/bin/hello".to_string(), "x".to_string()];
         let env = ["HOME=/var/mobile".to_string()];
         let apple = ["executable_path=/bin/hello".to_string()];
-        let st = build_stack(top, Some(0x2_8000_0000), &args, &env, &apple);
+        let st = build_stack(top, Some(0x1_0000_4000), &args, &env, &apple);
         assert_eq!(st.sp % 16, 0);
         assert_eq!(st.low + st.bytes.len() as u64, top);
         let w = |i: usize| u64::from_le_bytes(st.bytes[i * 8..i * 8 + 8].try_into().unwrap());
@@ -676,7 +710,7 @@ mod tests {
             let n = st.bytes[o..].iter().position(|&c| c == 0).unwrap();
             String::from_utf8(st.bytes[o..o + n].to_vec()).unwrap()
         };
-        assert_eq!(w(0), 0x2_8000_0000);
+        assert_eq!(w(0), 0x1_0000_4000);
         assert_eq!(w(1), 2);
         assert_eq!(s(w(2)), "/bin/hello");
         assert_eq!(s(w(3)), "x");

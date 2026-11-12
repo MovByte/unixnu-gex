@@ -2,15 +2,14 @@
 # Build the Darwin test programs with Xcode's iOS toolchain into bin/.
 #
 # The static programs make raw system calls and need neither dyld nor a
-# shared cache. They are linked where gex places a position-independent
-# Darwin program (gex_ld::macho::PIE_BASE), above its dispatch tables and
-# the shared region, because a static image has no fixups to slide it with.
+# shared cache. A static image has no fixups to slide it with, so exec
+# loads it where it was linked: the linker's default, after a 4 GiB
+# __PAGEZERO.
 set -eu
 
 HERE=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 OUT=$HERE/bin
 TARGET=${GEX_DARWIN_TARGET:-arm64-apple-ios17.0}
-STATIC_BASE=0x280000000
 mkdir -p "$OUT"
 
 cc() {
@@ -19,11 +18,10 @@ cc() {
 
 for p in hello-static bsd-carry commpage exclusive-pair aes; do
     cc -O2 -ffreestanding -fno-stack-protector -nostdlib -static \
-        -Wl,-e,_start -Wl,-image_base,$STATIC_BASE \
-        -o "$OUT/$p" "$HERE/src/$p.c"
+        -Wl,-e,_start -o "$OUT/$p" "$HERE/src/$p.c"
 done
 
-for p in hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit xpc-anon sbxinit sbxexec sbxkill hostspecial sbxmask sbxnet; do
+for p in hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit xpc-anon sbxinit sbxexec sbxkill hostspecial sbxmask sbxnet layout; do
     cc -O2 -o "$OUT/$p" "$HERE/src/$p.c"
 done
 cc -O2 -framework CoreFoundation -o "$OUT/cfrunloop" "$HERE/src/cfrunloop.c"
