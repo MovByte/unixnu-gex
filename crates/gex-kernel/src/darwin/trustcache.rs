@@ -133,11 +133,57 @@ pub fn set_static(m: Option<Module>) {
     let _ = STATIC.set(m);
 }
 
+/// The trust caches loaded since boot, in load order: a boot cryptex's
+/// (`kTCTypeCryptex1BootOS`), which libignition in launchd's dyld loads
+/// through AMFI after checking the cryptex's manifest.
+static LOADED: std::sync::Mutex<Vec<Module>> = std::sync::Mutex::new(Vec::new());
+
+/// A loaded trust cache's module: the payload of its IM4P (`trcs`), an
+/// uncompressed module.
+pub fn im4p_module(b: &[u8]) -> Result<Module, Error> {
+    let bad = |what: &str| Error::Bundle(what.into());
+    // DER: a length's bytes after its tag.
+    let item = |b: &[u8], at: usize| -> Option<(u8, usize, usize)> {
+        let tag = *b.get(at)?;
+        let first = *b.get(at + 1)? as usize;
+        let (len, body) = if first & 0x80 == 0 {
+            (first, at + 2)
+        } else {
+            let n = first & 0x7f;
+            let len = b.get(at + 2..at + 2 + n)?.iter().fold(0usize, |v, &x| v << 8 | x as usize);
+            (len, at + 2 + n)
+        };
+        (body + len <= b.len()).then_some((tag, body, len))
+    };
+    let (tag, body, len) = item(b, 0).ok_or(bad("not DER"))?;
+    if tag != 0x30 {
+        return Err(bad("not an IM4P"));
+    }
+    let mut at = body;
+    let mut fields = Vec::new();
+    while at < body + len {
+        let (t, fb, fl) = item(b, at).ok_or(bad("a truncated IM4P field"))?;
+        fields.push((t, &b[fb..fb + fl]));
+        at = fb + fl;
+    }
+    match fields.as_slice() {
+        [(0x16, magic), (0x16, kind), (0x16, _), (0x04, payload), ..] if *magic == b"IM4P" && *kind == b"trcs" => Module::load(payload),
+        _ => Err(bad("not a trust cache IM4P")),
+    }
+}
+
+/// A trust cache loaded at run time, after the static one in each query.
+pub fn add_loaded(m: Module) {
+    let mut l = LOADED.lock().unwrap_or_else(|e| e.into_inner());
+    if !l.iter().any(|x| x.uuid == m.uuid) {
+        l.push(m);
+    }
+}
+
 /// AMFI's platform test (`0x...ab3e10`): a query of the static trust cache,
-/// then of the loaded ones (none are loaded here: loading one is AMFI's
-/// user client's, after the cryptexes' manifests are checked).
+/// then of the loaded ones.
 pub fn platform(cdhash: &[u8; 20]) -> Option<Entry> {
-    STATIC.get().and_then(Option::as_ref).and_then(|m| m.lookup(cdhash))
+    STATIC.get().and_then(Option::as_ref).and_then(|m| m.lookup(cdhash)).or_else(|| LOADED.lock().unwrap_or_else(|e| e.into_inner()).iter().find_map(|m| m.lookup(cdhash)))
 }
 
 #[cfg(test)]
