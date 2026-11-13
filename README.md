@@ -54,12 +54,19 @@ moves itself into its copy in the shared cache); the main stack's top is
 `USRSTACK64` (`0x1_6fe0_0000`) less the main image's slide. A release
 kernel slides every image: `_POSIX_SPAWN_DISABLE_ASLR` is ignored. The
 shared region, `0x1_8000_0000` for `0x1_8000_0000`, is one read-only
-entry, the system's: the first dyld to find it empty (launchd's, at boot)
+entry, the system's, one per environment (`shregion.rs`): a task enters
+its environment's at exec, made empty if there is none, and a fork's child
+its parent's. The first dyld to find its region empty (launchd's, at boot)
 maps the dyld shared cache into it with `shared_region_map_and_slide_2_np`,
-passing the cache's `maxSlide`, and the kernel slides the cache once a
-boot below it, on a 16 KiB boundary, relocating the slid mappings by their
-slide info; every task after enters it as it is. A run's region is made as
-launchd's dyld makes it, before the run's first program. libmalloc's nano
+passing the cache's `maxSlide`, and the kernel slides the cache once below
+it, on a 16 KiB boundary, relocating the slid mappings by their slide
+info; every task in the region sees it, and every task after enters it as
+it is. An unused region is kept two minutes. When pid 1 is the kernel's
+own, standing in for launchd, the boot's region holds what launchd's dyld
+mapped at boot: the OS cryptex's trust cache loaded (as libignition loads
+it), the cache's files preflighted and their code signatures added as
+dyld does, and the same mapping call made with dyld's arguments.
+`/sbin/launchd` as the first program finds its region empty. libmalloc's nano
 allocator, in a process exec engages it for (a spawn with
 `_POSIX_SPAWN_NANO_ALLOCATOR`, as an app's is), takes the 512 MiB after
 the shared region.
@@ -298,6 +305,7 @@ missing has effects:
 | `sandbox_builtin.bin` | the Sandbox kext's builtin profile collection (its named profiles), a compiled collection blob from the kernelcache | a process that would get a builtin profile is reported and its exec killed (or its `sandbox_init` refused, EPERM) |
 | `sandbox_protobox.bin` | the Sandbox kext's protobox profile collection (profiles named by executable path), a compiled collection blob from the kernelcache | every exec is reported and killed, since its protobox profile cannot be looked up |
 | `DeviceTree` | the flattened device tree: the payload of the IPSW's device tree image (an IM4P) for this device | the IOKit registry has no device tree, which is reported |
+| `os.dmg.trustcache` | the SystemOS cryptex's trust cache, an IM4P (in the IPSW, the `Firmware/<os cryptex>.dmg.trustcache` whose cdhashes are the shared cache's files'), which libignition loads at boot | with pid 1 standing in for launchd, the boot's shared region cannot be mapped: the cache's ad-hoc signatures are in no trust cache |
 
 A `TrustCache` that does not load stops the boot. `tools/darwin-trust-cache.py`
 makes the bundle from the IPSW's static trust cache (its IM4P-wrapped
@@ -447,7 +455,7 @@ dyld and libSystem from the device's shared cache.
 | policy and resources | `taskpolicy`, `priority`, `procpolicy`, `cpumon`, `rlimit`, `rlimitctl`, `cputime`, `vtimer`, `itimer`, `memlimit` |
 | signals and exceptions | `sighandler`, `sigthread`, `sigwait`, `sigio`, `procmask`, `excports`, `excdeliver`, `efault`, `protect` |
 | Mach IPC | `portrefs`, `crosstask`, `taskname`, `readports`, `extractright`, `sonce`, `rcvlarge`, `guardesc`, `circular`, `voucherx`, `importance`, `lockimp`, `watchport` |
-| memory | `layout`, `stackfb`, `mmapflags`, `madvise`, `msync`, `mlock`, `vmregion`, `vmcopy`, `vmwx`, `jit` |
+| memory | `layout`, `shregion`, `stackfb`, `mmapflags`, `madvise`, `msync`, `mlock`, `vmregion`, `vmcopy`, `vmwx`, `jit` |
 | files | `fsops`, `pathrules`, `pathconf`, `statino`, `statfsino`, `dirino`, `setattr`, `xattr`, `clone`, `renameswap`, `lockf`, `lastclose`, `guarded`, `fileport`, `filesec`, `openmode`, `vectored`, `aio`, `fixedcalls`, `ioctl`, `realdev` |
 | kqueue, poll and pipes | `kq-pipe`, `vnode`, `vnextend`, `select`, `poll`, `pipe`, `timeouts` |
 | terminals and `/dev` | `pty`, `ptyjob`, `ptyclose`, `bsdpty`, `ttyinfo`, `ttydead`, `ttydrain`, `fcntltty`, `revoke`, `devfs`, `devattr` |
@@ -465,9 +473,10 @@ is the reference (search `crates/gex-kernel/src/` for
 `darwin_unimplemented`, `note_unimplemented` and `Unported`).
 
 - **The browser.** The page runs no Darwin process yet.
-- **Code signing.** Only the static trust cache is consulted; trust caches
-  loaded at run time (by AMFI's user client, after a cryptex's manifest is
-  checked) are not. CMS signatures (CoreTrust and amfid) are not
+- **Code signing.** Besides the static trust cache, only the OS cryptex's
+  is loaded, at a boot pid 1 stands in for; loading one at run time (AMFI's
+  user client, after a cryptex's manifest is checked) is not implemented.
+  CMS signatures (CoreTrust and amfid) are not
   implemented. AMFI's `__mac_syscall` calls for local signing, trust cache
   loading and launch constraints are reported.
 - **Launch constraints.** A requirement on a fact this kernel cannot
@@ -529,10 +538,10 @@ is the reference (search `crates/gex-kernel/src/` for
   and the device has unmapped space), and the memory's end. A fixed
   mapping that reaches past `0x3_ffff_4000`, and an anywhere one with no
   room below it, is reported and fails; a random address (`MAP_JIT`,
-  `VM_FLAGS_RANDOM_ADDR`) is drawn below it. `shared_region_map_and_slide_2_np`
-  itself is not implemented: a run's shared region is made before its first
-  program, so `/sbin/launchd` as the first program finds it made, which is
-  reported.
+  `VM_FLAGS_RANDOM_ADDR`) is drawn below it. The shared region pager's
+  slide info versions 1 and 4 are reported; a region's root directory is
+  always the root vnode's (no `chroot`); and the owner the mapping call
+  requires to be root is the caller, as `stat` reports every file's.
 - **Memory.** Purgeable memory, 4 GB chunks and other `mach_vm_allocate`
   and `mach_vm_map` flags not handled, `MAP_TPRO`, reuse advice on a
   region a fork left copy-on-write, the freezer, and the
