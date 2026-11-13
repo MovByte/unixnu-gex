@@ -36,6 +36,8 @@ pub mod fileport;
 pub mod footprint;
 pub mod xattr;
 pub mod iokit;
+pub mod iosurface;
+pub mod osserialize;
 pub mod accel;
 pub mod guarded;
 pub mod exit;
@@ -366,6 +368,29 @@ impl crate::syscalls::Kernel {
                 self.darwin_unimplemented(format!("the protection table past the guest memory's end (page {page:#x})"));
             }
         }
+    }
+
+    /// The pages of this process's protection table a kernel object
+    /// watches for stores ([`crate::SoftPages`]): a call's copies may write
+    /// them, noted for the object. None when it watches none.
+    pub(crate) fn darwin_soft_pages(&mut self) -> Option<std::sync::Arc<crate::SoftPages>> {
+        let pages = self.mem.lock().withheld_write_pages()?;
+        Some(std::sync::Arc::new(crate::SoftPages { pages, written: Default::default() }))
+    }
+
+    /// The watched pages a call's copies wrote, told to the objects that
+    /// watch them.
+    pub(crate) fn darwin_soft_written(&mut self, m: &mut GuestMem<'_>, soft: &crate::SoftPages) {
+        let mut pages = std::mem::take(&mut *soft.written.lock().unwrap_or_else(|e| e.into_inner()));
+        if pages.is_empty() {
+            return;
+        }
+        pages.sort_unstable();
+        pages.dedup();
+        for p in pages {
+            iosurface::note_store(self, m, p);
+        }
+        self.darwin_flush_perms(m);
     }
 
     /// This task's IPC state, with the system's table taken for the rest
