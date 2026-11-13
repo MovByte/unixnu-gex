@@ -2357,6 +2357,11 @@ impl ProcTable {
         self.virtual_init.store(on, Ordering::Release);
     }
 
+    /// Whether pid 1 is the kernel's own ([`ProcTable::set_virtual_init`]).
+    pub fn virtual_init(&self) -> bool {
+        self.virtual_init.load(Ordering::Acquire)
+    }
+
     /// A program started as pid 1 on Darwin: `bsd_utaskbootstrap` clones it
     /// from the kernel's process, whose group and session are 0, and it
     /// leads neither until it calls `setsid`.

@@ -192,9 +192,6 @@ pub struct CodeSign {
     pub xml: Option<Vec<u8>>,
     pub der: Option<Vec<u8>>,
     pub cms: Option<usize>,
-    /// Launch constraints of its own (`CSSLOT_LAUNCH_CONSTRAINT_SELF`,
-    /// `_PARENT`, `_RESPONSIBLE`).
-    pub launch_constraints: bool,
     /// The blob as added (`csb_mem_kaddr`, `csb_mem_size`).
     pub blob: Vec<u8>,
     /// The cdhash of the best CodeDirectory.
@@ -274,7 +271,6 @@ impl CodeSign {
                 (CSSLOT_ENTITLEMENTS, CSMAGIC_EMBEDDED_ENTITLEMENTS) => cs.xml = Some(b.to_vec()),
                 (CSSLOT_DER_ENTITLEMENTS, CSMAGIC_EMBEDDED_DER_ENTITLEMENTS) => cs.der = Some(b.to_vec()),
                 (CSSLOT_SIGNATURESLOT, CSMAGIC_BLOBWRAPPER) => cs.cms = Some(b.len()),
-                (8..=10, CSMAGIC_EMBEDDED_LAUNCH_CONSTRAINT) => cs.launch_constraints = true,
                 _ => {}
             }
         }
@@ -511,20 +507,6 @@ impl Kernel {
         Ok(LoadResult { sig, csflags: flags, uuid: m.uuid.unwrap_or_default(), cputype: (le(4), le(8)) })
     }
 
-    /// `mac_proc_check_launch_constraints` (AMFI's): the image's trust cache
-    /// category names the constraints it and its parent must meet, and an
-    /// image may carry its own. Category 0 has none.
-    pub(crate) fn darwin_launch_constraints(&mut self) -> Result<(), crate::errno::Errno> {
-        let Some(c) = &self.dtask.codesign else { return Ok(()) };
-        let category = c.trust_cache.and_then(|e| e.category).unwrap_or(0);
-        let own = c.launch_constraints;
-        if category != 0 || own {
-            self.darwin_unimplemented(format!("AMFI launch constraints (trust cache category {category}{})", if own { ", the image's own" } else { "" }));
-            return Err(crate::errno::Errno::EPERM);
-        }
-        Ok(())
-    }
-
     /// `ubc_cs_blob_add` for an image's load: a refusal is EBADEXEC.
     fn darwin_blob_add(&mut self, path: &str, file_start: i64, blob: &[u8]) -> Result<std::sync::Arc<CodeSign>, crate::errno::Errno> {
         let abs = self.vfs.absolute(path);
@@ -605,7 +587,7 @@ const CSSLOT_LIBRARY_CONSTRAINT: u32 = 11;
 const CSSLOT_ALTERNATE_CODEDIRECTORIES: u32 = 0x1000;
 const CSSLOT_ALTERNATE_CODEDIRECTORY_LIMIT: u32 = 0x1005;
 const CSMAGIC_EMBEDDED_DER_ENTITLEMENTS: u32 = 0xfade_7172;
-const CSMAGIC_EMBEDDED_LAUNCH_CONSTRAINT: u32 = 0xfade_8181;
+pub const CSMAGIC_EMBEDDED_LAUNCH_CONSTRAINT: u32 = 0xfade_8181;
 /// `PAGE_SHIFT_4K`, and the A10X's `PAGE_SHIFT`.
 const PAGE_SHIFT_4K: u8 = 12;
 const PAGE_SHIFT: u8 = 14;
@@ -751,6 +733,39 @@ pub fn validate_csblob(b: &[u8]) -> Result<(usize, usize), crate::errno::Errno> 
             }
         }
         _ => bad,
+    }
+}
+
+/// `csblob_find_blob_bytes`: the blob of slot `ty` whose magic is `magic`
+/// (the first such that lies inside the superblob), or the bare
+/// CodeDirectory a blob may be.
+pub fn find_blob(b: &[u8], ty: u32, magic: u32) -> Option<&[u8]> {
+    let length = b.len();
+    if be32(b, 0)? == CSMAGIC_EMBEDDED_SIGNATURE {
+        let count = be32(b, 8)? as usize;
+        for n in 0..count {
+            if be32(b, 12 + 8 * n)? != ty {
+                continue;
+            }
+            let offset = be32(b, 16 + 8 * n)? as usize;
+            if length.checked_sub(8)? < offset {
+                return None;
+            }
+            if be32(b, offset)? != magic {
+                continue;
+            }
+            let end = offset.checked_add(be32(b, offset + 4)? as usize)?;
+            if end > length {
+                continue;
+            }
+            return Some(&b[offset..end]);
+        }
+        None
+    } else if ty == CSSLOT_CODEDIRECTORY && be32(b, 0)? == CSMAGIC_CODEDIRECTORY && magic == CSMAGIC_CODEDIRECTORY {
+        let end = be32(b, 4)? as usize;
+        (end <= length).then(|| &b[..end])
+    } else {
+        None
     }
 }
 

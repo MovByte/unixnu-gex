@@ -42,6 +42,8 @@ pub struct Public {
     pub persona: Option<Arc<super::persona::Persona>>,
     /// `p_csflags`.
     pub csflags: Arc<std::sync::atomic::AtomicU32>,
+    /// The signature on its executable (`p_textvp`'s blob at `p_textoff`).
+    pub codesign: Option<Arc<super::codesign::CodeSign>>,
     /// `p_name`, all of it.
     pub p_name: super::reason::PName,
     /// Its signal dispositions, real timer and accounting flags.
@@ -72,6 +74,7 @@ impl Public {
             pcaction: Default::default(),
             persona: None,
             csflags: Default::default(),
+            codesign: None,
             p_name: Default::default(),
             live: Default::default(),
         }
@@ -289,6 +292,7 @@ impl Kernel {
             pcaction: Arc::clone(&self.dtask.pcaction),
             persona: self.dtask.persona.clone(),
             csflags: Arc::clone(&self.dtask.csflags),
+            codesign: self.dtask.codesign.clone().map(Arc::new),
             p_name: self.dtask.p_name,
             live: Arc::clone(&self.dtask.live),
         }

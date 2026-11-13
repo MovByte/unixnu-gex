@@ -502,6 +502,11 @@ impl Kernel {
                 self.darwin_load_signatures(l.exe_path, off, slice)?
             }
         };
+        // The run's first program was forked by its parent (pid 1, or the
+        // kernel's process for launchd) as bsd_init forks initproc.
+        if strings.is_none() {
+            self.dtask.original_ppid = self.procs.ppid(self.pid);
+        }
         self.dtask.textoff = l.file_start as i64;
         // p_uuid, p_cputype and p_cpusubtype: the image's.
         self.dtask.uuid = lr.uuid;
@@ -526,7 +531,8 @@ impl Kernel {
             }
             return Err(Errno::EPERM);
         }
-        self.darwin_launch_constraints()?;
+        // process_signature: the launch constraints hook.
+        self.darwin_launch_constraints(l.exe_path)?;
         self.darwin_publish();
         // The image's entitlements that raise its default memory limit.
         self.darwin_jetsam_entitlements();

@@ -11,6 +11,8 @@ use std::sync::Arc;
 pub mod ns {
     pub const JETSAM: u32 = 1;
     pub const SIGNAL: u32 = 2;
+    /// `OS_REASON_CODESIGNING`.
+    pub const CODESIGNING: u32 = 3;
     /// `OS_REASON_GUARD`.
     pub const GUARD: u32 = 23;
 }
@@ -35,6 +37,9 @@ pub mod flag {
 
 /// `JETSAM_REASON_MEMORY_PERPROCESSLIMIT`.
 pub const JETSAM_REASON_MEMORY_PERPROCESSLIMIT: u64 = 7;
+
+/// `CODESIGNING_EXIT_REASON_LAUNCH_CONSTRAINT_VIOLATION`.
+pub const CODESIGNING_EXIT_REASON_LAUNCH_CONSTRAINT_VIOLATION: u64 = 4;
 
 /// `OS_REASON_BUFFER_MAX_SIZE`.
 const BUFFER_MAX_SIZE: u32 = 5120;
@@ -289,6 +294,22 @@ impl OsReason {
                         failed(&mut r);
                         return r;
                     }
+                }
+            }
+        }
+        r
+    }
+
+    /// A policy's fatal failure, as `mac_proc_check_launch_constraints`
+    /// makes it: the namespace, code and flags, and the description as the
+    /// `EXIT_REASON_USER_DESC` item of a buffer sized for it (none when the
+    /// buffer cannot be had; an empty one when the item cannot).
+    pub fn with_desc(namespace: u32, code: u64, flags: u64, desc: &[u8]) -> OsReason {
+        let mut r = OsReason { namespace, code, flags, kcd: None };
+        if r.alloc_buffer(estimate(1, desc.len() as u32)).is_ok() {
+            if let Some(k) = r.kcd.as_mut() {
+                if let Some(at) = k.item(USER_DESC, desc.len() as u32) {
+                    k.buf[at..at + desc.len()].copy_from_slice(desc);
                 }
             }
         }

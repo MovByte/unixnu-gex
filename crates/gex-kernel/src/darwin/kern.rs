@@ -149,7 +149,7 @@ pub enum Fs {
 /// `MNT_MULTILABEL`.
 const MNT_RDONLY: u32 = 0x1;
 const MNT_LOCAL: u32 = 0x1000;
-const MNT_ROOTFS: u32 = 0x4000;
+pub(crate) const MNT_ROOTFS: u32 = 0x4000;
 const MNT_DONTBROWSE: u32 = 0x10_0000;
 const MNT_MULTILABEL: u32 = 0x400_0000;
 
