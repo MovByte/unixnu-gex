@@ -147,7 +147,16 @@ subsystem, most naming in their header the XNU source they port:
   - Its classes and its user clients' are the device's. The device client
     (type 1) is `AGXDeviceUserClient`, with IOGPUFamily's methods; the
     memory information client is type 33. The WebMetal connection (type 0)
-    presents as a device client and carries WebMetal's wire protocol.
+    presents as a device client and carries WebMetal's wire protocol to
+    the host executor (`accel/wire.rs`, `accel/host.rs`): a control
+    request is read from the caller's memory and answered when the
+    executor is done, through `fetch_reply` when its reply does not fit;
+    a command buffer's stream is read in place at its commit; and events
+    ring the doorbell `register_event_port` set, as IOKit's async
+    completion. gexc runs the executor (`crates/gexc/src/host_webmetal/`,
+    its `webmetal` build): one host thread owning one WebGPU device for
+    the whole system, reaching each connection's task's memory, and the
+    kernel's IOSurfaces through the executor's surface table.
   - Its properties are its personality's and matching's, but
     `MetalPluginName` and `MetalPluginClassName` name the WebMetal
     bundle.
@@ -239,6 +248,25 @@ cargo build --release -p gexc
 That builds `target/release/gexc`, for AArch64 guests, which is what Darwin
 programs are. The page, Wine and the other upstream builds are documented
 upstream (see [gex, upstream](#gex-upstream)).
+
+The Darwin personality's GPU is WebMetal's host executor, which gexc runs
+when built with its `webmetal` feature. WebMetal and the AIR to WGSL
+compiler it uses, AirWgsl, are submodules at pinned commits of their public
+repositories (`third_party/WebMetal`, `third_party/AirWgsl`), and the
+executor runs on a native WebGPU implementation, chosen at build time as
+WebMetal's own builds choose it: `WEBGPU_NATIVE` is `dawn` or
+`wgpu-native`, and `WEBGPU_NATIVE_DIR` its install root (with
+`include/webgpu/webgpu.h` and `lib/`).
+
+```sh
+git submodule update --init third_party/WebMetal third_party/AirWgsl
+WEBGPU_NATIVE=dawn WEBGPU_NATIVE_DIR=<dawn> cargo build --release -p gexc --features webmetal
+target/release/gexc webmetal-info
+```
+
+`gexc webmetal-info` names the implementation a build runs on. Without the
+feature, Metal's requests to the accelerator are reported as having no
+executor to run them.
 
 ### The Darwin test programs
 
@@ -414,6 +442,8 @@ The Darwin work, beside upstream's tree:
 | `crates/gex-ld/src/macho.rs`, `dsc.rs` | Mach-O loading; the dyld shared cache |
 | `crates/gex-abi/src/crypto.rs` | the A64 cryptographic extension |
 | `crates/gexc/src/darwin_run.rs`, `dsc_info.rs` | `gexc run` for Mach-O; `gexc dsc-info` |
+| `crates/gexc/src/host_webmetal/` | WebMetal's executor on its host thread, its embedder over the kernel, and the executor's IOSurface table |
+| `third_party/WebMetal`, `third_party/AirWgsl` | WebMetal (guest plugin, wire protocol, host executor) and AirWgsl, submodules at pinned commits |
 | `hosts/native/src/darwin_image.rs` | a Darwin program's image, as exec loads it |
 | `tests/darwin/src/` | the test programs, and the entitlements some are signed with |
 | `tests/darwin/build.sh`, `run.sh` | building and running them |
@@ -493,7 +523,12 @@ is the reference (search `crates/gex-kernel/src/` for
   - properties those drivers set in their start or probe;
   - IOGPU selectors and traps that make IOGPU objects, and AGXG9G's own
     selectors;
-  - WebMetal requests, which have no host executor yet;
+  - in a gexc built without its `webmetal` feature, WebMetal requests,
+    which have no executor to run them; with it, what the executor
+    reports it does not implement or cannot honor (its statuses 2 and 3),
+    a call on a connection from a task that did not open it, the
+    executor's IOSurface shared events (which the kernel does not have),
+    and an IOSurface with an `IOSurfaceOffset` given to the GPU;
   - matching dictionaries of kinds not handled.
 - **Mach.** The traps `clock_sleep` and `debug_control_port_for_pid`; MIG
   routines not in `mig.rs`, and some `task_info`, `thread_info`,
