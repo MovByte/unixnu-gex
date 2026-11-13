@@ -1249,6 +1249,11 @@ impl crate::syscalls::Kernel {
         if command != cmd::GET_JETSAM_SNAPSHOT && size > BUFFERSIZE_MAX {
             return Err(Errno::EINVAL);
         }
+        // mac_proc_check_memorystatus_control, before the command.
+        let e = self.darwin_mac_check_memorystatus_control(command);
+        if e != 0 {
+            return Err(super::errno::errno_of(e as i32));
+        }
         let ledger_limit = |_pid: i32| MAX_TASK_FOOTPRINT_MB;
         let r = match command {
             cmd::GET_PRIORITY_LIST => {

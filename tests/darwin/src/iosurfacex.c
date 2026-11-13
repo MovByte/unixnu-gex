@@ -6,9 +6,20 @@
 // under its own lock and once outside any lock, and this task sees both
 // writes when it next locks the surface, the seed the child's lock raised,
 // and the child's value.
+//
+// It runs as PreBoard, as an app launchd starts for FrontBoard (user
+// mobile): unsandboxed by its no-sandbox entitlement, which also lets it
+// exec a file under /private/var (the platform profile refuses that to a
+// program holding neither no-sandbox nor no-container), and admitted
+// IOSurfaceRootUserClient by its iokit-user-client-class entitlement.
+//
+// With "container", it runs as an app does, in the container profile's
+// sandbox: it makes the surface and its send right, and the profile
+// refuses it the spawn of the child (process-fork): EPERM.
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOSurface/IOSurfaceRef.h>
+#include <errno.h>
 #include <limits.h>
 #include <mach-o/dyld.h>
 #include <mach/mach.h>
@@ -18,6 +29,9 @@
 #include <string.h>
 #include <sys/wait.h>
 
+#define SANDBOX_NAMED_BUILTIN 2
+
+int sandbox_init(const char *profile, uint64_t flags, char **errorbuf);
 extern int posix_spawnattr_set_registered_ports_np(posix_spawnattr_t *, mach_port_t[], uint32_t);
 extern char **environ;
 
@@ -81,6 +95,9 @@ static int child(IOSurfaceID id) {
 
 int main(int argc, char **argv) {
     if (argc > 2) return child((IOSurfaceID)strtoul(argv[2], NULL, 0));
+    int contained = argc > 1 && strcmp(argv[1], "container") == 0;
+    char *err = NULL;
+    if (contained && sandbox_init("container", SANDBOX_NAMED_BUILTIN, &err) != 0) return bad("parent", "the container sandbox", 0, 1);
     CFMutableDictionaryRef d = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     long w = 64, bpe = 4, fmt = 'BGRA';
     CFNumberRef nw = CFNumberCreate(NULL, kCFNumberLongType, &w), nb = CFNumberCreate(NULL, kCFNumberLongType, &bpe), nf = CFNumberCreate(NULL, kCFNumberLongType, &fmt);
@@ -114,9 +131,19 @@ int main(int argc, char **argv) {
     mach_port_t reg[2] = {port, back};
     posix_spawnattr_set_registered_ports_np(&at, reg, 2);
     pid_t pid;
-    int e;
-    if ((e = posix_spawn(&pid, self, NULL, &at, args, environ))) return bad("parent", "spawning", e, 0);
+    int e = posix_spawn(&pid, self, NULL, &at, args, environ);
     posix_spawnattr_destroy(&at);
+    if (contained) {
+        // The container's process-fork refused.
+        if (e != EPERM) return bad("parent", "spawning in the container", e, EPERM);
+        IOSurfaceDecrementUseCount(s);
+        mach_port_deallocate(mach_task_self(), port);
+        if (IOSurfaceIsInUse(s)) return bad("parent", "in use after the right", 1, 0);
+        CFRelease(s);
+        printf("iosurfacex ok\n");
+        return 0;
+    }
+    if (e) return bad("parent", "spawning", e, 0);
     rcv_t m;
     kern_return_t kr = mach_msg(&m.h, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof m, back, 120000, MACH_PORT_NULL);
     int fail = 0;

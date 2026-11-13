@@ -365,7 +365,12 @@ impl Kernel {
     /// rights destroyed. The reply, if any, for sending.
     pub(crate) fn kobject_server(&mut self, port: ObjId, req: Box<Kmsg>) -> Option<Box<Kmsg>> {
         let obj = self.ipc().port(port).kobject.clone().expect("a kernel port");
-        let reply = super::mig::serve(self, &obj, &req);
+        // The MAC filter of the sender's kernel MIG mask: a refusal is the
+        // reply's error, the routine not run.
+        let reply = match self.darwin_kobj_filter(req.id as u32) {
+            Some(kr) => Reply::err(kr),
+            None => super::mig::serve(self, &obj, &req),
+        };
         let ipc = &mut self.ipc();
         match bits::remote(req.bits) {
             msgt::PORT_SEND => ipc.release_send(port),

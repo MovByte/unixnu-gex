@@ -29,7 +29,9 @@ int main(void) {
     if (check("crossarch_trap", syscall(38, 0), ENOTSUP_)) return 1;
     if (check("crossarch_trap's namespace", syscall(38, 1), EINVAL)) return 1;
     if (check("swapon", syscall(85, 0), ENOTSUP_)) return 1;
-    if (check("undelete", syscall(205, "/x"), ENOTSUP_)) return 1;
+    // undelete never reaches its stub: the platform profile's Unix call mask
+    // leaves it to be asked, and its syscall-unix denies it.
+    if (check("undelete", syscall(205, "/x"), EPERM)) return 1;
     if (check("searchfs", syscall(225, 0, 0, 0, 0, 0, 0), ENOTSUP_)) return 1;
     if (check("kas_info", syscall(439, 0, 0, 0), ENOTSUP_)) return 1;
     if (check("debug_syscall_reject", syscall(547, 0), ENOTSUP_)) return 1;

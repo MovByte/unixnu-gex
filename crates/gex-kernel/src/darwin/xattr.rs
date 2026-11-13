@@ -33,6 +33,23 @@ enum Target {
     File(std::sync::Arc<crate::file::OpenFile>),
 }
 
+/// The vnode an attribute call works on, as Sandbox reads it, if the
+/// filesystem keeps attributes for its type (`XATTR_VNODE_SUPPORTED`: EPERM
+/// otherwise, before the MAC check).
+fn xattr_vnode(f: Option<super::macvfs::Found>) -> Option<super::mac::SbVnode> {
+    use crate::vfs::FileType;
+    let f = f?;
+    matches!(f.md.file_type, FileType::Regular | FileType::Directory | FileType::Symlink | FileType::Socket | FileType::Fifo).then(|| super::macvfs::sb_vnode(&f.path, &f.md))
+}
+
+/// A MAC hook's errno as the call's error.
+fn mac(e: u32) -> Result<(), Errno> {
+    match e {
+        0 => Ok(()),
+        e => Err(errno_of(e as i32)),
+    }
+}
+
 impl Kernel {
     fn darwin_xattr_name(&self, m: &GuestMem<'_>, at: u64) -> Result<String, Errno> {
         let raw = m.read_cstr(at, XATTR_MAXNAMELEN + 2)?;
@@ -54,9 +71,10 @@ impl Kernel {
         Ok(())
     }
 
-    /// The path or descriptor a call names: `file_vnode`'s EINVAL for what
-    /// is not a vnode.
-    fn darwin_xattr_target(&mut self, m: &GuestMem<'_>, by_fd: bool, arg: u64, options: u64) -> Result<Target, Errno> {
+    /// The path or descriptor a call names (`file_vnode`'s EINVAL for what
+    /// is not a vnode), and its vnode as Sandbox reads it
+    /// ([`xattr_vnode`]).
+    fn darwin_xattr_target(&mut self, m: &GuestMem<'_>, by_fd: bool, arg: u64, options: u64) -> Result<(Target, Option<super::mac::SbVnode>), Errno> {
         if by_fd {
             if options & XATTR_NOFOLLOW != 0 {
                 return Err(Errno::EINVAL);
@@ -65,11 +83,14 @@ impl Kernel {
             if self.darwin_vnode_of(&file).is_none() {
                 return Err(Errno::EINVAL);
             }
-            return Ok(Target::File(file));
+            let v = xattr_vnode(self.darwin_sb_fd_vnode(arg as i32));
+            return Ok((Target::File(file), v));
         }
+        let follow = options & XATTR_NOFOLLOW == 0;
+        let found = self.darwin_sb_namei(m, super::bsd::AT_FDCWD as u64, arg, follow, false)?.found();
         let path = self.path_io().at_path(m, super::bsd::dirfd(super::bsd::AT_FDCWD as u64) as i32, arg)?;
         self.vfs.metadata(&path)?;
-        Ok(Target::Path(path, options & XATTR_NOFOLLOW == 0))
+        Ok((Target::Path(path, follow), xattr_vnode(found)))
     }
 
     fn darwin_xattr_op(&self, target: &Target, op: XattrOp<'_>) -> Result<usize, Errno> {
@@ -95,7 +116,7 @@ impl Kernel {
         if options & (XATTR_NOSECURITY | XATTR_NODEFAULT) != 0 {
             return Err(Errno::EINVAL);
         }
-        let target = self.darwin_xattr_target(m, by_fd, a[0], options)?;
+        let (target, vnode) = self.darwin_xattr_target(m, by_fd, a[0], options)?;
         let name = self.darwin_xattr_name(m, a[1])?;
         self.darwin_xattr_protected(&name, false)?;
         if position != 0 {
@@ -103,6 +124,10 @@ impl Kernel {
                 self.darwin_unimplemented("a resource fork's offset".into());
             }
             return Err(Errno::EINVAL);
+        }
+        // vn_getxattr's MAC check.
+        if let Some(v) = vnode {
+            mac(self.darwin_mac_check_vnode_getextattr(v, name.as_bytes()))?;
         }
         let full = format!("{PREFIX}{name}");
         let no_buffer = size == 0xffff_ffff || size == u64::MAX || value == 0;
@@ -136,7 +161,7 @@ impl Kernel {
         if size > i32::MAX as u64 {
             return Err(Errno::E2BIG);
         }
-        let target = self.darwin_xattr_target(m, by_fd, a[0], options)?;
+        let (target, vnode) = self.darwin_xattr_target(m, by_fd, a[0], options)?;
         if position != 0 {
             if name == "com.apple.ResourceFork" {
                 self.darwin_unimplemented("a resource fork's offset".into());
@@ -145,6 +170,10 @@ impl Kernel {
         }
         if options & XATTR_CREATE != 0 && options & XATTR_REPLACE != 0 {
             return Err(Errno::EINVAL);
+        }
+        // vn_setxattr's MAC check.
+        if let Some(v) = vnode {
+            mac(self.darwin_mac_check_vnode_setextattr(v, name.as_bytes()))?;
         }
         let flags = u32::from(options & XATTR_CREATE != 0) | u32::from(options & XATTR_REPLACE != 0) << 1;
         let bytes = m.read(value, size as usize)?.to_vec();
@@ -160,7 +189,11 @@ impl Kernel {
         }
         let name = self.darwin_xattr_name(m, a[1])?;
         self.darwin_xattr_protected(&name, true)?;
-        let target = self.darwin_xattr_target(m, by_fd, a[0], options)?;
+        let (target, vnode) = self.darwin_xattr_target(m, by_fd, a[0], options)?;
+        // vn_removexattr's MAC check (deleteextattr, as setextattr's).
+        if let Some(v) = vnode {
+            mac(self.darwin_mac_check_vnode_setextattr(v, name.as_bytes()))?;
+        }
         let full = format!("{PREFIX}{name}");
         self.darwin_xattr_op(&target, XattrOp::Remove { name: &full }).map(|_| 0).map_err(xattr_errno)
     }
@@ -172,7 +205,11 @@ impl Kernel {
         if options & (XATTR_NOSECURITY | XATTR_NODEFAULT) != 0 {
             return Err(Errno::EINVAL);
         }
-        let target = self.darwin_xattr_target(m, by_fd, a[0], options)?;
+        let (target, vnode) = self.darwin_xattr_target(m, by_fd, a[0], options)?;
+        // vn_listxattr's MAC check.
+        if let Some(v) = vnode {
+            mac(self.darwin_mac_check_vnode_listextattr(v))?;
+        }
         let size = self.darwin_xattr_op(&target, XattrOp::List { buf: &mut [] }).map_err(xattr_errno)?;
         let mut raw = vec![0u8; size];
         let n = self.darwin_xattr_op(&target, XattrOp::List { buf: &mut raw }).map_err(xattr_errno)?;

@@ -23,6 +23,7 @@ const KERN_FAILURE: i32 = 5;
 const KERN_TERMINATED: i32 = 37;
 const KERN_RESOURCE_SHORTAGE: i32 = 6;
 const KERN_NO_ACCESS: i32 = 8;
+const KERN_DENIED: i32 = 53;
 const KERN_INVALID_RIGHT: i32 = 17;
 const KERN_INVALID_VALUE: i32 = 18;
 const KERN_INVALID_TASK: i32 = 16;
@@ -311,6 +312,10 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             const IO_STRUCT_INBAND_MAX: usize = 4096;
             let Some((name, next)) = inline_cstr(req, 0, 128) else { return bad() };
             let Some(cnt) = i32_at(&req.body, next) else { return bad() };
+            // mac_iokit_check_get_property, before the lookup.
+            if k.darwin_mac_check_iokit_get_property(super::iokit::sb_entry(*i), super::iokit::is_nvram(*i), name) != 0 {
+                return Reply::err(super::iokit::ret::NOT_PERMITTED);
+            }
             const K_IO_RETURN_BAD_ARGUMENT: i32 = 0xe00002c2_u32 as i32;
             let Some(node) = super::iokit::tree().get(*i as usize) else { return bad() };
             let name = String::from_utf8_lossy(name);
@@ -348,6 +353,10 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             let Some((name, next)) = inline_cstr_at(req, next, 128) else { return bad() };
             let (Some(options), Some(buf), Some(bufsize)) = (i32_at(&req.body, next), req.body.get(next + 4..next + 12), req.body.get(next + 12..next + 20)) else { return bad() };
             let (buf, bufsize) = (u64::from_le_bytes(buf.try_into().unwrap()), u64::from_le_bytes(bufsize.try_into().unwrap()));
+            // mac_iokit_check_get_property of the entry asked, first.
+            if k.darwin_mac_check_iokit_get_property(super::iokit::sb_entry(*i), super::iokit::is_nvram(*i), name) != 0 {
+                return Reply::err(super::iokit::ret::NOT_PERMITTED);
+            }
             let Some(node) = super::iokit::tree().get(*i as usize) else { return bad() };
             let name = String::from_utf8_lossy(name).into_owned();
             if options as u32 & K_IO_REGISTRY_ITERATE_RECURSIVELY != 0 && !plane.is_empty() || name == "IORegistryEntryPropertyKeys" {
@@ -883,6 +892,8 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         },
         // task_get_special_port(task, which) -> port
         (Kobject::Task | Kobject::TaskRead | Kobject::TaskInspect, 3409) => match arg(req, 0) {
+            // The MAC policies' check of the task's process, first.
+            Some(which) if k.darwin_mac_check_task_special_port(k.pid, which, false) != 0 => Reply::err(KERN_DENIED),
             Some(which) => {
                 let f = match obj {
                     Kobject::TaskRead => flavor::READ,
@@ -905,6 +916,9 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         }
         // task_set_special_port(task, which, port)
         (Kobject::Task, 3410) => match (desc_port(req, 0), arg_after(req, 1, 0)) {
+            // The MAC policies' check of the task's process, first (a
+            // failed request's right goes with its descriptors).
+            (Some(_), Some(which)) if k.darwin_mac_check_task_special_port(k.pid, which, true) != 0 => Reply::err(KERN_DENIED),
             (Some((right, _)), Some(which)) => task_set_special_port(k, which, right),
             _ => bad(),
         },
@@ -1768,12 +1782,15 @@ fn host_get_special_port(k: &mut Kernel, obj: &Kobject, port: super::ipc::ObjId,
     Reply::port(Carried::Port(p))
 }
 
-/// `host_set_special_port_from_user`, then `host_set_special_port`: a user
-/// port, not an immovable right, and only launchd may. Its Sandbox check is
-/// no check for launchd, which has no profile.
+/// `host_set_special_port_from_user`, then `host_set_special_port`
+/// (host.c): a user port, set by no driver task, not an immovable right;
+/// only launchd may set one, but for the telemetry port, which a task
+/// entitled to monitor launchd's events may (iOS has no CSR); then the MAC
+/// policies' `mac_task_check_set_host_special_port`.
 fn host_set_special_port(k: &mut Kernel, obj: &Kobject, _port: super::ipc::ObjId, id: i32, right: Option<Carried>) -> Reply {
     const HOST_MAX_SPECIAL_KERNEL_PORT: i32 = 7;
     const HOST_MAX_SPECIAL_PORT: i32 = 7 + 27;
+    const HOST_TELEMETRY_PORT: i32 = 7 + 13;
     const KERN_NO_ACCESS: i32 = 8;
     const KERN_INVALID_RIGHT: i32 = 17;
     let port = match right {
@@ -1783,13 +1800,20 @@ fn host_set_special_port(k: &mut Kernel, obj: &Kobject, _port: super::ipc::ObjId
     if !matches!(obj, Kobject::HostPriv) || id <= HOST_MAX_SPECIAL_KERNEL_PORT || id > HOST_MAX_SPECIAL_PORT {
         return Reply::err(KERN_INVALID_ARGUMENT);
     }
+    // task_is_driver.
+    if k.darwin_policy().requested.apptype == super::taskpolicy::apptype::DRIVER {
+        return Reply::err(KERN_NO_ACCESS);
+    }
     if let Some(p) = port {
         let port = k.ipc().port(p);
         if port.immovable_receive || port.immovable_send {
             return Reply::err(KERN_INVALID_RIGHT);
         }
     }
-    if k.pid != crate::proc::INIT_PID {
+    if k.pid != crate::proc::INIT_PID && !(id == HOST_TELEMETRY_PORT && k.darwin_task_entitled("com.apple.private.xpc.launchd.event-monitor")) {
+        return Reply::err(KERN_NO_ACCESS);
+    }
+    if k.darwin_mac_check_set_host_special_port(id) != 0 {
         return Reply::err(KERN_NO_ACCESS);
     }
     let ipc = k.ipc();
@@ -1945,6 +1969,10 @@ fn io_service_open(k: &mut Kernel, req: &Kmsg, service: u32) -> Reply {
     if !is_own_task(k, task) {
         return Reply::err(ret::BAD_ARGUMENT);
     }
+    // mac_iokit_check_open_service, before the properties are looked at.
+    if k.darwin_mac_check_iokit_open_service(super::iokit::sb_entry(service), ty as u32) != 0 {
+        return Reply::err(ret::NOT_PERMITTED);
+    }
     if !data.is_empty() {
         return Reply::err(ret::UNSUPPORTED);
     }
@@ -2049,6 +2077,9 @@ fn connect_routine(k: &mut Kernel, req: &Kmsg, id: u32, n: i32) -> Reply {
         2812 => match inline_cstr(req, 0, 128) {
             Some((name, next)) => {
                 let Some(cnt) = i32_at(&req.body, next) else { return bad() };
+                if k.darwin_mac_check_iokit_get_property(super::iokit::sb_client(&c), false, name) != 0 {
+                    return Reply::err(ret::NOT_PERMITTED);
+                }
                 match super::iokit::client_property(&c, &String::from_utf8_lossy(name)).map(|p| p.map(|p| super::iokit::prop_bytes(&p))) {
                     Err(what) => {
                         let mut r = Reply::err(ret::NO_RESOURCES);
@@ -2258,6 +2289,9 @@ fn client_property_bin_buf(k: &mut Kernel, req: &Kmsg, c: &super::iokit::UserCli
     let Some((name, next)) = inline_cstr_at(req, next, 128) else { return Reply::err(MIG_BAD_ARGUMENTS) };
     let (Some(_options), Some(buf), Some(bufsize)) = (i32_at(&req.body, next), req.body.get(next + 4..next + 12), req.body.get(next + 12..next + 20)) else { return Reply::err(MIG_BAD_ARGUMENTS) };
     let (buf, bufsize) = (u64::from_le_bytes(buf.try_into().unwrap()), u64::from_le_bytes(bufsize.try_into().unwrap()));
+    if k.darwin_mac_check_iokit_get_property(super::iokit::sb_client(c), false, name) != 0 {
+        return Reply::err(super::iokit::ret::NOT_PERMITTED);
+    }
     let p = match super::iokit::client_property(c, &String::from_utf8_lossy(name)) {
         Ok(Some(p)) => p,
         Ok(None) => return Reply::err(super::iokit::ret::NOT_FOUND),

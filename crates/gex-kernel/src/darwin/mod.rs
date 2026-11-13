@@ -57,6 +57,7 @@ pub mod kern;
 pub mod kevent;
 pub mod kfilt;
 pub mod mac;
+pub mod macvfs;
 pub mod kobject;
 pub mod lockf;
 pub mod mach;
@@ -264,6 +265,13 @@ pub struct Task {
     pub sandbox: sandboxes::Label,
     /// `TFRO_FILTER_MSG`: the task's Mach messages are filtered.
     pub filter_msg: bool,
+    /// The process's Unix call filter mask (`proc_ro`'s
+    /// `syscall_filter_mask`) and its task's Mach trap and kernel MIG
+    /// routine masks (`task_filters`), as Sandbox set them: none lets every
+    /// call through unasked.
+    pub syscall_mask: Option<sandbox::FilterMask>,
+    pub mach_trap_mask: Option<sandbox::FilterMask>,
+    pub kobj_mask: Option<sandbox::FilterMask>,
     /// What the exec in progress keeps for Sandbox's hook.
     pub exec_sandbox: Option<sandboxes::Pending>,
     /// What the spawn in progress gave AMFI's launch constraints hook.
@@ -275,6 +283,9 @@ pub struct Task {
     /// this kernel sets it otherwise (no kext imports
     /// `proc_set_responsible_pid`), so it is `kernproc`'s, 0.
     pub responsible_pid: i32,
+    /// A spawned child's activation, done in its parent's call
+    /// (`Kernel::darwin_activate`): its answer, for the child's start.
+    pub activated: Option<Result<(), crate::errno::Errno>>,
 
     /// `P_LADVLOCK`: the process has taken a POSIX record lock.
     pub ladvlock: bool,
@@ -617,11 +628,7 @@ pub enum Bsd {
 /// arguments follow it; the number is truncated to 16 bits, and one past
 /// the table is `SYS_invalid`, a `nosys` entry.
 pub fn bsd_call(m: &GuestMem<'_>, ctx_addr: u64, raw: u64) -> Bsd {
-    let (code, first) = if raw != 0 {
-        (raw as u16 as u64, 0)
-    } else {
-        (m.read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(0) as u16 as u64, 1)
-    };
+    let (code, first) = bsd_code(m, ctx_addr, raw);
     if code == 0 || code >= sysno::NSYSENT {
         Bsd::Nosys
     } else if sysno::ENOSYS.contains(&code) {
@@ -631,6 +638,26 @@ pub fn bsd_call(m: &GuestMem<'_>, ctx_addr: u64, raw: u64) -> Bsd {
     } else {
         Bsd::Call { nr: code, first }
     }
+}
+
+/// The call's number, as `arm_get_syscall_number` reads it, and the
+/// register its arguments start at.
+fn bsd_code(m: &GuestMem<'_>, ctx_addr: u64, raw: u64) -> (u64, u8) {
+    if raw != 0 {
+        (raw as u16 as u64, 0)
+    } else {
+        (m.read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(0) as u16 as u64, 1)
+    }
+}
+
+/// `SYS_invalid`: the entry a number past the table is taken as.
+const SYS_INVALID: u64 = 63;
+
+/// `unix_syscall`'s `syscode`, which its MAC filter asks about: the call's
+/// number, or `SYS_invalid` past the table.
+pub fn bsd_syscode(m: &GuestMem<'_>, ctx_addr: u64, raw: u64) -> u64 {
+    let (code, _) = bsd_code(m, ctx_addr, raw);
+    if code < sysno::NSYSENT { code } else { SYS_INVALID }
 }
 
 pub fn mach_trap_number(raw: u64) -> Option<i32> {

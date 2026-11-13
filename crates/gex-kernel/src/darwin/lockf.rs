@@ -916,9 +916,13 @@ impl Kernel {
             t => t,
         }) else {
             // VNOP_ADVLOCK of a vnode without lockf lists: err_advlock,
-            // once the arguments are read and checked.
+            // once the arguments are read and checked (and a lock to set
+            // let through by the MAC policies).
             let fl = Flock::read(m, argp)?;
             check_file_seek_range(&fl, file.offset() as i64)?;
+            if matches!(c, cmd::F_SETLK | cmd::F_SETLKW | cmd::F_SETLKWTIMEOUT | cmd::F_OFD_SETLK | cmd::F_OFD_SETLKW | cmd::F_OFD_SETLKWTIMEOUT) {
+                self.darwin_sb_setlk(&file)?;
+            }
             return Err(Errno::EOPNOTSUPP);
         };
         let offset = file.offset() as i64;
@@ -967,6 +971,8 @@ impl Kernel {
                 if fl.whence == SEEK_CUR {
                     fl.start += offset;
                 }
+                // mac_file_check_lock, before the lock's type is looked at.
+                self.darwin_sb_setlk(&file)?;
                 let ofd = matches!(c, cmd::F_OFD_SETLK | cmd::F_OFD_SETLKW | cmd::F_OFD_SETLKWTIMEOUT);
                 let (id, base, owner, mark) = if ofd { (Id::Ofd(fg), lf::F_OFD_LOCK, None, FG_HAS_OFDLOCK) } else { (Id::Proc(self.pid), lf::F_POSIX, Some(self.pid), 0) };
                 let op = match fl.ty {
@@ -1007,10 +1013,9 @@ impl Kernel {
 
     fn darwin_flock_inner(&mut self, fd: i32, how: u64) -> Result<Option<(Cont, Option<std::time::Instant>)>, Errno> {
         let file = self.fds.get(fd)?;
-        let v = match self.darwin_lock_target(&file) {
-            Target::Lockf(v) => v,
-            Target::NoAdvlock => return Err(Errno::EOPNOTSUPP),
+        let target = match self.darwin_lock_target(&file) {
             Target::NotVnode => return Err(Errno::EOPNOTSUPP),
+            t => t,
         };
         let ty = if how & LOCK_UN != 0 {
             F_UNLCK
@@ -1021,6 +1026,12 @@ impl Kernel {
         } else {
             return Err(Errno::EBADF);
         };
+        // A lock to set: mac_file_check_lock, then VNOP_ADVLOCK (a vnode
+        // without lockf lists refuses it, as it does an unlock).
+        if ty != F_UNLCK {
+            self.darwin_sb_setlk(&file)?;
+        }
+        let Target::Lockf(v) = target else { return Err(Errno::EOPNOTSUPP) };
         let wait = if how & LOCK_NB == 0 { lf::F_WAIT } else { 0 };
         self.darwin_flock_set(&file, v, ty, wait, None)
     }
@@ -1057,12 +1068,13 @@ impl Kernel {
         const O_NONBLOCK: u64 = 0x4;
         let r = (|| {
             let file = self.fds.get(fd)?;
-            let v = match self.darwin_lock_target(&file) {
-                Target::Lockf(v) => v,
-                Target::NoAdvlock => return Err(Errno::EOPNOTSUPP),
+            let target = match self.darwin_lock_target(&file) {
                 Target::NotVnode => return Ok(None),
+                t => t,
             };
             let ty = if dflags & O_EXLOCK != 0 { F_WRLCK } else if dflags & O_SHLOCK != 0 { F_RDLCK } else { return Ok(None) };
+            self.darwin_sb_setlk(&file)?;
+            let Target::Lockf(v) = target else { return Err(Errno::EOPNOTSUPP) };
             let wait = if dflags & O_NONBLOCK == 0 { lf::F_WAIT } else { 0 };
             self.darwin_flock_set(&file, v, ty, wait, Some(fd))
         })();
@@ -1089,12 +1101,13 @@ impl Kernel {
         const O_EXLOCK: u64 = 0x20;
         const O_NONBLOCK: u64 = 0x4;
         let file = self.fds.get(fd)?;
-        let v = match self.darwin_lock_target(&file) {
-            Target::Lockf(v) => v,
-            Target::NoAdvlock => return Err(Errno::EOPNOTSUPP),
+        let target = match self.darwin_lock_target(&file) {
             Target::NotVnode => return Ok(()),
+            t => t,
         };
         let ty = if dflags & O_EXLOCK != 0 { F_WRLCK } else if dflags & O_SHLOCK != 0 { F_RDLCK } else { return Ok(()) };
+        self.darwin_sb_setlk(&file)?;
+        let Target::Lockf(v) = target else { return Err(Errno::EOPNOTSUPP) };
         let wait = if dflags & O_NONBLOCK == 0 { lf::F_WAIT } else { 0 };
         match self.darwin_flock_set(&file, v, ty, wait, Some(fd))? {
             None => Ok(()),

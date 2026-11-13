@@ -29,10 +29,11 @@ impl Kernel {
         if flags & !(CLONE_NOFOLLOW | CLONE_NOOWNERCOPY | CLONE_ACL) != 0 {
             return Err(Errno::EINVAL);
         }
+        let found = self.darwin_sb_namei(m, a[0], a[1], flags & CLONE_NOFOLLOW == 0, false)?.found();
         let abs = self.path_io().at_path(m, dirfd(a[0]) as i32, a[1])?;
         let md = if flags & CLONE_NOFOLLOW != 0 { self.vfs.metadata_nofollow(&abs) } else { self.vfs.metadata(&abs) }?;
         let abs = if flags & CLONE_NOFOLLOW != 0 { abs } else { self.vfs.canonical(&abs) };
-        self.darwin_clone_internal(m, &abs, None, md, a[2], a[3], flags)
+        self.darwin_clone_internal(m, &abs, None, md, found, a[2], a[3], flags)
     }
 
     /// `fclonefileat(src_fd, dst_dirfd, dst, flags)`.
@@ -50,11 +51,12 @@ impl Kernel {
         }
         let md = file.metadata()?;
         let path = self.vfs.canonical(&file.path);
-        self.darwin_clone_internal(m, &path, Some(Arc::clone(&file.handle)), md, a[1], a[2], flags)
+        let found = self.darwin_sb_fd_vnode(a[0] as i32);
+        self.darwin_clone_internal(m, &path, Some(Arc::clone(&file.handle)), md, found, a[1], a[2], flags)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn darwin_clone_internal(&mut self, m: &GuestMem<'_>, src: &str, handle: Option<Arc<dyn FileHandle>>, md: Metadata, dst_dirfd: u64, dst: u64, flags: u64) -> Result<u64, Errno> {
+    fn darwin_clone_internal(&mut self, m: &GuestMem<'_>, src: &str, handle: Option<Arc<dyn FileHandle>>, md: Metadata, found: Option<super::macvfs::Found>, dst_dirfd: u64, dst: u64, flags: u64) -> Result<u64, Errno> {
         match md.file_type {
             FileType::Regular | FileType::Symlink => {}
             FileType::Directory if src == "/" || super::kern::MOUNTS.iter().any(|mnt| mnt.on == src) => return Err(Errno::EINVAL),
@@ -65,6 +67,7 @@ impl Kernel {
             self.darwin_unimplemented("clonefile CLONE_ACL (the filesystems here keep no access control lists)".into());
             return Err(Errno::EINVAL);
         }
+        let named = self.darwin_sb_namei(m, dst_dirfd, dst, false, false)?;
         let to = self.path_io().at_path(m, dirfd(dst_dirfd) as i32, dst)?;
         let parent = crate::vfs::parent_of(&to);
         let dir = self.vfs.metadata(&parent)?;
@@ -76,6 +79,13 @@ impl Kernel {
         }
         if super::kern::mount_of(src).fsid != super::kern::mount_of(&self.vfs.canonical(&parent)).fsid {
             return Err(Errno::EXDEV);
+        }
+        // clonefile_internal's MAC check of the file and the new name.
+        if let (Some(f), super::macvfs::Lookup::Missing { dir, name }) = (&found, &named) {
+            let e = self.darwin_mac_check_vnode_clone(f, dir, name);
+            if e != 0 {
+                return Err(super::errno::errno_of(e as i32));
+            }
         }
         let done = self.darwin_clone_tree(src, handle, &md, &to);
         if done.is_err() {
@@ -183,13 +193,14 @@ impl Kernel {
     /// what passes the checks is ENOTSUP.
     pub(crate) fn darwin_exchangedata(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
         let follow = a[2] & FSOPT_NOFOLLOW == 0;
-        let look = |k: &mut Kernel, m: &GuestMem<'_>, p: u64| -> Result<(String, Metadata), Errno> {
+        let look = |k: &mut Kernel, m: &GuestMem<'_>, p: u64| -> Result<(String, Metadata, Option<super::macvfs::Found>), Errno> {
+            let found = k.darwin_sb_namei(m, super::bsd::AT_FDCWD as u64, p, follow, false)?.found();
             let abs = k.path_io().at_path(m, dirfd(super::bsd::AT_FDCWD as u64) as i32, p)?;
             let md = if follow { k.vfs.metadata(&abs) } else { k.vfs.metadata_nofollow(&abs) }?;
-            Ok((k.vfs.canonical(&abs), md))
+            Ok((k.vfs.canonical(&abs), md, found))
         };
-        let (p1, md1) = look(self, m, a[0])?;
-        let (p2, md2) = look(self, m, a[1])?;
+        let (p1, md1, f1) = look(self, m, a[0])?;
+        let (p2, md2, f2) = look(self, m, a[1])?;
         if md1.ino == md2.ino && super::kern::mount_of(&p1).fsid == super::kern::mount_of(&p2).fsid {
             return Err(Errno::EINVAL);
         }
@@ -198,6 +209,12 @@ impl Kernel {
         }
         if md1.file_type != FileType::Regular || md2.file_type != FileType::Regular {
             return Err(Errno::EINVAL);
+        }
+        if let (Some(f1), Some(f2)) = (f1, f2) {
+            let e = self.darwin_mac_check_vnode_exchangedata(super::macvfs::sb_vnode(&f1.path, &f1.md), super::macvfs::sb_vnode(&f2.path, &f2.md));
+            if e != 0 {
+                return Err(super::errno::errno_of(e as i32));
+            }
         }
         Err(Errno::EOPNOTSUPP)
     }

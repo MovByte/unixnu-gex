@@ -21,7 +21,7 @@ for p in hello-static bsd-carry commpage exclusive-pair aes; do
         -Wl,-e,_start -o "$OUT/$p" "$HERE/src/$p.c"
 done
 
-for p in hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit xpc-anon sbxinit sbxexec sbxkill layout launchcon; do
+for p in hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit xpc-anon sbxinit sbxexec sbxkill hostspecial sbxmask sbxnet sbxpriv sbxfile layout launchcon; do
     cc -O2 -o "$OUT/$p" "$HERE/src/$p.c"
 done
 cc -O2 -framework CoreFoundation -o "$OUT/cfrunloop" "$HERE/src/cfrunloop.c"
@@ -50,6 +50,13 @@ cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/accel" "$HERE/src/acc
 cc -O2 -framework IOKit -framework IOSurface -framework CoreFoundation -o "$OUT/iosurface" "$HERE/src/iosurface.c"
 cc -O2 -framework IOSurface -framework CoreFoundation -o "$OUT/iosurfacex" "$HERE/src/iosurfacex.c"
 cc -O2 -framework IOKit -framework IOSurface -framework CoreFoundation -o "$OUT/iogpudev" "$HERE/src/iogpudev.c"
+# iosurfacesplash and iosurfacexpreboard: iosurface as splashboardd and
+# iosurfacex as PreBoard, outside the container.
+cc -O2 -framework IOKit -framework IOSurface -framework CoreFoundation -o "$OUT/iosurfacesplash" "$HERE/src/iosurface.c"
+cc -O2 -framework IOSurface -framework CoreFoundation -o "$OUT/iosurfacexpreboard" "$HERE/src/iosurfacex.c"
+cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/sbxiokit" "$HERE/src/sbxiokit.c"
+# sbxscrub: sbxfile's directory times, in a task that may run any cdhash.
+cc -O2 -o "$OUT/sbxscrub" "$HERE/src/sbxfile.c"
 # accelr: accel in a task entitled to be a restricted GPU client.
 cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/accelr" "$HERE/src/accel.c"
 # amfi's: a program in no trust cache, and one holding get-task-allow.
@@ -74,7 +81,7 @@ xcrun -sdk iphoneos clang -target arm64e-apple-ios17.0 -O2 -o "$OUT/hello-arm64e
 # exec copies of themselves and files they write there. The static programs
 # run from this directory and exec nothing. sbxexec's entitlements and
 # sbxkill's children's are what those tests are about, so they hold only
-# theirs.
+# theirs, and those signed as a system program hold only its.
 for f in "$OUT"/*; do
     [ -f "$f" ] || continue
     case "$(basename "$f")" in
@@ -86,6 +93,7 @@ done
 # task.
 codesign -s - -f --entitlements "$HERE/src/memlimit.entitlements" "$OUT/memlimit" 2>/dev/null
 codesign -s - -f --entitlements "$HERE/src/gta.entitlements" "$OUT/gta" 2>/dev/null
+codesign -s - -f --entitlements "$HERE/src/sbxscrub.entitlements" "$OUT/sbxscrub" 2>/dev/null
 # persona manages personas, which takes the persona manager's entitlement.
 codesign -s - -f --entitlements "$HERE/src/persona.entitlements" "$OUT/persona" 2>/dev/null
 # killperm spawns into a persona to have another user's process.
@@ -96,10 +104,20 @@ codesign -s - -f -i com.apple.test.xnu.jitbox --entitlements "$HERE/src/jit.enti
 # workinterval creates work intervals, which PRIV_WORK_INTERVAL grants by
 # its entitlement.
 codesign -s - -f --entitlements "$HERE/src/workinterval.entitlements" "$OUT/workinterval" 2>/dev/null
+# The IOSurface programs outside the container are signed as system
+# programs whose iokit-user-client-class entitlement names
+# IOSurfaceRootUserClient are, with their identifiers and entitlements:
+# /usr/libexec/splashboardd's, and for iosurfacex, which spawns a copy of
+# itself from /private/var, /Applications/PreBoard.app's, which hold
+# no-sandbox.
+codesign -s - -f -i com.apple.splashboardd --entitlements "$HERE/src/splashboardd.entitlements" "$OUT/iosurfacesplash" 2>/dev/null
+codesign -s - -f -i com.apple.PreBoard --entitlements "$HERE/src/preboard.entitlements" "$OUT/iosurfacexpreboard" 2>/dev/null
 # accelr's IOGPU device client is restricted by its entitlement.
 codesign -s - -f --entitlements "$HERE/src/gpurestricted.entitlements" "$OUT/accelr" 2>/dev/null
 # atmflag sets the ATM diagnostic flag, which its entitlement allows.
 codesign -s - -f --entitlements "$HERE/src/atmflag.entitlements" "$OUT/atmflag" 2>/dev/null
+# hostspecial sets the telemetry port, which launchd's event monitor may.
+codesign -s - -f --entitlements "$HERE/src/hostspecial.entitlements" "$OUT/hostspecial" 2>/dev/null
 # sbxexec's seatbelt-profiles entitlement names the builtin profile its exec
 # gives it; sbxkill's children name two, a number, and an unknown name.
 for p in sbxexec sbxstacked sbxnotstr sbxunknown; do

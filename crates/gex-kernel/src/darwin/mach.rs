@@ -235,6 +235,16 @@ mod derrno {
     pub const ENOTSUP: u64 = 45;
 }
 
+/// The traps of `mach_trap_table` (`osfmk/kern/syscall_sw.c`), by number:
+/// the rest are `kern_invalid`.
+const TRAPS: [usize; 61] = [
+    10, 11, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42,
+    43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 58, 59, 60, 61, 62, 70, 72, 76, 77, 88, 89, 90, 91, 92, 93, 94, 95, 96, 100,
+];
+
+/// The traps marked `mach_trap_returns_port`.
+const RETURNS_PORT: [usize; 6] = [26, 27, 28, 29, 50, 91];
+
 /// `MACH_ACTIVITY_ID_COUNT_MAX`.
 const ACTIVITY_ID_COUNT_MAX: u32 = 16;
 
@@ -248,6 +258,20 @@ const NOTIFY_MACH_PORTS_OFFSET: u64 = 0xc8;
 impl Kernel {
     /// Run Mach trap `t` (negative), writing its result.
     pub(crate) fn mach_trap(&mut self, m: &mut GuestMem<'_>, t: i32, a: &[u64; 6]) -> SyscallOutcome {
+        // mach_syscall's MAC filter, for a trap of the table (handle_svc
+        // answers the two time traps before it; a number with no trap is
+        // EXC_SYSCALL's): a refusal is the trap's result, MACH_PORT_NULL
+        // for a trap that returns a port.
+        if t != trap::MACH_ABSOLUTE_TIME && t != trap::MACH_CONTINUOUS_TIME {
+            let call = (-i64::from(t)) as usize;
+            if TRAPS.contains(&call) {
+                if let Some(kr) = self.darwin_mach_trap_filter(call) {
+                    let r = if RETURNS_PORT.contains(&call) { 0 } else { kr };
+                    let _ = super::set_mach_result(m, self.ctx_addr, r);
+                    return SyscallOutcome::Continue;
+                }
+            }
+        }
         let r = match t {
             trap::MACH_MSG2 => return <Mach as MachIpc>::mach_msg2(self, m, a),
             trap::MACH_MSG => return <Mach as MachIpc>::mach_msg_trap(self, m, a, false),

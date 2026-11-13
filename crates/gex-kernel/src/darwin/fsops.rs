@@ -252,6 +252,7 @@ impl Kernel {
         if cmd == FSIOC_FD_ONLY_OPEN_ONCE {
             return Err(Errno::EINVAL);
         }
+        self.darwin_sb_namei(m, super::bsd::AT_FDCWD as u64, path, options & FSOPT_NOFOLLOW == 0, false)?;
         let raw = m.read_cstr(path, MAXPATHLEN)?;
         let given = std::str::from_utf8(&raw).map_err(|_| Errno::EINVAL)?;
         let abs = self.path_io().at_path_str(dirfd(super::bsd::AT_FDCWD as u64) as i32, given)?;
@@ -454,34 +455,44 @@ impl Kernel {
             sys::FCHOWNAT => (a[2] as u32, a[3] as u32),
             _ => (a[1] as u32, a[2] as u32),
         };
-        match raw {
+        // vn_chown_internal: the owner's MAC check, once the file is found.
+        let found = match raw {
             sys::FCHOWN => {
                 let file = self.fds.get(a[0] as i32)?;
                 if self.darwin_vnode_of(&file).is_none() {
                     return Err(Errno::EINVAL);
                 }
+                self.darwin_sb_fd_vnode(a[0] as i32)
             }
             _ => {
-                let (fd, path, follow) = match raw {
-                    sys::CHOWN => (cwd, a[0], true),
-                    sys::LCHOWN => (cwd, a[0], false),
+                let (fd, path, follow, nofollow_any) = match raw {
+                    sys::CHOWN => (cwd, a[0], true, false),
+                    sys::LCHOWN => (cwd, a[0], false, false),
                     _ => {
                         let flag = a[4] as u32 as u64;
                         if flag & !(AT_SYMLINK_NOFOLLOW | AT_SYMLINK_NOFOLLOW_ANY) != 0 {
                             return Err(Errno::EINVAL);
                         }
-                        if flag & AT_SYMLINK_NOFOLLOW_ANY != 0 {
-                            self.darwin_no_link_on_the_way(m, a[0], a[1])?;
-                        }
-                        (a[0], a[1], flag & (AT_SYMLINK_NOFOLLOW | AT_SYMLINK_NOFOLLOW_ANY) == 0)
+                        (a[0], a[1], flag & (AT_SYMLINK_NOFOLLOW | AT_SYMLINK_NOFOLLOW_ANY) == 0, flag & AT_SYMLINK_NOFOLLOW_ANY != 0)
                     }
                 };
+                let found = self.darwin_sb_namei(m, fd, path, follow, nofollow_any)?.found();
+                if nofollow_any {
+                    self.darwin_no_link_on_the_way(m, a[0], a[1])?;
+                }
                 let abs = self.path_io().at_path(m, dirfd(fd) as i32, path)?;
                 if follow {
                     self.vfs.metadata(&abs)?;
                 } else {
                     self.vfs.metadata_nofollow(&abs)?;
                 }
+                found
+            }
+        };
+        if let Some(f) = found {
+            let e = self.darwin_mac_check_vnode_setowner(super::macvfs::sb_vnode(&f.path, &f.md));
+            if e != 0 {
+                return Err(super::errno::errno_of(e as i32));
             }
         }
         if uid == VNOVAL && gid == VNOVAL {

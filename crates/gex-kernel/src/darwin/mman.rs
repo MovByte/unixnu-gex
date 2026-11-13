@@ -236,6 +236,8 @@ impl Kernel {
                 maxprot |= prot::WRITE as u8;
                 attrs.kind = kind::FILE_PRIVATE;
             }
+            // mac_file_check_mmap of the vnode and the protection asked for.
+            self.darwin_sb_mmap(&f, u64::from(cur))?;
         }
         if size == 0 {
             return Ok(0);
