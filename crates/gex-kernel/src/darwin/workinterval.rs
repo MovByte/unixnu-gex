@@ -77,8 +77,6 @@ mod kr {
     pub const INVALID_CAPABILITY: u64 = 20;
 }
 
-/// The entitlement PRIV_WORK_INTERVAL is granted by (`sys/work_interval.h`).
-const ENTITLEMENT: &str = "com.apple.private.kernel.work-interval";
 
 /// `struct work_interval`.
 #[derive(Debug)]
@@ -266,11 +264,12 @@ impl Kernel {
                 }
                 let p = m.read(arg, CREATE_PARAMS_SIZE as usize)?;
                 let create_flags = u32::from_le_bytes(p[12..16].try_into().unwrap());
-                // priv_check_cred(PRIV_WORK_INTERVAL): root, or the
-                // entitlement.
-                let entitled = self.dtask.codesign.as_ref().is_some_and(|c| c.entitled(ENTITLEMENT));
-                if self.creds.uid() != 0 && !entitled {
-                    return Err(Errno::EPERM);
+                // priv_check_cred(PRIV_WORK_INTERVAL): the platform
+                // profile grants it with its entitlement and denies it
+                // without, root included.
+                const PRIV_WORK_INTERVAL: u32 = 1008;
+                if let Err(e) = self.darwin_priv_check_cred(PRIV_WORK_INTERVAL, 0) {
+                    return Err(super::errno::errno_of(e as i32));
                 }
                 let (id, port) = match self.darwin_work_interval_create(create_flags) {
                     Ok(v) => v,

@@ -101,7 +101,8 @@ pub fn set_tree(b: &[u8]) -> Result<(), String> {
     if let Some(gpu) = super::platform::add(&mut t) {
         super::accel::add_service(&mut t, gpu);
     }
-    super::iosurface::add_service(&mut t);
+    let resources = super::platform::add_resources(&mut t);
+    super::iosurface::add_service(&mut t, resources);
     add_root(&mut t);
     let _ = TREE.set(t);
     Ok(())
@@ -183,14 +184,15 @@ pub fn links(t: &[Node], i: u32, plane: Plane, parents: bool) -> Result<Vec<u32>
         // they are not registry entries here.
         (Plane::Service, false) if n.class == super::accel::CLASS => Err(format!("the user clients of {} as its children in the IOService plane", n.name)),
         (Plane::Service, false) if super::platform::is_driver(n.class) => Err(format!("the nubs and clients of {} (its children in the IOService plane)", n.name)),
+        (Plane::Service, false) if n.class == super::platform::RESOURCES => Err("the services matched on IOResources (its children in the IOService plane)".to_string()),
         (Plane::Service, false) => Ok(n.children.clone()),
     }
 }
 
 /// The entry's provider, its parent in the `IOService` plane: none for the
-/// registry's root; the root for the platform expert device; a nub's
-/// driver; a driver's nub. `Err` for a device tree entry the platform's
-/// drivers here did not make a nub of.
+/// registry's root; the root for the platform expert device and for
+/// IOResources; a nub's driver; a driver's nub. `Err` for a device tree
+/// entry the platform's drivers here did not make a nub of.
 pub fn provider(t: &[Node], i: u32) -> Result<Option<u32>, String> {
     let Some(n) = t.get(i as usize) else { return Ok(None) };
     let root = t.len() as u32 - 1;
@@ -204,8 +206,10 @@ pub fn provider(t: &[Node], i: u32) -> Result<Option<u32>, String> {
             None => Err(format!("whether the platform made {} a nub in the IOService plane", n.name)),
         };
     }
-    let provider = if n.class == super::iosurface::CLASS { "IOResources" } else { "the storage controller" };
-    n.parent.map(Some).ok_or_else(|| format!("the provider of {} ({provider})", n.name))
+    if n.class == super::platform::RESOURCES {
+        return Ok(Some(root));
+    }
+    n.parent.map(Some).ok_or_else(|| format!("the provider of {} (the storage controller)", n.name))
 }
 
 /// `IORegistryEntry::getName()`: the device tree root's is its first
@@ -292,6 +296,8 @@ fn add_volumes(t: &mut Vec<Node>) {
 /// - A device tree entry that no driver here made a nub of has only its
 ///   own, and IOSurfaceRoot only those it is given
 ///   ([`super::iosurface::is_service`]).
+/// - IOResources has the resources kexts and user space publish besides
+///   those modelled ([`super::platform`]), and IOResourceMatched.
 /// - Every other entry has properties its drivers set that are not
 ///   modelled. The exception is `IOClassNameOverride` on the entries from
 ///   the platform expert device to the GPU. In the kernelcache, only
@@ -301,6 +307,9 @@ pub fn property_unknown(t: &[Node], i: u32, name: &str) -> bool {
     let Some(n) = t.get(i as usize) else { return false };
     if i as usize + 1 == t.len() {
         return root_has(name);
+    }
+    if n.class == super::platform::RESOURCES {
+        return true;
     }
     if n.class.is_empty() && n.nub.is_none() && i != 0 || n.class == super::iosurface::CLASS {
         return false;
@@ -341,6 +350,21 @@ pub fn matching(tree: &[Node], dict: &[(String, DictValue)]) -> Result<Vec<u32>,
             .map(|(i, _)| i as u32)
             .collect();
         return Ok(found);
+    }
+    // IOResources, the one of its class: matched by the resources an
+    // IOResourceMatch names being published (`IOResourcesMatchPropertyTable`);
+    // by another property, or a resource not modelled, not known.
+    if class == Some(super::platform::RESOURCES) {
+        let Some(at) = tree.iter().position(|n| n.class == super::platform::RESOURCES) else { return Ok(Vec::new()) };
+        for &(k, v) in &props {
+            if k != "IOResourceMatch" {
+                return Err(format!("IOResources by its property {k}"));
+            }
+            if !tree[at].service_props.iter().any(|(pk, _)| pk == v) {
+                return Err(format!("whether the resource {v} is published"));
+            }
+        }
+        return Ok(vec![at as u32]);
     }
     // The platform expert device is registered (`IOPlatformExpertDevice`
     // calls `registerService`); its properties are partly the platform's.
@@ -892,7 +916,91 @@ pub fn open_user_client(k: &mut crate::syscalls::Kernel, service: u32, ty: u32) 
             return Err(ret::UNSUPPORTED);
         }
     };
-    Ok(client_add(service, class, creator, default_locking, kind))
+    let id = client_add(service, class, creator, default_locking, kind);
+    // is_io_service_open_extended, the client made: the MAC policies'
+    // mac_iokit_check_open, then, allowed, Sandbox's filter resolver; a
+    // refusal is the open's result, the client closed and let go.
+    let Some(cell) = client(id) else { return Err(ret::ERROR) };
+    let object = sb_client(&cell.lock().unwrap_or_else(|e| e.into_inner()));
+    let res = match k.darwin_mac_check_iokit_open(object.clone()) {
+        0 => match k.darwin_sb_iokit_resolve(object) {
+            ret::UNSUPPORTED => ret::SUCCESS,
+            r => r,
+        },
+        _ => ret::NOT_PERMITTED,
+    };
+    if res != ret::SUCCESS {
+        if let Some(cell) = client_remove(id) {
+            let mut c = cell.lock().unwrap_or_else(|e| e.into_inner());
+            c.closed = true;
+            client_close(k, &mut c);
+            if let Kind::Accel(a) = &mut c.kind {
+                super::accel::client_free(k, a);
+            }
+        }
+        return Err(res);
+    }
+    Ok(id)
+}
+
+/// A class with its superclasses and OSObject, as a Sandbox class walk
+/// visits them (`getMetaClass`, then each `getSuperClass`); none for a
+/// class this registry does not know.
+fn class_chain(class: &str) -> Option<Vec<&'static str>> {
+    let s = superclasses(class);
+    if s.is_empty() {
+        return None;
+    }
+    let mut v = s.to_vec();
+    v.push("OSObject");
+    Some(v)
+}
+
+/// The class chains from entry `at` up the IOService plane, as Sandbox's
+/// iokit-connection walk (`0x...9f2564`) takes them with
+/// `getParentEntry(gIOServicePlane)`: its own, each provider's, to the
+/// registry's root (an IORegistryEntry). An entry whose provider this
+/// registry does not know ends the chains with none.
+fn chains_from(t: &[Node], mut at: Option<u32>) -> Vec<Option<Vec<&'static str>>> {
+    let mut out = Vec::new();
+    while let Some(i) = at {
+        out.push(class(t, i).ok().and_then(class_chain));
+        match provider(t, i) {
+            Ok(p) => at = p,
+            Err(_) => {
+                out.push(None);
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Registry entry `i` as a Sandbox IOKit operation names it.
+pub fn sb_entry(i: u32) -> super::sandbox::IoKitObject {
+    super::sandbox::IoKitObject { chains: chains_from(tree(), Some(i)), ..Default::default() }
+}
+
+/// User client `c` as a Sandbox IOKit operation names it: its classes,
+/// then its provider's (the service it was opened on, which it is attached
+/// to) and up; and its provider's USB device class and subclass.
+pub fn sb_client(c: &UserClient) -> super::sandbox::IoKitObject {
+    let t = tree();
+    let mut chains = vec![class_chain(c.class)];
+    chains.extend(chains_from(t, Some(c.service)));
+    let num = |name: &str| {
+        t.get(c.service as usize)?.service_props.iter().find(|(k, _)| k == name).and_then(|(_, p)| match p {
+            Prop::Num(v, bits) => Some((*v, *bits)),
+            _ => None,
+        })
+    };
+    super::sandbox::IoKitObject { chains, usb_class: num("bDeviceClass"), usb_subclass: num("bDeviceSubClass"), ..Default::default() }
+}
+
+/// Whether entry `i` is the NVRAM's (IODTNVRAM, which the platform expert
+/// publishes on `/options`: `createNVRAM`).
+pub fn is_nvram(i: u32) -> bool {
+    from_path(tree(), "IODeviceTree:/options").ok().flatten() == Some(i)
 }
 
 /// The client's `clientClose`.
@@ -1230,5 +1338,32 @@ mod tests {
         let mut b = Vec::new();
         node(&mut b, "device-tree", &[("compatible", b"Other\0")], 0);
         assert_eq!(super::super::platform::add(&mut parse(&b).unwrap()), None);
+    }
+
+    /// IOSurfaceRoot on IOResources, on the root.
+    #[test]
+    fn iosurface_root_hangs_from_the_resources_nub() {
+        let mut t = small_tree();
+        t.pop();
+        let resources = super::super::platform::add_resources(&mut t);
+        super::super::iosurface::add_service(&mut t, resources);
+        let surface = resources + 1;
+        add_root(&mut t);
+        let root = t.len() as u32 - 1;
+        assert_eq!((class(&t, resources), class(&t, surface)), (Ok("IOResources"), Ok("IOSurfaceRoot")));
+        assert_eq!(name(&t, resources), "IOResources");
+        assert_eq!((provider(&t, surface), provider(&t, resources)), (Ok(Some(resources)), Ok(Some(root))));
+        assert_eq!(links(&t, resources, Plane::Service, true), Ok(vec![root]));
+        assert!(links(&t, resources, Plane::Service, false).is_err());
+        // Sandbox's walk: the root's class, its provider's, the registry's.
+        let chains: Vec<Vec<&str>> = chains_from(&t, Some(surface)).into_iter().map(Option::unwrap).collect();
+        assert_eq!(chains, [vec!["IOSurfaceRoot", "IOService", "IORegistryEntry", "OSObject"], vec!["IOResources", "IOService", "IORegistryEntry", "OSObject"], vec!["IORegistryEntry", "OSObject"]]);
+        // The kernel's resources are published; the others are not known.
+        assert!(t[resources as usize].service_props.iter().all(|(_, v)| *v == Prop::Sym("IOService".to_string())));
+        assert!(property_unknown(&t, resources, "IONVRAM") && property_unknown(&t, resources, "IOResourceMatched"));
+        let dict = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), DictValue::Str(v.to_string()))).collect::<Vec<_>>();
+        assert_eq!(matching(&t, &dict(&[("IOProviderClass", "IOResources")])), Ok(vec![resources]));
+        assert_eq!(matching(&t, &dict(&[("IOProviderClass", "IOResources"), ("IOResourceMatch", "IOBSD")])), Ok(vec![resources]));
+        assert!(matching(&t, &dict(&[("IOProviderClass", "IOResources"), ("IOResourceMatch", "IONVRAM")])).is_err());
     }
 }

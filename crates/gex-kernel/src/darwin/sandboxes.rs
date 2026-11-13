@@ -28,6 +28,13 @@
 //! policy's call 1; call 22 says whether one is named so) gives the caller
 //! one, once: a second is refused (`forbidden-sandbox-reinit`).
 //!
+//! A sandbox filters its process's calls by masks (`proc_set_syscall_filter_mask`):
+//! of its Unix calls, Mach traps and kernel MIG routines, each its
+//! profile's call operation's (syscall-unix, syscall-mach, syscall-mig) and-ed
+//! with the platform profile's, which are a process's with no sandbox; a
+//! clear bit has the call asked of the policy. Kernel MIG routines are
+//! known by the indexes Sandbox gives their message ids at boot.
+//!
 //! The user states `policy_init` makes (the front user's and the role
 //! accounts') give the HOME and PROCESS_TEMP_DIR pattern variables their
 //! paths; the calls that change them, and containermanagerd's that register
@@ -39,13 +46,13 @@
 //! `:embedded` entitlements' profiles, a container (one given by the spawn
 //! or to `sandbox_init`, and the upcall to containermanagerd that one
 //! expected and not registered makes), the extensions the
-//! `com.apple.security.exception.*` entitlements issue, and a profile whose
-//! syscall operations give the process filter masks of its own. A process
+//! `com.apple.security.exception.*` entitlements issue. A process
 //! whose profile filters its Mach messages (flag bit 12) stops at its first
 //! message to a port that enforces filtering (`mach_msg.rs`). An
-//! extension is kept as its class and path; what it is bound to and what an
-//! extension filter matches it by are not ported, and such a filter stops
-//! its evaluation (see `sandbox.rs`).
+//! extension is kept as its class, its path and the storage category its
+//! file had when it was bound to it, which the vnode filters match a path
+//! by; what a filter of another kind's object matches it by is not ported,
+//! and such a filter stops its evaluation (see `sandbox.rs`).
 
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -59,15 +66,33 @@ pub struct Collection {
     blob: Vec<u8>,
     profiles: Vec<Profile>,
     names: Vec<Vec<u8>>,
+    masks: Vec<[sandbox::ProfileMask; 4]>,
 }
 
 impl Collection {
-    /// The kext's `collection_load` of a blob, which the boot panics on.
+    /// The kext's `collection_load` of a blob, which the boot panics on:
+    /// its profiles, with their names and the masks of their call
+    /// operations (`0x...a091f0`).
     fn load(b: Vec<u8>) -> Result<Collection, String> {
         let profiles = sandbox::collection(&b).map_err(|e| format!("{e:?}"))?;
         let names = profiles.iter().map(|p| sandbox::string(&b, p, p.name).ok_or_else(|| "a profile's name".to_string())).collect::<Result<Vec<_>, _>>()?;
-        Ok(Collection { blob: b, profiles, names })
+        let masks = profiles.iter().map(|p| profile_masks(&b, p, p.flags & 4 != 0)).collect::<Result<Vec<_>, _>>()?;
+        Ok(Collection { blob: b, profiles, names, masks })
     }
+}
+
+/// The call operations whose masks a profile's loader makes, with the
+/// filter type of their numbers: syscall-unix, syscall-mach, syscall-mig
+/// (which a process's masks are) and system-fcntl.
+pub const MASK_OPS: [(usize, u8); 4] = [(152, 65), (153, 75), (154, 76), (163, 78)];
+
+/// The masks of profile `p` (`0x...a091f0`), whose error fails its load.
+pub fn profile_masks(b: &[u8], p: &Profile, stacks_protobox: bool) -> Result<[sandbox::ProfileMask; 4], String> {
+    let mut out: [sandbox::ProfileMask; 4] = Default::default();
+    for (m, &(op, ty)) in out.iter_mut().zip(&MASK_OPS) {
+        *m = sandbox::profile_mask(b, p, op, ty, stacks_protobox).map_err(|e| format!("the mask of {}: {e}", mac::OPERATION_NAMES[op]))?;
+    }
+    Ok(out)
 }
 
 /// The builtin collection (`0x...6ecab0`, named profiles) and the protobox
@@ -133,6 +158,11 @@ impl ProfileRef {
     /// stacked under it; bit 12, the process's Mach messages are filtered.
     pub fn flags(self) -> u16 {
         self.profile().flags
+    }
+
+    /// Its call operations' masks, as its load made them.
+    pub fn masks(self) -> &'static [sandbox::ProfileMask; 4] {
+        &self.collection().masks[self.index]
     }
 }
 
@@ -212,12 +242,16 @@ pub fn user_state(uid: u32) -> Option<UserState> {
     ROLE_ACCOUNTS.iter().find(|&&(u, _)| u == uid).map(|&(_, home)| UserState { home, tmp: "/private/var/tmp" })
 }
 
-/// An extension a sandbox holds (`0x...a10d58`, `0x...a11010`): its class
-/// and the path it was issued for.
+/// An extension a sandbox holds (`0x...a10d58`, `0x...a11010`): its class,
+/// the path it was issued for, and the storage category its file had when
+/// it was bound to it (`0x...a11518`: the class the platform profile's
+/// storage-class-map gives it, none for the default, which leaves the
+/// extension out of the sandbox's index by category).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Extension {
     pub class: &'static [u8],
     pub path: Vec<u8>,
+    pub category: Option<Vec<u8>>,
 }
 
 /// A sandbox (`struct sandbox`).
@@ -234,11 +268,78 @@ pub struct Sandbox {
     pub container_expected: bool,
     pub container: Option<Vec<u8>>,
     pub extensions: Vec<Extension>,
+    /// Its masks (`+40`, of the Unix calls, Mach traps, kernel MIG
+    /// routines and fcntl commands; [`combine`]): none lets every call
+    /// through unasked.
+    pub masks: [Option<sandbox::FilterMask>; 4],
 }
 
-/// The syscall operations whose masks a sandbox applies to its process
-/// (`0x...9f5cdc`), with the filter type of their numbers.
-const MASKS: [(usize, u8, &str); 3] = [(152, 65, "Unix system call"), (153, 75, "Mach trap"), (154, 76, "kernel MIG routine")];
+/// The kernel MIG routines' indexes Sandbox gives them at boot
+/// (`proc_set_syscall_filter_index(SYSCALL_MASK_KOBJ, id, i)` for each id
+/// of its table at `0x...6ec434`): routine id `KOBJ_IDS[i]` is index `i`,
+/// the bit of a kernel MIG mask that stands for it.
+const KOBJ_IDS: [u32; 343] = [
+    200, 201, 202, 203, 204, 205, 206, 207, 209, 213, 215, 216, 217, 218, 219, 220, 221,
+    222, 225, 227, 228, 231, 232, 233, 234, 400, 401, 402, 403, 404, 405, 406, 407, 412,
+    413, 414, 415, 416, 418, 419, 420, 423, 424, 425, 600, 601, 1000, 1001, 1002, 1200,
+    1201, 2401, 2402, 2403, 2405, 2406, 2407, 2800, 2801, 2802, 2803, 2804, 2805, 2806,
+    2807, 2808, 2809, 2810, 2811, 2812, 2813, 2814, 2816, 2817, 2818, 2819, 2820, 2821,
+    2822, 2823, 2824, 2825, 2826, 2827, 2828, 2829, 2830, 2831, 2832, 2833, 2834, 2836,
+    2837, 2838, 2839, 2840, 2841, 2842, 2843, 2844, 2845, 2846, 2847, 2848, 2849, 2850,
+    2851, 2852, 2853, 2854, 2855, 2856, 2857, 2858, 2859, 2860, 2861, 2862, 2863, 2864,
+    2865, 2866, 2867, 2868, 2869, 2870, 2871, 2872, 2873, 2874, 2875, 2876, 2877, 2878,
+    2879, 2880, 2881, 2882, 2883, 2884, 2885, 2886, 2887, 2888, 2889, 2890, 3000, 3001,
+    3002, 3003, 3004, 3005, 3200, 3201, 3203, 3204, 3205, 3206, 3207, 3208, 3209, 3210,
+    3211, 3212, 3213, 3214, 3215, 3216, 3217, 3218, 3219, 3220, 3221, 3222, 3223, 3224,
+    3226, 3227, 3228, 3229, 3230, 3231, 3232, 3233, 3234, 3235, 3236, 3237, 3238, 3239,
+    3240, 3241, 3242, 3401, 3402, 3403, 3404, 3405, 3406, 3407, 3408, 3409, 3410, 3411,
+    3412, 3413, 3414, 3415, 3418, 3419, 3420, 3421, 3433, 3434, 3435, 3436, 3437, 3438,
+    3439, 3440, 3441, 3442, 3443, 3444, 3445, 3446, 3447, 3448, 3449, 3450, 3451, 3452,
+    3453, 3455, 3456, 3457, 3458, 3459, 3460, 3461, 3462, 3463, 3464, 3600, 3601, 3602,
+    3603, 3604, 3605, 3606, 3607, 3608, 3609, 3610, 3611, 3612, 3613, 3614, 3615, 3616,
+    3617, 3618, 3624, 3625, 3626, 3627, 3628, 3630, 3800, 3801, 3802, 3803, 3804, 3805,
+    3806, 3807, 3808, 3809, 3810, 3811, 3812, 3813, 3814, 3815, 3816, 3817, 3818, 3819,
+    3821, 3822, 3823, 3824, 3825, 3826, 3830, 3831, 3832, 4000, 4005, 4006, 4008, 4009,
+    4010, 4800, 4801, 4802, 4803, 4804, 4805, 4806, 4807, 4808, 4809, 4810, 4811, 4812,
+    4813, 4814, 4815, 4816, 4817, 4818, 4819, 4820, 4821, 4825, 4900, 4901, 4902, 5400,
+    5401, 5402, 5403, 5404, 6200, 6201, 8000, 8001, 51471, 716200, 716201, 716202,
+    716203,
+];
+
+/// The table's ids no kernel routine has (`ipc_kobject_set_kobjidx` finds
+/// none, ENOENT): they stay unindexed, and are never filtered.
+const KOBJ_NO_ROUTINE: [u32; 8] = [600, 601, 1200, 1201, 3832, 6200, 6201, 51471];
+
+/// The index of the kernel MIG routine of message id `id` (its bucket's
+/// `kobjidx`), none for one Sandbox gave none (`KOBJ_IDX_NOT_SET`).
+pub fn kobj_index(id: u32) -> Option<usize> {
+    if KOBJ_NO_ROUTINE.contains(&id) {
+        return None;
+    }
+    KOBJ_IDS.iter().position(|&k| k == id)
+}
+
+/// `0x...9f3570`: a sandbox's mask of one kind, from its profile's
+/// (`prof`, which may defer), the stacked protobox profile's (`pb`), and
+/// the platform profile's (`plat`); none is no mask, which lets every call
+/// through. A profile's own mask counts but for one that defers with no
+/// mask stacked under it; a deferring one's is or-ed with the protobox
+/// profile's (`0x...9f36b0`: either one's absence lets all through); and
+/// what counts is and-ed with the platform profile's (`0x...9f37f8`), or,
+/// with none of its own, the platform profile's is the sandbox's.
+pub fn combine(defer: bool, prof: Option<&sandbox::FilterMask>, pb: Option<&sandbox::FilterMask>, plat: Option<&sandbox::FilterMask>) -> Option<sandbox::FilterMask> {
+    let own = if pb.is_some() || !defer { prof } else { None };
+    let Some(own) = own else { return plat.cloned() };
+    let own = sandbox::mask_bytes(own);
+    let own: [u8; sandbox::MASK_BYTES] = match (defer, pb.map(|m| sandbox::mask_bytes(m))) {
+        (true, Some(pb)) => std::array::from_fn(|i| own[i] | pb[i]),
+        _ => own,
+    };
+    Some(sandbox::mask_of(match plat.map(|m| sandbox::mask_bytes(m)) {
+        Some(plat) => std::array::from_fn(|i| own[i] & plat[i]),
+        None => own,
+    }))
+}
 
 impl Sandbox {
     /// `0x...a0f1d0`: a sandbox of `profile`. A profile with flag bit 2
@@ -253,29 +354,17 @@ impl Sandbox {
         } else {
             None
         };
-        Ok(Sandbox { profile, protobox: stacked, flag_3b: false, container_expected: false, container: None, extensions: Vec::new() })
+        let plat = mac::platform_masks();
+        let masks = std::array::from_fn(|i| {
+            let own = &profile.masks()[i];
+            combine(own.defer, own.mask.as_ref(), stacked.and_then(|p| p.masks()[i].mask.as_ref()), plat[i].as_ref())
+        });
+        Ok(Sandbox { profile, protobox: stacked, flag_3b: false, container_expected: false, container: None, extensions: Vec::new(), masks })
     }
 
     /// Its profile is the protobox collection's.
     pub fn protoboxed(&self) -> bool {
         self.profile.set == Set::Protobox
-    }
-
-    /// The masks the sandbox gives its process beyond the platform
-    /// profile's (`0x...9f3570`): its profile's, unless that one only
-    /// defers to a protobox profile that has none. A mask whose deferral the
-    /// loader works out further is counted (see [`sandbox::syscall_mask`]).
-    pub fn own_masks(&self) -> Vec<&'static str> {
-        let mask = |p: ProfileRef, op: usize, ty: u8| sandbox::syscall_mask(p.blob(), p.profile(), op, ty, p.flags() & 4 != 0);
-        MASKS
-            .iter()
-            .filter(|&&(op, ty, _)| {
-                let m = mask(self.profile, op, ty);
-                let stacked = self.protobox.is_some_and(|p| mask(p, op, ty).present);
-                m.present && (stacked || !m.defer)
-            })
-            .map(|&(_, _, what)| what)
-            .collect()
     }
 }
 
@@ -614,18 +703,22 @@ impl Kernel {
             // sandbox.
             None if escape => {
                 self.dtask.filter_msg = false;
-                self.darwin_sb_apply_masks(None).map_err(Kill)?;
+                self.darwin_sb_apply_masks(None);
                 self.darwin_set_sandbox(None);
                 return Ok(());
             }
             None => {
                 if let Some(inh) = inherited {
                     // The carried sandbox, applied again.
-                    return self.darwin_sb_apply_masks(Some(&inh)).map_err(Kill);
+                    self.darwin_sb_apply_masks(Some(&inh));
+                    return Ok(());
                 }
                 match s.protobox {
                     Some(p) => Sandbox::new(p, None).map_err(|Missing(what)| self.darwin_sb_unported(what.into()))?,
-                    None => return self.darwin_sb_apply_masks(None).map_err(Kill),
+                    None => {
+                        self.darwin_sb_apply_masks(None);
+                        return Ok(());
+                    }
                 }
             }
         };
@@ -670,10 +763,15 @@ impl Kernel {
         // The executable's extension, for its bundle (or itself), which
         // must be found.
         let bundle = &ex.path[..s.bundle_end];
-        if let Err(e) = self.vfs.metadata(bundle) {
-            return Err(Kill(format!("failed to set executable path (err={})", e.0)));
-        }
-        sb.extensions.push(Extension { class: EXECUTABLE, path: bundle.as_bytes().to_vec() });
+        let md = match self.vfs.metadata(bundle) {
+            Ok(md) => md,
+            Err(e) => return Err(Kill(format!("failed to set executable path (err={})", e.0))),
+        };
+        let category = match self.darwin_sb_storage_class(Some(&sb), super::macvfs::sb_vnode(bundle, &md)) {
+            Ok(c) => c,
+            Err(what) => return Err(self.darwin_sb_unported(what)),
+        };
+        sb.extensions.push(Extension { class: EXECUTABLE, path: bundle.as_bytes().to_vec(), category });
         sb.flag_3b = s.extension_point;
         // Each item of the entitlements' (walked with a user state only).
         if !sb.protoboxed() && user_state(self.creds.uid()).is_some() {
@@ -691,22 +789,22 @@ impl Kernel {
         let sb = Arc::new(sb);
         self.darwin_set_sandbox(Some(Arc::clone(&sb)));
         self.dtask.filter_msg = filter;
-        self.darwin_sb_apply_masks(Some(&sb)).map_err(Kill)
+        self.darwin_sb_apply_masks(Some(&sb));
+        Ok(())
     }
 
-    /// `0x...9f5cdc`: the process's system call, Mach trap and MIG masks,
-    /// the sandbox's or the platform profile's. A sandbox that gives masks
-    /// of its own stops here: the filtering is not ported (nor are the
-    /// platform profile's masks applied).
-    fn darwin_sb_apply_masks(&mut self, sb: Option<&Sandbox>) -> Result<(), String> {
-        let Some(sb) = sb else { return Ok(()) };
-        let own = sb.own_masks();
-        if own.is_empty() {
-            return Ok(());
-        }
-        let what = format!("Sandbox's {} filtering of a process whose profile {} gives it a mask", own.join(", "), String::from_utf8_lossy(sb.profile.name()));
-        self.darwin_unimplemented(what.clone());
-        Err(format!("not implemented: {what}"))
+    /// `0x...9f5cdc`: the process's Unix call mask, and its task's Mach trap
+    /// and kernel MIG routine masks (`proc_set_syscall_filter_mask`, each
+    /// of the size the kernel gives it, so none is refused): its sandbox's,
+    /// or with none the platform profile's.
+    fn darwin_sb_apply_masks(&mut self, sb: Option<&Sandbox>) {
+        let [unix, mach, kobj, _] = match sb {
+            Some(sb) => sb.masks.clone(),
+            None => mac::platform_masks(),
+        };
+        self.dtask.syscall_mask = unix;
+        self.dtask.mach_trap_mask = mach;
+        self.dtask.kobj_mask = kobj;
     }
 
     /// `mpo_proc_notify_exec_complete` (`0x...9fa188`): a driver extension
@@ -780,7 +878,6 @@ impl Kernel {
     /// revoked when the sandbox denies mach-priv-host-port; its messages
     /// are filtered when its profile says; its masks apply.
     fn darwin_sb_apply_process(&mut self, sb: Sandbox) -> Result<(), i32> {
-        const EPERM: i32 = 1;
         let sb = Arc::new(sb);
         self.darwin_set_sandbox(Some(Arc::clone(&sb)));
         // mach-priv-host-port, quietly: a denial makes the task's host port
@@ -789,9 +886,7 @@ impl Kernel {
         let a = SbArgs { quiet: true, ..Default::default() };
         self.darwin_sb_evaluate_with(Some(&sb), mac::op::MACH_PRIV_HOST_PORT, &a);
         self.dtask.filter_msg = sb.profile.flags() & 0x1000 != 0;
-        if self.darwin_sb_apply_masks(Some(&sb)).is_err() {
-            return Err(EPERM);
-        }
+        self.darwin_sb_apply_masks(Some(&sb));
         if self.trace {
             eprintln!("[gex:{}] Sandbox apply: {}[{}] {}", self.pid, self.exe_path, self.pid, String::from_utf8_lossy(sb.profile.name()));
         }
@@ -827,6 +922,37 @@ impl Kernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sandboxs_masks_combine_its_profiles_with_the_platforms() {
+        let m = |bytes: &[u8]| {
+            let mut a = [0u8; sandbox::MASK_BYTES];
+            a[..bytes.len()].copy_from_slice(bytes);
+            sandbox::mask_of(a)
+        };
+        let (prof, pb, plat) = (m(&[0b0011]), m(&[0b0101]), m(&[0b0110]));
+        // No mask anywhere: none; the platform's alone: the platform's.
+        assert!(combine(false, None, None, None).is_none());
+        assert!(combine(false, None, None, Some(&plat)).is_some_and(|x| Arc::ptr_eq(&x, &plat)));
+        // Its own and-ed with the platform's, or alone.
+        let first = |m: Option<sandbox::FilterMask>| sandbox::mask_bytes(&m.unwrap())[0];
+        assert_eq!(first(combine(false, Some(&prof), Some(&pb), Some(&plat))), 0b0010);
+        assert_eq!(first(combine(false, Some(&prof), None, None)), 0b0011);
+        // Deferring: or-ed with the protobox profile's first; with none
+        // stacked, its own does not count.
+        assert_eq!(first(combine(true, Some(&prof), Some(&pb), Some(&plat))), 0b0110);
+        assert!(combine(true, Some(&prof), None, Some(&plat)).is_some_and(|x| Arc::ptr_eq(&x, &plat)));
+        assert!(combine(true, Some(&prof), None, None).is_none());
+    }
+
+    #[test]
+    fn kernel_mig_routines_have_sandboxs_indexes() {
+        assert_eq!(kobj_index(200), Some(0));
+        assert_eq!(kobj_index(2405), Some(54));
+        assert_eq!(kobj_index(600), None);
+        assert_eq!(kobj_index(3201), KOBJ_IDS.iter().position(|&k| k == 3201));
+        assert_eq!(kobj_index(9999), None);
+    }
 
     #[test]
     fn a_bundles_end_is_found_from_the_paths_end() {

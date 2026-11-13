@@ -302,6 +302,11 @@ impl Kernel {
             cred: t.cred.clone(),
             sandbox: std::sync::Arc::new(std::sync::Mutex::new(super::sandboxes::of(&t.sandbox))),
             filter_msg: t.filter_msg,
+            // forkproc: the parent's Unix call mask; task_create_internal:
+            // its task's Mach trap and kernel MIG masks.
+            syscall_mask: t.syscall_mask.clone(),
+            mach_trap_mask: t.mach_trap_mask.clone(),
+            kobj_mask: t.kobj_mask.clone(),
             sugid: t.sugid,
             csflags: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(t.csflags.load(std::sync::atomic::Ordering::Acquire) & !super::amfi::cs::KILLED)),
             // forkproc: the parent's persona.
@@ -1084,6 +1089,8 @@ impl Kernel {
                 psfa::CHDIR => {
                     let mut s = Scratch::path(&b[o + 8..o + 8 + PATH_MAX]);
                     let mut gm = GuestMem::new(&mut s.0);
+                    // chdir_internal's lookup (Sandbox has no chdir check).
+                    self.darwin_sb_namei(&gm, super::bsd::AT_FDCWD as u64, Scratch::AT, true, false)?;
                     self.canonical(&mut gm, nr::CHDIR, [Scratch::AT, 0, 0, 0, 0, 0])?;
                 }
                 psfa::FCHDIR => {

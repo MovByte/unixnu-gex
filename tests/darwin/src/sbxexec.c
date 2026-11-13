@@ -1,9 +1,8 @@
 // An exec gives the program the builtin profile its seatbelt-profiles
 // entitlement names: it starts with that profile's sandbox, which denies
 // mach-priv-host-port and allows process-fork, expects no container, can
-// not be replaced, and goes to a fork's child. With "wait", it writes a
-// byte to its standard output and reads one from its standard input, then
-// exits 0 if it has a sandbox.
+// not be replaced, and goes to a fork's child. With "wait", it reads a
+// byte from its standard input, then exits 0 if it has a sandbox.
 
 #include <errno.h>
 #include <stdint.h>
@@ -37,8 +36,7 @@ int main(int argc, char **argv) {
     pid_t me = getpid();
     int sandboxed = sandbox_check(me, NULL, 0) == 1;
     if (argc > 1 && strcmp(argv[1], "wait") == 0) {
-        char c = 'r';
-        (void)write(1, &c, 1);
+        char c;
         (void)read(0, &c, 1);
         return sandboxed ? 0 : 1;
     }

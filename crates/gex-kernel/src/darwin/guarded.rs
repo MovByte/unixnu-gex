@@ -292,8 +292,10 @@ impl Kernel {
         let at = if raw == sys::OPEN || raw == sys::OPEN_NOCANCEL { 1 } else { 2 };
         let dflags = a[at];
         self.darwin_open_mode(dflags)?;
-        // A creation whose last component ends in a slash: namei's ENOENT.
         let (dirfd, path) = if at == 1 { (super::bsd::AT_FDCWD as u64, a[0]) } else { (a[0], a[1]) };
+        // vn_open_auth's lookup and Sandbox's checks of it.
+        self.darwin_sb_open_check(m, dirfd, path, dflags)?;
+        // A creation whose last component ends in a slash: namei's ENOENT.
         if dflags & super::kern::DARWIN_O_CREAT != 0 && self.darwin_slash_creation(m, dirfd, path) {
             return Err(Errno::ENOENT);
         }

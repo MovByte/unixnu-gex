@@ -485,14 +485,22 @@ impl Kernel {
         out
     }
 
-    /// The new image's main stack with its strings on it: `create_unix_stack`
-    /// below `user_stack`, the `apple[]` strings, `exec_copyout_strings`,
-    /// and dyld's copy of the executable's header pushed below them.
-    /// `strings` is the exec's area; the run's first program has its
-    /// path and vectors from the kernel.
-    fn darwin_start_body(&mut self, strings: Option<Strings>, l: &Loaded, user_stack: u64) -> Result<MainStack, Errno> {
-        // The image's code signing flags and its credential's
-        // entitlements; the policy's refusal kills the exec.
+    /// A spawned child's image activated in its parent's `posix_spawn`, as
+    /// XNU's `exec_activate_image` and `process_signature` do there before
+    /// the call returns ([`Self::darwin_activate_body`]): the child's
+    /// signature, credential labels and launch constraints are set when its
+    /// parent goes on. The answer is kept for the child's start, which a
+    /// refusal kills.
+    pub fn darwin_activate(&mut self, l: &Loaded) {
+        let out = self.darwin_activate_body(l);
+        self.darwin_ipc_leave();
+        self.dtask.activated = Some(out);
+    }
+
+    /// The image's code signing flags and its credential's entitlements
+    /// (AMFI's label update), then Sandbox's label update, then the launch
+    /// constraints (`process_signature`); a policy's refusal kills the exec.
+    fn darwin_activate_body(&mut self, l: &Loaded) -> Result<(), Errno> {
         let lr = match l.signature.clone() {
             Some(s) => s,
             None => {
@@ -526,7 +534,21 @@ impl Kernel {
             }
             return Err(Errno::EPERM);
         }
-        self.darwin_launch_constraints()?;
+        self.darwin_launch_constraints()
+    }
+
+    /// The new image's main stack with its strings on it: `create_unix_stack`
+    /// below `user_stack`, the `apple[]` strings, `exec_copyout_strings`,
+    /// and dyld's copy of the executable's header pushed below them.
+    /// `strings` is the exec's area; the run's first program has its
+    /// path and vectors from the kernel. A spawned child's image was
+    /// activated in its parent's call ([`Self::darwin_activate`]); an
+    /// exec's and the first program's is activated here.
+    fn darwin_start_body(&mut self, strings: Option<Strings>, l: &Loaded, user_stack: u64) -> Result<MainStack, Errno> {
+        match self.dtask.activated.take() {
+            Some(r) => r?,
+            None => self.darwin_activate_body(l)?,
+        }
         self.darwin_publish();
         // The image's entitlements that raise its default memory limit.
         self.darwin_jetsam_entitlements();

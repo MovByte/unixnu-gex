@@ -72,8 +72,8 @@ const DEBUG_DEFAULT: u32 = 0x10;
 pub const REPLY_SIZE: usize = 0xc68;
 
 /// The service in the registry ([`shared::add_service`]).
-pub fn add_service(t: &mut Vec<Node>) {
-    shared::add_service(t);
+pub fn add_service(t: &mut Vec<Node>, resources: u32) {
+    shared::add_service(t, resources);
 }
 
 /// One surface.

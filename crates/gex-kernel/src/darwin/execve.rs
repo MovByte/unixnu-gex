@@ -302,6 +302,11 @@ impl Kernel {
             self.darwin_unimplemented("execve of a path that is not UTF-8 (gex's namespace names files in UTF-8)".into());
             return Err(Errno::ENOENT);
         };
+        // The lookup's preflights and the readlink checks of its links.
+        if !path.is_empty() {
+            let start = if path.starts_with('/') { None } else { self.darwin_sb_start_cwd() };
+            self.darwin_sb_lookup(start, path, true, false)?;
+        }
         let abs = self.vfs.absolute(path);
         let md = self.vfs.metadata(&abs)?;
         if md.file_type != crate::vfs::FileType::Regular {
@@ -562,6 +567,18 @@ impl Kernel {
                 c.svgid = c.gid();
                 c
             },
+            // The credential's Sandbox label, the slot the new task's link
+            // shows too, for the exec's label update to take over; and what
+            // the exec in progress keeps for that update.
+            sandbox: old.sandbox,
+            exec_sandbox: old.exec_sandbox,
+            // task_create_internal: the new task has the old one's message
+            // filtering and Mach trap and kernel MIG masks, and the process
+            // keeps its Unix call mask, until the label update sets them.
+            filter_msg: old.filter_msg,
+            syscall_mask: old.syscall_mask,
+            mach_trap_mask: old.mach_trap_mask,
+            kobj_mask: old.kobj_mask,
             // Until the image's policies make it (`vm_map_set_max_addr`).
             map_max: spawn.map_or(0, |s| s.max_addr),
             crash_behavior: spawn.map_or(0, |s| s.crash_behavior),

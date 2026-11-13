@@ -29,10 +29,11 @@ const RW_PER_CHUNK: u32 = (CHUNK / rw::SIZE) as u32;
 /// kext's one personality in `__PRELINK_INFO`), those the catalogue and
 /// matching add (`CFBundleIdentifierKernel`, `IOMatchedAtBoot`,
 /// `IOProbeScore` 0 for a personality with none), under its name. Its
-/// provider, the IOResources nub, is not in this registry. The device
-/// tree has no "non-coherent" property, so start sets no
-/// "iosurface-non-coherent".
-pub fn add_service(t: &mut Vec<Node>) {
+/// provider is the IOResources nub `resources`, which its personality's
+/// `IOProviderClass` names and on which its `IOResourceMatch`, "IOBSD",
+/// matched. The device tree has no "non-coherent" property, so start sets
+/// no "iosurface-non-coherent".
+pub fn add_service(t: &mut Vec<Node>, resources: u32) {
     let s = |v: &str| Prop::Str(v.to_string());
     let service_props = vec![
         ("IOClass".to_string(), s(super::CLASS)),
@@ -44,7 +45,9 @@ pub fn add_service(t: &mut Vec<Node>) {
         ("IOMatchedAtBoot".to_string(), Prop::Bool(true)),
         ("IOProbeScore".to_string(), Prop::Num(0, 32)),
     ];
-    t.push(Node { name: super::NAME.to_string(), props: Vec::new(), class: super::CLASS, service_props, parent: None, children: Vec::new(), kernel_only: false, nub: None });
+    let at = t.len() as u32;
+    t.push(Node { name: super::NAME.to_string(), props: Vec::new(), class: super::CLASS, service_props, parent: Some(resources), children: Vec::new(), kernel_only: false, nub: None });
+    t[resources as usize].children.push(at);
 }
 
 /// The root's shared memory.
