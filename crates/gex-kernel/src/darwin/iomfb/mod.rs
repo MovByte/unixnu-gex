@@ -69,7 +69,7 @@ pub fn is_service(i: u32) -> bool {
 /// - There is no `IOMatchCategory` in the personality.
 ///
 /// What the framebuffer's start sets besides is reported when read (see
-/// [`property_absent`] for the names no image can set).
+/// [`property_absent`] for the names no driver sets).
 pub fn add_service(t: &mut Vec<Node>, nub: u32) {
     let s = |v: &str| Prop::Str(v.to_string());
     let sym = |v: &str| Prop::Sym(v.to_string());
@@ -89,15 +89,38 @@ pub fn add_service(t: &mut Vec<Node>, nub: u32) {
     t.push(Node { name: CLASS.to_string(), props: Vec::new(), class: CLASS, service_props, parent: Some(nub), children: Vec::new(), kernel_only: false, nub: None });
 }
 
-/// Property names that no image of the 21H461 kernelcache has as a
-/// string, and that so no driver can set on the framebuffer or its nub:
-/// read on them, they are answered as missing.
-/// - `GainMapVersion`, which `IOMobileFramebufferOpen` reads from the
-///   service.
-/// - `canvas-width` and `canvas-height`, which it reads from the service's
-///   provider (`getEDTProperty`); disp0's device tree entry has neither.
-pub fn property_absent(name: &str) -> bool {
-    matches!(name, "GainMapVersion" | "canvas-width" | "canvas-height")
+/// Property names no driver sets on the framebuffer (entry `i`, the
+/// service) or on its nub (the service's provider), which read on them are
+/// answered as missing:
+/// - Names no image of the 21H461 kernelcache has as a string:
+///   `GainMapVersion`, which `IOMobileFramebufferOpen` reads from the
+///   service; `canvas-width` and `canvas-height`, which it reads from the
+///   service's provider (`getEDTProperty`; disp0's device tree entry has
+///   neither); and `dfr`, which the framework's `iomfb_match_callback`
+///   reads from each framebuffer it finds.
+/// - Names other kexts use only otherwise: `AppleTV`, which
+///   IOUSBDeviceFamily compares a model string with (0xfffffff00617c0c0),
+///   and `hdcp-hoover-protocol`, which AUC reads from the framebuffer
+///   (0xfffffff00655fb8c) and nothing sets.
+/// - `IOMFBIntDcpUsedForExtWhenLidClose`, the name of the pipe's runtime
+///   property 0x7f (IOMobileGraphicsFamily's names, 0xfffffff00677d36c).
+///   The pipe publishes each runtime property it registers in its table
+///   (`FUN_fffffff006bde66c`) as the framebuffer's registry property of
+///   that name (the table's publisher, 0xfffffff006bea4e4), and
+///   AppleMobileDispH9G registers no property 0x7f.
+/// - On the service, `external`: AppleCLCD sets it (0xfffffff006bf55ec,
+///   0xfffffff006bf5a54) only when its provider's device tree entry has
+///   `external`.
+pub fn property_absent(t: &[Node], i: u32, name: &str) -> bool {
+    if matches!(name, "GainMapVersion" | "canvas-width" | "canvas-height" | "dfr" | "AppleTV" | "hdcp-hoover-protocol" | "IOMFBIntDcpUsedForExtWhenLidClose") {
+        return true;
+    }
+    let Some(n) = t.get(i as usize) else { return false };
+    if n.class != CLASS || name != "external" {
+        return false;
+    }
+    let provider = n.parent.and_then(|p| t.get(p as usize));
+    provider.is_some_and(|p| !p.props.iter().any(|(k, _)| k == "external"))
 }
 
 // ---------------------------------------------------------------------------

@@ -313,8 +313,7 @@ fn add_volumes(t: &mut Vec<Node>) {
 ///   kernelcache, only IOSkywalkFamily sets it, on its own objects
 ///   (0xfffffff00593be08); the kernel only reads it (`skipKey`,
 ///   0xfffffff007816644). On the display's framebuffer and its nub, so are
-///   the names no image of the kernelcache has
-///   ([`super::iomfb::property_absent`]).
+///   the names no driver sets there ([`super::iomfb::property_absent`]).
 pub fn property_unknown(t: &[Node], i: u32, name: &str) -> bool {
     let Some(n) = t.get(i as usize) else { return false };
     if i as usize + 1 == t.len() {
@@ -327,7 +326,7 @@ pub fn property_unknown(t: &[Node], i: u32, name: &str) -> bool {
         return false;
     }
     let display = n.class == super::iomfb::CLASS || t.iter().any(|m| m.class == super::iomfb::CLASS && m.parent == Some(i));
-    if display && super::iomfb::property_absent(name) {
+    if display && super::iomfb::property_absent(t, i, name) {
         return false;
     }
     let on_gpu_path = i == 0 || n.nub.is_some() || super::platform::is_driver(n.class) || n.class == super::accel::CLASS || n.class == super::iomfb::CLASS;
@@ -1439,10 +1438,16 @@ mod tests {
         let classes: Vec<&str> = up.iter().map(|&i| class(&t, i).unwrap()).collect();
         assert_eq!(classes, ["AppleCLCD", "AppleARMIODevice", "AppleT8011IO", "IOPlatformDevice", "AppleARMPE", "IOPlatformExpertDevice", "IORegistryEntry"]);
         assert_eq!(conforms(&t, clcd, "IOMobileFramebuffer"), Ok(true));
-        // What no image can set is missing, on the service and its nub;
+        // What no driver sets is missing, on the service and its nub;
         // the rest of what the drivers set is not known.
         assert!(!property_unknown(&t, clcd, "GainMapVersion") && !property_unknown(&t, disp, "canvas-width"));
+        assert!(!property_unknown(&t, clcd, "dfr") && !property_unknown(&t, clcd, "IOMFBIntDcpUsedForExtWhenLidClose"));
         assert!(property_unknown(&t, clcd, "IOMFBSupportsHeadOfLineSwaps") && property_unknown(&t, disp, "IODeviceMemory"));
+        // AppleCLCD sets external only from its provider's device tree
+        // entry, which has none here.
+        assert!(!property_unknown(&t, clcd, "external"));
+        t[disp as usize].props.push(("external".to_string(), 1u32.to_le_bytes().to_vec()));
+        assert!(property_unknown(&t, clcd, "external"));
         // The personality's dictionary, serialized as OSSerializeBinary.
         let backlight = &t[clcd as usize].service_props.iter().find(|(k, _)| k == "BacklightMatching").unwrap().1;
         let bin = serialize_prop(backlight);
