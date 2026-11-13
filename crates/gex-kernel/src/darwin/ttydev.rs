@@ -187,6 +187,12 @@ fn tty_dev_of(md: &Metadata) -> Option<u32> {
     dev_node(dev).map(|_| dev)
 }
 
+/// Whether node `md` is a terminal's (`VISTTY`): a character device whose
+/// major's `cdevsw` entry is D_TTY, the console's (0) or one kept here.
+pub fn vnode_is_tty(md: &Metadata) -> bool {
+    md.file_type == FileType::CharDevice && (tty_dev_of(md).is_some() || super::attrcall::darwin_dev(md.rdev) >> 24 == 0)
+}
+
 /// The node of terminal device `dev`.
 fn dev_node(dev: u32) -> Option<Node> {
     let (major, minor) = (dev >> 24, dev & 0x00ff_ffff);
@@ -1545,6 +1551,7 @@ impl Kernel {
     /// (`va_uid`) or `suser`. The terminal device to revoke, or none when
     /// nothing has it in use.
     fn darwin_revoke_check(&mut self, m: &mut GuestMem<'_>, path: u64) -> Result<Option<u32>, Errno> {
+        self.darwin_sb_namei(m, super::bsd::AT_FDCWD as u64, path, true, false)?;
         let abs = self.path_io().at_path(m, super::bsd::dirfd(super::bsd::AT_FDCWD as u64) as i32, path)?;
         let md = self.vfs.metadata(&abs)?;
         // (No block device is kept here: there is none mounted on.)
@@ -1555,7 +1562,7 @@ impl Kernel {
         let tty_dev = tty_dev_of(&md);
         let owner = node_owner(&md).or_else(|| super::devfs::node_of(&md).map(|n| (n.uid, n.gid)));
         // VCHR, a terminal's with VISTTY; a devfs node has no file flags.
-        let e = self.darwin_mac_check_vnode_revoke(super::mac::SbVnode::at(&canonical, 4, tty_dev.is_some(), md.mode, 0));
+        let e = self.darwin_mac_check_vnode_revoke(super::macvfs::sb_vnode(&canonical, &md));
         if e != 0 {
             return Err(super::errno::errno_of(e as i32));
         }

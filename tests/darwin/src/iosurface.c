@@ -5,6 +5,15 @@
 // their seeds, values, bulk attachments, use counts, purgeability, a send
 // right to the surface looked up again, the graphics comm page, and the
 // errors the kernel answers.
+//
+// It runs as splashboardd, as launchd starts it (user mobile, no sandbox):
+// the platform profile admits IOSurfaceRootUserClient to an unsandboxed
+// program by its signing identifier or by an iokit-user-client-class
+// entitlement naming the class, as splashboardd's does. With "container",
+// it runs as an app does, in the container profile's sandbox, which admits
+// the user client but refuses the root's IOMatchCategory
+// (iokit-get-properties): there it opens the root, makes a surface, locks
+// it, and looks it up.
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
@@ -15,6 +24,16 @@
 
 // The framework's own call, which the SDK does not declare.
 extern void *IOSurfaceGetGraphicsCommPageAddress(void);
+
+// IOKitLib's IORegistryEntryGetProperty (io_registry_entry_get_property_bytes),
+// which the iOS SDK marks unavailable.
+extern kern_return_t registry_entry_get_property(io_registry_entry_t entry, const char *name, char *buffer, uint32_t *size) __asm__("_IORegistryEntryGetProperty");
+
+#define SANDBOX_NAMED_BUILTIN 2
+
+int sandbox_init(const char *profile, uint64_t flags, char **errorbuf);
+
+static int contained;
 
 static int bad(const char *what, long got, long want) {
     printf("iosurface: %s: %#lx, want %#lx\n", what, got, want);
@@ -50,14 +69,29 @@ static int service(void) {
     io_name_t cls;
     if (IOObjectGetClass(root, cls) != KERN_SUCCESS || strcmp(cls, "IOSurfaceRoot") != 0) return bad("the root's class", 0, 1);
     CFTypeRef cat = IORegistryEntryCreateCFProperty(root, CFSTR("IOMatchCategory"), NULL, 0);
-    if (cat == NULL || !CFEqual(cat, CFSTR("IOSurfaceRoot"))) return bad("the root's match category", 0, 1);
-    CFRelease(cat);
+    if (contained) {
+        // iokit-get-properties refused: no value, and the routine's
+        // kIOReturnNotPermitted for its bytes.
+        if (cat != NULL) return bad("the root's match category in the container", 1, 0);
+        char buf[64];
+        uint32_t len = sizeof buf;
+        kr = registry_entry_get_property(root, "IOMatchCategory", buf, &len);
+        if (kr != kIOReturnNotPermitted) return bad("the bytes of the root's match category in the container", kr, kIOReturnNotPermitted);
+    } else {
+        if (cat == NULL || !CFEqual(cat, CFSTR("IOSurfaceRoot"))) return bad("the root's match category", 0, 1);
+        CFRelease(cat);
+    }
     io_connect_t c;
     kr = IOServiceOpen(root, mach_task_self(), 1, &c);
     if (kr != kIOReturnUnsupported) return bad("opening type 1", kr, kIOReturnUnsupported);
     kr = IOServiceOpen(root, mach_task_self(), 0, &c);
     if (kr != KERN_SUCCESS) return bad("opening type 0", kr, 0);
     if (IOObjectGetClass(c, cls) != KERN_SUCCESS || strcmp(cls, "IOSurfaceRootUserClient") != 0) return bad("the client's class", 0, 1);
+    if (contained) {
+        IOServiceClose(c);
+        IOObjectRelease(root);
+        return 0;
+    }
     // The limits the framework checks at connect (selector 13).
     unsigned char lim[40];
     size_t n = sizeof lim;
@@ -285,8 +319,15 @@ static int comm_page(void) {
     return 0;
 }
 
-int main(void) {
-    if (service() || geometry() || locks() || values() || uses() || purgeable() || comm_page()) return 1;
+int main(int argc, char **argv) {
+    contained = argc > 1 && strcmp(argv[1], "container") == 0;
+    if (contained) {
+        char *err = NULL;
+        if (sandbox_init("container", SANDBOX_NAMED_BUILTIN, &err) != 0) return bad("the container sandbox", 0, 1);
+        if (service() || locks() || uses()) return 1;
+    } else if (service() || geometry() || locks() || values() || uses() || purgeable() || comm_page()) {
+        return 1;
+    }
     printf("iosurface ok\n");
     return 0;
 }

@@ -766,6 +766,9 @@ pub struct Kernel {
     /// A Darwin `stat`, `lstat`, `fstat` or `fstatat` (not their `64`
     /// forms) in progress: its `struct stat` is the 32-bit-inode one.
     pub darwin_stat_ino32: bool,
+    /// The Darwin call in progress is a stat whose attributes Sandbox's
+    /// getattr check took the times out of.
+    pub darwin_stat_scrub: bool,
     /// A parked Darwin `wait4`'s status address, for its status in Darwin's
     /// encoding ([`crate::darwin::exit`]).
     pub darwin_wait4: Option<u64>,
@@ -3529,6 +3532,8 @@ pub struct PathIo<'a> {
     pub darwin: bool,
     /// Its `struct stat` the 32-bit-inode one ([`Kernel::darwin_stat_ino32`]).
     pub stat_ino32: bool,
+    /// Its `struct stat` without its times ([`Kernel::darwin_stat_scrub`]).
+    pub stat_scrub: bool,
     pub pid: i32,
     /// The process's ids, read at each call: the owner a stat reports.
     pub creds: &'a Creds,
@@ -4081,6 +4086,12 @@ impl PathIo<'_> {
                 if p.starts_with('/') && crate::darwin::kern::mount_of(p).fs == crate::darwin::kern::Fs::Devfs {
                     crate::darwin::devfs::stat_fixup(&mut st, md, p);
                 }
+            }
+            // Sandbox's getattr check zeroed the vnode's times (its
+            // creation, access, modification and change times).
+            if self.stat_scrub {
+                (st.atime, st.atime_ns, st.mtime, st.mtime_ns, st.ctime, st.ctime_ns) = (0, 0, 0, 0, 0, 0);
+                st.birth = Some((0, 0));
             }
             if self.stat_ino32 {
                 st.encode_darwin_ino32()
@@ -10606,6 +10617,7 @@ impl Kernel {
             darwin_finish: None,
             darwin_pipe_sigpipe: None,
             darwin_stat_ino32: false,
+            darwin_stat_scrub: false,
             darwin_wait4: None,
             darwin_retry: None,
             darwin_exec: None,
@@ -11104,6 +11116,7 @@ impl Kernel {
             darwin_finish: None,
             darwin_pipe_sigpipe: None,
             darwin_stat_ino32: false,
+            darwin_stat_scrub: false,
             darwin_wait4: None,
             darwin_retry: None,
             darwin_exec: None,
@@ -11407,6 +11420,15 @@ impl Kernel {
             raw = if raw as u32 as u64 == crate::darwin::PLATFORM {
                 raw
             } else {
+                // unix_syscall's MAC filter, before the call's entry is
+                // taken: an error skips the call.
+                if let Err(e) = self.darwin_syscall_filter(crate::darwin::bsd_syscode(m, self.ctx_addr, raw)) {
+                    if self.trace {
+                        eprintln!("[gex:{}] pc=0x{pc:x} darwin syscall {} refused by its filter", self.pid, crate::darwin::bsd_syscode(m, self.ctx_addr, raw));
+                    }
+                    let _ = crate::darwin::set_result(m, self.ctx_addr, e.as_return());
+                    return SyscallOutcome::Continue;
+                }
                 match crate::darwin::bsd_call(m, self.ctx_addr, raw) {
                     crate::darwin::Bsd::Call { nr, first } => {
                         if first != 0 {
@@ -11447,6 +11469,15 @@ impl Kernel {
                     return SyscallOutcome::Continue;
                 }
             };
+            // Sandbox's checks of a file call, its lookups' and its hook's,
+            // before the call does anything they would refuse.
+            if let Some(e) = self.darwin_sb_file_call(m, raw, &a) {
+                if self.trace {
+                    eprintln!("[gex:{}] pc=0x{pc:x} darwin {} refused by Sandbox: {e:?}", self.pid, crate::darwin::sysno::name(raw).unwrap_or("?"));
+                }
+                let _ = crate::darwin::set_result(m, self.ctx_addr, e.as_return());
+                return SyscallOutcome::Continue;
+            }
             if let Some(out) = self.darwin_psynch_call(m, raw, &a) {
                 if self.trace {
                     eprintln!("[gex:{}] pc=0x{pc:x} darwin {}({:#x}, {:#x}, {:#x}) -> {}", self.pid, crate::darwin::sysno::name(raw).unwrap_or("?"), a[0], a[1], a[2], if matches!(out, SyscallOutcome::Blocking(_)) { "blocks" } else { "done" });
@@ -11921,6 +11952,7 @@ impl Kernel {
             compat: self.compat,
             darwin: self.darwin,
             stat_ino32: self.darwin_stat_ino32,
+            stat_scrub: self.darwin_stat_scrub,
             pid: self.pid,
             creds: &self.creds,
             procs: &self.procs,

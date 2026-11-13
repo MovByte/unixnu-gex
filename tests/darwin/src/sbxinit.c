@@ -3,8 +3,11 @@
 // is refused (forbidden-sandbox-reinit), as are an unknown name and a path.
 // The sandbox decides what the platform profile allows: this profile
 // denies mach-priv-host-port and allows process-fork, and a fork's child
-// carries the sandbox. Call 22 says whether a builtin profile is named so;
-// call 67 that no container is expected or held.
+// carries the sandbox. The credential's sandbox goes on through an exec
+// whose profile names none: a child sandboxed with nointernet, which lets
+// it exec and keep its label, execs this program again ("exec"), which
+// finds itself sandboxed. Call 22 says whether a builtin profile is named
+// so; call 67 that no container is expected or held.
 
 #include <errno.h>
 #include <stdint.h>
@@ -55,7 +58,13 @@ static int no_container(void) {
     return __sandbox_ms("Sandbox", 67, arg) == 0 && expected == 0 && has == 0;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "exec") == 0) {
+        int r;
+        if ((r = sandbox_check(getpid(), NULL, 0)) != 1) return fail("sandboxed after exec", r);
+        if ((r = sandbox_check(getpid(), "forbidden-sandbox-reinit", SANDBOX_CHECK_NO_REPORT)) != 1) return fail("forbidden after exec", r);
+        return 0;
+    }
     pid_t me = getpid();
     int r;
     if ((r = sandbox_check(me, NULL, 0)) != 0) return fail("sandboxed before", r);
@@ -63,6 +72,16 @@ int main(void) {
     if ((r = builtin_exists(PROFILE)) != 0) return fail("builtin " PROFILE, r);
     if ((r = builtin_exists("gex-no-such-profile")) != ENOENT) return fail("builtin gex-no-such-profile", r);
     if (!no_container()) return fail("container before", 0);
+    pid_t ex = fork();
+    if (ex < 0) return fail("fork", errno);
+    if (ex == 0) {
+        char *args[] = {argv[0], "exec", NULL};
+        if (init("nointernet") != 0) _exit(2);
+        execv(argv[0], args);
+        _exit(3);
+    }
+    int est = 0;
+    if (waitpid(ex, &est, 0) != ex || !WIFEXITED(est) || WEXITSTATUS(est) != 0) return fail("the exec's sandbox", est);
     if ((r = init("gex-no-such-profile")) != EINVAL) return fail("init gex-no-such-profile", r);
     if ((r = init("/usr/libexec/x")) != ENOTSUP) return fail("init a path", r);
     if ((r = sandbox_check(me, NULL, 0)) != 0) return fail("sandboxed by a refusal", r);

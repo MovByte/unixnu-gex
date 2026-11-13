@@ -112,7 +112,8 @@ impl Names {
     }
 
     /// The object `shm_open(name, oflag, mode)` opens, and whether it was
-    /// made by the call. `fmode` is `FFLAGS(oflag)`.
+    /// made by the call (an object already there is the caller's to check
+    /// the MAC policies and its access with). `fmode` is `FFLAGS(oflag)`.
     fn open(&self, name: &str, fmode: u32, mode: u32, cred: &Cred, pid: i32) -> Result<(Arc<Pshm>, bool), Errno> {
         let mut names = self.by_name.lock().unwrap();
         match names.get(name) {
@@ -124,7 +125,6 @@ impl Names {
                 if fmode & O_TRUNC != 0 && p.allocated() {
                     return Err(Errno::EINVAL);
                 }
-                access(p, fmode, cred)?;
                 Ok((Arc::clone(p), false))
             }
             None => {
@@ -136,6 +136,11 @@ impl Names {
                 Ok((p, true))
             }
         }
+    }
+
+    /// The object of a name.
+    fn find(&self, name: &str) -> Option<Arc<Pshm>> {
+        self.by_name.lock().unwrap().get(name).cloned()
     }
 
     /// `shm_unlink`: the name goes; the object lives while it is open.
@@ -251,7 +256,23 @@ impl Kernel {
         if fmode & (FREAD | FWRITE) == 0 {
             return Err(Errno::EINVAL);
         }
+        // The MAC policies' say on a name to make, before it is looked for.
+        if fmode & O_CREAT != 0 {
+            self.darwin_pshm_mac(78, &name)?;
+        }
         let (p, made) = NAMES.open(&name, fmode, a[2] as u32 & ALLPERMS, &self.dtask.cred, self.pid)?;
+        // An object there: the MAC policies' say on reading it, then on
+        // writing or truncating it (`fmode & (FWRITE | O_TRUNC)`), then its
+        // access.
+        if !made {
+            if fmode & FREAD != 0 {
+                self.darwin_pshm_mac(76, &name)?;
+            }
+            if fmode & (FWRITE | O_TRUNC) != 0 {
+                self.darwin_pshm_mac(79, &name)?;
+            }
+            access(&p, fmode, &self.dtask.cred)?;
+        }
         if !made && p.creator != self.pid {
             self.darwin_unimplemented(format!(
                 "shm_open {name:?}: the object is also held by process {}; their mappings of it agree only at msync and munmap",
@@ -267,7 +288,21 @@ impl Kernel {
     /// `shm_unlink(name)`: any failure of the name is `EINVAL`.
     pub(crate) fn darwin_shm_unlink(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
         let name = get_name(m, a[0]).map_err(|_| Errno::EINVAL)?;
+        // The object found, then the MAC policies' say on its unlink.
+        NAMES.find(&name).ok_or(Errno::ENOENT)?;
+        self.darwin_pshm_mac(80, &name)?;
         NAMES.unlink(&name, &self.dtask.cred).map(|_| 0)
+    }
+
+    /// Sandbox's check of operation `op` (ipc-posix-shm-read-data 76,
+    /// -write-create 78, -write-data 79, -write-unlink 80) of the object of
+    /// this name (`pshm_name`).
+    fn darwin_pshm_mac(&mut self, op: usize, name: &str) -> Result<(), Errno> {
+        let a = super::mac::SbArgs { kind: super::sandbox::kind::POSIX_IPC, string: Some(name.chars().map(|c| c as u8).collect()), ..Default::default() };
+        match self.darwin_sb_evaluate(op, &a) {
+            0 => Ok(()),
+            e => Err(super::errno::errno_of(e as i32)),
+        }
     }
 
     /// `ftruncate(fd, length)` on an object (`pshm_truncate`).
@@ -323,6 +358,16 @@ mod tests {
         n.open(name, fmode, mode, &Cred::of(501, 20), 7)
     }
 
+    /// An open of an object already there by `cred`, its access checked as
+    /// `shm_open` checks it (after the MAC policies').
+    fn open_as(n: &Names, name: &str, fmode: u32, cred: &Cred) -> Result<(), Errno> {
+        let (p, made) = n.open(name, fmode, 0, cred, 8)?;
+        if !made {
+            access(&p, fmode, cred)?;
+        }
+        Ok(())
+    }
+
     #[test]
     fn a_name_is_made_found_and_refused_as_posix_says() {
         let n = Names::new();
@@ -376,11 +421,11 @@ mod tests {
         open(&n, "x", RW | O_CREAT, 0o640).unwrap();
         // the group may read, not write; others nothing
         assert!(n.by_name.lock().unwrap().get("x").is_some());
-        assert_eq!(n.open("x", FREAD, 0, &Cred::of(600, 20), 8).map(|_| ()), Ok(()));
-        assert_eq!(n.open("x", FWRITE, 0, &Cred::of(600, 20), 8).unwrap_err(), Errno::EACCES);
-        assert_eq!(n.open("x", FREAD, 0, &Cred::of(600, 30), 8).unwrap_err(), Errno::EACCES);
+        assert_eq!(open_as(&n, "x", FREAD, &Cred::of(600, 20)), Ok(()));
+        assert_eq!(open_as(&n, "x", FWRITE, &Cred::of(600, 20)).unwrap_err(), Errno::EACCES);
+        assert_eq!(open_as(&n, "x", FREAD, &Cred::of(600, 30)).unwrap_err(), Errno::EACCES);
         // root may do anything
-        assert!(n.open("x", RW, 0, &Cred::of(0, 0), 8).is_ok());
+        assert!(open_as(&n, "x", RW, &Cred::of(0, 0)).is_ok());
         // a non-owner may not unlink what he cannot write; the owner may whatever the mode
         assert_eq!(n.unlink("x", &Cred::of(600, 20)).unwrap_err(), Errno::EACCES);
         let (p, _) = open(&n, "ro", RW | O_CREAT, 0o400).unwrap();
@@ -393,16 +438,16 @@ mod tests {
         let n = Names::new();
         open(&n, "g", RW | O_CREAT, 0o044).unwrap();
         // no owner bits: the group's and others' let the owner read
-        assert!(n.open("g", FREAD, 0, &Cred::of(501, 20), 8).is_ok());
-        assert_eq!(n.open("g", FWRITE, 0, &Cred::of(501, 20), 8).unwrap_err(), Errno::EACCES);
+        assert!(open_as(&n, "g", FREAD, &Cred::of(501, 20)).is_ok());
+        assert_eq!(open_as(&n, "g", FWRITE, &Cred::of(501, 20)).unwrap_err(), Errno::EACCES);
         // a member of a group the bits refuse is refused, whatever others may
         open(&n, "w", RW | O_CREAT, 0o604).unwrap();
-        assert_eq!(n.open("w", FREAD, 0, &Cred::of(600, 20), 8).unwrap_err(), Errno::EACCES);
-        assert!(n.open("w", FREAD, 0, &Cred::of(600, 30), 8).is_ok());
+        assert_eq!(open_as(&n, "w", FREAD, &Cred::of(600, 20)).unwrap_err(), Errno::EACCES);
+        assert!(open_as(&n, "w", FREAD, &Cred::of(600, 30)).is_ok());
         // supplementary groups count
         let mut c = Cred::of(600, 30);
         c.groups.push(20);
         open(&n, "s", RW | O_CREAT, 0o640).unwrap();
-        assert!(n.open("s", FREAD, 0, &c, 8).is_ok());
+        assert!(open_as(&n, "s", FREAD, &c).is_ok());
     }
 }

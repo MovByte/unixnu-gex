@@ -235,7 +235,17 @@ impl Kernel {
 
     /// The file type's `fo_ioctl`.
     pub(crate) fn darwin_fo_ioctl(&mut self, file: &Arc<OpenFile>, com: u64, data: &mut [u8]) -> Result<(), Errno> {
-        match self.darwin_file_kind(file) {
+        let kind = self.darwin_file_kind(file);
+        // vn_ioctl: the MAC check of a vnode's command first.
+        if matches!(kind, Kind::Tty(_) | Kind::Vnode(_)) {
+            let md = file.handle.metadata()?;
+            let v = super::macvfs::sb_vnode(&self.vfs.canonical(&file.path), &md);
+            let e = self.darwin_mac_check_vnode_ioctl(v, com);
+            if e != 0 {
+                return Err(super::errno::errno_of(e as i32));
+            }
+        }
+        match kind {
             // vn_ioctl to the device's ptyioctl.
             Kind::Tty(dev) => self.darwin_tty_fo_ioctl(&dev, file, com, data),
             // pipe_ioctl.
@@ -265,8 +275,9 @@ impl Kernel {
                 }
                 _ => Err(Errno::ENOTTY),
             },
-            // soo_ioctl: the descriptor's FNONBLOCK is what the socket here
-            // goes by.
+            // soo_ioctl: soioctl's MAC check first; the descriptor's
+            // FNONBLOCK is what the socket here goes by.
+            Kind::Socket if let Some(e) = super::mac::sb_socket(&file.handle).map(|so| self.darwin_mac_check_socket_ioctl(so, com)).filter(|&e| e != 0) => Err(super::errno::errno_of(e as i32)),
             Kind::Socket => match com {
                 cmd::FIONBIO => Ok(()),
                 cmd::FIOASYNC if int(data) == 0 => Ok(()),

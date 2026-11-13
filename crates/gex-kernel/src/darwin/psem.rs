@@ -51,6 +51,9 @@ struct Inner {
     usecount: u32,
     /// `PSEM_REMOVED`: unlinked while still open.
     removed: bool,
+    /// `psem_creator_pid` and `psem_creator_uniqueid`: its maker's, or the
+    /// process's that last opened or unlinked it with no other open.
+    creator: (i32, u64),
 }
 
 /// A semaphore (`struct pseminfo`).
@@ -59,8 +62,6 @@ pub struct Psem {
     pub mode: u32,
     pub uid: u32,
     pub gid: u32,
-    /// `psem_creator_pid`.
-    pub creator: i32,
     inner: Mutex<Inner>,
 }
 
@@ -157,14 +158,30 @@ impl Kernel {
         Ok(buf[..n].iter().map(|&b| char::from(b)).collect())
     }
 
-    /// The Sandbox's answer for an operation on a semaphore of this name.
-    fn darwin_psem_mac(&mut self, op: &str, name: &str) -> Result<(), Errno> {
+    /// The Sandbox's answer for an operation on a semaphore of this name,
+    /// made by `creator` (its pid and unique id, and whether it is the
+    /// calling process: `args[0xe0]`, `args[0xe8]`, `args[0xf0]`).
+    fn darwin_psem_mac(&mut self, op: &str, name: &str, creator: (i32, u64, bool)) -> Result<(), Errno> {
         let op = super::mac::OPERATION_NAMES.iter().position(|n| *n == op).expect("a Sandbox operation");
-        let a = super::mac::SbArgs { kind: super::sandbox::kind::POSIX_IPC, string: Some(name.chars().map(|c| c as u8).collect()), ..Default::default() };
+        let a = super::mac::SbArgs { kind: super::sandbox::kind::POSIX_IPC, string: Some(name.chars().map(|c| c as u8).collect()), creator: Some(creator), ..Default::default() };
         match self.darwin_sb_evaluate(op, &a) {
             0 => Ok(()),
             e => Err(super::errno::errno_of(e as i32)),
         }
+    }
+
+    /// The creator a check of an existing semaphore names: its record's;
+    /// for an open or an unlink of one that nothing has open
+    /// (`psem_usecount` 1, the name's own), the calling process, which the
+    /// record then names (`0x...a00c30`).
+    fn darwin_psem_creator(&self, p: &Psem, claim: bool) -> (i32, u64, bool) {
+        let _n = names();
+        let mut i = p.inner();
+        if claim && i.usecount == 1 {
+            i.creator = (self.pid, self.dtask.uniqueid);
+            return (self.pid, self.dtask.uniqueid, true);
+        }
+        (i.creator.0, i.creator.1, false)
     }
 
     /// `psem_access`: root may; anyone else as `posix_cred_access` says.
@@ -204,15 +221,14 @@ impl Kernel {
             fmode &= !O_CREAT;
         }
         let p = if fmode & O_CREAT != 0 {
-            self.darwin_psem_mac("ipc-posix-sem-create", &name)?;
+            self.darwin_psem_mac("ipc-posix-sem-create", &name, (self.pid, self.dtask.uniqueid, true))?;
             let cred = &self.dtask.cred;
             let p = Arc::new(Psem {
                 name: name.clone(),
                 mode: cmode,
                 uid: cred.uid,
                 gid: cred.groups.first().copied().unwrap_or(0),
-                creator: self.pid,
-                inner: Mutex::new(Inner { count: value, usecount: 1, ..Inner::default() }),
+                inner: Mutex::new(Inner { count: value, usecount: 1, creator: (self.pid, self.dtask.uniqueid), ..Inner::default() }),
             });
             let mut n = names();
             // Another process's create between the look and now is the
@@ -227,7 +243,8 @@ impl Kernel {
             }
         } else {
             let p = found.ok_or(Errno::ENOENT)?;
-            self.darwin_psem_mac("ipc-posix-sem-open", &name)?;
+            let creator = self.darwin_psem_creator(&p, true);
+            self.darwin_psem_mac("ipc-posix-sem-open", &name, creator)?;
             self.darwin_psem_access(&p, fmode)?;
             p
         };
@@ -244,7 +261,8 @@ impl Kernel {
     fn darwin_sem_unlink(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
         let name = self.darwin_psem_name(m, a[0])?;
         let p = names().get(&name).cloned().ok_or(Errno::ENOENT)?;
-        self.darwin_psem_mac("ipc-posix-sem-unlink", &name)?;
+        let creator = self.darwin_psem_creator(&p, true);
+        self.darwin_psem_mac("ipc-posix-sem-unlink", &name, creator)?;
         // psem_access with the semaphore's own mode as the open mode.
         self.darwin_psem_access(&p, p.mode)?;
         let mut n = names();
@@ -272,7 +290,7 @@ impl Kernel {
     /// `sem_trywait(sem)`: `semaphore_timedwait` of no time.
     fn darwin_sem_trywait(&mut self, a: &[u64; 6]) -> Result<u64, Errno> {
         let p = self.darwin_psem_of(a[0])?;
-        self.darwin_psem_mac("ipc-posix-sem-wait", &p.name)?;
+        self.darwin_psem_mac("ipc-posix-sem-wait", &p.name, self.darwin_psem_creator(&p, false))?;
         let mut i = p.inner();
         if i.count == 0 {
             return Err(Errno::EAGAIN);
@@ -284,7 +302,7 @@ impl Kernel {
     /// `sem_post(sem)`.
     fn darwin_sem_post(&mut self, a: &[u64; 6]) -> Result<u64, Errno> {
         let p = self.darwin_psem_of(a[0])?;
-        self.darwin_psem_mac("ipc-posix-sem-post", &p.name)?;
+        self.darwin_psem_mac("ipc-posix-sem-post", &p.name, self.darwin_psem_creator(&p, false))?;
         p.signal();
         Ok(0)
     }
@@ -304,7 +322,10 @@ impl Kernel {
     /// `sem_wait(sem)` and `sem_wait_nocancel`: `semaphore_wait`, which a
     /// signal ends (KERN_ABORTED, EINTR).
     pub(crate) fn darwin_sem_wait(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> SyscallOutcome {
-        let r = self.darwin_psem_of(a[0]).and_then(|p| self.darwin_psem_mac("ipc-posix-sem-wait", &p.name).map(|()| p));
+        let r = self.darwin_psem_of(a[0]).and_then(|p| {
+            let creator = self.darwin_psem_creator(&p, false);
+            self.darwin_psem_mac("ipc-posix-sem-wait", &p.name, creator).map(|()| p)
+        });
         let p = match r {
             Ok(p) => p,
             Err(e) => {

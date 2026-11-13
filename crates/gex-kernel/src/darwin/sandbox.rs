@@ -233,12 +233,52 @@ pub mod kind {
     pub const SOCKET: u32 = 2;
     pub const PROCESS: u32 = 4;
     pub const FSCTL: u32 = 5;
+    pub const PRIVILEGE: u32 = 0x10;
+    pub const MEMORYSTATUS: u32 = 0x1b;
     pub const SYSCTL: u32 = 0xf;
     pub const POSIX_IPC: u32 = 6;
     pub const HOST_SPECIAL_PORT: u32 = 7;
+    pub const IOKIT: u32 = 8;
+    pub const NVRAM: u32 = 0x11;
     pub const SYSCALL_UNIX: u32 = 0x14;
+    pub const SYSCALL_MACH: u32 = 0x16;
+    pub const SYSCALL_MIG: u32 = 0x17;
+    pub const FCNTL: u32 = 0x18;
+    pub const NECP_ACTION: u32 = 0x1a;
     pub const MAC_SYSCALL: u32 = 0x19;
 }
+
+/// A socket's `sock_gettype`, and whether the operation has a socket.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SocketType {
+    pub present: bool,
+    pub domain: u32,
+    pub ty: u32,
+    pub protocol: u32,
+}
+
+/// What an IOKit operation's filters read of its object (kind 8): the
+/// class chains (each class with its superclasses, to OSObject) of the
+/// object and then of each of its providers (its IOService-plane parents),
+/// to the registry's root, none for an entry whose class or provider this
+/// registry does not know; the property the operation names (`+0xe0`);
+/// the user client type an open asks for (`+0xf0`); and, for a user
+/// client, its provider's USB device class and subclass (`OSNumber`s:
+/// value and size in bits).
+#[derive(Clone, Debug, Default)]
+pub struct IoKitObject {
+    pub chains: Vec<Option<Vec<&'static str>>>,
+    pub property: Option<Vec<u8>>,
+    pub client_type: u32,
+    pub usb_class: Option<(u64, u32)>,
+    pub usb_subclass: Option<(u64, u32)>,
+}
+
+const AF_UNIX: u32 = 1;
+const AF_INET: u32 = 2;
+const AF_SYSTEM: u32 = 32;
+const AF_INET6: u32 = 30;
+const AF_MULTIPATH: u32 = 39;
 
 /// What evaluation asks of the system: the operation's subject (the
 /// process and credential), its objects, and the system's state. Each
@@ -294,9 +334,26 @@ pub trait Facts {
     fn target_is(&mut self, which: u16) -> Result<bool, Stop> {
         Err(Stop::Unported(format!("sandbox: the target process's relation {which}")))
     }
-    /// The sandbox evaluated with holds an extension of `class`.
+    /// The same relation of a POSIX semaphore's creator (kind 6), which
+    /// matches nothing when it cannot be found.
+    fn creator_is(&mut self, which: u16) -> Result<bool, Stop> {
+        Err(Stop::Unported(format!("sandbox: a semaphore creator's relation {which}")))
+    }
+    /// The sandbox evaluated with holds an extension of `class`; holds
+    /// any extension.
     fn has_extension(&mut self, _class: &[u8]) -> bool {
         false
+    }
+    fn holds_extensions(&mut self) -> bool {
+        false
+    }
+    /// The paths of the extensions the sandbox holds (of `class`, or of
+    /// any; or of storage category `category`), none revoked.
+    fn extension_paths(&mut self, _class: Option<&[u8]>) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
+    fn category_extension_paths(&mut self, _category: &[u8]) -> Vec<Vec<u8>> {
+        Vec::new()
     }
     /// The current thread's persona's uid and type (`current_persona_get`),
     /// none without one.
@@ -311,9 +368,40 @@ pub trait Facts {
     /// `kern.osreleasetype`, as launchd set it (empty before).
     fn os_release_type(&self) -> Vec<u8>;
     fn developer_mode(&self) -> bool;
+    /// A socket operation's socket (kind 2): its domain, type and protocol,
+    /// and whether there is one (`socket_check_create` has none).
+    fn socket(&self) -> Option<SocketType> {
+        None
+    }
+    /// Its local address: the hook's, else its name (`sock_getsockname`),
+    /// none for a socket with none (EOPNOTSUPP); another error refuses.
+    fn socket_local(&mut self) -> Result<Option<Vec<u8>>, Stop> {
+        Ok(None)
+    }
+    /// The remote address the hook names, a socket option's level and
+    /// name, an ioctl's command.
+    fn socket_remote(&self) -> Option<Vec<u8>> {
+        None
+    }
+    fn socket_option(&self) -> (u32, u32) {
+        (0, 0)
+    }
+    fn socket_command(&self) -> u64 {
+        0
+    }
+    /// An IOKit operation's object (kind 8).
+    fn iokit(&self) -> Option<IoKitObject> {
+        None
+    }
+    /// Whether `sa` is an address of the host's own (`0x...a08950`): the
+    /// unspecified address, or one of an interface's.
+    fn host_address(&mut self, _sa: &[u8]) -> Result<bool, Stop> {
+        Ok(false)
+    }
     /// The operation's numbers: the host special port (kind 7), the reboot
-    /// flags, the Unix syscall number (kind 0x14), the MAC syscall's call
-    /// number (kind 0x19).
+    /// flags, the call number (`+0xd8`: a Unix call's, kind 0x14; a Mach
+    /// trap's, kind 0x16; a kernel MIG routine's index, kind 0x17), the MAC
+    /// syscall's call number (kind 0x19).
     fn host_special_port(&self) -> u16;
     fn reboot_flags(&self) -> u16;
     fn syscall_number(&self) -> u32;
@@ -323,9 +411,19 @@ pub trait Facts {
     fn mac_policy(&self) -> Option<Vec<u8>>;
     fn posix_ipc_name(&self) -> Option<Vec<u8>>;
     /// A vnode operation's vnode type (`enum vtype`) and whether it is a
-    /// terminal, none when the operation has no vnode or names a path whose
-    /// type is not known yet (a lookup's preflight).
+    /// terminal, none when the operation has no vnode or names a path under
+    /// a directory without giving its type (a lookup's preflight).
     fn vnode_type(&mut self) -> Result<Option<(u32, bool)>, Stop>;
+    /// A vnode operation's device (`args[0x174]`, its `va_rdev`), none
+    /// without a vnode.
+    fn vnode_rdev(&mut self) -> Result<Option<u32>, Stop> {
+        Err(Stop::Unported("sandbox: a vnode's device".into()))
+    }
+    /// Whether device `rdev` is an IOMedia's whose class is, or derives
+    /// from, `class` (`0x...9f20a8`).
+    fn media_device(&mut self, _rdev: u32, class: &[u8]) -> Result<bool, Stop> {
+        Err(Stop::Unported(format!("sandbox: whether a device is an IOMedia of class {}", String::from_utf8_lossy(class))))
+    }
     /// A vnode operation's path (`0x...3874`: the vnode's path, or the
     /// path the hook gave, made canonical) and its mount point's length in
     /// it (`args[0x160]`: -1 when the path is the mount point); none
@@ -452,35 +550,153 @@ pub fn string(b: &[u8], p: &Profile, index: u16) -> Option<Vec<u8>> {
     string_at(b, p, p.nodes_end + usize::from(index) * NODE)
 }
 
-/// What a profile's syscall operation (syscall-unix, syscall-mach,
-/// syscall-mig, system-fcntl) makes of the mask a sandbox filters those
-/// calls by (`0x...a09308`, the loader's): `present` unless the
-/// operation's first node is a terminal that allows with no flags and no
-/// modifiers (a call is then never asked about); `defer` when that
-/// terminal allows with flag 10 alone (the protobox profile decides); and
-/// `undecided` when the first node is the bitmap filter of a profile that
-/// stacks a protobox profile, whose deferral the loader works out further
-/// (`0x...a095d4`), which is not followed here.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Mask {
-    pub present: bool,
-    pub defer: bool,
-    pub undecided: bool,
+/// A filter mask's size in bytes: Sandbox's zone of masks (`0x...9f75e0`)
+/// holds the largest of the kernel's three counts in bits (no fewer than
+/// 112), rounded up to whole bytes: this kernel's `nsysent` (556), against
+/// `mach_trap_count` (128) and `mach_kobj_count` (372: the 340 routines of
+/// its 17 MIG subsystems, and 32 to spare).
+pub const MASK_BYTES: usize = 70;
+
+/// A filter mask (`proc_set_syscall_filter_mask`'s): bit `n` set lets call
+/// `n` through unasked; a clear one has the MAC policies asked. A
+/// sandbox's is the one its process is filtered by, which Sandbox's
+/// evaluator sets bits of as it goes ([`mask_set`]).
+pub type FilterMask = std::sync::Arc<MaskBits>;
+
+/// A mask's bytes, which a bit may be set in while it is in use.
+pub type MaskBits = [std::sync::atomic::AtomicU8; MASK_BYTES];
+
+/// A mask of `bytes`.
+pub fn mask_of(bytes: [u8; MASK_BYTES]) -> FilterMask {
+    std::sync::Arc::new(bytes.map(std::sync::atomic::AtomicU8::new))
 }
 
-/// The mask operation `op` of profile `p` leaves; for a filter, `ty` is the
-/// filter type of the call's number (65, 75, 76 and 78).
-pub fn syscall_mask(b: &[u8], p: &Profile, op: usize, ty: u8, stacks_protobox: bool) -> Mask {
-    let Some(idx) = (op < OPERATIONS).then(|| u16_at(b, p.ops + 2 * op)).flatten() else { return Mask { present: true, ..Mask::default() } };
+/// A mask's bytes as they are now.
+pub fn mask_bytes(mask: &MaskBits) -> [u8; MASK_BYTES] {
+    std::array::from_fn(|i| mask[i].load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// `bitstr_test`: whether `mask` lets call `n` through.
+pub fn mask_allows(mask: &MaskBits, n: usize) -> bool {
+    mask.get(n / 8).is_some_and(|b| b.load(std::sync::atomic::Ordering::Relaxed) & (1 << (n % 8)) != 0)
+}
+
+/// `0x...9f3a90`: call `n` let through from now on (`zalloc_ro_mut_atomic`'s
+/// or), for a number the mask has a bit for.
+pub fn mask_set(mask: &MaskBits, n: usize) {
+    if let Some(b) = mask.get(n / 8) {
+        b.fetch_or(1 << (n % 8), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// What a profile's call operation (syscall-unix, syscall-mach,
+/// syscall-mig, system-fcntl) makes of the mask its process's calls are
+/// filtered by (`0x...a09308`, the profile loader's). `mask` is none when
+/// the operation's first node is a terminal that allows with no flags and
+/// no modifiers (no call is asked about); the bitmap that node names when
+/// it is the bitmap form of the call's number filter (its type with bit 7),
+/// past which the mask is clear; else all clear (every call asked). `defer`
+/// is that the operation defers to a stacked protobox profile: its first
+/// node is a terminal that allows with flag 10 alone, or, for a profile
+/// that stacks one, every way on from the bitmap's no-match edge does
+/// ([`defers`]).
+#[derive(Clone, Debug, Default)]
+pub struct ProfileMask {
+    pub mask: Option<FilterMask>,
+    pub defer: bool,
+}
+
+/// The loader's mask of operation `op` of profile `p`, whose calls' number
+/// filter is `ty` (65, 75, 76 or 78); EINVAL for a profile cut short. A
+/// bitmap longer than a mask panics the kext's loader; here it is refused.
+pub fn profile_mask(b: &[u8], p: &Profile, op: usize, ty: u8, stacks_protobox: bool) -> Result<ProfileMask, &'static str> {
+    const TRUNCATED: &str = "truncated";
+    let idx = (op < OPERATIONS).then(|| u16_at(b, p.ops + 2 * op)).flatten().ok_or(TRUNCATED)?;
     let at = p.nodes + usize::from(idx) * NODE;
-    let Some(n) = b.get(at..at + NODE) else { return Mask { present: true, ..Mask::default() } };
+    let n = b.get(at..at + NODE).ok_or(TRUNCATED)?;
+    let mut defer = false;
+    let mut bits: &[u8] = &[];
     match n[0] {
         1 => {
             let word = u32::from(n[1]) | u32::from(n[2]) << 8 | u32::from(n[3]) << 16;
-            Mask { present: word != 0 || n[4] != 0, defer: word == 0x400 && n[4] == 0, undecided: false }
+            if word == 0 && n[4] == 0 {
+                return Ok(ProfileMask::default());
+            }
+            defer = word == 0x400 && n[4] == 0;
         }
-        0 if n[1] == ty | 0x80 && stacks_protobox => Mask { present: true, defer: false, undecided: true },
-        _ => Mask { present: true, ..Mask::default() },
+        0 if n[1] == ty | 0x80 => {
+            // The bitmap the filter's argument names: an integer object
+            // (kind 1, its size, its bytes); another kind masks nothing.
+            let r = p.nodes_end + usize::from(u16::from_le_bytes([n[2], n[3]])) * NODE;
+            let kind = *b.get(r).ok_or(TRUNCATED)?;
+            let size = usize::from(u16_at(b, r + 2).ok_or(TRUNCATED)?);
+            if kind == 1 {
+                bits = b.get(r + 4..r + 4 + size).ok_or("bad integer object size")?;
+            }
+            if stacks_protobox {
+                defer = defers(b, p, at + 6)?;
+            }
+        }
+        _ => {}
+    }
+    if bits.len() > MASK_BYTES {
+        return Err("mask size exceeds maximum");
+    }
+    let mut m = [0u8; MASK_BYTES];
+    m[..bits.len()].copy_from_slice(bits);
+    Ok(ProfileMask { mask: Some(mask_of(m)), defer })
+}
+
+/// `0x...a095d4`: whether the calls a bitmap filter does not match all
+/// defer, every way on from its no-match edge (at `edge`) ending in a
+/// terminal that allows with no flags or flag 10 alone and no modifiers
+/// (or a node of neither kind). The walk follows each filter's match edge
+/// and keeps its no-match edge for later, at most 15 of them; one more, or
+/// a terminal of other flags, ends it with no deferral.
+fn defers(b: &[u8], p: &Profile, edge: usize) -> Result<bool, &'static str> {
+    const TRUNCATED: &str = "truncated";
+    // An edge's node, which must lie past the edge.
+    let target = |at: usize| -> Result<(u16, usize), &'static str> {
+        let i = u16_at(b, at).ok_or(TRUNCATED)?;
+        let n = p.nodes + usize::from(i) * NODE;
+        if n <= at || n >= b.len() {
+            return Err(TRUNCATED);
+        }
+        Ok((i, n))
+    };
+    let mut pending: Vec<u16> = Vec::with_capacity(15);
+    let (_, mut node) = target(edge)?;
+    loop {
+        match b[node] {
+            0 => {
+                let (other, _) = target(node + 6)?;
+                if !pending.contains(&other) {
+                    if pending.len() == 15 {
+                        return Ok(false);
+                    }
+                    pending.push(other);
+                }
+                node = target(node + 4)?.1;
+                continue;
+            }
+            1 => {
+                let word = b.get(node + 1..node + 4).ok_or(TRUNCATED)?;
+                let word = u32::from(word[0]) | u32::from(word[1]) << 8 | u32::from(word[2]) << 16;
+                if word & !0x400 != 0 || *b.get(node + 4).ok_or(TRUNCATED)? != 0 {
+                    return Ok(false);
+                }
+            }
+            _ => {}
+        }
+        match pending.pop() {
+            None => return Ok(true),
+            Some(i) => {
+                node = p.nodes + usize::from(i) * NODE;
+                if node >= b.len() {
+                    return Err(TRUNCATED);
+                }
+            }
+        }
     }
 }
 
@@ -859,6 +1075,20 @@ fn str_match(b: &[u8], p: &Profile, flag: bool, arg: u16, s: &[u8], facts: &mut 
 }
 
 /// The string a filter names by its argument (`0x...65b4`).
+/// Whether a path extension for `ext` takes `path` in (`0x...a11704`, for
+/// an extension that is not for its path alone): `ext` itself, a path
+/// under it, the name the kext keeps as `.sb-XXXXXXXX` after it, or any
+/// path for an extension of the root.
+fn extension_takes(ext: &[u8], path: &[u8]) -> bool {
+    if ext.len() > path.len() || !path.starts_with(ext) {
+        return false;
+    }
+    match path.get(ext.len()) {
+        None | Some(b'/') => true,
+        Some(_) => path[ext.len()..].starts_with(b".sb-XXXXXXXX") || ext == b"/",
+    }
+}
+
 fn operand(b: &[u8], p: &Profile, arg: u16) -> Result<(usize, Vec<u8>), Stop> {
     let at = p.nodes_end + usize::from(arg) * NODE;
     string_at(b, p, at).map(|s| (at, s)).ok_or(Stop::Refuse(REFUSED))
@@ -867,6 +1097,60 @@ fn operand(b: &[u8], p: &Profile, arg: u16) -> Result<(usize, Vec<u8>), Stop> {
 /// `kAMFI` entitlement key that keeps a platform binary from counting as
 /// Apple-signed.
 const CAN_EXECUTE_CDHASH: &[u8] = b"com.apple.private.amfi.can-execute-cdhash";
+
+/// `0x...9f2358`: the filter's string against each class of `chain` in
+/// turn: a match ends it; an error does not, but is the answer when the
+/// last class's compare is one.
+fn class_walk(b: &[u8], p: &Profile, flag: bool, arg: u16, chain: &[&str], facts: &mut dyn Facts) -> Result<bool, Stop> {
+    let mut last = Ok(false);
+    for class in chain {
+        last = str_match(b, p, flag, arg, class.as_bytes(), facts);
+        if matches!(last, Ok(true)) {
+            return Ok(true);
+        }
+    }
+    last.map(|_| false)
+}
+
+/// The local and remote filters' compare (`0x...a06394`) of address `sa`
+/// of a socket of `domain` and `ty` against the operand at `arg`: its flags
+/// (bit 0 inet, bit 1 inet6, bit 2 stream only, bit 3 datagram only), its
+/// host byte (non-zero: the host's own address) and port (non-zero: that
+/// port). A cut operand refuses.
+fn address_match(b: &[u8], p: &Profile, arg: u16, sa: Option<&[u8]>, domain: u32, ty: u32, facts: &mut dyn Facts) -> Result<bool, Stop> {
+    let r = p.nodes_end + usize::from(arg) * NODE;
+    let refused = Stop::Refuse(REFUSED);
+    let (Some(&flags), Some(&host), Some(port)) = (b.get(r), b.get(r + 1), u16_at(b, r + 2)) else { return Err(refused) };
+    let family_ok = match domain {
+        AF_INET => flags & 1 != 0,
+        AF_INET6 => flags & 2 != 0,
+        AF_MULTIPATH => flags & 3 != 0,
+        _ => false,
+    };
+    if !family_ok || (ty != 1 && flags & 4 != 0) || (ty != 2 && flags & 8 != 0) {
+        return Ok(false);
+    }
+    let Some(sa) = sa else { return Ok(false) };
+    let leg = |family: u32, facts: &mut dyn Facts| -> Result<bool, Stop> {
+        if sa.len() < 4 || u32::from(sa[1]) != family {
+            return Ok(false);
+        }
+        if port != 0 && u16::from_be_bytes([sa[2], sa[3]]) != port {
+            return Ok(false);
+        }
+        if host != 0 && !facts.host_address(sa)? {
+            return Ok(false);
+        }
+        Ok(true)
+    };
+    if matches!(domain, AF_INET | AF_MULTIPATH) && leg(AF_INET, facts)? {
+        return Ok(true);
+    }
+    if matches!(domain, AF_INET6 | AF_MULTIPATH) && leg(AF_INET6, facts)? {
+        return Ok(true);
+    }
+    Ok(false)
+}
 
 /// One filter node: whether it matches.
 fn filter(b: &[u8], p: &Profile, ty: u8, flag: bool, arg: u16, facts: &mut dyn Facts, scratch: &mut Scratch) -> Result<bool, Stop> {
@@ -965,6 +1249,125 @@ fn filter(b: &[u8], p: &Profile, ty: u8, flag: bool, arg: u16, facts: &mut dyn F
         // host-special-port, syscall-number, mac-syscall-number.
         47 => k == kind::HOST_SPECIAL_PORT && int_match(b, p, flag, arg, u64::from(facts.host_special_port()))?,
         65 => k == kind::SYSCALL_UNIX && int_match(b, p, flag, arg, u64::from(facts.syscall_number()))?,
+        // local / remote (`0x...a0444c`): the socket's local or remote
+        // address against the operand's families, types, host and port; a
+        // socket operation's local address fetched first, for either.
+        8 | 9 => {
+            if k != kind::SOCKET {
+                false
+            } else {
+                match facts.socket().filter(|s| s.present) {
+                    None => false,
+                    Some(t) => {
+                        let local = facts.socket_local()?;
+                        let sa = if ty == 8 { local } else { facts.socket_remote() };
+                        address_match(b, p, arg, sa.as_deref(), t.domain, t.ty, facts)?
+                    }
+                }
+            }
+        }
+        // control-name (`0x...a04604`): a kernel control's name, of a remote
+        // AF_SYSTEM address of SYSPROTO_CONTROL.
+        10 => {
+            let sys = k == kind::SOCKET && facts.socket_remote().is_some_and(|sa| sa.len() >= 4 && u32::from(sa[1]) == AF_SYSTEM && u16::from_le_bytes([sa[2], sa[3]]) == 2);
+            if sys {
+                return Err(facts.unported("a kernel control's name (ctl_name_by_id)".into()));
+            }
+            false
+        }
+        // socket-domain, socket-type, socket-protocol (the protocol's low 16
+        // bits, unchecked).
+        11 | 12 => match facts.socket().filter(|_| k == kind::SOCKET) {
+            Some(t) => int_match(b, p, flag, arg, u64::from(if ty == 11 { t.domain } else { t.ty }))?,
+            None => false,
+        },
+        13 => match facts.socket().filter(|_| k == kind::SOCKET) {
+            Some(t) => int_match_any(b, p, flag, arg, u64::from(t.protocol & 0xffff))?,
+            None => false,
+        },
+        // ioctl-command: a socket ioctl's or a vnode ioctl's (`args[0x140]`),
+        // its low 16 bits.
+        16 if k == kind::SOCKET => int_match_any(b, p, flag, arg, facts.socket_command() & 0xffff)?,
+        16 if k == kind::VNODE => match facts.object_number()? {
+            Some(cmd) => int_match_any(b, p, flag, arg, u64::from(cmd & 0xffff))?,
+            None => false,
+        },
+        // fcntl-command (`args[0xd8]`).
+        78 => k == kind::FCNTL && int_match(b, p, flag, arg, u64::from(facts.syscall_number()))?,
+        // device-major and device-minor (the device's top byte and low 16
+        // bits), and the IOMedia class a device is of: a block or character
+        // device's, read with its attributes; a path under a directory that
+        // gives no type has none.
+        20..=22 => {
+            if k != kind::VNODE {
+                return Ok(false);
+            }
+            let (Some((vtype, _)), Some(rdev)) = (facts.vnode_type()?, facts.vnode_rdev()?) else { return Ok(false) };
+            if vtype != 3 && vtype != 4 {
+                return Ok(false);
+            }
+            match ty {
+                20 => int_match_any(b, p, flag, arg, u64::from(rdev >> 24))?,
+                21 => int_match_any(b, p, flag, arg, u64::from(rdev & 0xffff))?,
+                _ => {
+                    let (_, class) = operand(b, p, arg)?;
+                    facts.media_device(rdev, &class)?
+                }
+            }
+        }
+        // A socket option's level and name.
+        79 => k == kind::SOCKET && int_match(b, p, flag, arg, u64::from(facts.socket_option().0))?,
+        80 => k == kind::SOCKET && int_match(b, p, flag, arg, u64::from(facts.socket_option().1))?,
+        // A memorystatus_control command.
+        84 => k == kind::MEMORYSTATUS && int_match(b, p, flag, arg, u64::from(facts.syscall_number()))?,
+        // An NECP client action's number.
+        83 => k == kind::NECP_ACTION && int_match(b, p, flag, arg, u64::from(facts.syscall_number()))?,
+        // iokit-registry-entry-class (and iokit-user-client-class): the
+        // object's class and superclasses (`0x...9f2358`); iokit-connection:
+        // those of the object and of each IOService-plane ancestor in turn
+        // (`0x...9f2564`).
+        17 | 19 => match facts.iokit().filter(|_| k == kind::IOKIT) {
+            None => false,
+            Some(o) => {
+                let walks = if ty == 17 { 1 } else { o.chains.len() };
+                let mut last = Ok(false);
+                for chain in o.chains.iter().take(walks) {
+                    let Some(chain) = chain else {
+                        return Err(facts.unported("the class or the provider of an IORegistry entry this registry does not know".into()));
+                    };
+                    last = class_walk(b, p, flag, arg, chain, facts);
+                    if matches!(last, Ok(true)) {
+                        break;
+                    }
+                }
+                last?
+            }
+        },
+        // iokit-property: the property the operation names.
+        18 => match facts.iokit().filter(|_| k == kind::IOKIT).and_then(|o| o.property) {
+            Some(name) => str_match(b, p, flag, arg, &name, facts)?,
+            None => false,
+        },
+        // iokit-usb-interface-class and -subclass: a user client's
+        // provider's, an OSNumber of at most two bytes; the argument is the
+        // operand itself.
+        60 | 61 => match facts.iokit().filter(|_| k == kind::IOKIT).and_then(|o| if ty == 60 { o.usb_class } else { o.usb_subclass }) {
+            Some((v, bits)) => bits <= 16 && v == u64::from(arg),
+            None => false,
+        },
+        // iokit-method-number and iokit-trap-number: only a user client's
+        // call filter sets the call's kind and number, which no hook here
+        // does.
+        73 | 74 => false,
+        // iokit-user-client-type: the type an open asks for.
+        77 => match facts.iokit().filter(|_| k == kind::IOKIT) {
+            Some(o) => int_match(b, p, flag, arg, u64::from(o.client_type))?,
+            None => false,
+        },
+        // A Mach trap's number; a kernel MIG routine's index (the one
+        // Sandbox gave its message id at boot).
+        75 => k == kind::SYSCALL_MACH && int_match(b, p, flag, arg, u64::from(facts.syscall_number()))?,
+        76 => k == kind::SYSCALL_MIG && int_match(b, p, flag, arg, u64::from(facts.syscall_number()))?,
         82 => k == kind::MAC_SYSCALL && int_match(b, p, flag, arg, u64::from(facts.mac_call()))?,
         // reboot-flags: every flag the argument names.
         54 => arg & !facts.reboot_flags() == 0,
@@ -1037,21 +1440,53 @@ fn filter(b: &[u8], p: &Profile, ty: u8, flag: bool, arg: u16, facts: &mut dyn F
             }
         }
         // extension, storage-class-extension, and the extension ancestry
-        // filter: a process without a sandbox has no extensions.
-        23 | 56 | 59 if !facts.sandboxed() => false,
-        // extension (`0x...a047c0`): for a vnode operation its path first;
-        // then the sandbox's extensions of the class. With none, no match;
-        // matching one against the operation's object is not ported.
+        // filter: a process without a sandbox has no extensions, and a
+        // vnode matches none of a sandbox that holds none.
+        23 if !facts.sandboxed() => {
+            operand(b, p, arg)?;
+            false
+        }
+        56 | 59 if !facts.sandboxed() => false,
+        // A sandbox that holds no extension has no table of them (it is made
+        // with the first), and matches none.
+        23 if !facts.holds_extensions() => {
+            operand(b, p, arg)?;
+            false
+        }
+        56 | 59 if k != kind::VNODE || !facts.holds_extensions() => false,
+        // extension (`0x...a047c0`): for a vnode operation its path, then
+        // whether an extension of the class takes it in (`0x...a11704`).
+        // Matching one against another kind's object is not ported.
         23 => {
             let (_, class) = operand(b, p, arg)?;
-            if k == kind::VNODE && facts.path()?.is_none() {
-                return Ok(false);
+            if k == kind::VNODE {
+                let Some((path, _)) = facts.path()? else { return Ok(false) };
+                return Ok(facts.extension_paths(Some(&class)).iter().any(|e| extension_takes(e, &path)));
             }
             if facts.has_extension(&class) {
                 return Err(facts.unported(format!("sandbox extension filter of class {} for an operation of kind {k}", String::from_utf8_lossy(&class))));
             }
             false
         }
+        // The extension ancestry filter (`0x...a04d2c`, `0x...a11658`): the
+        // root, or a path an extension's lies under or that one takes in.
+        56 => {
+            let Some((path, _)) = facts.path()? else { return Ok(false) };
+            path == b"/"
+                || facts.extension_paths(None).iter().any(|e| (path.len() <= e.len() && e.starts_with(&path) && matches!(e.get(path.len()), None | Some(b'/'))) || extension_takes(e, &path))
+        }
+        // storage-class-extension (`0x...a04ea4`, `0x...a118d4`): an
+        // extension of the vnode's storage category (its storage class; the
+        // default one indexes none) that takes its path in.
+        59 => {
+            let Some((path, _)) = facts.path()? else { return Ok(false) };
+            match facts.storage_class()? {
+                Some(class) => facts.category_extension_paths(&class).iter().any(|e| extension_takes(e, &path)),
+                None => false,
+            }
+        }
+        // A POSIX semaphore's creator (`0x...a04ac0`), as the target.
+        37 => k == kind::POSIX_IPC && (1..=7).contains(&arg) && facts.creator_is(arg)?,
         // The target process (`0x...a046dc`), of a process operation.
         14 => {
             if k != kind::PROCESS {
@@ -1152,6 +1587,11 @@ fn filter(b: &[u8], p: &Profile, ty: u8, flag: bool, arg: u16, facts: &mut dyn F
 pub fn evaluate(b: &[u8], p: &Profile, op: usize, facts: &mut dyn Facts, scratch: &mut Scratch) -> Outcome {
     let refused = Outcome::Decided(REFUSED, Effects::default());
     let Some(idx) = (op < OPERATIONS).then(|| u16_at(b, p.ops + 2 * op)).flatten() else { return refused };
+    // The interpreter's prelude (`0x...a041f0`): a socket operation on a
+    // unix domain socket is allowed at once, with no report.
+    if facts.kind() == kind::SOCKET && facts.socket().is_some_and(|s| s.present && s.domain == AF_UNIX) {
+        return Outcome::Decided(Decision { errno: 0, flags: 0 }, Effects::default());
+    }
     let mut at = p.nodes + usize::from(idx) * NODE;
     loop {
         if at < p.nodes || at >= p.nodes_end || at + NODE > b.len() {
@@ -1376,6 +1816,58 @@ mod tests {
     }
 
     #[test]
+    fn a_profiles_masks_are_its_loaders() {
+        // A terminal that allows with nothing: no mask; with flag 10 alone:
+        // all clear, deferring; with other flags: all clear.
+        let none = |n: [u8; 8]| {
+            let b = blob(0, &[n]);
+            let p = single(&b).unwrap();
+            profile_mask(&b, &p, 152, 65, false).unwrap()
+        };
+        assert!(none(allow()).mask.is_none());
+        let m = none([1, 0, 4, 0, 0, 0, 0, 0]);
+        assert!(m.defer && m.mask.is_some_and(|m| mask_bytes(&m) == [0; MASK_BYTES]));
+        let m = none(deny());
+        assert!(!m.defer && m.mask.is_some_and(|m| mask_bytes(&m) == [0; MASK_BYTES]));
+        // syscall-unix's bitmap filter (65 with bit 7) names an integer
+        // object of two bytes: its bits are the mask's, the rest clear.
+        let mut b = blob(0, &[[0, 65 | 0x80, 0, 0, 1, 0, 2, 0], allow(), deny()]);
+        b.extend_from_slice(&[1, 0, 2, 0, 0xdf, 0x07, 0, 0]);
+        let p = single(&b).unwrap();
+        let m = profile_mask(&b, &p, 152, 65, false).unwrap();
+        let mask = m.mask.unwrap();
+        assert_eq!((0..16).filter(|&n| mask_allows(&mask, n)).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4, 6, 7, 8, 9, 10]);
+        assert!(!m.defer);
+        // Another operation's filter is no bitmap of its own: all clear.
+        assert!(profile_mask(&b, &p, 153, 75, false).unwrap().mask.is_some_and(|m| mask_bytes(&m) == [0; MASK_BYTES]));
+        // Stacking a protobox profile, the bitmap's no-match edge decides:
+        // a denial does not defer; an allow with flag 10 alone does.
+        assert!(!profile_mask(&b, &p, 152, 65, true).unwrap().defer);
+        let mut b = blob(0, &[[0, 65 | 0x80, 0, 0, 1, 0, 2, 0], allow(), [1, 0, 4, 0, 0, 0, 0, 0]]);
+        b.extend_from_slice(&[1, 0, 2, 0, 0xdf, 0x07, 0, 0]);
+        let p = single(&b).unwrap();
+        assert!(profile_mask(&b, &p, 152, 65, true).unwrap().defer);
+        // A bitmap longer than a mask is refused.
+        let mut b = blob(0, &[[0, 65 | 0x80, 0, 0, 1, 0, 2, 0], allow(), deny()]);
+        b.extend_from_slice(&[1, 0, 71, 0]);
+        b.extend_from_slice(&[0xff; 71]);
+        let p = single(&b).unwrap();
+        assert!(profile_mask(&b, &p, 152, 65, false).is_err());
+    }
+
+    #[test]
+    fn a_masks_bit_is_set_in_place() {
+        let m = mask_of([0; MASK_BYTES]);
+        let shared = std::sync::Arc::clone(&m);
+        assert!(!mask_allows(&shared, 205));
+        mask_set(&m, 205);
+        assert!(mask_allows(&shared, 205) && !mask_allows(&shared, 204));
+        // Past the mask: nothing set, nothing let through.
+        mask_set(&m, MASK_BYTES * 8);
+        assert!(!mask_allows(&m, MASK_BYTES * 8));
+    }
+
+    #[test]
     fn malformed_profiles_are_refused() {
         // A node that leads back to itself.
         let b = blob(0, &[[0, 54, 0, 0, 0, 0, 0, 0]]);
@@ -1422,6 +1914,16 @@ mod tests {
 #[cfg(test)]
 mod platform {
     use super::*;
+
+    #[test]
+    fn an_extension_takes_in_its_path_and_what_is_under_it() {
+        assert!(extension_takes(b"/a/b", b"/a/b"));
+        assert!(extension_takes(b"/a/b", b"/a/b/c"));
+        assert!(!extension_takes(b"/a/b", b"/a/bc"));
+        assert!(extension_takes(b"/a/b", b"/a/b.sb-XXXXXXXX"));
+        assert!(!extension_takes(b"/a/b", b"/a"));
+        assert!(extension_takes(b"/", b"/usr"));
+    }
 
     /// Every operation of a real platform profile (`GEX_SANDBOX_PLATFORM`,
     /// the kernelcache's blob), for a subject that answers little: what

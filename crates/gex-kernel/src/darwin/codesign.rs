@@ -63,7 +63,7 @@ mod der {
 /// One DER element at the start of `b`: its class and constructed bits,
 /// its tag number, its contents and what follows it. Definite lengths
 /// only, in their shortest form.
-fn der_element(b: &[u8]) -> Option<(u8, u32, &[u8], &[u8])> {
+pub(crate) fn der_element(b: &[u8]) -> Option<(u8, u32, &[u8], &[u8])> {
     let (&first, mut rest) = b.split_first()?;
     let mut tag = u32::from(first & 0x1f);
     if tag == 0x1f {
@@ -192,9 +192,6 @@ pub struct CodeSign {
     pub xml: Option<Vec<u8>>,
     pub der: Option<Vec<u8>>,
     pub cms: Option<usize>,
-    /// Launch constraints of its own (`CSSLOT_LAUNCH_CONSTRAINT_SELF`,
-    /// `_PARENT`, `_RESPONSIBLE`).
-    pub launch_constraints: bool,
     /// The blob as added (`csb_mem_kaddr`, `csb_mem_size`).
     pub blob: Vec<u8>,
     /// The cdhash of the best CodeDirectory.
@@ -274,7 +271,6 @@ impl CodeSign {
                 (CSSLOT_ENTITLEMENTS, CSMAGIC_EMBEDDED_ENTITLEMENTS) => cs.xml = Some(b.to_vec()),
                 (CSSLOT_DER_ENTITLEMENTS, CSMAGIC_EMBEDDED_DER_ENTITLEMENTS) => cs.der = Some(b.to_vec()),
                 (CSSLOT_SIGNATURESLOT, CSMAGIC_BLOBWRAPPER) => cs.cms = Some(b.len()),
-                (8..=10, CSMAGIC_EMBEDDED_LAUNCH_CONSTRAINT) => cs.launch_constraints = true,
                 _ => {}
             }
         }
@@ -307,6 +303,17 @@ fn blobs() -> &'static std::sync::Mutex<std::collections::HashMap<(u64, u64), Ve
 /// The blob already on the vnode for the slice at `file_start`.
 fn added(vnode: (u64, u64), file_start: i64) -> Option<Added> {
     blobs().lock().unwrap_or_else(|e| e.into_inner()).get(&vnode).and_then(|v| v.iter().find(|a| file_start >= a.base + a.start as i64 && file_start < a.base + a.end as i64).cloned())
+}
+
+/// `ubc_cs_blob_get(vp, -1, -1, offset)`: the signature whose range holds
+/// `offset`.
+pub fn vnode_blob(vnode: (u64, u64), offset: i64) -> Option<std::sync::Arc<CodeSign>> {
+    added(vnode, offset).map(|a| a.sig)
+}
+
+/// `csfg_get_teamid`: the team identifier of the vnode's first blob.
+pub fn vnode_teamid(vnode: (u64, u64)) -> Option<Vec<u8>> {
+    blobs().lock().unwrap_or_else(|e| e.into_inner()).get(&vnode).and_then(|v| v.first()).and_then(|a| a.sig.team_id.clone())
 }
 
 /// Why `ubc_cs_blob_add` refused a blob.
@@ -442,15 +449,16 @@ impl Kernel {
         Ok(0)
     }
 
-    /// fcntl's F_CHECK_LV: its argument read; library validation is a MAC
-    /// policy's, and none is loaded, so the file may be mapped.
+    /// fcntl's F_CHECK_LV (`fchecklv_t`: the slice's offset, the message
+    /// buffer's size and address): `mac_file_check_library_validation`,
+    /// AMFI's ([`Kernel::darwin_library_validation`]).
     pub(crate) fn darwin_check_lv(&mut self, m: &mut GuestMem<'_>, fd: i32, argp: u64) -> Result<u64, crate::errno::Errno> {
         let file = self.fds.get(fd)?;
-        if self.darwin_vnode_of(&file).is_none() {
-            return Err(crate::errno::Errno::EBADF);
-        }
-        m.read(argp, 24)?;
-        Ok(0)
+        let Some(vnode) = self.darwin_vnode_of(&file) else { return Err(crate::errno::Errno::EBADF) };
+        let file_start = m.read_u64(argp)? as i64;
+        let (msg_size, msg) = (m.read_u64(argp + 8)?, m.read_u64(argp + 16)?);
+        let path = file.path.clone();
+        self.darwin_library_validation(m, vnode, &path, file_start, msg, msg_size)
     }
 
     /// An open file's vnode (its mount and inode), or `None` for what is
@@ -509,20 +517,6 @@ impl Kernel {
         }
         let le = |o: usize| slice.get(o..o + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
         Ok(LoadResult { sig, csflags: flags, uuid: m.uuid.unwrap_or_default(), cputype: (le(4), le(8)) })
-    }
-
-    /// `mac_proc_check_launch_constraints` (AMFI's): the image's trust cache
-    /// category names the constraints it and its parent must meet, and an
-    /// image may carry its own. Category 0 has none.
-    pub(crate) fn darwin_launch_constraints(&mut self) -> Result<(), crate::errno::Errno> {
-        let Some(c) = &self.dtask.codesign else { return Ok(()) };
-        let category = c.trust_cache.and_then(|e| e.category).unwrap_or(0);
-        let own = c.launch_constraints;
-        if category != 0 || own {
-            self.darwin_unimplemented(format!("AMFI launch constraints (trust cache category {category}{})", if own { ", the image's own" } else { "" }));
-            return Err(crate::errno::Errno::EPERM);
-        }
-        Ok(())
     }
 
     /// `ubc_cs_blob_add` for an image's load: a refusal is EBADEXEC.
@@ -605,7 +599,7 @@ const CSSLOT_LIBRARY_CONSTRAINT: u32 = 11;
 const CSSLOT_ALTERNATE_CODEDIRECTORIES: u32 = 0x1000;
 const CSSLOT_ALTERNATE_CODEDIRECTORY_LIMIT: u32 = 0x1005;
 const CSMAGIC_EMBEDDED_DER_ENTITLEMENTS: u32 = 0xfade_7172;
-const CSMAGIC_EMBEDDED_LAUNCH_CONSTRAINT: u32 = 0xfade_8181;
+pub const CSMAGIC_EMBEDDED_LAUNCH_CONSTRAINT: u32 = 0xfade_8181;
 /// `PAGE_SHIFT_4K`, and the A10X's `PAGE_SHIFT`.
 const PAGE_SHIFT_4K: u8 = 12;
 const PAGE_SHIFT: u8 = 14;
@@ -751,6 +745,39 @@ pub fn validate_csblob(b: &[u8]) -> Result<(usize, usize), crate::errno::Errno> 
             }
         }
         _ => bad,
+    }
+}
+
+/// `csblob_find_blob_bytes`: the blob of slot `ty` whose magic is `magic`
+/// (the first such that lies inside the superblob), or the bare
+/// CodeDirectory a blob may be.
+pub fn find_blob(b: &[u8], ty: u32, magic: u32) -> Option<&[u8]> {
+    let length = b.len();
+    if be32(b, 0)? == CSMAGIC_EMBEDDED_SIGNATURE {
+        let count = be32(b, 8)? as usize;
+        for n in 0..count {
+            if be32(b, 12 + 8 * n)? != ty {
+                continue;
+            }
+            let offset = be32(b, 16 + 8 * n)? as usize;
+            if length.checked_sub(8)? < offset {
+                return None;
+            }
+            if be32(b, offset)? != magic {
+                continue;
+            }
+            let end = offset.checked_add(be32(b, offset + 4)? as usize)?;
+            if end > length {
+                continue;
+            }
+            return Some(&b[offset..end]);
+        }
+        None
+    } else if ty == CSSLOT_CODEDIRECTORY && be32(b, 0)? == CSMAGIC_CODEDIRECTORY && magic == CSMAGIC_CODEDIRECTORY {
+        let end = be32(b, 4)? as usize;
+        (end <= length).then(|| &b[..end])
+    } else {
+        None
     }
 }
 
