@@ -333,6 +333,11 @@ pub trait Facts {
     fn target_is(&mut self, which: u16) -> Result<bool, Stop> {
         Err(Stop::Unported(format!("sandbox: the target process's relation {which}")))
     }
+    /// The same relation of a POSIX semaphore's creator (kind 6), which
+    /// matches nothing when it cannot be found.
+    fn creator_is(&mut self, which: u16) -> Result<bool, Stop> {
+        Err(Stop::Unported(format!("sandbox: a semaphore creator's relation {which}")))
+    }
     /// The sandbox evaluated with holds an extension of `class`; holds
     /// any extension.
     fn has_extension(&mut self, _class: &[u8]) -> bool {
@@ -1479,6 +1484,8 @@ fn filter(b: &[u8], p: &Profile, ty: u8, flag: bool, arg: u16, facts: &mut dyn F
                 None => false,
             }
         }
+        // A POSIX semaphore's creator (`0x...a04ac0`), as the target.
+        37 => k == kind::POSIX_IPC && (1..=7).contains(&arg) && facts.creator_is(arg)?,
         // The target process (`0x...a046dc`), of a process operation.
         14 => {
             if k != kind::PROCESS {

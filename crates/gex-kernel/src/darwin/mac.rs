@@ -184,6 +184,9 @@ pub struct SbArgs {
     pub quiet: bool,
     /// A process operation's target (kind 4), by pid.
     pub target: Option<i32>,
+    /// A POSIX semaphore's creator (kind 6): its pid and unique id, and
+    /// whether it is the calling process.
+    pub creator: Option<(i32, u64, bool)>,
     /// `args[0xd8]` as a number (a syscall number, a command), and
     /// `args[0xe0]`'s (a MAC syscall's call number).
     pub number: u32,
@@ -319,6 +322,37 @@ impl KernelFacts<'_> {
         self.k.dtask.csflags.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Process `t`'s relation `which` to the subject (`0x...a05584`): 1,
+    /// it is the subject; 2, in its process group; 3, in another; 4, its
+    /// child; 5, of the same sandbox (the one evaluated with, none being
+    /// one); 6, the initial process; 7, platform code.
+    fn relation(&mut self, t: i32, which: u16) -> bool {
+        let me = self.k.pid;
+        let pgrp = |k: &Kernel, pid: i32| k.procs.pgid(pid, pid).ok();
+        match which {
+            1 => t == me,
+            2 => pgrp(self.k, t) == pgrp(self.k, me),
+            3 => pgrp(self.k, t) != pgrp(self.k, me),
+            4 => self.k.procs.ppid(t) == me,
+            // The target's credential's sandbox is the very one.
+            5 => {
+                let theirs = if t == me {
+                    self.k.darwin_sandbox()
+                } else {
+                    let ipc = self.k.ipc();
+                    ipc.links.values().find(|l| l.pid == t).and_then(|l| super::sandboxes::of(&l.sandbox))
+                };
+                match (theirs, self.sb) {
+                    (Some(a), Some(b)) => std::ptr::eq(Arc::as_ptr(&a), b),
+                    (None, None) => true,
+                    _ => false,
+                }
+            }
+            6 => t == crate::proc::INIT_PID,
+            _ => self.sig_of(t).flatten().is_some_and(|c| c.platform_binary),
+        }
+    }
+
     /// Another process's signature, by its pid (its task's link).
     fn sig_of(&mut self, pid: i32) -> Option<Option<super::codesign::CodeSign>> {
         if pid == self.k.pid {
@@ -415,30 +449,28 @@ impl Facts for KernelFacts<'_> {
         Ok(self.sig_of(t).flatten().map(|c| c.ents.bool_true(key)))
     }
     fn target_is(&mut self, which: u16) -> Result<bool, Stop> {
-        let (me, t) = (self.k.pid, self.a.target.unwrap_or(0));
-        let pgrp = |k: &Kernel, pid: i32| k.procs.pgid(pid, pid).ok();
-        Ok(match which {
-            1 => t == me,
-            2 => pgrp(self.k, t) == pgrp(self.k, me),
-            3 => pgrp(self.k, t) != pgrp(self.k, me),
-            4 => self.k.procs.ppid(t) == me,
-            // The target's credential's sandbox is the very one.
-            5 => {
-                let theirs = if t == me {
-                    self.k.darwin_sandbox()
-                } else {
-                    let ipc = self.k.ipc();
-                    ipc.links.values().find(|l| l.pid == t).and_then(|l| super::sandboxes::of(&l.sandbox))
-                };
-                match (theirs, self.sb) {
-                    (Some(a), Some(b)) => std::ptr::eq(Arc::as_ptr(&a), b),
-                    (None, None) => true,
-                    _ => false,
-                }
+        let t = self.a.target.unwrap_or(0);
+        Ok(self.relation(t, which))
+    }
+    /// The semaphore's creator (`0x...a04ac0`): the calling process, or
+    /// the live process of its pid whose unique id is the one recorded (a
+    /// unique id of zero, a process gone, or one that has since taken the
+    /// pid, matches nothing).
+    fn creator_is(&mut self, which: u16) -> Result<bool, Stop> {
+        let Some((pid, uniqueid, current)) = self.a.creator else { return Ok(false) };
+        let t = if current {
+            self.k.pid
+        } else {
+            if uniqueid == 0 {
+                return Ok(false);
             }
-            6 => t == crate::proc::INIT_PID,
-            _ => self.sig_of(t).flatten().is_some_and(|c| c.platform_binary),
-        })
+            let theirs = if pid == self.k.pid { Some(self.k.dtask.uniqueid) } else { self.k.ipc().links.values().find(|l| l.pid == pid).map(|l| l.uniqueid) };
+            if theirs != Some(uniqueid) {
+                return Ok(false);
+            }
+            pid
+        };
+        Ok(self.relation(t, which))
     }
     fn has_extension(&mut self, class: &[u8]) -> bool {
         self.sb.is_some_and(|s| s.extensions.iter().any(|e| e.class == class))

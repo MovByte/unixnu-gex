@@ -13,11 +13,18 @@
 // Apple's own (it may run any cdhash) has a directory's times taken out
 // of what stat and getattrlist give it (the getattr check's flag 0x20).
 //
+// A semaphore another process made and holds open is its maker's, which
+// the container profile does not let a sandboxed process open; one that
+// nothing holds open becomes the opener's, which then may open it and
+// post it (ipc-posix-sem-open and -post of a semaphore the caller made).
+//
 // The checks run in a child, which the sandbox ends with; the parent
-// removes what it made (a directory of its own, by its pid).
+// removes what it made (a directory and semaphores of its own, by its
+// pid).
 
 #include <errno.h>
 #include <fcntl.h>
+#include <semaphore.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -55,6 +62,8 @@ static int refused(const char *what, long r) {
     return 0;
 }
 
+static char held[32], left[32];
+
 static int container(int fd) {
     char *err = NULL;
     if (sandbox_init("container", SANDBOX_NAMED_BUILTIN, &err) != 0) return fail("sandbox_init", errno);
@@ -84,6 +93,10 @@ static int container(int fd) {
     if (refused("listxattr", listxattr(file, buf, sizeof buf, 0))) return 1;
     if (fstat(fd, &st) != 0 || st.st_size != 3) return fail("fstat", errno);
     if (refused("fchmod", fchmod(fd, 0600))) return 1;
+    if (sem_open(held, 0) != SEM_FAILED || errno != EPERM) return fail("sem_open of another's semaphore", errno);
+    sem_t *s = sem_open(left, 0);
+    if (s == SEM_FAILED) return fail("sem_open of a semaphore nothing holds", errno);
+    if (sem_post(s) != 0) return fail("sem_post", errno);
     if (stat("/", &st) != 0) return fail("stat /", errno);
     int n = open("/dev/null", O_RDWR);
     if (n < 0) return fail("open /dev/null", errno);
@@ -122,12 +135,25 @@ int main(int argc, char **argv) {
     int fd = open(file, O_CREAT | O_RDWR | O_TRUNC, 0644);
     if (fd < 0 || write(fd, "abc", 3) != 3) return fail("the file", errno);
     if (symlink("file", link_) != 0) return fail("the link", errno);
+    snprintf(held, sizeof held, "/gex-sbxfile-h.%d", (int)getpid());
+    snprintf(left, sizeof left, "/gex-sbxfile-l.%d", (int)getpid());
+    sem_t *h = SEM_FAILED, *l = SEM_FAILED;
+    if (!scrubbing) {
+        h = sem_open(held, O_CREAT | O_EXCL, 0600, 0);
+        l = sem_open(left, O_CREAT | O_EXCL, 0600, 0);
+        if (h == SEM_FAILED || l == SEM_FAILED || sem_close(l) != 0) return fail("the semaphores", errno);
+    }
     pid_t pid = fork();
     if (pid < 0) return fail("fork", errno);
     if (pid == 0) _exit(scrubbing ? scrub() : container(fd));
     int status = 0;
     if (waitpid(pid, &status, 0) != pid) return fail("waitpid", errno);
     close(fd);
+    if (!scrubbing) {
+        sem_close(h);
+        sem_unlink(held);
+        sem_unlink(left);
+    }
     unlink(link_);
     unlink(file);
     rmdir(dir);
