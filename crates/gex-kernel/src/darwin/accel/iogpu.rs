@@ -238,8 +238,10 @@ fn restricted(k: &Kernel) -> bool {
 /// The device client, an `AGXDeviceUserClient`: the task that opened it, its options (the
 /// open type's high 16 bits), whether it is restricted (+259), whether its
 /// start succeeded and it is not stopped (+256), the read-only mapping of
-/// the accelerator's stamps in its task, and the `API` property selector 6
-/// set.
+/// the accelerator's stamps in its task, the `API` property selector 6
+/// set, its trace id (+0xe8), its device's first client-shared block in
+/// its task, and its own mapping of IOSurfaceRoot's graphics comm page
+/// (selector 4's, made at its first call).
 pub struct Device {
     owner: i32,
     options: u32,
@@ -247,7 +249,15 @@ pub struct Device {
     ready: bool,
     stamps: u64,
     api: Option<String>,
+    trace_id: u64,
+    shared_block: u64,
+    comm: Option<u64>,
 }
+
+/// A device's client-shared block (IOGPUClientSharedMachine,
+/// 0xfffffff005bcf030): 0x100 elements of `(0x80 + 8 + 0x3f) & !0x3f`
+/// bytes, the 8 being AGXG9G's +0x22c (0xfffffff005be6560).
+const SHARED_BLOCK: u64 = 0x100 * ((0x80 + 8 + 0x3f) & !0x3f);
 
 impl Device {
     /// `IOGPU::newUserClient` for type 1: an `AGXDeviceUserClient` (what
@@ -265,12 +275,24 @@ impl Device {
             Ok(Ok(addr)) => addr,
             _ => return Err(K_IO_RETURN_INTERNAL_ERROR),
         };
+        // The device's client-shared machine makes its first block
+        // (IOGPU's vtable+0x5d8, kIOMemoryKernelUserShared | InOut) and
+        // maps it read-only into the task; nothing here writes its
+        // elements.
+        let shared_block = match k.darwin_own_memory(|k, m| k.darwin_iokit_map(m, SHARED_BLOCK, super::super::mach::prot::READ)) {
+            Ok(Ok(addr)) => addr,
+            _ => {
+                let _ = k.darwin_own_memory(|k, m| k.darwin_vm_deallocate(m, stamps, STAMP_MEMORY));
+                return Err(K_IO_RETURN_INTERNAL_ERROR);
+            }
+        };
         use std::sync::atomic::Ordering::Relaxed;
-        // The device's id, then the client's trace id (+232), which
-        // selector 4 gives with IOSurfaceRoot's trace page.
+        // The device's id, then the client's trace id (+0xe8,
+        // 0xfffffff005bbcefc: OSAddAtomic64's old value), which selector 4
+        // gives.
         NEXT_ID.fetch_add(1, Relaxed);
-        NEXT_ID.fetch_add(1, Relaxed);
-        Ok(Device { owner: k.pid, options, restricted: restricted(k), ready: true, stamps, api: None })
+        let trace_id = NEXT_ID.fetch_add(1, Relaxed);
+        Ok(Device { owner: k.pid, options, restricted: restricted(k), ready: true, stamps, api: None, trace_id, shared_block, comm: None })
     }
 
     /// `IOGPUDeviceUserClient::clientClose` (0xfffffff005bbd0f0): the
@@ -282,9 +304,13 @@ impl Device {
         self.stop(k);
     }
 
-    /// The client freed without a close: stopped as its termination stops it.
+    /// The client freed (0xfffffff005bbb290): stopped as its termination
+    /// stops it, and its comm page mapping let go.
     pub fn free(&mut self, k: &mut Kernel) {
         self.stop(k);
+        if let Some(addr) = self.comm.take() {
+            super::super::iosurface::comm_unmap(k, self.owner, addr);
+        }
     }
 
     fn stop(&mut self, k: &mut Kernel) {
@@ -293,8 +319,11 @@ impl Device {
         }
         self.ready = false;
         if k.pid == self.owner {
-            let addr = self.stamps;
-            let _ = k.darwin_own_memory(|k, m| k.darwin_vm_deallocate(m, addr, STAMP_MEMORY));
+            let (addr, block) = (self.stamps, self.shared_block);
+            let _ = k.darwin_own_memory(|k, m| {
+                k.darwin_vm_deallocate(m, addr, STAMP_MEMORY);
+                k.darwin_vm_deallocate(m, block, SHARED_BLOCK);
+            });
         } else if k.procs.vm(self.owner).is_ok() {
             k.darwin_unimplemented(format!("unmapping a device client's stamp memory from pid {} for pid {}", self.owner, k.pid));
         }
@@ -389,13 +418,34 @@ impl Device {
                 put(out, 20, &0u32.to_le_bytes());
                 ret::SUCCESS
             }
-            // The trace filter (0xfffffff005bbb618) and the trace object id
-            // with the task's view of the trace page (0xfffffff005bbb644)
-            // read IOSurfaceRoot's shared page (IOGPU::start's
-            // 0xfffffff005bd4b64), which is IOSurface's.
-            3 | 4 => {
-                k.darwin_unimplemented(format!("IOGPUDeviceUserClient selector {} ({}): IOSurfaceRoot's shared trace page", a.selector, selector_name(a.selector)));
-                ret::UNSUPPORTED
+            // The trace filter (0xfffffff005bbb618): the first word of
+            // IOSurfaceRoot's graphics comm page, which IOGPU::start mapped
+            // into the kernel (0xfffffff005bd4b64).
+            3 => {
+                put(out, 0, &super::super::iosurface::comm_word().to_le_bytes());
+                put(out, 4, &0u32.to_le_bytes());
+                ret::SUCCESS
+            }
+            // The trace object id, the comm page mapped into the task
+            // (0xfffffff005bd6a48: kIOMapAnywhere | kIOMapReadOnly |
+            // kIOMapUnique, once), the device's first client-shared block
+            // and the mapping's length (0xfffffff005bbb644).
+            4 => {
+                put(out, 0, &self.trace_id.to_le_bytes());
+                put(out, 0x10, &self.shared_block.to_le_bytes());
+                let comm = match self.comm {
+                    Some(a) => Ok((a, 0x4000)),
+                    None => super::super::iosurface::comm_map_unique(k),
+                };
+                match comm {
+                    Ok((addr, len)) => {
+                        self.comm = Some(addr);
+                        put(out, 8, &addr.to_le_bytes());
+                        put(out, 0x18, &(len as u32).to_le_bytes());
+                        ret::SUCCESS
+                    }
+                    Err(_) => ret::NO_MEMORY,
+                }
             }
             // A range of 0x1000000 ids (0xfffffff005bbb6f8).
             5 => {

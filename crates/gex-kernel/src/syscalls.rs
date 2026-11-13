@@ -11262,8 +11262,14 @@ impl Kernel {
             self.darwin_flush_perms(m);
         }
         let prev = if self.darwin { m.set_user(Some((self.ctx_addr, self.ctx_addr + ctx::SIZE as u64))) } else { None };
+        let soft = if self.darwin { self.darwin_soft_pages() } else { None };
+        let prev_soft = m.set_soft(soft.clone());
         let out = self.syscall_body(m, pc);
         m.set_user(prev);
+        m.set_soft(prev_soft);
+        if let Some(soft) = soft {
+            self.darwin_soft_written(m, &soft);
+        }
         self.darwin_ipc_leave();
         if self.darwin {
             self.darwin_flush_perms(m);
@@ -12067,8 +12073,14 @@ impl Kernel {
             self.darwin_flush_perms(m);
         }
         let prev = if self.darwin { m.set_user(Some((self.ctx_addr, self.ctx_addr + ctx::SIZE as u64))) } else { None };
+        let soft = if self.darwin { self.darwin_soft_pages() } else { None };
+        let prev_soft = m.set_soft(soft.clone());
         let out = self.finish_blocking_body(m, r);
         m.set_user(prev);
+        m.set_soft(prev_soft);
+        if let Some(soft) = soft {
+            self.darwin_soft_written(m, &soft);
+        }
         self.darwin_ipc_leave();
         if self.darwin {
             self.darwin_flush_perms(m);

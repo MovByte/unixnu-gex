@@ -466,6 +466,18 @@ impl Kernel {
             // iokit_client_died: the user client's clientDied, and the
             // client is gone with its connection.
             Some(Kobject::IoConnect(id)) => super::iokit::client_died(self, id),
+            // iokit_no_senders for IKOT_IOKIT_IDENT: the object goes with
+            // the port's last send right, unless one was made since
+            // (IOMachPort::noMoreSendersForObject compares the make-send
+            // count).
+            Some(Kobject::IoIdent(id)) => {
+                let p = self.ipc().port_mut(port);
+                if p.srights == 0 && p.mscount == mscount {
+                    super::iosurface::send_right_no_senders(self, id);
+                } else {
+                    p.nsrequest_kobject = true;
+                }
+            }
             Some(Kobject::WorkInterval(id)) => super::workinterval::work_interval_no_senders(id),
             Some(Kobject::Eventlink(..)) => self.darwin_eventlink_no_senders(port),
             Some(Kobject::TaskRead | Kobject::TaskInspect | Kobject::ThreadRead(_) | Kobject::ThreadInspect(_)) => self.darwin_flavor_port_no_senders(port),

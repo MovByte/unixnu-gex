@@ -255,6 +255,9 @@ pub enum Kobject {
     /// IKOT_IOKIT_CONNECT: a user client, by its number
     /// ([`super::iokit::client`]).
     IoConnect(u32),
+    /// IKOT_IOKIT_IDENT: an IOKit object a task names by a send right, by
+    /// its number: an IOSurface send right ([`super::iosurface`]).
+    IoIdent(u32),
     /// A thread's kernel reply port (`ith_rpc_reply`): the reply to an RPC
     /// the kernel made for it.
     RpcReply(i32),

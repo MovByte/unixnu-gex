@@ -238,6 +238,8 @@ pub struct RunOptions {
     /// The main thread's stack top (`load_result.user_stack`), which the
     /// executable's slide moved down from `USRSTACK64`.
     pub darwin_user_stack: u64,
+    /// The stack pointer the executable's `LC_UNIXTHREAD` names, 0 for none.
+    pub darwin_thread_stack: u64,
     /// `LC_LOAD_DYLINKER`'s path, as the guest names it.
     pub darwin_dylinker: Option<String>,
     /// The boot payload's directory (`GEX_DARWIN_BOOT`): the trust cache
@@ -264,6 +266,7 @@ impl Default for RunOptions {
             darwin_code_signature: None,
             darwin_stacksize: 0,
             darwin_user_stack: 0,
+            darwin_thread_stack: 0,
             darwin_dylinker: None,
             darwin_boot: None,
             args: Vec::new(),
@@ -4064,6 +4067,7 @@ fn run_darwin_image(
         darwin_code_signature: loaded.code_signature,
         darwin_stacksize: loaded.stacksize,
         darwin_user_stack: loaded.user_stack,
+        darwin_thread_stack: loaded.thread_stack,
         darwin_dylinker: loaded.dylinker,
         darwin_dyld_infos: loaded.dyld_infos,
         darwin_dyld_infos_size: loaded.dyld_infos_size,
@@ -4969,10 +4973,22 @@ fn place_image(
     if opts.darwin {
         store.data_mut().with_kernel(|k| k.dtask.map_min = image.page_zero);
     }
+    // load_threadstack: an LC_UNIXTHREAD that names a stack (a static
+    // program's, which only a DEVELOPMENT kernel runs) has it as its own,
+    // with nothing allocated; the default stack is made instead.
+    if opts.darwin && opts.darwin_thread_stack != 0 {
+        let sp = opts.darwin_thread_stack;
+        store.data_mut().with_kernel(|k| k.darwin_unimplemented(format!("an LC_UNIXTHREAD that names its stack ({sp:#x}, load_threadstack's custom stack): the default stack is made instead")));
+    }
 
-    // A Darwin program's shared cache, where the kernel maps it.
-    if let Some(cache) = opts.darwin_cache.as_deref().filter(|_| opts.darwin) {
-        let region = map_shared_cache(store, &memory, cache)?;
+    // A Darwin program's shared region, which every task enters at exec
+    // (`vm_map_exec`), with the shared cache mapped in it; empty where the
+    // run has no cache.
+    if opts.darwin {
+        let region = match opts.darwin_cache.as_deref() {
+            Some(cache) => map_shared_cache(store, &memory, cache)?,
+            None => (gex_ld::macho::SHARED_REGION_BASE, gex_ld::macho::SHARED_REGION_SIZE),
+        };
         store.data_mut().with_kernel(|k| k.darwin_region = region);
     }
     if opts.darwin {
@@ -5080,15 +5096,41 @@ fn place_image(
     Ok(())
 }
 
-/// Map a dyld shared cache, its main file and every subcache it names, at
-/// the addresses it was linked for, rebased by its slide info at a zero
-/// slide, and record each mapping as the kernel would. Returns the shared
-/// region as `(start, size)`: arm64's (`SHARED_REGION_BASE_ARM64` and
-/// `SHARED_REGION_SIZE_ARM64`), which every mapping must be inside
-/// (`vm_shared_region_map_file`).
+/// The shared region a task enters at exec (`vm_shared_region_enter`): the
+/// boot's, which the first dyld to find it empty maps the cache into (on a
+/// device launchd's, at boot; here [`boot_region`] makes it as that dyld
+/// would have before the run's first program), each of its mappings put in
+/// this task's memory and recorded as the kernel would. Returns the region
+/// as `(start, size)`: arm64's (`SHARED_REGION_BASE_ARM64` and
+/// `SHARED_REGION_SIZE_ARM64`).
 fn map_shared_cache(store: &mut Store<HostState>, memory: &gex_mem::GuestMemory, main: &std::path::Path) -> Result<(u64, u64)> {
+    let mut made = false;
+    let region = gex_kernel::darwin::shregion::region_or(|| {
+        made = true;
+        boot_region(main).map_err(|e| format!("{e:#}"))
+    })
+    .map_err(|e| anyhow!(e))?;
+    // launchd's own dyld maps the region on a device; here it is made
+    // before, without the call it makes.
+    if made && store.data_mut().with_kernel(|k| k.pid) == 1 {
+        store.data_mut().with_kernel(|k| k.darwin_unimplemented("launchd's dyld mapping the shared region (shared_region_map_and_slide_2_np): the run made it before launchd started".into()));
+    }
+    enter_region(store, memory, &region)?;
+    Ok((gex_ld::macho::SHARED_REGION_BASE, gex_ld::macho::SHARED_REGION_SIZE))
+}
+
+/// The region launchd's dyld maps at boot (`mapSplitCacheSystemWide`, then
+/// `shared_region_map_and_slide_2_np`): every mapping of the main cache file
+/// and of each subcache it names, with the cache's protections (dyld keeps
+/// `__DATA_CONST` read-only by default), and the dynamic data page dyld fills
+/// in (which file the cache is) as a mapping of its own memory; all moved by
+/// the slide the kernel picks from the cache's `maxSlide`, which dyld passes
+/// as the first file's `sf_slide`. Every mapping must be inside the region
+/// (`vm_shared_region_map_file`).
+fn boot_region(main: &std::path::Path) -> Result<gex_kernel::darwin::shregion::Region> {
+    use gex_kernel::darwin::shregion::{self, Mapping, Region};
     use gex_ld::dsc;
-    use std::io::{Read, Seek, SeekFrom};
+    use std::io::Read;
     let head = |p: &std::path::Path, len: usize| -> Result<Vec<u8>> {
         let mut f = std::fs::File::open(p).with_context(|| format!("opening {}", p.display()))?;
         let mut b = vec![0u8; len];
@@ -5106,81 +5148,103 @@ fn map_shared_cache(store: &mut Store<HostState>, memory: &gex_mem::GuestMemory,
         }
         files.push((p, sh));
     }
+    let slide = shregion::choose_slide(u32::try_from(h.max_slide).context("the shared cache's maxSlide")?);
     let (region, region_size) = (gex_ld::macho::SHARED_REGION_BASE, gex_ld::macho::SHARED_REGION_SIZE);
-    let data = memory.bytes();
-    for (p, fh) in &files {
-        let mut f = std::fs::File::open(p).with_context(|| format!("opening {}", p.display()))?;
+    let mut mappings = Vec::new();
+    for (i, (p, fh)) in files.iter().enumerate() {
         for m in &fh.mappings {
-            if m.address < region || m.address.checked_add(m.size).is_none_or(|e| e > region + region_size) {
-                bail!("{}'s mapping {:#x}+{:#x} is outside the shared region {region:#x}+{region_size:#x}", p.display(), m.address, m.size);
+            let address = m.address + slide;
+            if address < region || address.checked_add(m.size).is_none_or(|e| e > region + region_size) {
+                bail!("{}'s mapping {:#x}+{:#x} is outside the shared region {region:#x}+{region_size:#x}", p.display(), address, m.size);
             }
-            let (start, end) = (m.address as usize, (m.address + m.size) as usize);
-            if end > data.len() {
-                bail!("shared cache mapping {:#x}..{:#x} does not fit in guest memory", m.address, m.address + m.size);
-            }
-            gex_kernel::big_op("shared cache", end - start);
-            // The file's pages, copy on write, where the host can map them:
-            // a mapping with no slide info straight from the cache, a slid
-            // one from its slid copy (made by the first process to need it).
-            let info = match m.slide_info {
-                Some((off, size)) => {
-                    let mut info = vec![0u8; size as usize];
-                    f.seek(SeekFrom::Start(off))?;
-                    f.read_exact(&mut info)?;
-                    Some(info)
-                }
-                None => None,
-            };
-            let mapped = {
-                let mut gm = GuestMem::new(&mut data[..]);
-                match &info {
-                    None => {
-                        use std::os::fd::AsRawFd;
-                        gm.map_file(m.address, m.size, f.as_raw_fd(), m.file_offset).unwrap_or(false)
-                    }
-                    Some(info) => map_slid(&mut gm, &fh.uuid, m, info),
-                }
-            };
-            if !mapped {
-                f.seek(SeekFrom::Start(m.file_offset))?;
-                f.read_exact(&mut data[start..end]).with_context(|| format!("reading {}", p.display()))?;
-                if let Some(info) = &info {
-                    dsc::apply_slide(&mut data[start..end], info, 0).with_context(|| format!("sliding {}", p.display()))?;
-                    save_slid(&fh.uuid, m, info, &data[start..end]);
-                }
-            }
-            let mut pr = 0;
-            if m.init_prot & dsc::PROT_READ != 0 {
-                pr |= prot::READ;
-            }
-            if m.init_prot & dsc::PROT_WRITE != 0 {
-                pr |= prot::WRITE;
-            }
-            if m.init_prot & dsc::PROT_EXEC != 0 {
-                pr |= prot::EXEC;
-            }
-            store.data_mut().with_kernel(|k| k.mem.lock().insert(m.address, m.address + m.size, pr, "[shared-cache]"));
+            mappings.push(Mapping { address, size: m.size, file: Some(i), file_offset: m.file_offset, slide_info: m.slide_info, max_prot: m.max_prot, init_prot: m.init_prot });
         }
     }
-    // The page the first process to map the cache (launchd's dyld) fills in
-    // for every later one: which file the cache is.
+    let mut data = Vec::new();
     if let Some((off, size)) = h.dynamic_data {
-        let at = h.mappings.first().map_or(h.shared_region_start, |m| m.address) + off;
-        let (start, end) = (at as usize, (at + size) as usize);
-        if end > data.len() {
-            bail!("the shared cache's dynamic data at {at:#x} does not fit in guest memory");
-        }
-        data[start..end].fill(0);
+        let address = h.mappings.first().map_or(h.shared_region_start, |m| m.address) + off + slide;
+        data = vec![0u8; size as usize];
         let hdr = dsc::dynamic_data_header(gex_kernel::darwin::CACHE_FS_ID, gex_kernel::darwin::CACHE_OBJ_ID);
-        data[start..start + hdr.len()].copy_from_slice(&hdr);
-        store.data_mut().with_kernel(|k| k.mem.lock().insert(at, at + size, prot::READ | prot::WRITE, "[shared-cache-data]"));
+        data[..hdr.len()].copy_from_slice(&hdr);
+        mappings.push(Mapping { address, size, file: None, file_offset: 0, slide_info: None, max_prot: shregion::prot::READ, init_prot: shregion::prot::READ });
     }
-    Ok((region, region_size))
+    Ok(Region { slide, files: files.into_iter().map(|(p, fh)| (p, fh.uuid)).collect(), mappings, data })
 }
 
-/// The file a shared cache mapping is kept in slid (at its linked
-/// address): named by the cache, the mapping and its slide info.
-fn slid_path(uuid: &[u8; 16], m: &gex_ld::dsc::Mapping, info: &[u8]) -> Option<std::path::PathBuf> {
+/// The region's mappings put in a task's memory: a file's pages copy on
+/// write where the host can map them, a slid mapping's from its slid copy
+/// for this slide (made by the first task to need it), relocated by its
+/// slide info with the region's slide; the page with no file copied in.
+fn enter_region(store: &mut Store<HostState>, memory: &gex_mem::GuestMemory, region: &gex_kernel::darwin::shregion::Region) -> Result<()> {
+    use gex_kernel::darwin::shregion::prot as vp;
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::fd::AsRawFd;
+    let data = memory.bytes();
+    let mut open: Vec<Option<std::fs::File>> = (0..region.files.len()).map(|_| None).collect();
+    for m in &region.mappings {
+        let (start, end) = (m.address as usize, (m.address + m.size) as usize);
+        if end > data.len() {
+            bail!("shared cache mapping {:#x}..{:#x} does not fit in guest memory", m.address, m.address + m.size);
+        }
+        gex_kernel::big_op("shared cache", end - start);
+        match m.file {
+            None => {
+                let n = region.data.len().min(end - start);
+                data[start..start + n].copy_from_slice(&region.data[..n]);
+                data[start + n..end].fill(0);
+            }
+            Some(i) => {
+                let (p, uuid) = &region.files[i];
+                if open[i].is_none() {
+                    open[i] = Some(std::fs::File::open(p).with_context(|| format!("opening {}", p.display()))?);
+                }
+                let f = open[i].as_mut().expect("opened");
+                let info = match m.slide_info {
+                    Some((off, size)) => {
+                        let mut info = vec![0u8; size as usize];
+                        f.seek(SeekFrom::Start(off))?;
+                        f.read_exact(&mut info)?;
+                        Some(info)
+                    }
+                    None => None,
+                };
+                let mapped = {
+                    let mut gm = GuestMem::new(&mut data[..]);
+                    match &info {
+                        None => gm.map_file(m.address, m.size, f.as_raw_fd(), m.file_offset).unwrap_or(false),
+                        Some(info) => map_slid(&mut gm, uuid, m, info, region.slide),
+                    }
+                };
+                if !mapped {
+                    f.seek(SeekFrom::Start(m.file_offset))?;
+                    f.read_exact(&mut data[start..end]).with_context(|| format!("reading {}", p.display()))?;
+                    if let Some(info) = &info {
+                        gex_ld::dsc::apply_slide(&mut data[start..end], info, region.slide).with_context(|| format!("sliding {}", p.display()))?;
+                        save_slid(uuid, m, info, region.slide, &data[start..end]);
+                    }
+                }
+            }
+        }
+        let mut pr = 0;
+        if m.init_prot & vp::READ != 0 {
+            pr |= prot::READ;
+        }
+        if m.init_prot & vp::WRITE != 0 {
+            pr |= prot::WRITE;
+        }
+        if m.init_prot & vp::EXECUTE != 0 {
+            pr |= prot::EXEC;
+        }
+        let name = if m.file.is_some() { "[shared-cache]" } else { "[shared-cache-data]" };
+        store.data_mut().with_kernel(|k| k.mem.lock().insert(m.address, m.address + m.size, pr, name));
+    }
+    Ok(())
+}
+
+/// The file a shared cache mapping is kept in slid: named by the cache, the
+/// mapping, its slide info and the slide, beside the copies of the same
+/// mapping at other slides (`<mapping>-<slide>.slid`).
+fn slid_path(uuid: &[u8; 16], m: &gex_kernel::darwin::shregion::Mapping, info: &[u8], slide: u64) -> Option<std::path::PathBuf> {
     use gex_key::sha256;
     let mut h = sha256::Sha256::new();
     h.update(b"gex dsc slid 1\0");
@@ -5188,23 +5252,26 @@ fn slid_path(uuid: &[u8; 16], m: &gex_ld::dsc::Mapping, info: &[u8]) -> Option<s
     h.update(&m.file_offset.to_le_bytes());
     h.update(&m.size.to_le_bytes());
     h.update(info);
-    Some(gex_cache::slid_cache_dir()?.join(format!("{}.slid", sha256::hex(&h.finish()))))
+    Some(gex_cache::slid_cache_dir()?.join(format!("{}-{slide:x}.slid", sha256::hex(&h.finish()))))
 }
 
 /// Map a slid mapping's kept file over its place, if there is one.
-fn map_slid(gm: &mut GuestMem<'_>, uuid: &[u8; 16], m: &gex_ld::dsc::Mapping, info: &[u8]) -> bool {
+fn map_slid(gm: &mut GuestMem<'_>, uuid: &[u8; 16], m: &gex_kernel::darwin::shregion::Mapping, info: &[u8], slide: u64) -> bool {
     use std::os::fd::AsRawFd;
-    let Some(path) = slid_path(uuid, m, info) else { return false };
+    let Some(path) = slid_path(uuid, m, info, slide) else { return false };
     match std::fs::File::open(&path) {
         Ok(f) if f.metadata().is_ok_and(|md| md.len() == m.size) => gm.map_file(m.address, m.size, f.as_raw_fd(), 0).unwrap_or(false),
         _ => false,
     }
 }
 
-/// Keep a mapping's slid bytes for the next process (written whole, then
-/// renamed into place, so a reader never sees part of one).
-fn save_slid(uuid: &[u8; 16], m: &gex_ld::dsc::Mapping, info: &[u8], bytes: &[u8]) {
-    let Some(path) = slid_path(uuid, m, info) else { return };
+/// Keep a mapping's slid bytes for the boot's next task (written whole,
+/// then renamed into place, so a reader never sees part of one). Each boot
+/// slides anew, so the same mapping's copies at other slides are removed:
+/// a task that has one mapped keeps its pages, and a boot whose copy went
+/// makes it again.
+fn save_slid(uuid: &[u8; 16], m: &gex_kernel::darwin::shregion::Mapping, info: &[u8], slide: u64, bytes: &[u8]) {
+    let Some(path) = slid_path(uuid, m, info, slide) else { return };
     let Some(dir) = path.parent() else { return };
     if std::fs::create_dir_all(dir).is_err() {
         return;
@@ -5212,6 +5279,16 @@ fn save_slid(uuid: &[u8; 16], m: &gex_ld::dsc::Mapping, info: &[u8], bytes: &[u8
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
     if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, &path).is_err() {
         let _ = std::fs::remove_file(&tmp);
+    }
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+    let Some((stem, _)) = name.rsplit_once('-') else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let other = e.file_name();
+        let other = other.to_string_lossy();
+        if other != name && other.ends_with(".slid") && other.rsplit_once('-').is_some_and(|(s, _)| s == stem) {
+            let _ = std::fs::remove_file(e.path());
+        }
     }
 }
 

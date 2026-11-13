@@ -54,10 +54,15 @@ moves itself into its copy in the shared cache); the main stack's top is
 `USRSTACK64` (`0x1_6fe0_0000`) less the main image's slide. A release
 kernel slides every image: `_POSIX_SPAWN_DISABLE_ASLR` is ignored. The
 shared region, `0x1_8000_0000` for `0x1_8000_0000`, is one read-only
-entry, with the dyld shared cache mapped in it where it was linked and its
-slide info applied. libmalloc's nano allocator, in a process exec engages
-it for (a spawn with `_POSIX_SPAWN_NANO_ALLOCATOR`, as an app's is), takes
-the 512 MiB after the shared region.
+entry, the system's: the first dyld to find it empty (launchd's, at boot)
+maps the dyld shared cache into it with `shared_region_map_and_slide_2_np`,
+passing the cache's `maxSlide`, and the kernel slides the cache once a
+boot below it, on a 16 KiB boundary, relocating the slid mappings by their
+slide info; every task after enters it as it is. A run's region is made as
+launchd's dyld makes it, before the run's first program. libmalloc's nano
+allocator, in a process exec engages it for (a spawn with
+`_POSIX_SPAWN_NANO_ALLOCATOR`, as an app's is), takes the 512 MiB after
+the shared region.
 
 The kernel side is in `crates/gex-kernel/src/darwin/`, one module per
 subsystem, most naming in their header the XNU source they port:
@@ -100,8 +105,9 @@ subsystem, most naming in their header the XNU source they port:
 - **Memory.** The task's VM map entries (`vm.rs`); `mmap`, `madvise` and
   `mach_vm_behavior_set` (`mman.rs`); `map_with_linking_np` and the dyld
   pager's fixups (`mwl.rs`); the commpage (`commpage.rs`); the
-  `phys_footprint` ledger (`footprint.rs`); memorystatus and the jetsam
-  bands (`memorystatus.rs`); POSIX shared memory (`shm.rs`).
+  `phys_footprint` ledger and `TASK_VM_INFO` (`footprint.rs`);
+  memorystatus and the jetsam bands (`memorystatus.rs`); POSIX shared
+  memory (`shm.rs`).
 - **Files.** Name, mode and time changes and `getdirentries64`
   (`fsops.rs`); the `getattrlist` family (`attrlist.rs`, `attrcall.rs`);
   `clonefile` and `exchangedata` (`clonefile.rs`); extended attributes
@@ -152,6 +158,15 @@ subsystem, most naming in their header the XNU source they port:
     driver `AppleT8011IO`, and the `AppleARMIODevice` nub of arm-io's sgx.
   - The shipped Sandbox profiles decide by those classes and by that
     ancestry.
+- **IOSurface.** `IOSurfaceRoot` and its user client as the device's
+  IOSurface kext has them (`iosurface/`): surfaces created, looked up by id
+  and by send right, locked with their seeds, their values, use counts and
+  purgeability, and the records and graphics comm page the root shares with
+  every client. A surface's memory is the kernel's, and each task that maps
+  it has a view of it, brought up to date when the task locks the surface
+  and sent back when it unlocks; a store outside a lock is caught by the
+  page's protection and kept. libkern's binary serialization, which its
+  methods carry, is `osserialize.rs`.
 - **sysctl.** The kernel's own nodes, read from the device's kernelcache
   (`sysctl_nodes.rs`), and the values this kernel has for them
   (`sysctl.rs`).
@@ -228,8 +243,8 @@ upstream (see [gex, upstream](#gex-upstream)).
 ### The Darwin test programs
 
 The test programs are C, built with Xcode's iOS toolchain: you need macOS
-with Xcode and its iOS SDK (`xcrun -sdk iphoneos clang`), plus `codesign`
-and `lipo`.
+with Xcode and its iOS SDK (`xcrun -sdk iphoneos clang`), plus `codesign`,
+`lipo` and `python3`.
 
 ```sh
 tests/darwin/build.sh
@@ -426,12 +441,12 @@ dyld and libSystem from the device's shared cache.
 | policy and resources | `taskpolicy`, `priority`, `procpolicy`, `cpumon`, `rlimit`, `rlimitctl`, `cputime`, `vtimer`, `itimer`, `memlimit` |
 | signals and exceptions | `sighandler`, `sigthread`, `sigwait`, `sigio`, `procmask`, `excports`, `excdeliver`, `efault`, `protect` |
 | Mach IPC | `portrefs`, `crosstask`, `taskname`, `readports`, `extractright`, `sonce`, `rcvlarge`, `guardesc`, `circular`, `voucherx`, `importance`, `lockimp`, `watchport` |
-| memory | `layout`, `mmapflags`, `madvise`, `msync`, `mlock`, `vmregion`, `vmcopy`, `vmwx`, `jit` |
+| memory | `layout`, `stackfb`, `mmapflags`, `madvise`, `msync`, `mlock`, `vmregion`, `vmcopy`, `vmwx`, `jit` |
 | files | `fsops`, `pathrules`, `pathconf`, `statino`, `statfsino`, `dirino`, `setattr`, `xattr`, `clone`, `renameswap`, `lockf`, `lastclose`, `guarded`, `fileport`, `filesec`, `openmode`, `vectored`, `aio`, `fixedcalls`, `ioctl`, `realdev` |
 | kqueue, poll and pipes | `kq-pipe`, `vnode`, `vnextend`, `select`, `poll`, `pipe`, `timeouts` |
 | terminals and `/dev` | `pty`, `ptyjob`, `ptyclose`, `bsdpty`, `ttyinfo`, `ttydead`, `ttydrain`, `fcntltty`, `revoke`, `devfs`, `devattr` |
 | sockets | `sockerr`, `sockevent`, `sockname`, `sockopts`, `halfclose`, `nosigpipe`, `dgrambuf`, `streambuf` |
-| code signing and IOKit | `codesig`, `amfi`, `policy`, `iokit`, `ioreg`, `accel`, `accelr` |
+| code signing and IOKit | `codesig`, `amfi`, `policy`, `iokit`, `ioreg`, `iosurface`, `iosurfacex`, `iogpudev`, `accel`, `accelr` |
 
 The suite runs single programs and the processes they create. None of it
 boots launchd or runs an app.
@@ -467,8 +482,9 @@ is the reference (search `crates/gex-kernel/src/` for
   facts the kernel does not have, some `sandbox_check` filter types,
   `sandbox_check` of another process's operation, and Sandbox's other
   `__mac_syscall` calls.
-- **IOKit.** The registry holds the device tree, the APFS services, and
-  the GPU's accelerator with the drivers and nubs on its path to the root.
+- **IOKit.** The registry holds the device tree, the APFS services,
+  IOSurfaceRoot, and the GPU's accelerator with the drivers and nubs on its
+  path to the root.
   These are reported:
   - opening any other driver;
   - those drivers' other nubs and clients;
@@ -495,9 +511,10 @@ is the reference (search `crates/gex-kernel/src/` for
   and the device has unmapped space), and the memory's end. A fixed
   mapping that reaches past `0x3_ffff_4000`, and an anywhere one with no
   room below it, is reported and fails; a random address (`MAP_JIT`,
-  `VM_FLAGS_RANDOM_ADDR`) is drawn below it. The shared cache is mapped at
-  a zero slide, where the device's first dyld picks a random one at each
-  boot.
+  `VM_FLAGS_RANDOM_ADDR`) is drawn below it. `shared_region_map_and_slide_2_np`
+  itself is not implemented: a run's shared region is made before its first
+  program, so `/sbin/launchd` as the first program finds it made, which is
+  reported.
 - **Memory.** Purgeable memory, 4 GB chunks and other `mach_vm_allocate`
   and `mach_vm_map` flags not handled, `MAP_TPRO`, reuse advice on a
   region a fork left copy-on-write, the freezer, and the
@@ -524,10 +541,13 @@ is the reference (search `crates/gex-kernel/src/` for
   `posix_spawn` with a subsystem root path or an audit session port action.
 - **Accounting.** What needs ledgers the kernel does not keep: a
   coalition's resource usage, the CPU monitor's actions on a violation, the
-  task-wide CPU limit, the wakeups monitor, workloop CPU limits. On a host
-  without per-thread clocks, the virtual timers, `RLIMIT_CPU`, the CPU
-  monitor, the workqueue's quantum and `getrusage`'s times are reported; on
-  one that cannot say which pages are a task's, `phys_footprint` is.
+  task-wide CPU limit, the wakeups monitor, workloop CPU limits, and the
+  pmap's and compressor's ledgers in `TASK_VM_INFO` (resident, internal,
+  external, reusable and compressed sizes and their peaks, the footprint's
+  peak, decompressions, swap-ins). On a host without per-thread clocks,
+  the virtual timers, `RLIMIT_CPU`, the CPU monitor, the workqueue's
+  quantum and `getrusage`'s times are reported; on one that cannot say
+  which pages are a task's, `phys_footprint` is.
 - **Terminals.** Terminal `ioctl`s not handled, an `fcntl` that would sleep
   in the driver, calls that would wait for a revoke to finish, and parts of
   `revoke` itself.

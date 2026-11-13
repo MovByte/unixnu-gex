@@ -15,7 +15,10 @@
 //   main image's slide (kern.usrstack64).
 // - vm_shared_region_enter nests the whole shared region, from
 //   SHARED_REGION_BASE_ARM64 (0x180000000) for SHARED_REGION_SIZE_ARM64
-//   (0x180000000), as one read-only entry inherited by share.
+//   (0x180000000), as one read-only entry inherited by share. The cache in
+//   it is slid once a boot: dyld passes the cache's maxSlide and
+//   shared_region_map_and_slide_2_np picks the slide below it, on a 16 KiB
+//   boundary; every task of the boot sees the same.
 // - libmalloc's nano allocator follows the shared region: 512 MiB at
 //   0x300000000 (NANOZONE_BASE_REGION_ADDRESS). It is engaged when exec
 //   gives apple[] "MallocNanoZone=1" (a spawn with
@@ -84,6 +87,9 @@ static int in_nano(const void *p) {
     return (uintptr_t)p >= NANO_BASE && (uintptr_t)p < NANO_BASE + NANO_SIZE;
 }
 
+// The shared cache's slide, which check_layout finds.
+static uint64_t cache_slide;
+
 // The layout every process has, whatever its spawn asked for. dyld is where
 // exec loaded it when `dyld_on_disk`, else its copy in the shared cache.
 static int check_layout(int dyld_on_disk) {
@@ -139,6 +145,12 @@ static int check_layout(int dyld_on_disk) {
         if (dinfo.all_image_info_addr < REGION_BASE || dinfo.all_image_info_addr >= REGION_BASE + REGION_SIZE) return bad("the image list is not in the shared cache", dinfo.all_image_info_addr);
     }
 
+    // TASK_VM_INFO refuses a count short of its first revision (whose
+    // ledgers this kernel does not keep: a full one is reported).
+    task_vm_info_data_t vi;
+    count = TASK_VM_INFO_REV0_COUNT - 1;
+    if ((kr = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &count)) != KERN_INVALID_ARGUMENT) return bad("TASK_VM_INFO with too small a count", kr);
+
     // The main stack: USRSTACK64 less the slide.
     uint64_t top = 0;
     size_t tn = sizeof top;
@@ -155,6 +167,13 @@ static int check_layout(int dyld_on_disk) {
     uint64_t start = 0;
     if (syscall(SYS_shared_region_check_np, &start) != 0) return bad("shared_region_check_np", errno);
     if (start < REGION_BASE || start >= REGION_BASE + REGION_SIZE || start != ai->sharedCacheBaseAddress) return bad("the shared cache's start", start);
+    // Its header, at its start: linked at sharedRegionStart (0xe0), slid
+    // below maxSlide (0xf0) on a 16 KiB boundary, as dyld says it is.
+    const uint8_t *hdr = (const uint8_t *)(uintptr_t)start;
+    uint64_t linked = *(const uint64_t *)(hdr + 0xe0), max_slide = *(const uint64_t *)(hdr + 0xf0);
+    if (memcmp(hdr, "dyld_v1", 7) || linked != REGION_BASE) return bad("the shared cache's header", linked);
+    cache_slide = start - linked;
+    if (cache_slide % PAGE || cache_slide >= max_slide || cache_slide != ai->sharedCacheSlide) return bad("the shared cache's slide", cache_slide);
     raddr = REGION_BASE + 0x1000;
     count = VM_REGION_BASIC_INFO_COUNT_64;
     kr = vm_region_64(mach_task_self(), &raddr, &rsize, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &obj);
@@ -163,6 +182,41 @@ static int check_layout(int dyld_on_disk) {
         return bad("the shared region's entry's attributes", info.protection | info.max_protection << 4 | info.inheritance << 8 | info.reserved << 12 | info.shared << 16);
     at = REGION_BASE + REGION_SIZE - PAGE;
     if ((kr = vm_allocate(mach_task_self(), &at, PAGE, VM_FLAGS_FIXED)) != KERN_NO_SPACE) return bad("a fixed allocation in the shared region's last page", kr);
+    return 0;
+}
+
+// The region's submap entry is permanent: a range of it may be replaced or
+// removed only where the region holds no permanent mapping (vm_map_delete,
+// shared_region_make_permanent: one neither writable nor executable, as its
+// dynamic data page is), else KERN_PROTECTION_FAILURE (EACCES from
+// mmap(MAP_FIXED), EINVAL from munmap). Its holes may go.
+static int check_region_permanence(void) {
+    uint64_t start = 0;
+    if (syscall(SYS_shared_region_check_np, &start) != 0) return bad("shared_region_check_np", errno);
+    uint64_t dyn = start + *(const uint64_t *)(uintptr_t)(start + 0x1f0);
+    if (memcmp((const void *)(uintptr_t)dyn, "dyld_data    v0", 16)) return bad("the shared cache's dynamic data page", dyn);
+    void *p = mmap((void *)(uintptr_t)dyn, PAGE, PROT_READ, MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0);
+    if (p != MAP_FAILED || errno != EACCES) return bad("a fixed mapping over the dynamic data page", errno);
+    vm_address_t at = dyn;
+    kern_return_t kr = vm_allocate(mach_task_self(), &at, PAGE, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE);
+    if (kr != KERN_PROTECTION_FAILURE) return bad("an overwriting allocation over the dynamic data page", kr);
+    if ((kr = vm_deallocate(mach_task_self(), dyn, PAGE)) != KERN_PROTECTION_FAILURE) return bad("vm_deallocate of the dynamic data page", kr);
+    if (munmap((void *)(uintptr_t)dyn, PAGE) != -1 || errno != EINVAL) return bad("munmap of the dynamic data page", errno);
+    if (memcmp((const void *)(uintptr_t)dyn, "dyld_data    v0", 16)) return bad("the dynamic data page after", dyn);
+
+    vm_address_t hole = REGION_BASE + REGION_SIZE - PAGE, raddr = hole;
+    p = mmap((void *)hole, PAGE, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0);
+    if (p != (void *)hole) return bad("a fixed mapping over a hole of the region", errno);
+    vm_size_t rsize = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t obj = MACH_PORT_NULL;
+    kr = vm_region_64(mach_task_self(), &raddr, &rsize, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &obj);
+    if (kr != KERN_SUCCESS || raddr != hole || rsize != PAGE || info.reserved) return bad("the mapping that replaced part of the region", raddr);
+    if (munmap(p, PAGE) != 0) return bad("munmap of that mapping", errno);
+    at = hole;
+    if ((kr = vm_allocate(mach_task_self(), &at, PAGE, VM_FLAGS_FIXED)) != KERN_SUCCESS) return bad("a fixed allocation where the region was", kr);
+    vm_deallocate(mach_task_self(), at, PAGE);
     return 0;
 }
 
@@ -249,12 +303,14 @@ static int check_nano(const char **apple) {
 
 int main(int argc, char **argv, char **envp, const char **apple) {
     (void)envp;
-    if (argc > 1 && !strcmp(argv[1], "nano")) {
+    if (argc > 2 && !strcmp(argv[1], "nano")) {
         who = "layout (nano)";
         if (check_layout(1) || check_nano(apple)) return 1;
+        // One slide a boot: the parent's.
+        if (cache_slide != strtoull(argv[2], NULL, 16)) return bad("the shared cache's slide differs from the parent's", cache_slide);
         return 0;
     }
-    if (check_layout(0) || check_nano_off(apple)) return 1;
+    if (check_layout(0) || check_nano_off(apple) || check_region_permanence()) return 1;
 
     char path[1024];
     uint32_t n = sizeof path;
@@ -262,7 +318,9 @@ int main(int argc, char **argv, char **envp, const char **apple) {
     posix_spawnattr_t attr;
     posix_spawnattr_init(&attr);
     posix_spawnattr_setflags(&attr, _POSIX_SPAWN_NANO_ALLOCATOR | _POSIX_SPAWN_DISABLE_ASLR);
-    char *args[] = {path, "nano", NULL};
+    char slide[32];
+    snprintf(slide, sizeof slide, "%llx", (unsigned long long)cache_slide);
+    char *args[] = {path, "nano", slide, NULL};
     int envc = 0;
     while (environ[envc]) envc++;
     char **env = calloc((size_t)envc + 2, sizeof *env);
