@@ -18,6 +18,7 @@ pub mod aot_only;
 pub mod libprov;
 pub(crate) mod elfprov;
 pub mod aot_share;
+pub mod darwin_frames;
 pub mod darwin_image;
 pub mod gl;
 pub mod profile;
@@ -248,6 +249,10 @@ pub struct RunOptions {
     /// collection (`sandbox_builtin.bin`) and protobox collection
     /// (`sandbox_protobox.bin`).
     pub darwin_boot: Option<std::path::PathBuf>,
+    /// Record the frames the Darwin framebuffer presents into this
+    /// directory (`GEX_DARWIN_FRAMES`, [`darwin_frames`]): the test
+    /// embedder's panel.
+    pub darwin_frames: Option<std::path::PathBuf>,
     /// Run ahead-of-time code only (`aot_only`): an ejected Windows
     /// program's runtime, with no tier-1 module and no run-time translator.
     pub aot_only: bool,
@@ -269,6 +274,7 @@ impl Default for RunOptions {
             darwin_thread_stack: 0,
             darwin_dylinker: None,
             darwin_boot: None,
+            darwin_frames: None,
             args: Vec::new(),
             env: Vec::new(),
             trace: false,
@@ -1280,6 +1286,11 @@ fn run_program_with(
         let sandbox = gex_kernel::darwin::SandboxProfiles { platform: read("sandbox_profile.bin")?, builtin: read("sandbox_builtin.bin")?, protobox: read("sandbox_protobox.bin")? };
         let device_tree = read("DeviceTree")?;
         gex_kernel::darwin::boot(tc.as_deref(), sandbox, device_tree.as_deref()).map_err(|e| anyhow!("the boot payload: {e}"))?;
+        // The panel: the test embedder's recorder when asked for.
+        if let Some(dir) = &opts.darwin_frames {
+            std::fs::create_dir_all(dir).map_err(|e| anyhow!("making {}: {e}", dir.display()))?;
+            gex_kernel::darwin::iomfb::sink::install(Box::new(darwin_frames::Recorder::new(dir.clone()))).map_err(|_| anyhow!("the framebuffer's presentation sink is installed already"))?;
+        }
         // The run's first process: of the user it runs as.
         kernel.dtask.cred = gex_kernel::darwin::cred::Cred::of(kernel_uid, kernel_gid);
         kernel.dtask.uniqueid = gex_kernel::darwin::next_uniqueid();
