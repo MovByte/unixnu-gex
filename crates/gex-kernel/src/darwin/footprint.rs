@@ -290,6 +290,93 @@ impl Kernel {
     }
 }
 
+impl Kernel {
+    /// `task_info(TASK_VM_INFO)` and `TASK_VM_INFO_PURGEABLE` of this task
+    /// (`task.c`), with the caller's count checked and fixed as XNU does
+    /// (an iOS 12 SDK's larger count is taken as rev2's): the map's size,
+    /// entries, page and bounds; the purgeable volatile sizes (none: no
+    /// purgeable memory is made here); its `phys_footprint` and what its
+    /// memory limit leaves (`memorystatus_available_memory_internal`); the
+    /// purgeable and owned-memory ledgers (none: neither purgeable memory
+    /// nor ownership changes are made here). What needs the pmap's and the
+    /// compressor's ledgers, which are not kept (resident, internal,
+    /// external, reusable and compressed sizes and peaks, the footprint's
+    /// peak, decompressions, swap-ins), is reported and given as 0.
+    pub(crate) fn darwin_task_vm_info(&mut self, m: &mut GuestMem<'_>, count: u32) -> super::kobject::Reply {
+        use super::kobject::Reply;
+        const KERN_INVALID_ARGUMENT: i32 = 4;
+        const TASK_VM_INFO_PURGEABLE: i32 = 23;
+        // TASK_VM_INFO_REV*_COUNT: natural_t of the packed structure.
+        const REV0: u32 = 36;
+        const REV1: u32 = 38;
+        const REV2: u32 = 42;
+        const REV3: u32 = 84;
+        const REV4: u32 = 86;
+        const REV5: u32 = 87;
+        const REV6: u32 = 89;
+        const PLATFORM_IOS: u32 = 2;
+        let mut original = count;
+        let (platform, sdk) = self.dtask.platform;
+        if original > REV2 && platform == PLATFORM_IOS && sdk != 0 && (sdk >> 16) <= 12 {
+            original = REV2;
+        }
+        if original < REV0 {
+            return Reply::err(KERN_INVALID_ARGUMENT);
+        }
+        let mut out = vec![0u8; REV6 as usize * 4];
+        let put = |out: &mut Vec<u8>, at: usize, v: u64| out[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        let (size, entries) = self.dtask.vm.size_and_count();
+        put(&mut out, 0, size);
+        out[8..12].copy_from_slice(&entries.to_le_bytes());
+        out[12..16].copy_from_slice(&((super::mach::PAGE_MASK + 1) as u32).to_le_bytes());
+        let mut unkept = vec!["resident_size", "resident_size_peak", "internal", "internal_peak", "external", "external_peak", "reusable", "reusable_peak", "compressed", "compressed_peak", "compressed_lifetime"];
+        // device and device_peak (32, 40) are 0, and so are the purgeable
+        // volatile sizes (96-112), TASK_VM_INFO_PURGEABLE's
+        // vm_map_query_volatile finding no purgeable object.
+        let _ = TASK_VM_INFO_PURGEABLE;
+        let mut n = REV0;
+        let footprint = if original >= REV1 { self.darwin_phys_footprint(m) } else { None };
+        if original >= REV1 {
+            match footprint {
+                Some(f) => put(&mut out, 144, f),
+                None => unkept.push("phys_footprint (the host cannot say which pages are the task's)"),
+            }
+            n = REV1;
+        }
+        if original >= REV2 {
+            put(&mut out, 152, self.dtask.map_min);
+            put(&mut out, 160, self.darwin_map_max());
+            n = REV2;
+        }
+        if original >= REV3 {
+            // ledger_phys_footprint_peak; the purgeable and tag ledgers
+            // after it are 0.
+            unkept.push("ledger_phys_footprint_peak");
+            n = REV3;
+        }
+        if original >= REV4 {
+            match footprint {
+                Some(f) => put(&mut out, 336, self.procs.jetsam().available_memory(self.pid, f)),
+                None => unkept.push("limit_bytes_remaining"),
+            }
+            n = REV4;
+        }
+        if original >= REV5 {
+            unkept.push("decompressions");
+            n = REV5;
+        }
+        if original >= REV6 {
+            unkept.push("ledger_swapins");
+            n = REV6;
+        }
+        self.darwin_unimplemented(format!("task_info TASK_VM_INFO's {}: the pmap's and the compressor's ledgers are not kept (given as 0)", unkept.join(", ")));
+        // task_info_out, CountInOut: the count, then that many words.
+        let mut reply = n.to_le_bytes().to_vec();
+        reply.extend_from_slice(&out[..n as usize * 4]);
+        Reply::ok(reply)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

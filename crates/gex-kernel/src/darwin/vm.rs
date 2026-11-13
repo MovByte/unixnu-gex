@@ -373,6 +373,12 @@ impl Entries {
         out
     }
 
+    /// The map's size (`map->size`, every entry's bytes) and its entries
+    /// (`map->hdr.nentries`).
+    pub fn size_and_count(&self) -> (u64, u32) {
+        self.ranges.iter().fold((0, 0), |(size, n), (&s, e)| (size + (e.end - s), n + 1))
+    }
+
     /// The submap entries (the shared region's) that meet `[start, end)`,
     /// clipped to it.
     pub fn submaps(&self, start: u64, end: u64) -> Vec<(u64, u64)> {

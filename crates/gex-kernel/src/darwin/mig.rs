@@ -876,6 +876,10 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         (Kobject::Task | Kobject::TaskRead | Kobject::TaskInspect | Kobject::TaskName, 3405) => match (arg(req, 0), arg(req, 1)) {
             (Some(17), Some(_)) if matches!(obj, Kobject::TaskName | Kobject::TaskInspect) => Reply::err(KERN_INVALID_ARGUMENT),
             (Some(17), Some(_)) if matches!(obj, Kobject::TaskRead) && !k.darwin_read_conversion_ok() => Reply::err(KERN_INVALID_ARGUMENT),
+            // TASK_VM_INFO and TASK_VM_INFO_PURGEABLE: the map's.
+            (Some(22 | 23), Some(count)) => match k.darwin_own_memory(|k, m| k.darwin_task_vm_info(m, count as u32)) {
+                Ok(r) | Err(r) => r,
+            },
             (Some(flavor), Some(count)) => task_info(flavor, count as u32, (k.darwin_dyld_infos, k.darwin_dyld_infos_size), k.darwin_audit_token()),
             _ => bad(),
         },
