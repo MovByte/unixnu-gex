@@ -534,7 +534,8 @@ impl Kernel {
             }
             return Err(Errno::EPERM);
         }
-        self.darwin_launch_constraints()
+        // process_signature: the launch constraints hook.
+        self.darwin_launch_constraints(l.exe_path)
     }
 
     /// The new image's main stack with its strings on it: `create_unix_stack`
@@ -547,7 +548,15 @@ impl Kernel {
     fn darwin_start_body(&mut self, strings: Option<Strings>, l: &Loaded, user_stack: u64) -> Result<MainStack, Errno> {
         match self.dtask.activated.take() {
             Some(r) => r?,
-            None => self.darwin_activate_body(l)?,
+            None => {
+                // The run's first program was forked by its parent (pid 1,
+                // or the kernel's process for launchd) as bsd_init forks
+                // initproc.
+                if strings.is_none() {
+                    self.dtask.original_ppid = self.procs.ppid(self.pid);
+                }
+                self.darwin_activate_body(l)?
+            }
         }
         self.darwin_publish();
         // The image's entitlements that raise its default memory limit.

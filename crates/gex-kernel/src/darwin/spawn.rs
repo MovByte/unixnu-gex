@@ -50,6 +50,11 @@ const PORT_ACTION_SIZE: u64 = 24;
 const PORT_HDR: u64 = 8;
 const MAC_EXT_SIZE: u64 = 144;
 const MAC_HDR: u64 = 8;
+
+/// The `Sandbox` and the `AMFI` extensions' data from a spawn's MAC policy
+/// information.
+type MacPolicyData = (Option<Vec<u8>>, Option<Vec<u8>>);
+
 const PERSONA_INFO_SIZE: u64 = 88;
 const POSIX_CRED_INFO_SIZE: u64 = 340;
 /// `PATH_MAX`, and `NGROUPS_MAX`.
@@ -99,6 +104,8 @@ struct SpawnCreds {
     persona: Option<super::persona::SpawnPersona>,
     /// The data of the MAC extension named `Sandbox`, for its exec hook.
     sandbox: Option<Vec<u8>>,
+    /// The data of the one named `AMFI`, for its launch constraints hook.
+    amfi: Option<Vec<u8>>,
 }
 
 fn le16(b: &[u8], o: usize) -> u16 {
@@ -139,6 +146,8 @@ pub struct Attr {
     pub options: u32,
     pub limits: [u32; 6],
     pub crash_behavior: u32,
+    /// `psa_launch_type`.
+    pub launch_type: u8,
 }
 
 impl Attr {
@@ -168,6 +177,7 @@ impl Attr {
             options: le32(b, 128),
             limits: [le32(b, 132), le32(b, 136), le32(b, 140), le32(b, 144), le32(b, 180), le32(b, 184)],
             crash_behavior: le32(b, 148),
+            launch_type: b[168],
         }
     }
 }
@@ -314,6 +324,10 @@ impl Kernel {
             // task_bank_init for the child, with the parent's credential.
             vouchers: super::voucher::Vouchers::forked(t.cred.uid, t.cred.gid()),
             puniqueid: t.uniqueid,
+            // forkproc: the parent is the child's original parent;
+            // proc_set_responsible_pid with the parent's.
+            original_ppid: self.pid,
+            responsible_pid: t.responsible_pid,
             // The ids and start time a fork chose for its child; a spawn's
             // child takes new ones.
             ..match t.fork_ids.lock().unwrap_or_else(|e| e.into_inner()).take() {
@@ -466,6 +480,7 @@ impl Kernel {
                 let (argv, envp) = (lossy(img.strings.args()), lossy(img.strings.envs()));
                 let path = img.path.clone();
                 self.dtask.exec_sandbox = Some(img.sandbox.clone());
+                self.dtask.exec_launch = img.launch.clone();
                 self.darwin_exec = Some(img);
                 SyscallOutcome::Exec { path, argv, envp }
             }
@@ -543,7 +558,7 @@ impl Kernel {
                 creds.pcred = Some(PosixCred::parse(c));
             }
             if mx_size != 0 {
-                creds.sandbox = self.darwin_spawn_macpolicyinfo(m, mx_size, mx)?;
+                (creds.sandbox, creds.amfi) = self.darwin_spawn_macpolicyinfo(m, mx_size, mx)?;
             }
             // A subsystem root takes an entitlement the caller is checked for.
             if root_size > 0 && root_size <= PATH_MAX as u64 && self.dtask.codesign.as_ref().is_some_and(|c| c.entitled("com.apple.private.spawn-subsystem-root")) {
@@ -675,6 +690,9 @@ impl Kernel {
             }
         };
         img.sandbox.spawnattrs = creds.sandbox.clone();
+        // mac_proc_check_launch_constraints: the launch type when the spawn
+        // had attributes.
+        img.launch = Some(super::launchcon::Spawn { launch_type: attr.map_or(0, |a| a.launch_type), amfi: creds.amfi.clone() });
         if let Some(at) = attr {
             // setpgid() and setsid_internal() as the child calls them.
             let r = (|| {
@@ -745,6 +763,7 @@ impl Kernel {
         }
         img.spawn = Some(after);
         child.dtask.exec_sandbox = Some(img.sandbox.clone());
+        child.dtask.exec_launch = img.launch.clone();
         child.darwin_exec = Some(Box::new(img));
         Ok(())
     }
@@ -917,6 +936,7 @@ impl Kernel {
         // its close_all_fds, which would end this process's locks).
         let mut img = activated?;
         img.sandbox.spawnattrs = creds.sandbox.clone();
+        img.launch = Some(super::launchcon::Spawn { launch_type: at.launch_type, amfi: creds.amfi.clone() });
         self.fds = std::sync::Arc::clone(&copy.fds);
         // POSIX_SPAWN_RESETIDS's credential, the exec's.
         if copy.dtask.cred != self.dtask.cred {
@@ -970,10 +990,10 @@ impl Kernel {
     }
 
     /// `spawn_copyin_macpolicyinfo`: the extensions' sizes checked and
-    /// their data copied in; the data of the first named `Sandbox`
-    /// (`exec_spawnattr_getmacpolicyinfo`), for that policy's exec hook.
-    /// AMFI's exec hook reads none.
-    fn darwin_spawn_macpolicyinfo(&mut self, m: &GuestMem<'_>, size: u64, at: u64) -> Result<Option<Vec<u8>>, Errno> {
+    /// their data copied in; the data of the first named `Sandbox`, for
+    /// that policy's exec hook, and of the first named `AMFI`, for its
+    /// launch constraints hook (`exec_spawnattr_getmacpolicyinfo`).
+    fn darwin_spawn_macpolicyinfo(&mut self, m: &GuestMem<'_>, size: u64, at: u64) -> Result<MacPolicyData, Errno> {
         if size < MAC_HDR + MAC_EXT_SIZE || size > super::exec::PAGE_SIZE {
             return Err(Errno::EINVAL);
         }
@@ -991,17 +1011,21 @@ impl Kernel {
             }
             total = total.checked_add(len).ok_or(Errno::ENOMEM)?;
         }
-        let mut sandbox = None;
+        let (mut sandbox, mut amfi) = (None, None);
         for i in 0..count as usize {
             let e = MAC_HDR as usize + MAC_EXT_SIZE as usize * i;
             let data = m.read(le64(&b, e + 128), le64(&b, e + 136) as usize).map_err(|_| Errno::ENOMEM)?;
-            // strncmp of the 128-byte name with "Sandbox".
+            // strncmp of the 128-byte name with the policy's.
             let name = &b[e..e + 128];
-            if sandbox.is_none() && name[..name.iter().position(|&c| c == 0).unwrap_or(128)] == *b"Sandbox" {
+            let name = &name[..name.iter().position(|&c| c == 0).unwrap_or(128)];
+            if sandbox.is_none() && name == b"Sandbox" {
                 sandbox = Some(data.to_vec());
             }
+            if amfi.is_none() && name == b"AMFI" {
+                amfi = Some(data.to_vec());
+            }
         }
-        Ok(sandbox)
+        Ok((sandbox, amfi))
     }
 
     /// `exec_handle_file_actions` on this (the child's) descriptor table:

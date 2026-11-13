@@ -91,6 +91,8 @@ pub mod sockopt;
 pub mod sockerr;
 pub mod spawn;
 pub mod kinfo;
+pub mod launchcon;
+pub mod lwcr;
 pub mod sysctl;
 mod sysctl_nodes;
 pub mod sysno;
@@ -272,6 +274,15 @@ pub struct Task {
     pub kobj_mask: Option<sandbox::FilterMask>,
     /// What the exec in progress keeps for Sandbox's hook.
     pub exec_sandbox: Option<sandboxes::Pending>,
+    /// What the spawn in progress gave AMFI's launch constraints hook.
+    pub exec_launch: Option<launchcon::Spawn>,
+    /// `p_original_ppid`: the pid of the process that forked this one,
+    /// kept across exec and reparenting.
+    pub original_ppid: i32,
+    /// `p_responsible_pid`, which a fork copies from the parent. Nothing on
+    /// this kernel sets it otherwise (no kext imports
+    /// `proc_set_responsible_pid`), so it is `kernproc`'s, 0.
+    pub responsible_pid: i32,
     /// A spawned child's activation, done in its parent's call
     /// (`Kernel::darwin_activate`): its answer, for the child's start.
     pub activated: Option<Result<(), crate::errno::Errno>>,

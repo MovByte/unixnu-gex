@@ -64,6 +64,9 @@ pub struct Image {
     /// What Sandbox's hook is to see of the exec: the script, the spawn's
     /// Sandbox attributes.
     pub sandbox: super::sandboxes::Pending,
+    /// What AMFI's launch constraints hook is to see of a spawn: its launch
+    /// type and AMFI's MAC extension (none for an execve).
+    pub launch: Option<super::launchcon::Spawn>,
     /// An exec in place's new thread (`cloneproc`'s): its thread id. Zero
     /// for a spawn's child, whose thread the spawn made.
     pub thread_id: u64,
@@ -237,6 +240,7 @@ impl Kernel {
                     eprintln!("[gex:{}] darwin execve({path:?}, {} args)", self.pid, argv.len());
                 }
                 self.dtask.exec_sandbox = Some(img.sandbox.clone());
+                self.dtask.exec_launch = img.launch.clone();
                 self.darwin_exec = Some(Box::new(img));
                 SyscallOutcome::Exec { path, argv, envp }
             }
@@ -292,7 +296,7 @@ impl Kernel {
         let slice = bytes.get(img.arch_offset as usize..(img.arch_offset + size) as usize).ok_or(ebadmacho())?;
         let load = self.darwin_load_signatures(&img.path, img.arch_offset, slice)?;
         let sandbox = super::sandboxes::Pending { script, spawnattrs: None, marked: img.sandbox_mark };
-        Ok(Image { path: img.path, arch_offset: img.arch_offset, arch_size: img.arch_size, cputype: img.origcputype, cpusubtype: img.origcpusubtype, strings: img.strings, spawn: None, load, thread_id: 0, sandbox })
+        Ok(Image { path: img.path, arch_offset: img.arch_offset, arch_size: img.arch_size, cputype: img.origcputype, cpusubtype: img.origcpusubtype, strings: img.strings, spawn: None, load, thread_id: 0, sandbox, launch: None })
     }
 
     /// `namei` of the saved path, links followed, then
@@ -555,6 +559,13 @@ impl Kernel {
             uniqueid: old.uniqueid,
             puniqueid: old.puniqueid,
             start: old.start,
+            // The proc's, which the exec keeps (`proc_exec_switch_task`'s
+            // new proc takes its sibling's).
+            original_ppid: old.original_ppid,
+            responsible_pid: old.responsible_pid,
+            // What the exec's launch constraints hook is to be given, for
+            // the image's start.
+            exec_launch: old.exec_launch,
             // Written over by the image's name once it is accepted.
             p_name: old.p_name,
             user_faults: old.user_faults,
