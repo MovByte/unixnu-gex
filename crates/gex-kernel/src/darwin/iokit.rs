@@ -1,7 +1,8 @@
 //! IOKit as a task reaches it (`iokit/Kernel/IOUserClient.cpp`), over the
-//! device's own device tree: the registry's `IODeviceTree` plane. The
-//! `IOService` plane's drivers are not here, and what would need them is
-//! reported.
+//! device's own device tree: the registry's `IODeviceTree` plane. Of the
+//! `IOService` plane's drivers, those on the path to the GPU
+//! ([`super::platform`], [`super::accel`]) and APFS's are here; what would
+//! need the others is reported.
 
 use std::sync::OnceLock;
 
@@ -19,6 +20,9 @@ pub struct Node {
     /// A `kernel-only` node: a release kernel's `IODeviceTreeAlloc` makes
     /// each of its properties unserializable, so a task reads them empty.
     pub kernel_only: bool,
+    /// A device tree entry a driver made a nub of: the nub's class, and its
+    /// provider in the `IOService` plane.
+    pub nub: Option<(&'static str, u32)>,
 }
 
 /// A property of a service, as `OSSerialize` writes it.
@@ -47,7 +51,10 @@ pub fn superclasses(class: &str) -> &'static [&'static str] {
         "IOUserClient" => &["IOUserClient", "IOService", "IORegistryEntry"],
         "AppleAPFSUserClient" => &["AppleAPFSUserClient", "IOUserClient", "IOService", "IORegistryEntry"],
         "IOSurfaceRoot" | "IOSurfaceRootUserClient" => super::iosurface::superclasses(class),
-        _ => super::accel::superclasses(class),
+        _ => match super::platform::superclasses(class) {
+            [] => super::accel::superclasses(class),
+            s => s,
+        },
     }
 }
 
@@ -73,7 +80,7 @@ pub fn parse(b: &[u8]) -> Result<Vec<Node>, String> {
         let name = props.iter().find(|(k, _)| k == "name").map_or(String::new(), |(_, v)| String::from_utf8_lossy(&v[..v.iter().position(|&c| c == 0).unwrap_or(v.len())]).into_owned());
         let id = out.len() as u32;
         let kernel_only = props.iter().any(|(k, _)| k == "kernel-only");
-        out.push(Node { name, props, class: "", service_props: Vec::new(), parent, children: Vec::new(), kernel_only });
+        out.push(Node { name, props, class: "", service_props: Vec::new(), parent, children: Vec::new(), kernel_only, nub: None });
         for _ in 0..nchildren {
             let c = node(b, at, Some(id), out)?;
             out[id as usize].children.push(c);
@@ -91,7 +98,9 @@ pub fn parse(b: &[u8]) -> Result<Vec<Node>, String> {
 pub fn set_tree(b: &[u8]) -> Result<(), String> {
     let mut t = parse(b)?;
     add_volumes(&mut t);
-    super::accel::add_service(&mut t);
+    if let Some(gpu) = super::platform::add(&mut t) {
+        super::accel::add_service(&mut t, gpu);
+    }
     super::iosurface::add_service(&mut t);
     add_root(&mut t);
     let _ = TREE.set(t);
@@ -101,7 +110,7 @@ pub fn set_tree(b: &[u8]) -> Result<(), String> {
 /// `IORegistryEntry::initialize`: the registry's root, "Root"; the device
 /// tree hangs from it in the `IODeviceTree` plane.
 fn add_root(t: &mut Vec<Node>) {
-    t.push(Node { name: "Root".to_string(), props: Vec::new(), class: "IORegistryEntry", service_props: Vec::new(), parent: None, children: vec![0], kernel_only: false });
+    t.push(Node { name: "Root".to_string(), props: Vec::new(), class: "IORegistryEntry", service_props: Vec::new(), parent: None, children: vec![0], kernel_only: false, nub: None });
 }
 
 /// Whether the kernel sets the root entry's property `name`: the planes
@@ -161,19 +170,42 @@ pub fn links(t: &[Node], i: u32, plane: Plane, parents: bool) -> Result<Vec<u32>
         return match (plane, parents) {
             (Plane::DeviceTree, true) => Ok(vec![n.parent.unwrap_or(root)]),
             (Plane::DeviceTree, false) => Ok(n.children.clone()),
-            (Plane::Service, true) if i == 0 => Ok(vec![root]),
+            (Plane::Service, true) => provider(t, i).map(|p| p.into_iter().collect()),
             (Plane::Service, false) if i == 0 => Err("the platform expert device's children in the IOService plane (its drivers)".to_string()),
-            (Plane::Service, _) => Err(format!("whether the platform made {} a nub in the IOService plane", n.name)),
+            (Plane::Service, false) if n.nub.is_some() => Err(format!("the drivers matched on {} (its children in the IOService plane)", n.name)),
+            (Plane::Service, false) => Err(format!("whether the platform made {} a nub in the IOService plane", n.name)),
         };
     }
     match (plane, parents) {
         (Plane::DeviceTree, _) => Ok(Vec::new()),
-        (Plane::Service, true) => n.parent.map(|p| vec![p]).ok_or_else(|| format!("the provider of {} (the storage controller)", n.name)),
+        (Plane::Service, true) => provider(t, i).map(|p| p.into_iter().collect()),
         // The user clients a service has opened are attached to it, and
         // they are not registry entries here.
-        (Plane::Service, false) if super::accel::is_service(i) => Err(format!("the user clients of {} as its children in the IOService plane", n.name)),
+        (Plane::Service, false) if n.class == super::accel::CLASS => Err(format!("the user clients of {} as its children in the IOService plane", n.name)),
+        (Plane::Service, false) if super::platform::is_driver(n.class) => Err(format!("the nubs and clients of {} (its children in the IOService plane)", n.name)),
         (Plane::Service, false) => Ok(n.children.clone()),
     }
+}
+
+/// The entry's provider, its parent in the `IOService` plane: none for the
+/// registry's root; the root for the platform expert device; a nub's
+/// driver; a driver's nub. `Err` for a device tree entry the platform's
+/// drivers here did not make a nub of.
+pub fn provider(t: &[Node], i: u32) -> Result<Option<u32>, String> {
+    let Some(n) = t.get(i as usize) else { return Ok(None) };
+    let root = t.len() as u32 - 1;
+    if i == root {
+        return Ok(None);
+    }
+    if n.class.is_empty() {
+        return match n.nub {
+            _ if i == 0 => Ok(Some(root)),
+            Some((_, p)) => Ok(Some(p)),
+            None => Err(format!("whether the platform made {} a nub in the IOService plane", n.name)),
+        };
+    }
+    let provider = if n.class == super::iosurface::CLASS { "IOResources" } else { "the storage controller" };
+    n.parent.map(Some).ok_or_else(|| format!("the provider of {} ({provider})", n.name))
 }
 
 /// `IORegistryEntry::getName()`: the device tree root's is its first
@@ -190,8 +222,9 @@ pub fn name(t: &[Node], i: u32) -> String {
 }
 
 /// The entry's class: a device tree entry other than the root is an
-/// `IOService` that the platform expert may have replaced with a nub of
-/// its own class, which is the platform's to say.
+/// `IOService` that a driver may have replaced with a nub of its own class:
+/// those the drivers here made ([`super::platform`]) have theirs, and the
+/// others' are the platform's to say.
 pub fn class(t: &[Node], i: u32) -> Result<&'static str, String> {
     let Some(n) = t.get(i as usize) else { return Err("no such entry".to_string()) };
     if !n.class.is_empty() {
@@ -199,6 +232,9 @@ pub fn class(t: &[Node], i: u32) -> Result<&'static str, String> {
     }
     if i == 0 {
         return Ok("IOPlatformExpertDevice");
+    }
+    if let Some((class, _)) = n.nub {
+        return Ok(class);
     }
     Err(format!("the class of the device tree entry {}", n.name))
 }
@@ -221,6 +257,7 @@ fn add_volumes(t: &mut Vec<Node>) {
         parent,
         children: Vec::new(),
         kernel_only: false,
+        nub: None,
     };
     let store = t.len() as u32;
     t.push(service("disk0s1", "IOMedia", None, Some("disk0s1")));
@@ -244,9 +281,32 @@ fn add_volumes(t: &mut Vec<Node>) {
             ("Role".to_string(), Prop::Strs(vec![name.clone()])),
         ];
         let id = t.len() as u32;
-        t.push(Node { name, props: Vec::new(), class: "AppleAPFSVolume", service_props, parent: Some(container), children: Vec::new(), kernel_only: false });
+        t.push(Node { name, props: Vec::new(), class: "AppleAPFSVolume", service_props, parent: Some(container), children: Vec::new(), kernel_only: false, nub: None });
         t[container as usize].children.push(id);
     }
+}
+
+/// Whether a property entry `i` lacks may yet be one the device's entry
+/// has, which is reported rather than answered missing:
+/// - The registry's root has only the properties [`root_has`] names.
+/// - A device tree entry that no driver here made a nub of has only its
+///   own, and IOSurfaceRoot only those it is given
+///   ([`super::iosurface::is_service`]).
+/// - Every other entry has properties its drivers set that are not
+///   modelled. The exception is `IOClassNameOverride` on the entries from
+///   the platform expert device to the GPU. In the kernelcache, only
+///   IOSkywalkFamily sets it, on its own objects (0xfffffff00593be08); the
+///   kernel only reads it (`skipKey`, 0xfffffff007816644).
+pub fn property_unknown(t: &[Node], i: u32, name: &str) -> bool {
+    let Some(n) = t.get(i as usize) else { return false };
+    if i as usize + 1 == t.len() {
+        return root_has(name);
+    }
+    if n.class.is_empty() && n.nub.is_none() && i != 0 || n.class == super::iosurface::CLASS {
+        return false;
+    }
+    let on_gpu_path = i == 0 || n.nub.is_some() || super::platform::is_driver(n.class) || n.class == super::accel::CLASS;
+    !(on_gpu_path && name == "IOClassNameOverride")
 }
 
 /// The services a matching dictionary asks for: `IOProviderClass` by class
@@ -817,12 +877,11 @@ pub fn open_user_client(k: &mut crate::syscalls::Kernel, service: u32, ty: u32) 
         // IOSurfaceRootUserClient sets its own locking properties (start,
         // 0xfffffff005baf29c): no default locking.
         c if c == super::iosurface::CLASS => (super::iosurface::UC_CLASS, Kind::Surface(super::iosurface::new_user_client(k, ty)?), false),
+        // AGXG9G and IOGPUFamily, whose classes the accelerator's clients
+        // are, both depend on IOSurface.
         c if c == super::accel::CLASS => {
             let (class, client) = super::accel::new_user_client(k, service, ty)?;
-            // IOGPUFamily depends on IOSurface; the WebMetal client is
-            // the kernel's own and depends on nothing.
-            let locking = class == super::accel::WIRE_CLASS;
-            (class, Kind::Accel(client), locking)
+            (class, Kind::Accel(client), false)
         }
         _ => {
             k.darwin_unimplemented(format!("newUserClient of {} (type {ty:#x})", name(t, service)));
@@ -1196,5 +1255,52 @@ mod tests {
         assert!(svc.next(&t).is_err());
         assert_eq!(links(&t, 0, Plane::Service, true), Ok(vec![root]));
         assert!(links(&t, 1, Plane::Service, false).is_err());
+    }
+
+    /// The path to the GPU: device-tree { chosen, arm-io { sgx, uart0 } }.
+    #[test]
+    fn the_gpu_path_is_the_devices() {
+        let mut b = Vec::new();
+        node(&mut b, "device-tree", &[("compatible", b"J120AP\0iPad7,1\0AppleARM\0")], 2);
+        node(&mut b, "chosen", &[], 0);
+        node(&mut b, "arm-io", &[("compatible", b"arm-io,t8011\0"), ("device_type", b"t8011-io\0")], 2);
+        node(&mut b, "sgx", &[("compatible", b"gpu,t8011\0")], 0);
+        node(&mut b, "uart0", &[("compatible", b"uart-1,samsung\0")], 0);
+        let mut t = parse(&b).unwrap();
+        let (chosen, arm_io, sgx, uart) = (1, 2, 3, 4);
+        let gpu = super::super::platform::add(&mut t).unwrap();
+        assert_eq!(gpu, sgx);
+        super::super::accel::add_service(&mut t, gpu);
+        add_root(&mut t);
+        let root = t.len() as u32 - 1;
+        let accel = root - 1;
+        // Up the IOService plane, each entry's class.
+        let mut up = vec![accel];
+        while let Some(p) = provider(&t, *up.last().unwrap()).unwrap() {
+            up.push(p);
+        }
+        let classes: Vec<&str> = up.iter().map(|&i| class(&t, i).unwrap()).collect();
+        assert_eq!(classes, ["AGXAcceleratorG9G_A0", "AppleARMIODevice", "AppleT8011IO", "IOPlatformDevice", "AppleARMPE", "IOPlatformExpertDevice", "IORegistryEntry"]);
+        assert_eq!((up[1], up[3], up[5], up[6]), (sgx, arm_io, 0, root));
+        assert_eq!(name(&t, up[2]), "AppleT8011IO");
+        assert_eq!(superclasses("AGXAcceleratorG9G_A0")[5..], ["IOGPU", "IOAcceleratorES", "IOService", "IORegistryEntry"]);
+        assert_eq!(conforms(&t, up[4], "IODTPlatformExpert"), Ok(true));
+        assert_eq!(conforms(&t, up[2], "AppleARMIO"), Ok(true));
+        assert_eq!(links(&t, sgx, Plane::Service, true), Ok(vec![up[2]]));
+        // The device tree plane is as it was; the drivers' other nubs and
+        // the entries no driver here published are not known.
+        assert_eq!(links(&t, sgx, Plane::DeviceTree, true), Ok(vec![arm_io]));
+        assert!(class(&t, uart).is_err() && provider(&t, uart).is_err() && provider(&t, chosen).is_err());
+        assert!(links(&t, arm_io, Plane::Service, false).is_err() && links(&t, up[2], Plane::Service, false).is_err());
+        // Properties a driver here may have set are reported, but for
+        // IOClassNameOverride; a plain device tree entry has only its own.
+        assert!(property_unknown(&t, accel, "PerformanceStatistics") && property_unknown(&t, sgx, "IODeviceMemory"));
+        assert!(!property_unknown(&t, accel, "IOClassNameOverride") && !property_unknown(&t, up[4], "IOClassNameOverride") && !property_unknown(&t, 0, "IOClassNameOverride"));
+        assert!(property_unknown(&t, 0, "IOPlatformSerialNumber"));
+        assert!(!property_unknown(&t, uart, "anything") && property_unknown(&t, root, "IOKitBuildVersion") && !property_unknown(&t, root, "anything"));
+        // Without the platform's compatible name, no expert here matches.
+        let mut b = Vec::new();
+        node(&mut b, "device-tree", &[("compatible", b"Other\0")], 0);
+        assert_eq!(super::super::platform::add(&mut parse(&b).unwrap()), None);
     }
 }

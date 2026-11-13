@@ -1,6 +1,9 @@
 //! The WebMetal connection: the accelerator's user client of type 0, over
 //! which the WebMetal plugin exchanges wire protocol records with the host
-//! executor (WebMetal `wire/README.md`, "Channels" and "Transport").
+//! executor (WebMetal `wire/README.md`, "Channels" and "Transport"). It
+//! presents as the device client Metal's driver opens on the device, an
+//! `AGXDeviceUserClient` (its class, superclasses and properties); its
+//! methods are WebMetal's.
 //!
 //! Its selectors take and return 64-bit scalars:
 //!

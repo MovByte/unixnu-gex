@@ -39,6 +39,7 @@ pub mod iokit;
 pub mod iosurface;
 pub mod osserialize;
 pub mod accel;
+pub mod platform;
 pub mod guarded;
 pub mod exit;
 pub mod exception;

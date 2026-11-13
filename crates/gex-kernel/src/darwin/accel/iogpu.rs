@@ -1,7 +1,10 @@
-//! IOGPUFamily's user clients of the accelerator (IOGPUFamily 93.40.4 in
-//! the 21H461 kernelcache): `IOGPUDeviceUserClient`, type 1, which
-//! IOGPU.framework's `IOGPUDeviceCreate` opens, and
-//! `IOGPUMemoryInfoUserClient`, type 33.
+//! The accelerator's IOGPU user clients (IOGPUFamily 93.40.4 and AGXG9G
+//! 282.14 in the 21H461 kernelcache):
+//! - the device client, type 1, which IOGPU.framework's `IOGPUDeviceCreate`
+//!   opens: AGXG9G's `AGXDeviceUserClient`, an `IOGPUDeviceUserClient`
+//!   whose methods are IOGPUFamily's but for AGXG9G's own selectors and
+//!   its display parameters;
+//! - `IOGPUMemoryInfoUserClient`, type 33.
 //!
 //! The accelerator is an `IOGPU` with no IOGPU channels: Metal's work
 //! reaches the host through the WebMetal connection, not IOGPU command
@@ -214,24 +217,29 @@ fn max_resource_size(options: u32) -> u64 {
 /// (0xfffffff005bcf01c, 0xfffffff005bbcefc), and selector 5 takes ranges.
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// The restricted entitlements (0xfffffff005bcf814, through
-/// 0xfffffff005bcf080): a key that is missing does not restrict, a boolean
-/// is its value, any other value restricts.
-fn restricted(k: &Kernel) -> bool {
+/// IOGPUFamily's entitlement check (0xfffffff005bcf080): a key that is
+/// missing does not entitle, a boolean is its value, any other value
+/// entitles.
+fn entitled(k: &Kernel, key: &str) -> bool {
     use super::super::codesign::Ent;
     let Some(c) = k.dtask.codesign.as_ref() else { return false };
-    ["com.apple.private.gpu-restricted", "com.apple.developer.gpu-restricted"].iter().any(|key| match c.ents.get(key.as_bytes()) {
+    match c.ents.get(key.as_bytes()) {
         None => false,
         Some(Ent::Bool(b)) => *b,
         Some(_) => true,
-    })
+    }
 }
 
-/// An `IOGPUDeviceUserClient`: the task that opened it, its options (the
-/// open type's high 16 bits), whether it is restricted (+259), whether its
-/// start succeeded and it is not stopped (+256), the read-only mapping of
-/// the accelerator's stamps in its task, the `API` property selector 6
-/// set, its trace id (+0xe8), its device's first client-shared block in
+/// The restricted entitlements (0xfffffff005bcf814).
+fn restricted(k: &Kernel) -> bool {
+    ["com.apple.private.gpu-restricted", "com.apple.developer.gpu-restricted"].iter().any(|key| entitled(k, key))
+}
+
+/// The device client, an `AGXDeviceUserClient`: the task that opened it,
+/// its options (the open type's high 16 bits), whether it is restricted
+/// (+259), whether its start succeeded and it is not stopped (+256), the
+/// read-only mapping of the accelerator's stamps in its task, the `API`
+/// property selector 6 set, its trace id (+0xe8), its device's first client-shared block in
 /// its task, and its own mapping of IOSurfaceRoot's graphics comm page
 /// (selector 4's, made at its first call).
 pub struct Device {
@@ -252,9 +260,9 @@ pub struct Device {
 const SHARED_BLOCK: u64 = 0x100 * ((0x80 + 8 + 0x3f) & !0x3f);
 
 impl Device {
-    /// `IOGPU::newUserClient` for type 1: an `IOGPUDeviceUserClient` (what
-    /// IOGPU's own 0xfffffff005bd595c makes), its `init` (`initWithTask`
-    /// and the task kept), `attach` and `start`, whose
+    /// `IOGPU::newUserClient` for type 1: an `AGXDeviceUserClient` (what
+    /// AGXG9G's `newDeviceUserClient`, 0xfffffff005be7e0c, makes), its
+    /// `init` (`initWithTask` and the task kept), `attach` and `start`, whose
     /// `deviceUserClientStart` (0xfffffff005bbce5c) maps the accelerator's
     /// stamp memory read-only into the task (`createMappingInTask` with
     /// kIOMapAnywhere | kIOMapReadOnly | kIOMapUnique), makes the client's
@@ -342,17 +350,29 @@ impl Device {
         ret::BAD_ARGUMENT
     }
 
-    /// `IOGPUDeviceUserClient::externalMethod` (0xfffffff005bbd138): a
-    /// client not started (or stopped) is kIOReturnNotReady; a selector past
-    /// the table goes to IOUserClient's, which has none for it; an
-    /// asynchronous call is kIOReturnBadArgument; then the table's checks,
-    /// and a restricted client's refused selectors (0xfffffff005bbcd1c:
-    /// kIOReturnNotPermitted).
+    /// `AGXDeviceUserClient::externalMethod` (0xfffffff005c00f54), which
+    /// gives selectors 0x107 and 0x108 AGXG9G's dispatch and goes on to
+    /// `IOGPUDeviceUserClient::externalMethod` (0xfffffff005bbd138):
+    /// - A client not started (or stopped) is kIOReturnNotReady.
+    /// - A selector past the table goes to IOUserClient's. That has
+    ///   AGXG9G's methods 0x100 to 0x10f (`getTargetAndMethodForIndex`,
+    ///   0xfffffff005c00f8c, table 0xfffffff006d49a68), and none for any
+    ///   other.
+    /// - An asynchronous call is kIOReturnBadArgument.
+    /// - Then come the table's checks, and a restricted client's refused
+    ///   selectors (0xfffffff005bbcd1c: kIOReturnNotPermitted).
     pub fn external_method(&mut self, k: &mut Kernel, a: &mut MethodArgs) -> i32 {
         if !self.ready {
             return ret::NOT_READY;
         }
         if a.selector > LAST {
+            // AGXG9G's own: the GPU's core configuration, its driver
+            // information, performance state and notifications, which read
+            // and drive the GPU's firmware.
+            if (0x100..=0x10f).contains(&a.selector) {
+                k.darwin_unimplemented(format!("AGXDeviceUserClient selector {:#x} (AGXG9G's own, the GPU's firmware)", a.selector));
+                return ret::UNSUPPORTED;
+            }
             return no_method(a);
         }
         if a.is_async {
@@ -454,8 +474,19 @@ impl Device {
                 a.scalar_out[0] = 0;
                 ret::SUCCESS
             }
-            // Display parameters: IOGPUDeviceUserClient's (0xfffffff005bbd270).
-            33 => ret::UNSUPPORTED,
+            // Display parameters: AGXDeviceUserClient's (its vtable slot
+            // 188, 0xfffffff005c00fc8). It refuses a task without
+            // com.apple.internal.display-params-access-privileged
+            // (kIOReturnNotPrivileged). For an entitled one, it checks the
+            // process (0xfffffff0075facc8) before the parameters go to the
+            // display.
+            33 => {
+                if !entitled(k, "com.apple.internal.display-params-access-privileged") {
+                    return ret::NOT_PRIVILEGED;
+                }
+                k.darwin_unimplemented("AGXDeviceUserClient selector 33 (set display parameters) for an entitled task: the display".to_string());
+                ret::UNSUPPORTED
+            }
             // The app GPU role, set and got: the device's (IOGPUDevice's
             // 0xfffffff005bd0e4c and 0xfffffff005bd0e58), which keep none.
             34 | 35 => ret::UNSUPPORTED,

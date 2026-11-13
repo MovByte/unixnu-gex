@@ -329,8 +329,7 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
                 (None, Some((_, v))) => v.clone(),
                 (None, None) => {
                     let mut r = Reply::err(K_IO_RETURN_NO_RESOURCES);
-                    let root = Some(*i) == super::iokit::root();
-                    if (!node.class.is_empty() || *i == 0) && !(root && !super::iokit::root_has(&name)) && super::accel::property_unknown(*i, &name) && !super::iosurface::is_service(*i) {
+                    if super::iokit::property_unknown(super::iokit::tree(), *i, &name) {
                         r.unimplemented = Some(format!("the {} property {name:?}", super::iokit::name(super::iokit::tree(), *i)));
                     }
                     return r;
@@ -373,8 +372,7 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
                 // The platform expert device has the platform's properties
                 // besides the device tree's.
                 let mut r = Reply::err(K_IO_RETURN_NOT_FOUND);
-                let root = Some(*i) == super::iokit::root();
-                if (!node.class.is_empty() || *i == 0) && !(root && !super::iokit::root_has(&name)) && super::accel::property_unknown(*i, &name) && !super::iosurface::is_service(*i) {
+                if super::iokit::property_unknown(super::iokit::tree(), *i, &name) {
                     r.unimplemented = Some(format!("the {} property {name:?}", super::iokit::name(super::iokit::tree(), *i)));
                 }
                 return r;

@@ -142,6 +142,22 @@ subsystem, most naming in their header the XNU source they port:
 - **IOKit.** The registry's `IODeviceTree` plane, built from the device's
   own device tree, with the APFS volumes its file system table names
   published as services, reached through IOKit's MIG routines (`iokit.rs`).
+  Each open of a service makes its own user client. The GPU's accelerator
+  presents as the device's, AGXG9G's `AGXAcceleratorG9G_A0` (`accel/`).
+  - Its classes and its user clients' are the device's. The device client
+    (type 1) is `AGXDeviceUserClient`, with IOGPUFamily's methods; the
+    memory information client is type 33. The WebMetal connection (type 0)
+    presents as a device client and carries WebMetal's wire protocol.
+  - Its properties are its personality's and matching's, but
+    `MetalPluginName` and `MetalPluginClassName` name the WebMetal
+    bundle.
+  - It sits on its providers in the `IOService` plane, as the device's
+    kernelcache matches and publishes them over its device tree
+    (`platform.rs`): the platform expert `AppleARMPE` on the
+    `IOPlatformExpertDevice`, the `IOPlatformDevice` nub of arm-io, its
+    driver `AppleT8011IO`, and the `AppleARMIODevice` nub of arm-io's sgx.
+  - The shipped Sandbox profiles decide by those classes and by that
+    ancestry.
 - **IOSurface.** `IOSurfaceRoot` and its user client as the device's
   IOSurface kext has them (`iosurface/`): surfaces created, looked up by id
   and by send right, locked with their seeds, their values, use counts and
@@ -430,7 +446,7 @@ dyld and libSystem from the device's shared cache.
 | kqueue, poll and pipes | `kq-pipe`, `vnode`, `vnextend`, `select`, `poll`, `pipe`, `timeouts` |
 | terminals and `/dev` | `pty`, `ptyjob`, `ptyclose`, `bsdpty`, `ttyinfo`, `ttydead`, `ttydrain`, `fcntltty`, `revoke`, `devfs`, `devattr` |
 | sockets | `sockerr`, `sockevent`, `sockname`, `sockopts`, `halfclose`, `nosigpipe`, `dgrambuf`, `streambuf` |
-| code signing and IOKit | `codesig`, `amfi`, `policy`, `iokit`, `ioreg`, `iosurface`, `iosurfacex`, `iogpudev` |
+| code signing and IOKit | `codesig`, `amfi`, `policy`, `iokit`, `ioreg`, `iosurface`, `iosurfacex`, `iogpudev`, `accel`, `accelr` |
 
 The suite runs single programs and the processes they create. None of it
 boots launchd or runs an app.
@@ -470,17 +486,26 @@ is the reference (search `crates/gex-kernel/src/` for
   facts the kernel does not have, some `sandbox_check` filter types,
   `sandbox_check` of another process's operation, and Sandbox's other
   `__mac_syscall` calls.
-- **IOKit.** The registry holds the device tree and the APFS services
-  only; no `IOService` driver is present. `IOConnectCallMethod` on a
-  driver, `iokit_user_client_trap`, and matching dictionaries of kinds not
-  handled are reported.
-- **Mach.** The traps `clock_sleep`, `debug_control_port_for_pid` and
-  `iokit_user_client_trap`; MIG routines not in `mig.rs`, and some
-  `task_info`, `thread_info`, `host_statistics` and `task_policy_get`
-  flavors; `task_for_pid` and its read and inspect forms on another
-  process; a fault's exception (`EXC_BAD_ACCESS` and the like) sent to a
-  handler the program set, which is reported and taken as a signal instead;
-  telling an `EXC_CRASH` handler of a death outside a system call; corpses
+- **IOKit.** The registry holds the device tree, the APFS services,
+  IOSurfaceRoot, and the GPU's accelerator with the drivers and nubs on its
+  path to the root.
+  These are reported:
+  - opening any other driver;
+  - those drivers' other nubs and clients;
+  - device tree entries no driver here made a nub of, as `IOService`
+    entries;
+  - properties those drivers set in their start or probe;
+  - IOGPU selectors and traps that make IOGPU objects, and AGXG9G's own
+    selectors;
+  - WebMetal requests, which have no host executor yet;
+  - matching dictionaries of kinds not handled.
+- **Mach.** The traps `clock_sleep` and `debug_control_port_for_pid`; MIG
+  routines not in `mig.rs`, and some `task_info`, `thread_info`,
+  `host_statistics` and `task_policy_get` flavors; `task_for_pid` and its
+  read and inspect forms on another process; a fault's exception
+  (`EXC_BAD_ACCESS` and the like) sent to a handler the program set, which
+  is reported and taken as a signal instead; telling an `EXC_CRASH` handler
+  of a death outside a system call; corpses
   (`EXC_CORPSE_NOTIFY`, and the corpse an `EXC_RESOURCE` or simulated
   `EXC_GUARD` would make); handlers of `EXCEPTION_IDENTITY_PROTECTED`
   behavior; hardware breakpoints, watchpoints and single step.

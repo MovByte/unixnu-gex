@@ -44,7 +44,7 @@ pub fn add_service(t: &mut Vec<Node>) {
         ("IOMatchedAtBoot".to_string(), Prop::Bool(true)),
         ("IOProbeScore".to_string(), Prop::Num(0, 32)),
     ];
-    t.push(Node { name: super::NAME.to_string(), props: Vec::new(), class: super::CLASS, service_props, parent: None, children: Vec::new(), kernel_only: false });
+    t.push(Node { name: super::NAME.to_string(), props: Vec::new(), class: super::CLASS, service_props, parent: None, children: Vec::new(), kernel_only: false, nub: None });
 }
 
 /// The root's shared memory.
