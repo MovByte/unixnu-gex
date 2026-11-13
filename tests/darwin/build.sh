@@ -50,6 +50,7 @@ cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/accel" "$HERE/src/acc
 cc -O2 -framework IOKit -framework IOSurface -framework CoreFoundation -o "$OUT/iosurface" "$HERE/src/iosurface.c"
 cc -O2 -framework IOSurface -framework CoreFoundation -o "$OUT/iosurfacex" "$HERE/src/iosurfacex.c"
 cc -O2 -framework IOKit -framework IOSurface -framework CoreFoundation -o "$OUT/iogpudev" "$HERE/src/iogpudev.c"
+cc -O2 -framework IOKit -framework IOSurface -framework CoreFoundation -o "$OUT/iomfb" "$HERE/src/iomfb.c"
 # accelr: accel in a task entitled to be a restricted GPU client.
 cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/accelr" "$HERE/src/accel.c"
 # amfi's: a program in no trust cache, and one holding get-task-allow.
