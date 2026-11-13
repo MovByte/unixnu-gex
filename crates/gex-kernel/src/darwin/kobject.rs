@@ -299,18 +299,17 @@ impl Kernel {
     /// semaphores destroyed (`semaphore_destroy_all`), its threads' sends
     /// still waiting for room abandoned, its threads' and its own ports
     /// dead (`ipc_thread_terminate`, `ipc_task_terminate`), the send
-    /// rights it held (special, registered) released, and its space
-    /// ended (`ipc_space_terminate`), every right in it with the
-    /// notifications that owes; then its space leaves the system's table.
+    /// rights it held (special, registered, a spawn's watch ports not yet
+    /// bound) released, and its space ended (`ipc_space_terminate`), every
+    /// right in it with the notifications that owes; then its space and
+    /// its link leave the system's table, and its pid no longer finds it.
+    /// Once for a task: a spawn's child that never ran is ended so too.
     pub fn darwin_task_terminate(&mut self) {
-        if !self.darwin {
+        if !self.darwin || self.dtask.ipc_raw.ended {
             return;
         }
         // coalitions_remove_task, launchd told of those it emptied.
         self.darwin_coalitions_task_end();
-        if self.dtask.ipc_raw.task == 0 {
-            return;
-        }
         // Its threads' vouchers, its importance (ipc_importance_disconnect_task)
         // and its bank context (task_bank_reset).
         self.darwin_threads_vouchers_release();
@@ -339,7 +338,8 @@ impl Kernel {
         let k = std::mem::take(&mut self.dtask.kports);
         let name = self.ipc().task_name_port_take();
         let task_ports: Vec<ObjId> = k.task.map(|(a, b)| vec![a, b]).unwrap_or_default().into_iter().chain(name).chain(k.resume).chain(flavored).collect();
-        let sends: Vec<ObjId> = k.special.values().copied().chain(k.registered.into_iter().flatten()).collect();
+        let watch = self.dtask.pending_watchports.take().map(|(w, _)| w).unwrap_or_default();
+        let sends: Vec<ObjId> = k.special.values().copied().chain(k.registered.into_iter().flatten()).chain(watch.into_iter().flatten()).collect();
         let ipc = self.ipc();
         for p in task_ports {
             ipc.port_mut(p).kobject = None;

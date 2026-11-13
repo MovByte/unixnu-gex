@@ -489,10 +489,12 @@ impl Kernel {
     /// XNU's `exec_activate_image` and `process_signature` do there before
     /// the call returns ([`Self::darwin_activate_body`]): the child's
     /// signature, credential labels and launch constraints are set when its
-    /// parent goes on. The answer is kept for the child's start, which a
-    /// refusal kills.
+    /// parent goes on, and its record says so (its image's path and name,
+    /// its identity version). The answer is kept for the child's start,
+    /// which a refusal kills.
     pub fn darwin_activate(&mut self, l: &Loaded) {
         let out = self.darwin_activate_body(l);
+        self.darwin_publish();
         self.darwin_ipc_leave();
         self.dtask.activated = Some(out);
     }
@@ -546,6 +548,7 @@ impl Kernel {
     /// activated in its parent's call ([`Self::darwin_activate`]); an
     /// exec's and the first program's is activated here.
     fn darwin_start_body(&mut self, strings: Option<Strings>, l: &Loaded, user_stack: u64) -> Result<MainStack, Errno> {
+        let spawned = self.dtask.activated.is_some();
         match self.dtask.activated.take() {
             Some(r) => r?,
             None => {
@@ -559,6 +562,12 @@ impl Kernel {
             }
         }
         self.darwin_publish();
+        // exec_resettextvp, then ipc_task_enable of an exec's new task or
+        // the run's first, as its image left it (a spawn's child's was
+        // enabled in its spawn, its image activated).
+        if !spawned {
+            self.darwin_task_enable();
+        }
         // The image's entitlements that raise its default memory limit.
         self.darwin_jetsam_entitlements();
         self.darwin_vm_policies();
