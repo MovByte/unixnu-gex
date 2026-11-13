@@ -91,6 +91,7 @@ pub mod op {
     pub const SYSTEM_KAS_INFO: usize = 166;
     pub const SYSTEM_MAC_SYSCALL: usize = 173;
     pub const SYSTEM_MEMORYSTATUS_CONTROL: usize = 174;
+    pub const SYSTEM_PRIVILEGE: usize = 178;
     pub const SYSTEM_SCHED: usize = 180;
     pub const SYSTEM_SOCKET: usize = 182;
     pub const SYSTEM_SUSPEND_RESUME: usize = 183;
@@ -1073,6 +1074,31 @@ impl Kernel {
         so.command = command;
         let a = SbArgs { kind: sandbox::kind::SOCKET, socket: Some(so), ..Default::default() };
         self.darwin_sb_evaluate(op::SOCKET_IOCTL, &a)
+    }
+
+    /// `priv_check_cred(cred, priv, flags)` (kern_priv.c): the MAC policies'
+    /// `mac_priv_check` may deny (Sandbox's system-privilege of the
+    /// privilege, slot 313, its errno, root's too); root has every privilege
+    /// but with PRIVCHECK_DEFAULT_UNPRIVILEGED_FLAG; else a policy's
+    /// `mac_priv_grant` may grant it (Sandbox's system-privilege again,
+    /// quietly, slot 314: granted when the decision's flags have bit 1);
+    /// else EPERM. AMFI has neither hook.
+    pub(crate) fn darwin_priv_check_cred(&mut self, privilege: u32, flags: u32) -> Result<(), u32> {
+        const PRIVCHECK_DEFAULT_UNPRIVILEGED_FLAG: u32 = 1;
+        let a = SbArgs { kind: sandbox::kind::PRIVILEGE, number: privilege, ..Default::default() };
+        let e = self.darwin_sb_evaluate(op::SYSTEM_PRIVILEGE, &a);
+        if e != 0 {
+            return Err(e);
+        }
+        if flags & PRIVCHECK_DEFAULT_UNPRIVILEGED_FLAG == 0 && self.creds.uid() == 0 {
+            return Ok(());
+        }
+        let sb = self.darwin_sandbox();
+        let (_, granted, _) = self.darwin_sb_evaluate_with(sb.as_ref(), op::SYSTEM_PRIVILEGE, &SbArgs { quiet: true, ..a });
+        if granted & 0x2 != 0 {
+            return Ok(());
+        }
+        Err(e::EPERM)
     }
 
     /// `mac_task_check_get_task_special_port` and `_set_` (Sandbox's hooks,

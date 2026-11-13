@@ -723,7 +723,8 @@ impl Kernel {
 
     /// `proc_security_policy`: the MAC policies' `proc_check_proc_info`
     /// (Sandbox's operation for the call), then for most flavors the
-    /// caller's euid the target's, or root.
+    /// caller's euid the target's, or the privilege to see other users'
+    /// processes.
     fn darwin_proc_info_policy(&mut self, target: Option<&Public>, callnum: u64, same_user: bool) -> Result<(), i32> {
         let op = match callnum {
             call::LISTPIDS => 127,
@@ -743,7 +744,9 @@ impl Kernel {
             }
         }
         let Some(target) = target else { return Ok(()) };
-        if same_user && self.dtask.cred.uid != target.cred.uid && self.dtask.cred.uid != 0 {
+        // Another user's process: the caller's PRIV_GLOBAL_PROC_INFO.
+        const PRIV_GLOBAL_PROC_INFO: u32 = 1002;
+        if same_user && self.dtask.cred.uid != target.cred.uid && self.darwin_priv_check_cred(PRIV_GLOBAL_PROC_INFO, 0).is_err() {
             return Err(e::EPERM);
         }
         Ok(())
