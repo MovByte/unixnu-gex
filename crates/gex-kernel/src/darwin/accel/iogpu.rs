@@ -235,11 +235,11 @@ fn restricted(k: &Kernel) -> bool {
     ["com.apple.private.gpu-restricted", "com.apple.developer.gpu-restricted"].iter().any(|key| entitled(k, key))
 }
 
-/// The device client, an `AGXDeviceUserClient`: the task that opened it, its options (the
-/// open type's high 16 bits), whether it is restricted (+259), whether its
-/// start succeeded and it is not stopped (+256), the read-only mapping of
-/// the accelerator's stamps in its task, the `API` property selector 6
-/// set, its trace id (+0xe8), its device's first client-shared block in
+/// The device client, an `AGXDeviceUserClient`: the task that opened it,
+/// its options (the open type's high 16 bits), whether it is restricted
+/// (+259), whether its start succeeded and it is not stopped (+256), the
+/// read-only mapping of the accelerator's stamps in its task, the `API`
+/// property selector 6 set, its trace id (+0xe8), its device's first client-shared block in
 /// its task, and its own mapping of IOSurfaceRoot's graphics comm page
 /// (selector 4's, made at its first call).
 pub struct Device {
@@ -261,8 +261,8 @@ const SHARED_BLOCK: u64 = 0x100 * ((0x80 + 8 + 0x3f) & !0x3f);
 
 impl Device {
     /// `IOGPU::newUserClient` for type 1: an `AGXDeviceUserClient` (what
-    /// AGXG9G's `newDeviceUserClient`, 0xfffffff005be7e0c, makes), its `init` (`initWithTask`
-    /// and the task kept), `attach` and `start`, whose
+    /// AGXG9G's `newDeviceUserClient`, 0xfffffff005be7e0c, makes), its
+    /// `init` (`initWithTask` and the task kept), `attach` and `start`, whose
     /// `deviceUserClientStart` (0xfffffff005bbce5c) maps the accelerator's
     /// stamp memory read-only into the task (`createMappingInTask` with
     /// kIOMapAnywhere | kIOMapReadOnly | kIOMapUnique), makes the client's

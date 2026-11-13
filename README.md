@@ -497,10 +497,11 @@ is the reference (search `crates/gex-kernel/src/` for
   - matching dictionaries of kinds not handled.
 - **Mach.** The traps `clock_sleep` and `debug_control_port_for_pid`; MIG
   routines not in `mig.rs`, and some `task_info`, `thread_info`,
-  `host_statistics` and `task_policy_get` flavors; `task_for_pid` and its read and inspect forms on another
-  process; a fault's exception (`EXC_BAD_ACCESS` and the like) sent to a
-  handler the program set, which is reported and taken as a signal instead;
-  telling an `EXC_CRASH` handler of a death outside a system call; corpses
+  `host_statistics` and `task_policy_get` flavors; `task_for_pid` and its
+  read and inspect forms on another process; a fault's exception
+  (`EXC_BAD_ACCESS` and the like) sent to a handler the program set, which
+  is reported and taken as a signal instead; telling an `EXC_CRASH` handler
+  of a death outside a system call; corpses
   (`EXC_CORPSE_NOTIFY`, and the corpse an `EXC_RESOURCE` or simulated
   `EXC_GUARD` would make); handlers of `EXCEPTION_IDENTITY_PROTECTED`
   behavior; hardware breakpoints, watchpoints and single step.

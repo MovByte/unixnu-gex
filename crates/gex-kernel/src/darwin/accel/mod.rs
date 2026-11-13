@@ -10,9 +10,9 @@
 //! class `MetalPluginClassName` names: WebMetal's, in place of AGXMetalA10's
 //! (`AGXA10XDevice`, which AGXG9G sets at 0xfffffff005c28830).
 //! IOGPU.framework's clients (RunningBoard's `IOServiceMatching("IOGPU")`,
-//! then `IOGPUDeviceCreate`) open its device user client, type 1. The WebMetal plugin's own
-//! connection is type 0, which carries the WebMetal wire protocol (the
-//! public WebMetal `wire/README.md`, "Transport").
+//! then `IOGPUDeviceCreate`) open its device user client, type 1. The
+//! WebMetal plugin's own connection is type 0, which carries the WebMetal
+//! wire protocol (the public WebMetal `wire/README.md`, "Transport").
 //!
 //! Its classes, its clients' and its place in the `IOService` plane are the
 //! device's, which the shipped Sandbox profiles decide by. Their
