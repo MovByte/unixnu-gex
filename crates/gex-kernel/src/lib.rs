@@ -96,11 +96,33 @@ pub struct GuestMem<'a> {
     /// calling thread's context, which the kernel keeps in the runtime's
     /// memory below the floor, exempt.
     user: Option<(u64, u64)>,
+    /// Pages a checked copy may write although the table's byte goes
+    /// without the write bit ([`Self::set_soft`]).
+    soft: Option<std::sync::Arc<SoftPages>>,
+}
+
+/// Pages whose bytes in a Darwin process's protection table go without the
+/// write bit its mappings allow ([`mem::MemoryMap::withhold`]): a kernel
+/// object watches for their first store. The program's own store faults to
+/// the kernel; a call's `copyout` to one is let through, as the mapping
+/// allows it, and the page is noted here for the object to learn of.
+#[derive(Debug, Default)]
+pub struct SoftPages {
+    /// The pages (by [`gex_abi::PERM_PAGE`]) that go without the write bit.
+    pub pages: Vec<u64>,
+    /// The pages of them a checked copy wrote.
+    pub written: std::sync::Mutex<Vec<u64>>,
 }
 
 impl<'a> GuestMem<'a> {
     pub fn new(bytes: &'a mut [u8]) -> GuestMem<'a> {
-        GuestMem { span: gex_atomic::mem::Span::new(bytes), user: None }
+        GuestMem { span: gex_atomic::mem::Span::new(bytes), user: None, soft: None }
+    }
+
+    /// Let checked copies write `soft`'s pages, noting what they write
+    /// there; `None` lets none. What was set before.
+    pub fn set_soft(&mut self, soft: Option<std::sync::Arc<SoftPages>>) -> Option<std::sync::Arc<SoftPages>> {
+        std::mem::replace(&mut self.soft, soft)
     }
 
     /// Check what is read and written from now on against the pages'
@@ -115,7 +137,7 @@ impl<'a> GuestMem<'a> {
     /// The same memory, unchecked: the kernel's own reads and writes in a
     /// call ([`Self::set_user`]), not the program's buffers.
     pub fn kernel(&mut self) -> GuestMem<'_> {
-        GuestMem { span: self.span.reborrow(), user: None }
+        GuestMem { span: self.span.reborrow(), user: None, soft: None }
     }
 
     /// The protection byte of permission page `p` (`gex_abi::PERM_TABLE64`):
@@ -143,7 +165,20 @@ impl<'a> GuestMem<'a> {
         if last >= gex_abi::PERM_TABLE_BYTES {
             return false;
         }
-        (first..=last).all(|p| self.perm_byte(p).is_some_and(|b| b & need == need))
+        (first..=last).all(|p| {
+            let b = self.perm_byte(p).unwrap_or(0);
+            if b & need == need {
+                return true;
+            }
+            // A watched page's write: its mapping allows it.
+            match &self.soft {
+                Some(soft) if need == gex_abi::perm::WRITE && b & gex_abi::perm::MAPPED != 0 && soft.pages.binary_search(&p).is_ok() => {
+                    soft.written.lock().unwrap_or_else(|e| e.into_inner()).push(p);
+                    true
+                }
+                _ => false,
+            }
+        })
     }
 
     /// Where a checked call's string read from `start` must stop before
@@ -181,7 +216,7 @@ impl<'a> GuestMem<'a> {
     /// Over a [`gex_atomic::mem::Span`] (the browser's, from address 0 of
     /// its memory).
     pub fn of_span(span: gex_atomic::mem::Span<'a>) -> GuestMem<'a> {
-        GuestMem { span, user: None }
+        GuestMem { span, user: None, soft: None }
     }
 
     /// The memory as one slice, where it is one (a native host's, a

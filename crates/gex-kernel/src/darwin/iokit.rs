@@ -46,6 +46,7 @@ pub fn superclasses(class: &str) -> &'static [&'static str] {
         "IORegistryEntry" => &["IORegistryEntry"],
         "IOUserClient" => &["IOUserClient", "IOService", "IORegistryEntry"],
         "AppleAPFSUserClient" => &["AppleAPFSUserClient", "IOUserClient", "IOService", "IORegistryEntry"],
+        "IOSurfaceRoot" | "IOSurfaceRootUserClient" => super::iosurface::superclasses(class),
         _ => super::accel::superclasses(class),
     }
 }
@@ -91,6 +92,7 @@ pub fn set_tree(b: &[u8]) -> Result<(), String> {
     let mut t = parse(b)?;
     add_volumes(&mut t);
     super::accel::add_service(&mut t);
+    super::iosurface::add_service(&mut t);
     add_root(&mut t);
     let _ = TREE.set(t);
     Ok(())
@@ -253,12 +255,32 @@ fn add_volumes(t: &mut Vec<Node>) {
 pub fn matching(tree: &[Node], dict: &[(String, DictValue)]) -> Result<Vec<u32>, String> {
     let mut class = None;
     let mut props = Vec::new();
+    let mut name_match = None;
     for (k, v) in dict {
         match (k.as_str(), v) {
             ("IOProviderClass", DictValue::Str(c)) => class = Some(c.as_str()),
+            // compareNames: the service's name (copyName) against it.
+            ("IONameMatch", DictValue::Str(n)) => name_match = Some(n.as_str()),
             (_, DictValue::Str(s)) => props.push((k.as_str(), s.as_str())),
             _ => return Err(format!("the matching key {k} ({v:?})")),
         }
+    }
+    // By name: the services that only IOSurface's kext names are all here
+    // (a device tree nub's name is the platform's, compared by
+    // IODTCompareNubName, and no node of the tree bears these).
+    if let Some(n) = name_match {
+        if !super::iosurface::name_complete(n) {
+            return Err(format!("the services named {n:?}: the drivers' own are not here"));
+        }
+        let found = tree
+            .iter()
+            .enumerate()
+            .filter(|&(i, n2)| superclasses(n2.class).contains(&"IOService") && name(tree, i as u32) == n)
+            .filter(|(_, n2)| class.map_or(true, |c| superclasses(n2.class).contains(&c)))
+            .filter(|(_, n2)| props.iter().all(|&(k, v)| n2.service_props.iter().any(|(pk, pv)| pk == k && matches!(pv, Prop::Str(s) if s == v))))
+            .map(|(i, _)| i as u32)
+            .collect();
+        return Ok(found);
     }
     // The platform expert device is registered (`IOPlatformExpertDevice`
     // calls `registerService`); its properties are partly the platform's.
@@ -278,7 +300,7 @@ pub fn matching(tree: &[Node], dict: &[(String, DictValue)]) -> Result<Vec<u32>,
     // GPU, one accelerator). Of the classes above them (and of services by
     // property alone) the storage drivers' and the whole disk's are not, so
     // those are answered only by a BSD name found here.
-    let complete = matches!(class, Some("AppleAPFSVolume" | "AppleAPFSContainer" | "AppleAPFSMedia" | "AppleAPFSContainerScheme")) || class.is_some_and(super::accel::class_complete);
+    let complete = matches!(class, Some("AppleAPFSVolume" | "AppleAPFSContainer" | "AppleAPFSMedia" | "AppleAPFSContainerScheme")) || class.is_some_and(super::accel::class_complete) || class.is_some_and(super::iosurface::class_complete);
     let by_name = props.iter().any(|&(k, _)| k == "BSD Name");
     if !complete && !(by_name && !found.is_empty()) {
         return Err(format!("the services of class {class:?} with {props:?}: the drivers' own are not here"));
@@ -718,6 +740,9 @@ pub enum Kind {
     Apfs,
     /// One of the accelerator's ([`super::accel`]).
     Accel(super::accel::Client),
+    /// IOSurfaceRoot's, by its number among the root's clients
+    /// ([`super::iosurface`]).
+    Surface(u32),
 }
 
 /// An `IOUserClient` a task opened: the service it is attached to, its
@@ -789,6 +814,9 @@ pub fn open_user_client(k: &mut crate::syscalls::Kernel, service: u32, ty: u32) 
         // (its personality's), for any type; the apfs kext does not depend
         // on IOSurface.
         "AppleAPFSContainer" => ("AppleAPFSUserClient", Kind::Apfs, true),
+        // IOSurfaceRootUserClient sets its own locking properties (start,
+        // 0xfffffff005baf29c): no default locking.
+        c if c == super::iosurface::CLASS => (super::iosurface::UC_CLASS, Kind::Surface(super::iosurface::new_user_client(k, ty)?), false),
         c if c == super::accel::CLASS => {
             let (class, client) = super::accel::new_user_client(k, service, ty)?;
             // IOGPUFamily depends on IOSurface; the WebMetal client is
@@ -888,6 +916,7 @@ pub fn client_close(k: &mut crate::syscalls::Kernel, c: &mut UserClient) {
         // here, the container's opens not being modelled.
         Kind::Apfs => {}
         Kind::Accel(a) => super::accel::client_close(k, a),
+        Kind::Surface(id) => super::iosurface::client_close(k, *id),
     }
 }
 
@@ -904,13 +933,16 @@ pub fn client_died(k: &mut crate::syscalls::Kernel, id: u32) {
     if let Kind::Accel(a) = &mut c.kind {
         super::accel::client_free(k, a);
     }
+    if let Kind::Surface(id) = c.kind {
+        super::iosurface::client_free(k, id);
+    }
 }
 
 /// `getService`: the provider for the accelerator's clients, none for
 /// IOUserClient's default.
 pub fn client_service(c: &UserClient) -> Option<u32> {
     match &c.kind {
-        Kind::Apfs => None,
+        Kind::Apfs | Kind::Surface(_) => None,
         Kind::Accel(a) => super::accel::client_service(c.service, a),
     }
 }
@@ -929,6 +961,8 @@ pub fn register_notification_port(k: &mut crate::syscalls::Kernel, c: &mut UserC
             ret::UNSUPPORTED
         }
         Kind::Accel(a) => super::accel::register_notification_port(k, a, port, ty, reference),
+        // IOUserClient's (IOSurfaceRootUserClient has none of its own).
+        Kind::Surface(_) => ret::UNSUPPORTED,
     }
 }
 
@@ -937,6 +971,7 @@ pub fn external_method(k: &mut crate::syscalls::Kernel, c: &mut UserClient, a: &
     match &mut c.kind {
         Kind::Apfs => apfs_method(k, c.service, a),
         Kind::Accel(x) => super::accel::external_method(k, x, a),
+        Kind::Surface(id) => super::iosurface::external_method(k, *id, a),
     }
 }
 
@@ -963,7 +998,10 @@ pub fn client_property(c: &UserClient, name: &str) -> Result<Option<Prop>, Strin
     match name {
         "IOUserClientCreator" => Ok(Some(Prop::Str(c.creator.clone()))),
         "IOUserClientDefaultLocking" if c.default_locking => Ok(Some(Prop::Bool(true))),
-        _ => super::accel::client_property(c, name),
+        _ => match c.kind {
+            Kind::Surface(_) => Ok(super::iosurface::client_property(name)),
+            _ => super::accel::client_property(c, name),
+        },
     }
 }
 
@@ -1054,6 +1092,10 @@ impl crate::syscalls::Kernel {
                 ret::UNSUPPORTED
             }
             Kind::Accel(x) => super::accel::trap(self, x, index, [a[2], a[3], a[4], a[5]]),
+            Kind::Surface(id) => {
+                let id = *id;
+                super::iosurface::trap(self, id, index, [a[2], a[3], a[4], a[5]])
+            }
         };
         r
     }

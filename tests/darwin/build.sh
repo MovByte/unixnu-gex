@@ -25,9 +25,31 @@ for p in hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lo
     cc -O2 -o "$OUT/$p" "$HERE/src/$p.c"
 done
 cc -O2 -framework CoreFoundation -o "$OUT/cfrunloop" "$HERE/src/cfrunloop.c"
+# stackfb: an LC_MAIN stack of 1.75 GiB, which ld will not write (it caps
+# arm64 at 512 MB) but exec takes, written into the command.
+cc -O2 -o "$OUT/stackfb" "$HERE/src/stackfb.c"
+python3 -I - "$OUT/stackfb" <<'EOF2'
+import struct, sys
+p = sys.argv[1]
+b = bytearray(open(p, 'rb').read())
+ncmds = struct.unpack_from('<I', b, 16)[0]
+o = 32
+for _ in range(ncmds):
+    cmd, size = struct.unpack_from('<II', b, o)
+    if cmd == 0x80000028:
+        struct.pack_into('<Q', b, o + 16, 0x70000000)
+        break
+    o += size
+else:
+    sys.exit('no LC_MAIN in ' + p)
+open(p, 'wb').write(b)
+EOF2
 cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/iokit" "$HERE/src/iokit.c"
 cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/ioreg" "$HERE/src/ioreg.c"
 cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/accel" "$HERE/src/accel.c"
+cc -O2 -framework IOKit -framework IOSurface -framework CoreFoundation -o "$OUT/iosurface" "$HERE/src/iosurface.c"
+cc -O2 -framework IOSurface -framework CoreFoundation -o "$OUT/iosurfacex" "$HERE/src/iosurfacex.c"
+cc -O2 -framework IOKit -framework IOSurface -framework CoreFoundation -o "$OUT/iogpudev" "$HERE/src/iogpudev.c"
 cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/sbxiokit" "$HERE/src/sbxiokit.c"
 # sbxscrub: sbxfile's directory times, in a task that may run any cdhash.
 cc -O2 -o "$OUT/sbxscrub" "$HERE/src/sbxfile.c"

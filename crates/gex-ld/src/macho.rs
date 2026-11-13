@@ -68,6 +68,7 @@ const N_SECT: u8 = 0x0e;
 /// x0-x28, fp, lr and sp.
 const ARM_THREAD_STATE64: u32 = 6;
 const THREAD_STATE_PC: usize = 32 * 8;
+const THREAD_STATE_SP: usize = 31 * 8;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Section {
@@ -116,8 +117,9 @@ pub enum Entry {
     /// dyld calls as `main`.
     Main { entryoff: u64, stacksize: u64 },
     /// `LC_UNIXTHREAD`: the pc the kernel starts the thread at (a static
-    /// program, or dyld itself).
-    Thread { pc: u64 },
+    /// program, or dyld itself), and the stack pointer it names (0: the
+    /// default stack; else `load_threadstack`'s custom stack).
+    Thread { pc: u64, sp: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -247,7 +249,7 @@ pub fn parse(d: &[u8]) -> Result<MachO, LoadError> {
             }
             LC_UNIXTHREAD => {
                 if m.entry.is_none() {
-                    m.entry = thread_pc(c, o, size).map(|pc| Entry::Thread { pc });
+                    m.entry = thread_state(c, o, size).map(|(pc, sp)| Entry::Thread { pc, sp });
                 }
             }
             LC_LOAD_DYLINKER => m.dylinker = lc_str(c),
@@ -305,14 +307,14 @@ fn segment(d: &[u8], o: usize) -> Option<Seg> {
     })
 }
 
-/// The pc of an `LC_UNIXTHREAD`'s `ARM_THREAD_STATE64`.
-fn thread_pc(d: &[u8], o: usize, size: usize) -> Option<u64> {
+/// The pc and sp of an `LC_UNIXTHREAD`'s `ARM_THREAD_STATE64`.
+fn thread_state(d: &[u8], o: usize, size: usize) -> Option<(u64, u64)> {
     let mut p = o + 8;
     while p + 8 <= o + size {
         let flavor = u32_at(d, p)?;
         let count = u32_at(d, p + 4)? as usize;
         if flavor == ARM_THREAD_STATE64 {
-            return u64_at(d, p + 8 + THREAD_STATE_PC);
+            return Some((u64_at(d, p + 8 + THREAD_STATE_PC)?, u64_at(d, p + 8 + THREAD_STATE_SP)?));
         }
         p += 8 + count * 4;
     }
@@ -364,7 +366,7 @@ impl MachO {
     pub fn entry_pc(&self) -> Option<u64> {
         match self.entry? {
             Entry::Main { entryoff, .. } => Some(self.base() + entryoff),
-            Entry::Thread { pc } => Some(pc),
+            Entry::Thread { pc, .. } => Some(pc),
         }
     }
 
@@ -640,7 +642,7 @@ mod tests {
         assert_eq!(m.filetype, MH_EXECUTE);
         assert_eq!(m.segments.len(), 2);
         assert!(m.segments[0].is_guard());
-        assert_eq!(m.entry, Some(Entry::Thread { pc: 0x1_0000_0400 }));
+        assert_eq!(m.entry, Some(Entry::Thread { pc: 0x1_0000_0400, sp: 0 }));
         assert_eq!(m.base(), 0x1_0000_0000);
         assert!(!m.is_pie());
     }

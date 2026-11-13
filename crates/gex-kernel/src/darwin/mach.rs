@@ -903,9 +903,16 @@ impl Kernel {
                 return kr::NO_SPACE;
             }
             // Without VM_FLAGS_OVERWRITE a fixed request over anything
-            // mapped fails, the shared region's submap included.
+            // mapped fails, the shared region's submap included; with it,
+            // what it replaces must be removable.
             if flags & vmf::OVERWRITE == 0 && (self.darwin_in_shared_region(start, start + len) || self.mem.lock().vmas().iter().any(|v| v.start < start + len && start < v.end)) {
                 return kr::NO_SPACE;
+            }
+            if flags & vmf::OVERWRITE != 0 {
+                let k = self.darwin_region_delete_check(start, start + len);
+                if k != kr::SUCCESS {
+                    return k;
+                }
             }
             return match self.canonical(m, nr::MMAP, [start, len, linux_prot, mf::PRIVATE | mf::ANONYMOUS | mf::FIXED, u64::MAX, 0]) {
                 Ok(_) => {
@@ -1004,11 +1011,42 @@ impl Kernel {
         }
     }
 
+    /// Whether a fixed allocation of `size` bytes at `start` would be had
+    /// (`vm_map_enter` with VM_FLAGS_FIXED and no overwrite): inside the map,
+    /// and over nothing, the shared region's submap included.
+    pub(crate) fn darwin_fixed_fits(&self, start: u64, size: u64) -> bool {
+        let Some(end) = start.checked_add(size) else { return false };
+        start >= self.dtask.map_min
+            && end <= self.darwin_map_max().min(super::vm::BACKED_END)
+            && !self.darwin_in_shared_region(start, end)
+            && !self.mem.lock().vmas().iter().any(|v| v.start < end && start < v.end)
+    }
+
     /// Whether `[start, end)` meets the shared region the task's map nests
-    /// (`vm_shared_region_enter`'s one submap entry over all of it).
+    /// (`vm_shared_region_enter`'s one submap entry over all of it, less
+    /// what has since replaced or removed part of it).
     pub(crate) fn darwin_in_shared_region(&self, start: u64, end: u64) -> bool {
-        let (base, size) = self.darwin_region;
-        size != 0 && start < base + size && base < end
+        !self.dtask.vm.submaps(start, end).is_empty()
+    }
+
+    /// `vm_map_delete`'s check before removing or replacing `[start, end)`
+    /// from the task's map: the shared region's submap entry is permanent
+    /// (`vm_shared_region_enter`), and a range of it may go only where the
+    /// region holds no permanent mapping (`vm_map_delete_submap_recurse`:
+    /// those `shared_region_make_permanent` made, neither writable nor
+    /// executable); else KERN_PROTECTION_FAILURE, and nothing is removed.
+    pub(crate) fn darwin_region_delete_check(&self, start: u64, end: u64) -> u64 {
+        const KERN_PROTECTION_FAILURE: u64 = 2;
+        let pieces = self.dtask.vm.submaps(start, end);
+        if pieces.is_empty() {
+            return kr::SUCCESS;
+        }
+        let Some(region) = super::shregion::region() else { return kr::SUCCESS };
+        let permanent = region.permanent();
+        if pieces.iter().any(|&(s, e)| permanent.iter().any(|&(ps, pe)| ps < e && s < pe)) {
+            return KERN_PROTECTION_FAILURE;
+        }
+        kr::SUCCESS
     }
 
     /// `vm_map_random_address_for_size`: up to 1000 random page-aligned
@@ -1025,7 +1063,6 @@ impl Kernel {
         }
         let space = space - size;
         let map_max = self.darwin_map_max();
-        let (region, region_end) = (self.darwin_region.0, self.darwin_region.0 + self.darwin_region.1);
         let mm = self.mem.lock();
         let vmas = mm.vmas();
         for _ in 0..MAX_TRIES_TO_GET_RANDOM_ADDRESS {
@@ -1035,8 +1072,8 @@ impl Kernel {
                 continue;
             }
             let mut hole_end = vmas.get(vmas.partition_point(|v| v.start <= addr)).map_or(map_max, |v| v.start);
-            if region_end > region && addr < region {
-                hole_end = hole_end.min(region);
+            if let Some(&(s, _)) = self.dtask.vm.submaps(addr, hole_end).first() {
+                hole_end = s;
             }
             if hole_end - addr >= size {
                 return Ok(addr);
@@ -1048,7 +1085,6 @@ impl Kernel {
     /// `vm_map_store_find_space` from `hint`: the first `size` bytes free
     /// at or after it, aligned to `mask`, ending by `limit`.
     pub(crate) fn darwin_find_space(&self, hint: u64, limit: u64, size: u64, mask: u64) -> Option<u64> {
-        let region_end = self.darwin_region.0 + self.darwin_region.1;
         let mm = self.mem.lock();
         let mut at = hint.checked_add(mask)? & !mask;
         loop {
@@ -1057,7 +1093,7 @@ impl Kernel {
                 return None;
             }
             // The shared region's submap is one entry, its holes included.
-            if self.darwin_in_shared_region(at, end) {
+            if let Some(&(_, region_end)) = self.dtask.vm.submaps(at, end).last() {
                 at = region_end.checked_add(mask)? & !mask;
                 continue;
             }
@@ -1283,6 +1319,10 @@ impl Kernel {
         let (s, e) = (start & !PAGE_MASK, end.checked_add(PAGE_MASK).map_or(0, |e| e & !PAGE_MASK));
         if e == 0 {
             return kr::SUCCESS;
+        }
+        let k = self.darwin_region_delete_check(s, e);
+        if k != kr::SUCCESS {
+            return k;
         }
         self.dtask.vm.clear(s, e);
         match self.canonical(m, nr::MUNMAP, [s, e - s, 0, 0, 0, 0]) {

@@ -297,6 +297,11 @@ impl Kernel {
         if flags & FIXED != 0 && self.darwin_past_memory("a fixed mapping", addr, addr + size) {
             return Err(Errno::ENOMEM);
         }
+        // MAP_FIXED is VM_FLAGS_OVERWRITE: what it replaces must be
+        // removable (KERN_PROTECTION_FAILURE, EACCES).
+        if flags & FIXED != 0 && self.darwin_region_delete_check(addr, addr + size) != kr::SUCCESS {
+            return Err(Errno::EACCES);
+        }
         // Anywhere: vm_map_enter's search from the rounded hint; out of
         // space past a hint, once more from the map's first page.
         if flags & FIXED == 0 && !jit {
@@ -350,6 +355,10 @@ impl Kernel {
             }
         }
         let mut b = *a;
+        // MAP_FIXED replaces what is there, if it is removable.
+        if b[3] as u32 & map::FIXED != 0 && self.darwin_region_delete_check(b[0] & !PAGE_MASK, round(b[0].wrapping_add(b[1]))) != kr::SUCCESS {
+            return Err(Errno::EACCES);
+        }
         // Anywhere: vm_map_enter's search from the rounded hint.
         if b[3] as u32 & map::FIXED == 0 {
             b[0] = self.darwin_locate_space(round(b[0]), round(b[1]), 0).map_err(|_| Errno::ENOMEM)?;

@@ -461,6 +461,8 @@ impl Kernel {
                 self.dtask.disallow_mwl = true;
                 0
             }
+            // The task's region (none once removed: EINVAL); its first
+            // mapping, or ENOMEM while nothing has mapped it.
             sys::SHARED_REGION_CHECK_NP => match self.darwin_region {
                 (0, _) => neg(Errno::EINVAL),
                 (start, size) if a[0] == 0 => {
@@ -468,7 +470,10 @@ impl Kernel {
                     self.darwin_region = (0, 0);
                     0
                 }
-                (start, _) => res(m.write_u64(a[0], start).map(|_| 0)),
+                _ => match super::shregion::region().and_then(|r| r.start()) {
+                    Some(start) => res(m.write_u64(a[0], start).map(|_| 0)),
+                    None => neg(Errno::ENOMEM),
+                },
             },
             sys::MAP_WITH_LINKING_NP => res(self.darwin_map_with_linking(m, a)),
             sys::GETENTROPY => res(self.canonical(m, nr::GETRANDOM, [a[0], a[1], 0, 0, 0, 0]).map(|_| 0)),
@@ -1136,7 +1141,7 @@ impl Kernel {
         let image = self.dtask.image_files.iter().find(|f| (f.0, f.1) == (fs, a[3])).map(|f| f.2.clone());
         let path = if a[3] == ROOT_OBJID {
             mnt.on.to_string()
-        } else if (fs, a[3]) == (super::CACHE_FS_ID, super::CACHE_OBJ_ID) && self.darwin_region.0 != 0 {
+        } else if (fs, a[3]) == (super::CACHE_FS_ID, super::CACHE_OBJ_ID) && self.darwin_region.0 != 0 && super::shregion::region().is_some() {
             super::CACHE_PATH.to_string()
         } else if let Some(path) = image {
             path
