@@ -14,9 +14,10 @@
 //! Its user clients are attached to it in the IOService plane, so the
 //! shipped Sandbox profiles admit them by that ancestry: their
 //! `iokit-registry-entry-class` filter (`0xfffffff0069f2564`) walks the
-//! entry's provider chain and each class's superclasses, and the
-//! `container`, `backboardd`, `runningboardd` and `com.apple.WebKit.GPU`
-//! profiles allow `iokit-open-user-client` under an `IOGPU`.
+//! entry's provider chain ([`super::platform`]) and each class's
+//! superclasses, and the `container`, `backboardd`, `runningboardd` and
+//! `com.apple.WebKit.GPU` profiles allow `iokit-open-user-client` under an
+//! `IOGPU`.
 
 pub mod iogpu;
 pub mod wire;
@@ -58,14 +59,13 @@ pub fn is_service(i: u32) -> bool {
 /// (0xfffffff005bd3f20).
 const KDEBUG_VERSION: u64 = 0x1_0000_0000;
 
-/// The accelerator on the device tree's GPU nub, the entry whose
-/// `compatible` is `gpu,t8011` (AGXG9G_A0's `IONameMatch`): its provider in
-/// the IOService plane. Its properties are the wire documentation's
-/// (`IOMatchCategory`, `MetalPluginName`, `MetalPluginClassName`), the
-/// class and provider class that place it, and what `IOGPU::start` sets.
-pub fn add_service(t: &mut Vec<Node>) {
-    let gpu = t.iter().position(|n| n.props.iter().any(|(k, v)| k == "compatible" && v.split(|&c| c == 0).any(|c| c == b"gpu,t8011")));
-    let Some(gpu) = gpu else { return };
+/// The accelerator on the GPU's nub `gpu` (the `AppleARMIODevice` arm-io's
+/// driver made of the entry whose `compatible` is `gpu,t8011`, AGXG9G_A0's
+/// `IONameMatch`): its provider in the IOService plane. Its properties are
+/// the wire documentation's (`IOMatchCategory`, `MetalPluginName`,
+/// `MetalPluginClassName`), the class and provider class that place it, and
+/// what `IOGPU::start` sets.
+pub fn add_service(t: &mut Vec<Node>, gpu: u32) {
     let s = |v: &str| Prop::Str(v.to_string());
     let service_props = vec![
         ("IOClass".to_string(), s(CLASS)),
@@ -75,15 +75,15 @@ pub fn add_service(t: &mut Vec<Node>) {
         ("MetalPluginClassName".to_string(), s("WebMetalDevice")),
         ("KDebugVersion".to_string(), Prop::Num(KDEBUG_VERSION, 64)),
     ];
-    t.push(Node { name: CLASS.to_string(), props: Vec::new(), class: CLASS, service_props, parent: Some(gpu as u32), children: Vec::new(), kernel_only: false });
+    t.push(Node { name: CLASS.to_string(), props: Vec::new(), class: CLASS, service_props, parent: Some(gpu), children: Vec::new(), kernel_only: false, nub: None });
 }
 
 /// Whether a property tree entry `i` does not have may be one not
 /// modelled: for the accelerator, only `PerformanceStatistics`, which
 /// IOGPUFamily's statistics (IOGPUStatistics) set on it from the GPU's
 /// counters; its other properties are all the ones above.
-pub fn property_unknown(i: u32, name: &str) -> bool {
-    !is_service(i) || name == "PerformanceStatistics"
+pub fn property_unknown(name: &str) -> bool {
+    name == "PerformanceStatistics"
 }
 
 /// A user client of the accelerator.

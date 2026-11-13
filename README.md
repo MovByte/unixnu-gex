@@ -136,6 +136,12 @@ subsystem, most naming in their header the XNU source they port:
 - **IOKit.** The registry's `IODeviceTree` plane, built from the device's
   own device tree, with the APFS volumes its file system table names
   published as services, reached through IOKit's MIG routines (`iokit.rs`).
+  The GPU's accelerator (`accel/`) sits on its providers in the
+  `IOService` plane as the device's kernelcache matches and publishes them
+  over its device tree (`platform.rs`):
+  - the platform expert `AppleARMPE` on the `IOPlatformExpertDevice`;
+  - the `IOPlatformDevice` nub of arm-io and its driver `AppleT8011IO`;
+  - the `AppleARMIODevice` nub of arm-io's sgx.
 - **sysctl.** The kernel's own nodes, read from the device's kernelcache
   (`sysctl_nodes.rs`), and the values this kernel has for them
   (`sysctl.rs`).
@@ -415,7 +421,7 @@ dyld and libSystem from the device's shared cache.
 | kqueue, poll and pipes | `kq-pipe`, `vnode`, `vnextend`, `select`, `poll`, `pipe`, `timeouts` |
 | terminals and `/dev` | `pty`, `ptyjob`, `ptyclose`, `bsdpty`, `ttyinfo`, `ttydead`, `ttydrain`, `fcntltty`, `revoke`, `devfs`, `devattr` |
 | sockets | `sockerr`, `sockevent`, `sockname`, `sockopts`, `halfclose`, `nosigpipe`, `dgrambuf`, `streambuf` |
-| code signing and IOKit | `codesig`, `amfi`, `policy`, `iokit`, `ioreg` |
+| code signing and IOKit | `codesig`, `amfi`, `policy`, `iokit`, `ioreg`, `accel`, `accelr` |
 
 The suite runs single programs and the processes they create. None of it
 boots launchd or runs an app.
@@ -451,14 +457,20 @@ is the reference (search `crates/gex-kernel/src/` for
   facts the kernel does not have, some `sandbox_check` filter types,
   `sandbox_check` of another process's operation, and Sandbox's other
   `__mac_syscall` calls.
-- **IOKit.** The registry holds the device tree and the APFS services
-  only; no `IOService` driver is present. `IOConnectCallMethod` on a
-  driver, `iokit_user_client_trap`, and matching dictionaries of kinds not
-  handled are reported.
-- **Mach.** The traps `clock_sleep`, `debug_control_port_for_pid` and
-  `iokit_user_client_trap`; MIG routines not in `mig.rs`, and some
-  `task_info`, `thread_info`, `host_statistics` and `task_policy_get`
-  flavors; `task_for_pid` and its read and inspect forms on another
+- **IOKit.** The registry holds the device tree, the APFS services, and
+  the GPU's accelerator with the drivers and nubs on its path to the root.
+  These are reported:
+  - opening any other driver;
+  - those drivers' other nubs and clients;
+  - device tree entries no driver here made a nub of, as `IOService`
+    entries;
+  - properties those drivers set in their start or probe;
+  - IOGPU selectors and traps that make IOGPU objects;
+  - WebMetal requests, which have no host executor yet;
+  - matching dictionaries of kinds not handled.
+- **Mach.** The traps `clock_sleep` and `debug_control_port_for_pid`; MIG
+  routines not in `mig.rs`, and some `task_info`, `thread_info`,
+  `host_statistics` and `task_policy_get` flavors; `task_for_pid` and its read and inspect forms on another
   process; a fault's exception (`EXC_BAD_ACCESS` and the like) sent to a
   handler the program set, which is reported and taken as a signal instead;
   telling an `EXC_CRASH` handler of a death outside a system call; corpses

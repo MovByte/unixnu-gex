@@ -1,6 +1,7 @@
 // The GPU's accelerator service: found by class as Metal.framework finds it
 // (IOAcceleratorES) and as RunningBoard does (IOGPU), its registry
-// properties, and its user clients: the WebMetal connection (type 0), the
+// properties, its providers up the IOService plane to the registry's root,
+// and its user clients: the WebMetal connection (type 0), the
 // IOGPU device client (type 1), the memory information client (type 33),
 // and the types it refuses. For each client: its class and properties,
 // method argument checks as IOUserClient makes them, the asynchronous
@@ -49,6 +50,64 @@ static int string_prop(io_registry_entry_t e, const char *key, const char *want)
         printf("accel: %s: %s, want %s\n", key, buf, want);
         return 1;
     }
+    return 0;
+}
+
+static int num_prop(io_registry_entry_t e, CFStringRef key, long long want) {
+    CFTypeRef v = IORegistryEntryCreateCFProperty(e, key, kCFAllocatorDefault, 0);
+    long long got = -1;
+    if (v == NULL || CFGetTypeID(v) != CFNumberGetTypeID() || !CFNumberGetValue(v, kCFNumberLongLongType, &got) || got != want) {
+        char k[64];
+        CFStringGetCString(key, k, sizeof k, kCFStringEncodingUTF8);
+        return bad(k, (long)got, (long)want);
+    }
+    CFRelease(v);
+    return 0;
+}
+
+// An entry's class and its registry name.
+static int is(io_registry_entry_t e, const char *class_name, const char *name) {
+    io_name_t cls = "", n = "";
+    if (IOObjectGetClass(e, cls) != KERN_SUCCESS || strcmp(cls, class_name) != 0 || IORegistryEntryGetName(e, n) != KERN_SUCCESS || strcmp(n, name) != 0) {
+        printf("accel: an ancestor: %s %s, want %s %s\n", cls, n, class_name, name);
+        return 1;
+    }
+    return 0;
+}
+
+// The accelerator's providers, as the device's kexts publish them: the GPU's
+// nub (AppleARMIODevice, which AppleT8011IO made of arm-io's sgx), arm-io's
+// driver, arm-io's nub (an IOPlatformDevice the platform expert made), the
+// platform expert, the platform expert device and the registry's root; and
+// what matching set on the drivers.
+static int ancestors(io_service_t accel) {
+    static const struct { const char *cls, *name; } want[] = {
+        {"AppleARMIODevice", "sgx"}, {"AppleT8011IO", "AppleT8011IO"}, {"IOPlatformDevice", "arm-io"},
+        {"AppleARMPE", "AppleARMPE"}, {"IOPlatformExpertDevice", "J120AP"}, {"IORegistryEntry", "Root"},
+    };
+    io_registry_entry_t e = accel, up[6];
+    IOObjectRetain(e);
+    for (int i = 0; i < 6; i++) {
+        if (IORegistryEntryGetParentEntry(e, kIOServicePlane, &up[i]) != KERN_SUCCESS) return bad("a provider", i, 6);
+        IOObjectRelease(e);
+        e = up[i];
+        IOObjectRetain(e);
+        if (is(e, want[i].cls, want[i].name)) return 1;
+    }
+    io_registry_entry_t none = IO_OBJECT_NULL;
+    if (IORegistryEntryGetParentEntry(e, kIOServicePlane, &none) != kIOReturnNoDevice) return bad("a parent of the root", 0, 1);
+    IOObjectRelease(e);
+    // Their superclasses, from the kexts' metaclasses.
+    if (!IOObjectConformsTo(up[0], "IOService") || !IOObjectConformsTo(up[1], "AppleT801xIO") || !IOObjectConformsTo(up[1], "AppleARMIO") || !IOObjectConformsTo(up[1], "IOPlatformIO") || !IOObjectConformsTo(up[3], "IODTPlatformExpert") || !IOObjectConformsTo(up[3], "IOPlatformExpert")) return bad("the providers' superclasses", 0, 1);
+    // The drivers' properties from their personalities and matching.
+    if (string_prop(up[1], "IONameMatched", "arm-io,t8011") || string_prop(up[1], "CFBundleIdentifier", "com.apple.driver.AppleT8011") || string_prop(up[1], "IOMatchCategory", "IODefaultMatchCategory") || num_prop(up[1], CFSTR("IOProbeScore"), 0) || num_prop(up[1], CFSTR("IOPlatformActiveAction"), 80000)) return 1;
+    if (string_prop(up[3], "IONameMatched", "AppleARM") || string_prop(up[3], "IOProviderClass", "IOPlatformExpertDevice") || num_prop(up[3], CFSTR("IOProbeScore"), 1000)) return 1;
+    if (IORegistryEntryCreateCFProperty(up[3], CFSTR("IOMatchedAtBoot"), kCFAllocatorDefault, 0) != kCFBooleanTrue) return bad("the platform expert matched at boot", 0, 1);
+    // The nubs keep their device tree entries' properties.
+    CFTypeRef compat = IORegistryEntryCreateCFProperty(up[0], CFSTR("compatible"), kCFAllocatorDefault, 0);
+    if (compat == NULL || CFGetTypeID(compat) != CFDataGetTypeID() || CFDataGetLength(compat) != 10 || memcmp(CFDataGetBytePtr(compat), "gpu,t8011", 10) != 0) return bad("the GPU nub's compatible", 0, 1);
+    CFRelease(compat);
+    for (int i = 0; i < 6; i++) IOObjectRelease(up[i]);
     return 0;
 }
 
@@ -387,6 +446,8 @@ int main(int argc, char **argv) {
     if (kr != kIOReturnUnsupported || conn != IO_OBJECT_NULL) return bad("opening type 2", kr, kIOReturnUnsupported);
     kr = IOServiceOpen(accel, mach_task_self(), 0x10000, &conn);
     if (kr != kIOReturnUnsupported) return bad("opening type 0x10000", kr, kIOReturnUnsupported);
+
+    if (ancestors(accel)) return 1;
 
     if (argc > 1 && strcmp(argv[1], "restricted") == 0) {
         if (restricted_client(accel)) return 1;

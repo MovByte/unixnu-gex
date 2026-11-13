@@ -37,6 +37,7 @@ pub mod footprint;
 pub mod xattr;
 pub mod iokit;
 pub mod accel;
+pub mod platform;
 pub mod guarded;
 pub mod exit;
 pub mod exception;
