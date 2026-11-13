@@ -49,9 +49,10 @@
 //! `com.apple.security.exception.*` entitlements issue. A process
 //! whose profile filters its Mach messages (flag bit 12) stops at its first
 //! message to a port that enforces filtering (`mach_msg.rs`). An
-//! extension is kept as its class and path; what it is bound to and what an
-//! extension filter matches it by are not ported, and such a filter stops
-//! its evaluation (see `sandbox.rs`).
+//! extension is kept as its class, its path and the storage category its
+//! file had when it was bound to it, which the vnode filters match a path
+//! by; what a filter of another kind's object matches it by is not ported,
+//! and such a filter stops its evaluation (see `sandbox.rs`).
 
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -241,12 +242,16 @@ pub fn user_state(uid: u32) -> Option<UserState> {
     ROLE_ACCOUNTS.iter().find(|&&(u, _)| u == uid).map(|&(_, home)| UserState { home, tmp: "/private/var/tmp" })
 }
 
-/// An extension a sandbox holds (`0x...a10d58`, `0x...a11010`): its class
-/// and the path it was issued for.
+/// An extension a sandbox holds (`0x...a10d58`, `0x...a11010`): its class,
+/// the path it was issued for, and the storage category its file had when
+/// it was bound to it (`0x...a11518`: the class the platform profile's
+/// storage-class-map gives it, none for the default, which leaves the
+/// extension out of the sandbox's index by category).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Extension {
     pub class: &'static [u8],
     pub path: Vec<u8>,
+    pub category: Option<Vec<u8>>,
 }
 
 /// A sandbox (`struct sandbox`).
@@ -758,10 +763,15 @@ impl Kernel {
         // The executable's extension, for its bundle (or itself), which
         // must be found.
         let bundle = &ex.path[..s.bundle_end];
-        if let Err(e) = self.vfs.metadata(bundle) {
-            return Err(Kill(format!("failed to set executable path (err={})", e.0)));
-        }
-        sb.extensions.push(Extension { class: EXECUTABLE, path: bundle.as_bytes().to_vec() });
+        let md = match self.vfs.metadata(bundle) {
+            Ok(md) => md,
+            Err(e) => return Err(Kill(format!("failed to set executable path (err={})", e.0))),
+        };
+        let category = match self.darwin_sb_storage_class(Some(&sb), super::macvfs::sb_vnode(bundle, &md)) {
+            Ok(c) => c,
+            Err(what) => return Err(self.darwin_sb_unported(what)),
+        };
+        sb.extensions.push(Extension { class: EXECUTABLE, path: bundle.as_bytes().to_vec(), category });
         sb.flag_3b = s.extension_point;
         // Each item of the entitlements' (walked with a user state only).
         if !sb.protoboxed() && user_state(self.creds.uid()).is_some() {

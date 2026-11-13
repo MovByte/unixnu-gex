@@ -56,7 +56,32 @@ pub mod op {
     pub const IOKIT_GET_PROPERTIES: usize = 60;
     pub const IOKIT_OPEN_USER_CLIENT: usize = 63;
     pub const IOKIT_OPEN_SERVICE: usize = 64;
+    pub const FILE_CLONE: usize = 12;
+    pub const FILE_IOCTL: usize = 13;
+    pub const FILE_LINK: usize = 15;
+    pub const FILE_LOCK: usize = 16;
+    pub const FILE_MAP_EXECUTABLE: usize = 17;
+    pub const FILE_MKNOD: usize = 18;
+    pub const FILE_READ: usize = 21;
+    pub const FILE_READ_DATA: usize = 22;
+    pub const FILE_READ_METADATA: usize = 23;
+    pub const FILE_READ_XATTR: usize = 24;
     pub const FILE_REVOKE: usize = 25;
+    pub const FILE_TEST_EXISTENCE: usize = 27;
+    pub const FILE_WRITE: usize = 29;
+    pub const FILE_WRITE_ACL: usize = 30;
+    pub const FILE_WRITE_CREATE: usize = 31;
+    pub const FILE_WRITE_DATA: usize = 32;
+    pub const FILE_WRITE_FINDERINFO: usize = 33;
+    pub const FILE_WRITE_FLAGS: usize = 34;
+    pub const FILE_WRITE_MODE: usize = 35;
+    pub const FILE_WRITE_OWNER: usize = 36;
+    pub const FILE_WRITE_SETUGID: usize = 37;
+    pub const FILE_WRITE_TIMES: usize = 38;
+    pub const FILE_WRITE_UNLINK: usize = 39;
+    pub const FILE_WRITE_XATTR: usize = 40;
+    pub const FS_RENAME: usize = 50;
+    pub const HID_CONTROL: usize = 58;
     pub const MACH_HOST_EXCEPTION_PORT_SET: usize = 92;
     pub const MACH_HOST_SPECIAL_PORT_SET: usize = 93;
     pub const MACH_PRIV_HOST_PORT: usize = 98;
@@ -91,6 +116,7 @@ pub mod op {
     pub const SYSTEM_KAS_INFO: usize = 166;
     pub const SYSTEM_MAC_SYSCALL: usize = 173;
     pub const SYSTEM_MEMORYSTATUS_CONTROL: usize = 174;
+    pub const SYSTEM_PACKAGE_CHECK: usize = 177;
     pub const SYSTEM_PRIVILEGE: usize = 178;
     pub const SYSTEM_SCHED: usize = 180;
     pub const SYSTEM_SOCKET: usize = 182;
@@ -169,8 +195,10 @@ pub struct SbArgs {
     /// service's (`args[0xe1]`).
     pub global: bool,
     pub xpc: bool,
-    /// A vnode operation's vnode (kind 1).
+    /// A vnode operation's vnode (kind 1), and the path a lookup's has once
+    /// made canonical (`args[0xf8]`, kept for the profiles after the first).
     pub vnode: Option<SbVnode>,
+    pub resolved: std::cell::RefCell<Option<(Vec<u8>, i64)>>,
     /// A socket operation's socket (kind 2).
     pub socket: Option<SbSocket>,
     /// An IOKit operation's object (kind 8).
@@ -196,30 +224,47 @@ pub struct SbSocket {
     pub command: u64,
 }
 
-/// What a vnode operation's filters read of its vnode.
+/// What a vnode operation's filters read of its vnode (`args[0xd8]`), or
+/// of the name under a directory it gives instead (`args[0xe0]`, with the
+/// directory at `args[0xd8]`).
 #[derive(Clone, Debug, Default)]
 pub struct SbVnode {
-    /// Its path (`vn_getpath`), canonical.
+    /// Its path (`vn_getpath`), canonical; a name's, the directory's path
+    /// and the name; a lookup's (`args[0x190]` bit 2), the path it was
+    /// given, made canonical when a filter asks.
     pub path: Vec<u8>,
     /// Its mount point's length in the path (`args[0x160]`), -1 when the
-    /// path is the mount point's own.
+    /// path is the mount point's own; a name's, its directory's mount's;
+    /// an absolute lookup's, 0.
     pub mount_len: i64,
-    /// `enum vtype`, and whether it is a terminal (`VISTTY`).
-    pub vtype: u32,
+    pub lookup: bool,
+    /// Whether it is a name under a directory.
+    pub named: bool,
+    /// `enum vtype` (a name's: the one its hook gives, if any), and
+    /// whether the vnode is a terminal (`VISTTY`; a name's, its
+    /// directory's).
+    pub vtype: Option<u32>,
     pub tty: bool,
-    /// `va_mode & 0xfff`.
-    pub mode: u16,
-    /// `va_flags`.
+    /// `va_mode & 0xfff`: none for a name.
+    pub mode: Option<u16>,
+    /// `va_flags` and `va_rdev` (a name's, its directory's).
     pub flags: u32,
+    pub rdev: u32,
+    /// Its filesystem's name (`vfs_name`).
+    pub fs: &'static [u8],
+    /// An extended attribute's name (`args[0xe8]`), an ioctl's command
+    /// (`args[0x140]`).
+    pub xattr: Option<Vec<u8>>,
+    pub command: Option<u32>,
 }
 
 impl SbVnode {
     /// The vnode at canonical `path`, of type `vtype`, mode `mode` and
     /// file flags `flags`, on the mount it is under.
     pub fn at(path: &str, vtype: u32, tty: bool, mode: u32, flags: u32) -> SbVnode {
-        let on = super::kern::mount_of(path).on;
-        let mount_len = if path == on { -1 } else { on.len() as i64 };
-        SbVnode { path: path.as_bytes().to_vec(), mount_len, vtype, tty, mode: (mode & 0xfff) as u16, flags }
+        let mnt = super::kern::mount_of(path);
+        let mount_len = if path == mnt.on { -1 } else { mnt.on.len() as i64 };
+        SbVnode { path: path.as_bytes().to_vec(), mount_len, vtype: Some(vtype), tty, mode: Some((mode & 0xfff) as u16), flags, fs: super::kern::fs_name(mnt), ..Default::default() }
     }
 }
 
@@ -465,6 +510,10 @@ impl Facts for KernelFacts<'_> {
         self.a.number
     }
     fn object_number(&mut self) -> Result<Option<u32>, Stop> {
+        // (a vnode operation's `args[0x140]`, zero but for an ioctl's)
+        if self.a.kind == sandbox::kind::VNODE {
+            return Ok(Some(self.a.vnode.as_ref().and_then(|v| v.command).unwrap_or(0)));
+        }
         Ok(matches!(self.a.kind, sandbox::kind::FSCTL | sandbox::kind::PRIVILEGE).then_some(self.a.number))
     }
     fn mac_call(&self) -> u32 {
@@ -477,16 +526,55 @@ impl Facts for KernelFacts<'_> {
         self.a.string.clone()
     }
     fn vnode_type(&mut self) -> Result<Option<(u32, bool)>, Stop> {
-        Ok(self.a.vnode.as_ref().map(|v| (v.vtype, v.tty)))
+        Ok(self.a.vnode.as_ref().and_then(|v| v.vtype.map(|t| (t, v.tty))))
     }
+    fn vnode_rdev(&mut self) -> Result<Option<u32>, Stop> {
+        Ok(self.a.vnode.as_ref().map(|v| v.rdev))
+    }
+    /// The IOMedia whose `BSD Major` and `BSD Minor` are the device's:
+    /// none, as no disk's node is made here (`devfs.rs`).
+    fn media_device(&mut self, _rdev: u32, _class: &[u8]) -> Result<bool, Stop> {
+        Ok(false)
+    }
+    /// A lookup's path (`0x...3874`, then `0x...a14b1c`) is made canonical
+    /// once: the "`..`" after a component is checked first, and its error
+    /// refuses as a filter helper's does.
     fn path(&mut self) -> Result<Option<(Vec<u8>, i64)>, Stop> {
-        Ok(self.a.vnode.as_ref().map(|v| (v.path.clone(), v.mount_len)))
+        let a = self.a;
+        let Some(v) = a.vnode.as_ref() else { return Ok(None) };
+        if !v.lookup {
+            return Ok(Some((v.path.clone(), v.mount_len)));
+        }
+        if let Some(p) = a.resolved.borrow().clone() {
+            return Ok(Some(p));
+        }
+        let path = self.k.darwin_sb_canonical(&v.path).map_err(|errno| Stop::Refuse(sandbox::Decision { errno, flags: 5 }))?;
+        let mount_len = if v.mount_len != 0 && v.mount_len == path.len() as i64 { -1 } else { v.mount_len };
+        *a.resolved.borrow_mut() = Some((path.clone(), mount_len));
+        Ok(Some((path, mount_len)))
     }
     fn vnode_mode(&mut self) -> Result<Option<u16>, Stop> {
-        Ok(self.a.vnode.as_ref().map(|v| v.mode))
+        Ok(self.a.vnode.as_ref().and_then(|v| v.mode))
     }
     fn vnode_flags(&mut self) -> Result<Option<u32>, Stop> {
         Ok(self.a.vnode.as_ref().map(|v| v.flags))
+    }
+    fn xattr_name(&mut self) -> Option<Vec<u8>> {
+        self.a.vnode.as_ref().and_then(|v| v.xattr.clone())
+    }
+    fn filesystem_name(&mut self) -> Result<Option<Vec<u8>>, Stop> {
+        Ok(self.a.vnode.as_ref().map(|v| v.fs.to_vec()))
+    }
+    fn holds_extensions(&mut self) -> bool {
+        self.sb.is_some_and(|s| !s.extensions.is_empty())
+    }
+    fn extension_paths(&mut self, class: Option<&[u8]>) -> Vec<Vec<u8>> {
+        let Some(s) = self.sb else { return Vec::new() };
+        s.extensions.iter().filter(|e| class.is_none_or(|c| e.class == c)).map(|e| e.path.clone()).collect()
+    }
+    fn category_extension_paths(&mut self, category: &[u8]) -> Vec<Vec<u8>> {
+        let Some(s) = self.sb else { return Vec::new() };
+        s.extensions.iter().filter(|e| e.category.as_deref() == Some(category)).map(|e| e.path.clone()).collect()
     }
     /// The vnode's class (`0x...78cc`): a file Sandbox protects
     /// (SF_RESTRICTED, SF_NOUNLINK) or a data vault (UF_DATAVAULT) is
@@ -494,15 +582,21 @@ impl Facts for KernelFacts<'_> {
     /// the platform profile's storage-class-map names for it, or none.
     fn storage_class(&mut self) -> Result<Option<Vec<u8>>, Stop> {
         let Some(v) = self.a.vnode.clone() else { return Ok(None) };
-        if v.flags & 0x0018_0080 != 0 {
+        // (a name is classed by the map alone)
+        if !v.named && v.flags & 0x0018_0080 != 0 {
             return Err(Stop::Unported(format!("sandbox: the storage class of a file with flags {:#x}", v.flags)));
         }
         let Some(Some((blob, profile))) = PLATFORM.get() else {
             return Err(Stop::Unported("the Sandbox's platform profile (the boot payload's Sandbox/Platform)".into()));
         };
-        let a = SbArgs { kind: sandbox::kind::VNODE, vnode: Some(v), ..Default::default() };
+        // (a lookup's path made canonical once, for both)
+        let a = SbArgs { kind: sandbox::kind::VNODE, vnode: Some(v), resolved: self.a.resolved.clone(), ..Default::default() };
         let mut scratch = sandbox::Scratch::default();
-        match sandbox::evaluate(blob, profile, op::STORAGE_CLASS_MAP, &mut KernelFacts { k: &mut *self.k, a: &a, sb: self.sb }, &mut scratch) {
+        let out = sandbox::evaluate(blob, profile, op::STORAGE_CLASS_MAP, &mut KernelFacts { k: &mut *self.k, a: &a, sb: self.sb }, &mut scratch);
+        if self.a.resolved.borrow().is_none() {
+            *self.a.resolved.borrow_mut() = a.resolved.borrow().clone();
+        }
+        match out {
             Outcome::Decided(_, fx) => Ok(fx.storage_class),
             Outcome::Unported(what) => Err(Stop::Unported(what)),
         }
@@ -574,6 +668,18 @@ pub fn platform_masks() -> [Option<sandbox::FilterMask>; 4] {
 }
 
 impl Kernel {
+    /// The storage class the platform profile's storage-class-map gives
+    /// vnode `v`, evaluated with sandbox `sb`; none for the default. What
+    /// it cannot decide is the error.
+    pub(crate) fn darwin_sb_storage_class(&mut self, sb: Option<&Sandbox>, v: SbVnode) -> Result<Option<Vec<u8>>, String> {
+        let a = SbArgs { kind: sandbox::kind::VNODE, vnode: Some(v), ..Default::default() };
+        match (KernelFacts { k: self, a: &a, sb }).storage_class() {
+            Ok(c) => Ok(c),
+            Err(Stop::Unported(what)) => Err(what),
+            Err(Stop::Refuse(d)) => Err(format!("sandbox: the storage class map's refusal (errno {})", d.errno)),
+        }
+    }
+
     /// `cred_sb_evaluate` for the current process, with its credential's
     /// sandbox. The errno its hook returns.
     pub(crate) fn darwin_sb_evaluate(&mut self, op: usize, a: &SbArgs) -> u32 {
@@ -955,7 +1061,12 @@ impl Kernel {
                 if u32::from(sa[1]) == 32 {
                     return None;
                 }
-                self.darwin_mac_check_socket_bind(so, sa)
+                let unix = so.domain == 1;
+                match self.darwin_mac_check_socket_bind(so, sa.clone()) {
+                    // unp_bind's lookup and checks of a unix socket's name.
+                    0 if unix => return self.darwin_sb_unix_name(a[0] as i32, &sa, true).err(),
+                    e => e,
+                }
             }
             sys::LISTEN => {
                 let so = so(self)?;
@@ -967,7 +1078,12 @@ impl Kernel {
                 let so = so(self)?;
                 let dgram = so.ty == 2;
                 let sa = sockaddr_in(m, &so, a[1], a[2], !dgram)?;
-                self.darwin_mac_check_socket_connect(so, sa)
+                let unix = so.domain == 1;
+                match self.darwin_mac_check_socket_connect(so, sa.clone()) {
+                    // unp_connect's lookup and check of the socket's file.
+                    0 if unix => return self.darwin_sb_unix_name(a[0] as i32, &sa, false).err(),
+                    e => e,
+                }
             }
             // sendit, for a call naming a destination.
             sys::SENDTO | sys::SENDTO_NOCANCEL => {
@@ -1232,7 +1348,7 @@ mod tests {
         // The root's own mount point, and a file under it.
         assert_eq!(SbVnode::at("/", 2, false, 0o40755, 0).mount_len, -1);
         assert_eq!(SbVnode::at("/usr/lib/dyld", 1, false, 0o100755, 0).mount_len, 1);
-        assert_eq!(SbVnode::at("/dev/null", 4, false, 0o20666, 0).mode, 0o666);
+        assert_eq!(SbVnode::at("/dev/null", 4, false, 0o20666, 0).mode, Some(0o666));
     }
 
     #[test]

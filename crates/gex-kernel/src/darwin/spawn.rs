@@ -1089,6 +1089,8 @@ impl Kernel {
                 psfa::CHDIR => {
                     let mut s = Scratch::path(&b[o + 8..o + 8 + PATH_MAX]);
                     let mut gm = GuestMem::new(&mut s.0);
+                    // chdir_internal's lookup (Sandbox has no chdir check).
+                    self.darwin_sb_namei(&gm, super::bsd::AT_FDCWD as u64, Scratch::AT, true, false)?;
                     self.canonical(&mut gm, nr::CHDIR, [Scratch::AT, 0, 0, 0, 0, 0])?;
                 }
                 psfa::FCHDIR => {

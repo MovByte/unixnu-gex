@@ -333,9 +333,21 @@ pub trait Facts {
     fn target_is(&mut self, which: u16) -> Result<bool, Stop> {
         Err(Stop::Unported(format!("sandbox: the target process's relation {which}")))
     }
-    /// The sandbox evaluated with holds an extension of `class`.
+    /// The sandbox evaluated with holds an extension of `class`; holds
+    /// any extension.
     fn has_extension(&mut self, _class: &[u8]) -> bool {
         false
+    }
+    fn holds_extensions(&mut self) -> bool {
+        false
+    }
+    /// The paths of the extensions the sandbox holds (of `class`, or of
+    /// any; or of storage category `category`), none revoked.
+    fn extension_paths(&mut self, _class: Option<&[u8]>) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
+    fn category_extension_paths(&mut self, _category: &[u8]) -> Vec<Vec<u8>> {
+        Vec::new()
     }
     /// The current thread's persona's uid and type (`current_persona_get`),
     /// none without one.
@@ -393,9 +405,19 @@ pub trait Facts {
     fn mac_policy(&self) -> Option<Vec<u8>>;
     fn posix_ipc_name(&self) -> Option<Vec<u8>>;
     /// A vnode operation's vnode type (`enum vtype`) and whether it is a
-    /// terminal, none when the operation has no vnode or names a path whose
-    /// type is not known yet (a lookup's preflight).
+    /// terminal, none when the operation has no vnode or names a path under
+    /// a directory without giving its type (a lookup's preflight).
     fn vnode_type(&mut self) -> Result<Option<(u32, bool)>, Stop>;
+    /// A vnode operation's device (`args[0x174]`, its `va_rdev`), none
+    /// without a vnode.
+    fn vnode_rdev(&mut self) -> Result<Option<u32>, Stop> {
+        Err(Stop::Unported("sandbox: a vnode's device".into()))
+    }
+    /// Whether device `rdev` is an IOMedia's whose class is, or derives
+    /// from, `class` (`0x...9f20a8`).
+    fn media_device(&mut self, _rdev: u32, class: &[u8]) -> Result<bool, Stop> {
+        Err(Stop::Unported(format!("sandbox: whether a device is an IOMedia of class {}", String::from_utf8_lossy(class))))
+    }
     /// A vnode operation's path (`0x...3874`: the vnode's path, or the
     /// path the hook gave, made canonical) and its mount point's length in
     /// it (`args[0x160]`: -1 when the path is the mount point); none
@@ -1047,6 +1069,20 @@ fn str_match(b: &[u8], p: &Profile, flag: bool, arg: u16, s: &[u8], facts: &mut 
 }
 
 /// The string a filter names by its argument (`0x...65b4`).
+/// Whether a path extension for `ext` takes `path` in (`0x...a11704`, for
+/// an extension that is not for its path alone): `ext` itself, a path
+/// under it, the name the kext keeps as `.sb-XXXXXXXX` after it, or any
+/// path for an extension of the root.
+fn extension_takes(ext: &[u8], path: &[u8]) -> bool {
+    if ext.len() > path.len() || !path.starts_with(ext) {
+        return false;
+    }
+    match path.get(ext.len()) {
+        None | Some(b'/') => true,
+        Some(_) => path[ext.len()..].starts_with(b".sb-XXXXXXXX") || ext == b"/",
+    }
+}
+
 fn operand(b: &[u8], p: &Profile, arg: u16) -> Result<(usize, Vec<u8>), Stop> {
     let at = p.nodes_end + usize::from(arg) * NODE;
     string_at(b, p, at).map(|s| (at, s)).ok_or(Stop::Refuse(REFUSED))
@@ -1243,8 +1279,36 @@ fn filter(b: &[u8], p: &Profile, ty: u8, flag: bool, arg: u16, facts: &mut dyn F
             Some(t) => int_match_any(b, p, flag, arg, u64::from(t.protocol & 0xffff))?,
             None => false,
         },
-        // ioctl-command: a socket ioctl's, its low 16 bits.
+        // ioctl-command: a socket ioctl's or a vnode ioctl's (`args[0x140]`),
+        // its low 16 bits.
         16 if k == kind::SOCKET => int_match_any(b, p, flag, arg, facts.socket_command() & 0xffff)?,
+        16 if k == kind::VNODE => match facts.object_number()? {
+            Some(cmd) => int_match_any(b, p, flag, arg, u64::from(cmd & 0xffff))?,
+            None => false,
+        },
+        // fcntl-command (`args[0xd8]`).
+        78 => k == kind::FCNTL && int_match(b, p, flag, arg, u64::from(facts.syscall_number()))?,
+        // device-major and device-minor (the device's top byte and low 16
+        // bits), and the IOMedia class a device is of: a block or character
+        // device's, read with its attributes; a path under a directory that
+        // gives no type has none.
+        20..=22 => {
+            if k != kind::VNODE {
+                return Ok(false);
+            }
+            let (Some((vtype, _)), Some(rdev)) = (facts.vnode_type()?, facts.vnode_rdev()?) else { return Ok(false) };
+            if vtype != 3 && vtype != 4 {
+                return Ok(false);
+            }
+            match ty {
+                20 => int_match_any(b, p, flag, arg, u64::from(rdev >> 24))?,
+                21 => int_match_any(b, p, flag, arg, u64::from(rdev & 0xffff))?,
+                _ => {
+                    let (_, class) = operand(b, p, arg)?;
+                    facts.media_device(rdev, &class)?
+                }
+            }
+        }
         // A socket option's level and name.
         79 => k == kind::SOCKET && int_match(b, p, flag, arg, u64::from(facts.socket_option().0))?,
         80 => k == kind::SOCKET && int_match(b, p, flag, arg, u64::from(facts.socket_option().1))?,
@@ -1370,20 +1434,50 @@ fn filter(b: &[u8], p: &Profile, ty: u8, flag: bool, arg: u16, facts: &mut dyn F
             }
         }
         // extension, storage-class-extension, and the extension ancestry
-        // filter: a process without a sandbox has no extensions.
-        23 | 56 | 59 if !facts.sandboxed() => false,
-        // extension (`0x...a047c0`): for a vnode operation its path first;
-        // then the sandbox's extensions of the class. With none, no match;
-        // matching one against the operation's object is not ported.
+        // filter: a process without a sandbox has no extensions, and a
+        // vnode matches none of a sandbox that holds none.
+        23 if !facts.sandboxed() => {
+            operand(b, p, arg)?;
+            false
+        }
+        56 | 59 if !facts.sandboxed() => false,
+        // A sandbox that holds no extension has no table of them (it is made
+        // with the first), and matches none.
+        23 if !facts.holds_extensions() => {
+            operand(b, p, arg)?;
+            false
+        }
+        56 | 59 if k != kind::VNODE || !facts.holds_extensions() => false,
+        // extension (`0x...a047c0`): for a vnode operation its path, then
+        // whether an extension of the class takes it in (`0x...a11704`).
+        // Matching one against another kind's object is not ported.
         23 => {
             let (_, class) = operand(b, p, arg)?;
-            if k == kind::VNODE && facts.path()?.is_none() {
-                return Ok(false);
+            if k == kind::VNODE {
+                let Some((path, _)) = facts.path()? else { return Ok(false) };
+                return Ok(facts.extension_paths(Some(&class)).iter().any(|e| extension_takes(e, &path)));
             }
             if facts.has_extension(&class) {
                 return Err(facts.unported(format!("sandbox extension filter of class {} for an operation of kind {k}", String::from_utf8_lossy(&class))));
             }
             false
+        }
+        // The extension ancestry filter (`0x...a04d2c`, `0x...a11658`): the
+        // root, or a path an extension's lies under or that one takes in.
+        56 => {
+            let Some((path, _)) = facts.path()? else { return Ok(false) };
+            path == b"/"
+                || facts.extension_paths(None).iter().any(|e| (path.len() <= e.len() && e.starts_with(&path) && matches!(e.get(path.len()), None | Some(b'/'))) || extension_takes(e, &path))
+        }
+        // storage-class-extension (`0x...a04ea4`, `0x...a118d4`): an
+        // extension of the vnode's storage category (its storage class; the
+        // default one indexes none) that takes its path in.
+        59 => {
+            let Some((path, _)) = facts.path()? else { return Ok(false) };
+            match facts.storage_class()? {
+                Some(class) => facts.category_extension_paths(&class).iter().any(|e| extension_takes(e, &path)),
+                None => false,
+            }
         }
         // The target process (`0x...a046dc`), of a process operation.
         14 => {
@@ -1812,6 +1906,16 @@ mod tests {
 #[cfg(test)]
 mod platform {
     use super::*;
+
+    #[test]
+    fn an_extension_takes_in_its_path_and_what_is_under_it() {
+        assert!(extension_takes(b"/a/b", b"/a/b"));
+        assert!(extension_takes(b"/a/b", b"/a/b/c"));
+        assert!(!extension_takes(b"/a/b", b"/a/bc"));
+        assert!(extension_takes(b"/a/b", b"/a/b.sb-XXXXXXXX"));
+        assert!(!extension_takes(b"/a/b", b"/a"));
+        assert!(extension_takes(b"/", b"/usr"));
+    }
 
     /// Every operation of a real platform profile (`GEX_SANDBOX_PLATFORM`,
     /// the kernelcache's blob), for a subject that answers little: what

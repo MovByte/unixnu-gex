@@ -54,6 +54,7 @@ pub mod kern;
 pub mod kevent;
 pub mod kfilt;
 pub mod mac;
+pub mod macvfs;
 pub mod kobject;
 pub mod lockf;
 pub mod mach;

@@ -1534,6 +1534,14 @@ impl Namespace {
         }
     }
 
+    /// Whether the root filesystem's walk of absolute, normal `abs` meets
+    /// no symbolic link: on its directories, and with `follow_final` its
+    /// last component. False where the walk cannot say (it fails, or
+    /// reaches another mount).
+    pub fn no_link_on(&self, abs: &str, follow_final: bool) -> bool {
+        matches!(self.walk(abs, follow_final), Ok(Some(w)) if !w.at_mount && w.path == abs)
+    }
+
     /// The root filesystem's [`FileSystem::walk`] of absolute `abs`, or
     /// `None` with nothing mounted at `/`.
     fn walk(&self, abs: &str, follow_final: bool) -> Result<Option<Walked>, Errno> {

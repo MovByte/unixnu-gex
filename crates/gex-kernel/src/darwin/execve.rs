@@ -302,6 +302,11 @@ impl Kernel {
             self.darwin_unimplemented("execve of a path that is not UTF-8 (gex's namespace names files in UTF-8)".into());
             return Err(Errno::ENOENT);
         };
+        // The lookup's preflights and the readlink checks of its links.
+        if !path.is_empty() {
+            let start = if path.starts_with('/') { None } else { self.darwin_sb_start_cwd() };
+            self.darwin_sb_lookup(start, path, true, false)?;
+        }
         let abs = self.vfs.absolute(path);
         let md = self.vfs.metadata(&abs)?;
         if md.file_type != crate::vfs::FileType::Regular {

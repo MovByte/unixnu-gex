@@ -187,6 +187,14 @@ struct Counts {
     name: &'static [u8],
 }
 
+/// A mount's filesystem's name (`vfs_name`, its `vfc_name`).
+pub fn fs_name(mnt: &Mount) -> &'static [u8] {
+    match mnt.fs {
+        Fs::Apfs => b"apfs",
+        Fs::Devfs => b"devfs",
+    }
+}
+
 fn counts(mnt: &Mount) -> Counts {
     match mnt.fs {
         Fs::Apfs => Counts {
@@ -198,7 +206,7 @@ fn counts(mnt: &Mount) -> Counts {
             files: vfsstat::FILES,
             ffree: vfsstat::FFREE,
             typenum: vfsstat::APFS_TYPENUM,
-            name: b"apfs",
+            name: fs_name(mnt),
         },
         // devfs_statfs: 512-byte blocks of its bookkeeping, nothing free.
         Fs::Devfs => Counts {
@@ -210,7 +218,7 @@ fn counts(mnt: &Mount) -> Counts {
             files: super::devfs::stats().0,
             ffree: 0,
             typenum: DEVFS_TYPENUM,
-            name: b"devfs",
+            name: fs_name(mnt),
         },
     }
 }
@@ -1136,6 +1144,12 @@ impl Kernel {
             self.darwin_unimplemented(format!("fsgetpath of object {:#x} (VFS_VGET: the filesystems here look files up by name only)", a[3]));
             return Err(Errno::ENOENT);
         };
+        // fsgetpath_internal's MAC check of the vnode found.
+        let md = self.vfs.metadata_nofollow(&path)?;
+        let e = self.darwin_mac_check_vnode_fsgetpath(super::macvfs::sb_vnode(&path, &md));
+        if e != 0 {
+            return Err(super::errno::errno_of(e as i32));
+        }
         let mut b = path.as_bytes().to_vec();
         b.push(0);
         if (a[1] as usize) < b.len() {
