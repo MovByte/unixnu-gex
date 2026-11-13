@@ -1504,6 +1504,25 @@ mod tests {
     }
 
     #[test]
+    fn category_2_takes_the_system_volume_and_cannot_tell_an_authapfs_one() {
+        let s = sys();
+        let on = |root: bool| Proc::Live(Live { exe: Some(("/sbin/launchd".into(), Some(root))), ..match live(1, None) {
+            Proc::Live(l) => l,
+            _ => unreachable!(),
+        } });
+        let (resp, parent) = (Proc::Kernel, Proc::Kernel);
+        let run = |cur: &Proc| {
+            let i = Input { cur, parent: &parent, resp: &resp, system: &s, launch_type: launch_type::NONE, spawnattr: None };
+            let mut h = Hook { i: &i, policy: Policy { lt: 0, met: false, met_11: false }, log: Vec::new() };
+            h.category(2, 1, &mut Viol::default())
+        };
+        // On the root volume: met, whatever APFS would say of authapfs.
+        assert_eq!(run(&on(true)), Ok(true));
+        // Off it: the answer is APFS's, which is not modelled.
+        assert!(run(&on(false)).is_err());
+    }
+
+    #[test]
     fn an_application_launch_type_takes_launchd_as_its_parent() {
         let (cur, parent, resp) = (live(5, None), live(4, None), Proc::Kernel);
         let s = sys();
