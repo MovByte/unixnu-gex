@@ -11,12 +11,23 @@
 
 use std::sync::OnceLock;
 
-/// A surface as the executor's table describes it: its id, its pixel
-/// format, its size in bytes, each plane's geometry, and the seed of its
-/// contents.
+/// A surface as the executor's table describes it: its id, its geometry
+/// (as `IOSurfaceGetWidth` and the others give it), where its bytes start
+/// in its memory, its pixel format, its size in bytes, each plane's
+/// geometry, and the seed of its contents.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SurfaceDesc {
     pub id: u32,
+    pub width: u64,
+    pub height: u64,
+    pub bytes_per_row: u64,
+    pub bytes_per_element: u32,
+    pub element_width: u32,
+    pub element_height: u32,
+    /// The offset of the surface's first byte in its memory (the backing
+    /// store [`SurfaceTable::cpu_wrote`] and [`SurfaceTable::read_back`]
+    /// hand over).
+    pub offset: u64,
     pub pixel_format: u32,
     pub alloc_size: u64,
     pub planes: Vec<PlaneDesc>,
