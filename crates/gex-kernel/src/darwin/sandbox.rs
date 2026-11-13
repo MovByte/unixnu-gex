@@ -1131,7 +1131,7 @@ fn address_match(b: &[u8], p: &Profile, arg: u16, sa: Option<&[u8]>, domain: u32
         return Ok(false);
     }
     let Some(sa) = sa else { return Ok(false) };
-    let mut leg = |family: u32, facts: &mut dyn Facts| -> Result<bool, Stop> {
+    let leg = |family: u32, facts: &mut dyn Facts| -> Result<bool, Stop> {
         if sa.len() < 4 || u32::from(sa[1]) != family {
             return Ok(false);
         }
