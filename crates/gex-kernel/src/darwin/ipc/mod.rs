@@ -641,6 +641,8 @@ pub enum Remote {
     PsetKnote(ObjId, ObjId),
     /// A request to one of its kernel objects, from task `caller`.
     Kobject { kmsg: Box<msg::Kmsg>, options: u64, caller: TaskKey },
+    /// What the host executor left for one of its WebMetal connections.
+    Accel(super::accel::wire::Note),
 }
 
 /// How other tasks reach a task: its mailbox, and the bell of the thread

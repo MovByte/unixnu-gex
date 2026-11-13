@@ -1606,6 +1606,7 @@ impl Kernel {
                     self.tid = tid;
                     self.dtask.kcaller = kcaller;
                 }
+                super::ipc::Remote::Accel(note) => self.darwin_accel_note(m, note),
             }
         }
         self.darwin_pending_ready(m);

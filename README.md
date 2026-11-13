@@ -151,7 +151,16 @@ subsystem, most naming in their header the XNU source they port:
   - Its classes and its user clients' are the device's. The device client
     (type 1) is `AGXDeviceUserClient`, with IOGPUFamily's methods; the
     memory information client is type 33. The WebMetal connection (type 0)
-    presents as a device client and carries WebMetal's wire protocol.
+    presents as a device client and carries WebMetal's wire protocol to
+    the host executor (`accel/wire.rs`, `accel/host.rs`): a control
+    request is read from the caller's memory and answered when the
+    executor is done, through `fetch_reply` when its reply does not fit;
+    a command buffer's stream is read in place at its commit; and events
+    ring the doorbell `register_event_port` set, as IOKit's async
+    completion. gexc runs the executor (`crates/gexc/src/host_webmetal/`,
+    its `webmetal` build): one host thread owning one WebGPU device for
+    the whole system, reaching each connection's task's memory, and the
+    kernel's IOSurfaces through the executor's surface table.
   - Its properties are its personality's and matching's, but
     `MetalPluginName` and `MetalPluginClassName` name the WebMetal
     bundle.
@@ -261,6 +270,25 @@ That builds `target/release/gexc`, for AArch64 guests, which is what Darwin
 programs are. The page, Wine and the other upstream builds are documented
 upstream (see [gex, upstream](#gex-upstream)).
 
+The Darwin personality's GPU is WebMetal's host executor, which gexc runs
+when built with its `webmetal` feature. WebMetal and the AIR to WGSL
+compiler it uses, AirWgsl, are submodules at pinned commits of their public
+repositories (`third_party/WebMetal`, `third_party/AirWgsl`), and the
+executor runs on a native WebGPU implementation, chosen at build time as
+WebMetal's own builds choose it: `WEBGPU_NATIVE` is `dawn` or
+`wgpu-native`, and `WEBGPU_NATIVE_DIR` its install root (with
+`include/webgpu/webgpu.h` and `lib/`).
+
+```sh
+git submodule update --init third_party/WebMetal third_party/AirWgsl
+WEBGPU_NATIVE=dawn WEBGPU_NATIVE_DIR=<dawn> cargo build --release -p gexc --features webmetal
+target/release/gexc webmetal-info
+```
+
+`gexc webmetal-info` names the implementation a build runs on. Without the
+feature, Metal's requests to the accelerator are reported as having no
+executor to run them.
+
 ### The Darwin test programs
 
 The test programs are C, built with Xcode's iOS toolchain: you need macOS
@@ -271,7 +299,10 @@ with Xcode and its iOS SDK (`xcrun -sdk iphoneos clang`), plus `codesign`,
 tests/darwin/build.sh
 ```
 
-They are written to `tests/darwin/bin/` (not tracked).
+`metalwire` is C++ over WebMetal's generated wire header (the submodule's),
+and `metal` is Objective-C with a kernel compiled by Xcode's Metal toolchain
+(`xcrun -sdk iphoneos metal`). They are written to `tests/darwin/bin/` (not
+tracked).
 `GEX_DARWIN_TARGET` sets the clang target (default `arm64-apple-ios17.0`).
 The static ones make raw system calls and need neither dyld nor the shared
 cache; they are linked at the linker's default base, after a 4 GiB
@@ -422,6 +453,19 @@ exits 1 when any fails. It builds the programs first when
 runner discards each program's stderr, so run a failing program directly
 under gexc to see its reports.
 
+`metalwire` and `metal` use the GPU, so they need a gexc built with
+`webmetal` and are skipped without one (or fail, when named). `metal` goes
+through the root's own Metal.framework, which loads the bundle the
+accelerator's `MetalPluginName` names from `/System/Library/Extensions`:
+the web device's system volume carries `WebMetal.bundle` there, and the
+test is skipped for a root that has none. When the root has it, its
+executable's cdhash goes into the run's static trust cache with the
+programs', with the entry the device's trust cache gives its own plugin
+bundles on the system volume (launch constraint category 2): AMFI's library
+validation lets a platform process map only trusted code. The line `metal`
+prints ends with a digest of every output, the one the same program prints
+on WebMetal's macOS test shim over the same WebGPU implementation.
+
 The kernel's and loader's unit tests run with `cargo test -p gex-kernel`
 and `cargo test -p gex-ld`.
 
@@ -438,6 +482,8 @@ The Darwin work, beside upstream's tree:
 | `crates/gex-ld/src/macho.rs`, `dsc.rs` | Mach-O loading; the dyld shared cache |
 | `crates/gex-abi/src/crypto.rs` | the A64 cryptographic extension |
 | `crates/gexc/src/darwin_run.rs`, `dsc_info.rs` | `gexc run` for Mach-O; `gexc dsc-info` |
+| `crates/gexc/src/host_webmetal/` | WebMetal's executor on its host thread, its embedder over the kernel, and the executor's IOSurface table |
+| `third_party/WebMetal`, `third_party/AirWgsl` | WebMetal (guest plugin, wire protocol, host executor) and AirWgsl, submodules at pinned commits |
 | `hosts/native/src/darwin_image.rs` | a Darwin program's image, as exec loads it |
 | `tests/darwin/src/` | the test programs, and the entitlements some are signed with |
 | `tests/darwin/build.sh`, `run.sh` | building and running them |
@@ -471,6 +517,7 @@ dyld and libSystem from the device's shared cache.
 | terminals and `/dev` | `pty`, `ptyjob`, `ptyclose`, `bsdpty`, `ttyinfo`, `ttydead`, `ttydrain`, `fcntltty`, `revoke`, `devfs`, `devattr` |
 | sockets | `sockerr`, `sockevent`, `sockname`, `sockopts`, `halfclose`, `nosigpipe`, `dgrambuf`, `streambuf` |
 | code signing and IOKit | `codesig`, `amfi`, `launchcon`, `policy`, `iokit`, `ioreg`, `iosurface`, `iosurfacex`, `iogpudev`, `accel`, `accelr`, `iomfb` |
+| the GPU (WebMetal) | `metalwire`, `metal` |
 
 The suite runs single programs and the processes they create. None of it
 boots launchd or runs an app.
@@ -540,7 +587,12 @@ is the reference (search `crates/gex-kernel/src/` for
     timeout;
   - a swap that reaches the glass with no presentation sink installed, or
     that the embedder's sink cannot show;
-  - WebMetal requests, which have no host executor yet;
+  - in a gexc built without its `webmetal` feature, WebMetal requests,
+    which have no executor to run them; with it, what the executor
+    reports it does not implement or cannot honor (its statuses 2 and 3),
+    a call on a connection from a task that did not open it, the
+    executor's IOSurface shared events (which the kernel does not have),
+    and an IOSurface with an `IOSurfaceOffset` given to the GPU;
   - matching dictionaries of kinds not handled.
 - **The panel.** The IPSW's device tree carries the template's
   `display-timing-info`, a 1024×600 mode, which iBoot replaces on a device

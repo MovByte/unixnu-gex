@@ -51,6 +51,18 @@ cc -O2 -framework IOKit -framework IOSurface -framework CoreFoundation -o "$OUT/
 cc -O2 -framework IOSurface -framework CoreFoundation -o "$OUT/iosurfacex" "$HERE/src/iosurfacex.c"
 cc -O2 -framework IOKit -framework IOSurface -framework CoreFoundation -o "$OUT/iogpudev" "$HERE/src/iogpudev.c"
 cc -O2 -framework IOKit -framework IOSurface -framework CoreFoundation -o "$OUT/iomfb" "$HERE/src/iomfb.c"
+# metalwire: WebMetal's wire records, from its generated header (the pinned
+# submodule's).
+xcrun -sdk iphoneos clang++ -target "$TARGET" -std=c++17 -O2 -I "$HERE/../../third_party/WebMetal/wire/generated" \
+    -framework IOKit -framework CoreFoundation -o "$OUT/metalwire" "$HERE/src/metalwire.cpp"
+# metal: Metal through the root's Metal.framework, with its kernel compiled
+# by Xcode's Metal toolchain into a metallib linked in as a section (made
+# in a directory of its own: the runner trusts every file of bin/).
+mkdir -p "$OUT/metallib"
+xcrun -sdk iphoneos metal -std=ios-metal2.4 -c -o "$OUT/metallib/metal.air" "$HERE/src/metal.metal"
+xcrun -sdk iphoneos metallib -o "$OUT/metallib/metal.metallib" "$OUT/metallib/metal.air"
+cc -O2 -fobjc-arc -framework Foundation -framework IOSurface -framework Metal -Wl,-sectcreate,__DATA,__metallib,"$OUT/metallib/metal.metallib" \
+    -o "$OUT/metal" "$HERE/src/metal.m"
 # iosurfacesplash and iosurfacexpreboard: iosurface as splashboardd and
 # iosurfacex as PreBoard, outside the container.
 cc -O2 -framework IOKit -framework IOSurface -framework CoreFoundation -o "$OUT/iosurfacesplash" "$HERE/src/iosurface.c"

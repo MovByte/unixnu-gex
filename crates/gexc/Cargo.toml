@@ -24,7 +24,16 @@ gex-kernel.workspace = true
 gex-eject = { workspace = true, features = ["build"] }
 gex-cache = { workspace = true, features = ["compile"] }
 anyhow = "1"
+# The WebMetal host executor (third_party/WebMetal), over a native WebGPU
+# implementation chosen at build time: WEBGPU_NATIVE (`dawn` or
+# `wgpu-native`) and WEBGPU_NATIVE_DIR (its install root).
+webmetal-host = { path = "../../third_party/WebMetal/host", features = ["native"], optional = true }
+webmetal-wire = { path = "../../third_party/WebMetal/wire", optional = true }
 
 [features]
 # Build a gexc for x86-64 guests. See `gex_abi::X86`.
 x86 = ["gex-abi/x86", "gex-xlate/x86", "gex-native/x86", "gex-eject/x86"]
+# The GPU of the Darwin personality's accelerator: WebMetal's executor on a
+# host thread (src/host_webmetal). Without it, Metal's requests to the
+# accelerator are reported as having no executor to run them.
+webmetal = ["dep:webmetal-host", "dep:webmetal-wire"]

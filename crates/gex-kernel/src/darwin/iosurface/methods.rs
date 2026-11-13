@@ -581,12 +581,20 @@ fn lock(k: &mut Kernel, r: &mut Root, h: &Handle, options: u32) -> Result<u32, i
     } else {
         s.ro_locks += 1;
     }
-    if s.gpu {
-        k.darwin_unimplemented(format!("locking IOSurface {id:#x}, which the GPU uses: the executor's read-back"));
-    }
     if let Some(mem) = s.memory.as_mut() {
+        // What the GPU wrote since a task last locked it, into the backing
+        // store, for the view to take with the tasks' changes.
+        let gpu = s.gpu.then(super::executor::table).flatten();
+        if let Some(t) = gpu {
+            t.read_back(id, &mut mem.backing);
+        }
         if let Some(v) = (h.base != 0).then(|| mem.view(pid, h.base)).flatten() {
             let _ = k.darwin_own_memory(|k, m| mem.lock(k, m, v, write));
+        }
+        // The tasks' changes gathered here are the GPU's to see.
+        let changed = mem.take_changed();
+        if let Some(t) = gpu.filter(|_| !changed.is_empty()) {
+            t.cpu_wrote(id, &mem.backing, &changed);
         }
     }
     // Bit 4: clean the caches at the next lock (a coherent host has none
@@ -629,11 +637,13 @@ fn unlock(k: &mut Kernel, r: &mut Root, h: &Handle, options: u32) -> Result<u32,
         if let Some(v) = (h.base != 0).then(|| mem.view(pid, h.base)).flatten() {
             let _ = k.darwin_own_memory(|k, m| mem.unlock(k, m, v, write));
         }
+        // The view's changes are the GPU's to see from now on.
+        let changed = mem.take_changed();
+        if let Some(t) = s.gpu.then(super::executor::table).flatten().filter(|_| !changed.is_empty()) {
+            t.cpu_wrote(id, &mem.backing, &changed);
+        }
     }
     if write {
-        if s.gpu {
-            k.darwin_unimplemented(format!("unlocking IOSurface {id:#x}, which the GPU uses: the executor's copy of the CPU's writes"));
-        }
         let v = ro_u32(r, id, ro::WRITE_UNLOCKS).wrapping_add(1);
         ro_set_u32(k, r, id, ro::WRITE_UNLOCKS, v);
     }

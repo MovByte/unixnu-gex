@@ -2280,22 +2280,57 @@ fn connect_method(k: &mut Kernel, c: &mut super::iokit::UserClient, mut a: super
     // keeps it in its async reference (and lets it go with
     // releaseAsyncReference64); a failed request's goes with the request.
     let r = super::iokit::external_method(k, c, &mut a);
-    if r != ret::SUCCESS {
-        return Reply::err(r);
+    // A method that answers later: its reply goes to the request's reply
+    // port when it is done ([`later_reply`]); the calling thread waits for
+    // it there, as it waits in the method on the device.
+    if let Some(token) = a.later.take() {
+        if r == ret::SUCCESS {
+            LATER.lock().unwrap_or_else(|e| e.into_inner()).insert(token, (a, ool_out_field));
+            let mut reply = Reply::ok(Vec::new());
+            reply.defer = Some((k.tid, super::kobject::Deferred::Later(token)));
+            return reply;
+        }
     }
     // A method that answers later (IOMobileFramebuffer's swap wait): the
     // reply waits with it.
-    if let Some(d) = a.deferred.take() {
-        let mut r = Reply::ok(Vec::new());
-        r.defer = Some((k.tid, d));
-        return r;
+    if r == ret::SUCCESS {
+        if let Some(d) = a.deferred.take() {
+            let mut reply = Reply::ok(Vec::new());
+            reply.defer = Some((k.tid, d));
+            return reply;
+        }
+    }
+    connect_method_reply(r, &a, ool_out_field)
+}
+
+/// is_io_connect_method's reply for a method that returned `r` with the
+/// outputs in `a`.
+fn connect_method_reply(r: i32, a: &super::iokit::MethodArgs, ool_out_field: bool) -> Reply {
+    use super::iokit::ret;
+    if r != ret::SUCCESS {
+        return Reply::err(r);
     }
     if !ool_out_field {
         // io_connect_method_var_output: no client here gives variable
         // output, which is kIOReturnUnderrun.
         return Reply::err(ret::UNDERRUN);
     }
-    method_reply(&a, Some(a.ool_out.map_or(0, |(_, n)| n)))
+    method_reply(a, Some(a.ool_out.map_or(0, |(_, n)| n)))
+}
+
+/// The methods that answer later, by token: their arguments, and whether
+/// the routine was io_connect_method (with an out-of-line output field).
+static LATER: std::sync::Mutex<std::collections::BTreeMap<u64, (super::iokit::MethodArgs, bool)>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// The reply of method `token`, which answered later: it returned `r`, and
+/// on success the scalar outputs `scalars` (as many as the caller has room
+/// for). None for a token no method left.
+pub(crate) fn later_reply(token: u64, r: i32, scalars: &[u64]) -> Option<Reply> {
+    let (mut a, ool_out_field) = LATER.lock().unwrap_or_else(|e| e.into_inner()).remove(&token)?;
+    for (out, v) in a.scalar_out.iter_mut().zip(scalars) {
+        *out = *v;
+    }
+    Some(connect_method_reply(r, &a, ool_out_field))
 }
 
 /// io_registry_entry_get_property_bin_buf of a user client's property.

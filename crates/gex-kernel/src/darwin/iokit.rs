@@ -821,6 +821,10 @@ pub struct MethodArgs {
     pub is_async: bool,
     pub wake: Option<super::ipc::ObjId>,
     pub reference: Vec<u64>,
+    /// Set by a method that answers later (a WebMetal call the host
+    /// executor runs): the token its reply is sent by
+    /// ([`super::mig::later_reply`]).
+    pub later: Option<u64>,
     pub scalar_in: Vec<u64>,
     pub struct_in: Vec<u8>,
     pub ool_in: Option<(u64, u64)>,
