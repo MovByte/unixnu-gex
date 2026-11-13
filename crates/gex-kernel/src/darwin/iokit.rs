@@ -1,8 +1,9 @@
 //! IOKit as a task reaches it (`iokit/Kernel/IOUserClient.cpp`), over the
 //! device's own device tree: the registry's `IODeviceTree` plane. Of the
 //! `IOService` plane's drivers, those on the path to the GPU
-//! ([`super::platform`], [`super::accel`]) and APFS's are here; what would
-//! need the others is reported.
+//! ([`super::platform`], [`super::accel`]) and to the display
+//! ([`super::iomfb`]) and APFS's are here; what would need the others is
+//! reported.
 
 use std::sync::OnceLock;
 
@@ -36,6 +37,8 @@ pub enum Prop {
     Data(Vec<u8>),
     /// An `OSSymbol` (what `setProperty(const char *, const char *)` sets).
     Sym(String),
+    /// An `OSDictionary` of named values, in its order.
+    Dict(Vec<(String, Prop)>),
 }
 
 /// The classes a service belongs to, most derived first.
@@ -51,6 +54,7 @@ pub fn superclasses(class: &str) -> &'static [&'static str] {
         "IOUserClient" => &["IOUserClient", "IOService", "IORegistryEntry"],
         "AppleAPFSUserClient" => &["AppleAPFSUserClient", "IOUserClient", "IOService", "IORegistryEntry"],
         "IOSurfaceRoot" | "IOSurfaceRootUserClient" => super::iosurface::superclasses(class),
+        super::iomfb::CLASS | super::iomfb::UC_CLASS => super::iomfb::superclasses(class),
         _ => match super::platform::superclasses(class) {
             [] => super::accel::superclasses(class),
             s => s,
@@ -98,8 +102,13 @@ pub fn parse(b: &[u8]) -> Result<Vec<Node>, String> {
 pub fn set_tree(b: &[u8]) -> Result<(), String> {
     let mut t = parse(b)?;
     add_volumes(&mut t);
-    if let Some(gpu) = super::platform::add(&mut t) {
-        super::accel::add_service(&mut t, gpu);
+    if let Some(io) = super::platform::add(&mut t) {
+        if let Some(gpu) = super::platform::arm_io_nub(&mut t, io, "gpu,t8011") {
+            super::accel::add_service(&mut t, gpu);
+        }
+        if let Some(disp) = super::platform::arm_io_nub(&mut t, io, "disp0,t8011") {
+            super::iomfb::add_service(&mut t, disp);
+        }
     }
     super::iosurface::add_service(&mut t);
     add_root(&mut t);
@@ -181,7 +190,7 @@ pub fn links(t: &[Node], i: u32, plane: Plane, parents: bool) -> Result<Vec<u32>
         (Plane::Service, true) => provider(t, i).map(|p| p.into_iter().collect()),
         // The user clients a service has opened are attached to it, and
         // they are not registry entries here.
-        (Plane::Service, false) if n.class == super::accel::CLASS => Err(format!("the user clients of {} as its children in the IOService plane", n.name)),
+        (Plane::Service, false) if n.class == super::accel::CLASS || n.class == super::iomfb::CLASS => Err(format!("the user clients of {} as its children in the IOService plane", n.name)),
         (Plane::Service, false) if super::platform::is_driver(n.class) => Err(format!("the nubs and clients of {} (its children in the IOService plane)", n.name)),
         (Plane::Service, false) => Ok(n.children.clone()),
     }
@@ -294,9 +303,12 @@ fn add_volumes(t: &mut Vec<Node>) {
 ///   ([`super::iosurface::is_service`]).
 /// - Every other entry has properties its drivers set that are not
 ///   modelled. The exception is `IOClassNameOverride` on the entries from
-///   the platform expert device to the GPU. In the kernelcache, only
-///   IOSkywalkFamily sets it, on its own objects (0xfffffff00593be08); the
-///   kernel only reads it (`skipKey`, 0xfffffff007816644).
+///   the platform expert device to the GPU and to the display. In the
+///   kernelcache, only IOSkywalkFamily sets it, on its own objects
+///   (0xfffffff00593be08); the kernel only reads it (`skipKey`,
+///   0xfffffff007816644). On the display's framebuffer and its nub, so are
+///   the names no image of the kernelcache has
+///   ([`super::iomfb::property_absent`]).
 pub fn property_unknown(t: &[Node], i: u32, name: &str) -> bool {
     let Some(n) = t.get(i as usize) else { return false };
     if i as usize + 1 == t.len() {
@@ -305,7 +317,11 @@ pub fn property_unknown(t: &[Node], i: u32, name: &str) -> bool {
     if n.class.is_empty() && n.nub.is_none() && i != 0 || n.class == super::iosurface::CLASS {
         return false;
     }
-    let on_gpu_path = i == 0 || n.nub.is_some() || super::platform::is_driver(n.class) || n.class == super::accel::CLASS;
+    let display = n.class == super::iomfb::CLASS || t.iter().any(|m| m.class == super::iomfb::CLASS && m.parent == Some(i));
+    if display && super::iomfb::property_absent(name) {
+        return false;
+    }
+    let on_gpu_path = i == 0 || n.nub.is_some() || super::platform::is_driver(n.class) || n.class == super::accel::CLASS || n.class == super::iomfb::CLASS;
     !(on_gpu_path && name == "IOClassNameOverride")
 }
 
@@ -360,7 +376,7 @@ pub fn matching(tree: &[Node], dict: &[(String, DictValue)]) -> Result<Vec<u32>,
     // GPU, one accelerator). Of the classes above them (and of services by
     // property alone) the storage drivers' and the whole disk's are not, so
     // those are answered only by a BSD name found here.
-    let complete = matches!(class, Some("AppleAPFSVolume" | "AppleAPFSContainer" | "AppleAPFSMedia" | "AppleAPFSContainerScheme")) || class.is_some_and(super::accel::class_complete) || class.is_some_and(super::iosurface::class_complete);
+    let complete = matches!(class, Some("AppleAPFSVolume" | "AppleAPFSContainer" | "AppleAPFSMedia" | "AppleAPFSContainerScheme")) || class.is_some_and(super::accel::class_complete) || class.is_some_and(super::iosurface::class_complete) || class.is_some_and(super::iomfb::class_complete);
     let by_name = props.iter().any(|&(k, _)| k == "BSD Name");
     if !complete && !(by_name && !found.is_empty()) {
         return Err(format!("the services of class {class:?} with {props:?}: the drivers' own are not here"));
@@ -689,6 +705,11 @@ pub fn serialize_prop(p: &Prop) -> Vec<u8> {
             b.push(0);
             b.resize((b.len() + 3) & !3, 0);
         }
+        Prop::Dict(_) => {
+            let mut g = super::osserialize::Graph::default();
+            let root = prop_object(&mut g, p);
+            return super::osserialize::serialize_binary(&g, root);
+        }
         Prop::Strs(items) => {
             const K_OS_SERIALIZE_ARRAY: u32 = 0x0200_0000;
             b.extend_from_slice(&(K_OS_SERIALIZE_END_COLLECTION | K_OS_SERIALIZE_ARRAY | items.len() as u32).to_le_bytes());
@@ -701,6 +722,30 @@ pub fn serialize_prop(p: &Prop) -> Vec<u8> {
         }
     }
     b
+}
+
+/// A property as a libkern object of graph `g`.
+fn prop_object(g: &mut super::osserialize::Graph, p: &Prop) -> super::osserialize::Id {
+    use super::osserialize::Obj;
+    match p {
+        Prop::Str(s) => g.add(Obj::String(s.as_bytes().to_vec())),
+        Prop::Sym(s) => g.add(Obj::Symbol(s.as_bytes().to_vec())),
+        Prop::Bool(b) => g.add(Obj::Bool(*b)),
+        Prop::Num(v, bits) => g.number(*v, *bits),
+        Prop::Data(d) => g.add(Obj::Data(d.clone())),
+        Prop::Strs(items) => {
+            let ids = items.iter().map(|s| g.add(Obj::String(s.as_bytes().to_vec()))).collect();
+            g.add(Obj::Array(ids))
+        }
+        Prop::Dict(entries) => {
+            let d = g.add(Obj::Dict(Vec::new()));
+            for (k, v) in entries {
+                let id = prop_object(g, v);
+                g.dict_set(d, k.as_bytes(), id);
+            }
+            d
+        }
+    }
 }
 
 /// IOReturn codes (`IOReturn.h`).
@@ -758,6 +803,8 @@ pub struct MethodArgs {
     pub scalar_out: Vec<u64>,
     pub struct_out: Vec<u8>,
     pub ool_out: Option<(u64, u64)>,
+    /// A method that answers later: the reply deferred until then.
+    pub deferred: Option<super::kobject::Deferred>,
 }
 
 impl MethodArgs {
@@ -803,6 +850,8 @@ pub enum Kind {
     /// IOSurfaceRoot's, by its number among the root's clients
     /// ([`super::iosurface`]).
     Surface(u32),
+    /// The display framebuffer's ([`super::iomfb`]).
+    Framebuffer(super::iomfb::Client),
 }
 
 /// An `IOUserClient` a task opened: the service it is attached to, its
@@ -883,12 +932,22 @@ pub fn open_user_client(k: &mut crate::syscalls::Kernel, service: u32, ty: u32) 
             let (class, client) = super::accel::new_user_client(k, service, ty)?;
             (class, Kind::Accel(client), false)
         }
+        // IOMobileGraphicsFamily, whose class the framebuffer's client is,
+        // depends on IOSurface.
+        c if c == super::iomfb::CLASS => (super::iomfb::UC_CLASS, Kind::Framebuffer(super::iomfb::new_user_client(k, ty)?), false),
         _ => {
             k.darwin_unimplemented(format!("newUserClient of {} (type {ty:#x})", name(t, service)));
             return Err(ret::UNSUPPORTED);
         }
     };
-    Ok(client_add(service, class, creator, default_locking, kind))
+    let framebuffer = matches!(kind, Kind::Framebuffer(_));
+    let n = client_add(service, class, creator, default_locking, kind);
+    if framebuffer {
+        if let Some(cell) = client(n) {
+            super::iomfb::swap::client_started(cell.lock().unwrap_or_else(|e| e.into_inner()).id as u32);
+        }
+    }
+    Ok(n)
 }
 
 /// The client's `clientClose`.
@@ -900,6 +959,7 @@ pub fn client_close(k: &mut crate::syscalls::Kernel, c: &mut UserClient) {
         Kind::Apfs => {}
         Kind::Accel(a) => super::accel::client_close(k, a),
         Kind::Surface(id) => super::iosurface::client_close(k, *id),
+        Kind::Framebuffer(f) => super::iomfb::client_close(k, c.id as u32, f),
     }
 }
 
@@ -919,21 +979,29 @@ pub fn client_died(k: &mut crate::syscalls::Kernel, id: u32) {
     if let Kind::Surface(id) = c.kind {
         super::iosurface::client_free(k, id);
     }
+    let key = c.id as u32;
+    if let Kind::Framebuffer(f) = &mut c.kind {
+        super::iomfb::client_free(k, key, f);
+    }
 }
 
 /// `getService`: the provider for the accelerator's clients, none for
 /// IOUserClient's default.
 pub fn client_service(c: &UserClient) -> Option<u32> {
     match &c.kind {
-        Kind::Apfs | Kind::Surface(_) => None,
+        Kind::Apfs | Kind::Surface(_) | Kind::Framebuffer(_) => None,
         Kind::Accel(a) => super::accel::client_service(c.service, a),
     }
 }
 
-/// `clientMemoryForType`: no client here has memory of any type
-/// (IOUserClient's default, kIOReturnUnsupported).
-pub fn client_memory_for_type(_k: &mut crate::syscalls::Kernel, _c: &mut UserClient, _ty: u32) -> Result<std::convert::Infallible, i32> {
-    Err(ret::UNSUPPORTED)
+/// `clientMemoryForType`: no client here gives memory. `Ok`: the
+/// client answers success with none (the framebuffer's for most types);
+/// `Err`: its error (IOUserClient's default, kIOReturnUnsupported).
+pub fn client_memory_for_type(_k: &mut crate::syscalls::Kernel, c: &mut UserClient, ty: u32) -> Result<(), i32> {
+    match &c.kind {
+        Kind::Framebuffer(f) => super::iomfb::client_memory_for_type(f, ty),
+        _ => Err(ret::UNSUPPORTED),
+    }
 }
 
 /// `registerNotificationPort(port, type, refCon)`.
@@ -946,16 +1014,31 @@ pub fn register_notification_port(k: &mut crate::syscalls::Kernel, c: &mut UserC
         Kind::Accel(a) => super::accel::register_notification_port(k, a, port, ty, reference),
         // IOUserClient's (IOSurfaceRootUserClient has none of its own).
         Kind::Surface(_) => ret::UNSUPPORTED,
+        Kind::Framebuffer(f) => super::iomfb::register_notification_port(k, f, port, ty, reference),
     }
 }
 
 /// `callExternalMethod`: the client's externalMethod.
 pub fn external_method(k: &mut crate::syscalls::Kernel, c: &mut UserClient, a: &mut MethodArgs) -> i32 {
+    let key = c.id as u32;
     match &mut c.kind {
         Kind::Apfs => apfs_method(k, c.service, a),
         Kind::Accel(x) => super::accel::external_method(k, x, a),
         Kind::Surface(id) => super::iosurface::external_method(k, *id, a),
+        Kind::Framebuffer(f) => match super::iomfb::methods::external_method(k, key, f, a) {
+            super::iomfb::methods::Outcome::Done(r) => r,
+            super::iomfb::methods::Outcome::Wait { swap, options } => {
+                a.deferred = Some(super::kobject::Deferred::IomfbSwapWait { client: key, swap, options });
+                ret::SUCCESS
+            }
+        },
     }
+}
+
+/// A framebuffer swap wait's outcome now: done (its result), the client
+/// that waits stopped (kIOReturnAborted), or `None` while it waits.
+pub fn iomfb_wait_outcome(client: u32, swap: u32, options: u32) -> Option<i32> {
+    super::iomfb::swap::wait_done(client, swap, options)
 }
 
 /// AppleAPFSUserClient's methods: of them, selector 9, a volume's
@@ -981,8 +1064,9 @@ pub fn client_property(c: &UserClient, name: &str) -> Result<Option<Prop>, Strin
     match name {
         "IOUserClientCreator" => Ok(Some(Prop::Str(c.creator.clone()))),
         "IOUserClientDefaultLocking" if c.default_locking => Ok(Some(Prop::Bool(true))),
-        _ => match c.kind {
+        _ => match &c.kind {
             Kind::Surface(_) => Ok(super::iosurface::client_property(name)),
+            Kind::Framebuffer(f) => Ok(super::iomfb::client_property(f, name)),
             _ => super::accel::client_property(c, name),
         },
     }
@@ -998,7 +1082,7 @@ pub fn prop_bytes(p: &Prop) -> Option<Vec<u8>> {
         Prop::Bool(b) => Some(if *b { b"Yes\0".to_vec() } else { b"No\0".to_vec() }),
         Prop::Data(d) => Some(d.clone()),
         Prop::Num(v, bits) => Some(v.to_le_bytes()[..((*bits as usize + 7) / 8).min(8)].to_vec()),
-        Prop::Strs(_) => None,
+        Prop::Strs(_) | Prop::Dict(_) => None,
     }
 }
 
@@ -1079,6 +1163,9 @@ impl crate::syscalls::Kernel {
                 let id = *id;
                 super::iosurface::trap(self, id, index, [a[2], a[3], a[4], a[5]])
             }
+            // IOMobileFramebufferUserClient has no trap: IOUserClient's
+            // getTargetAndTrapForIndex, none, and so success.
+            Kind::Framebuffer(_) => ret::SUCCESS,
         };
         r
     }
@@ -1192,7 +1279,8 @@ mod tests {
         node(&mut b, "uart0", &[("compatible", b"uart-1,samsung\0")], 0);
         let mut t = parse(&b).unwrap();
         let (chosen, arm_io, sgx, uart) = (1, 2, 3, 4);
-        let gpu = super::super::platform::add(&mut t).unwrap();
+        let io = super::super::platform::add(&mut t).unwrap();
+        let gpu = super::super::platform::arm_io_nub(&mut t, io, "gpu,t8011").unwrap();
         assert_eq!(gpu, sgx);
         super::super::accel::add_service(&mut t, gpu);
         add_root(&mut t);
@@ -1222,6 +1310,33 @@ mod tests {
         assert!(!property_unknown(&t, accel, "IOClassNameOverride") && !property_unknown(&t, up[4], "IOClassNameOverride") && !property_unknown(&t, 0, "IOClassNameOverride"));
         assert!(property_unknown(&t, 0, "IOPlatformSerialNumber"));
         assert!(!property_unknown(&t, uart, "anything") && property_unknown(&t, root, "IOKitBuildVersion") && !property_unknown(&t, root, "anything"));
+        // The display's framebuffer on disp0's nub, a nub of arm-io's
+        // driver as the GPU's is.
+        let mut b = Vec::new();
+        node(&mut b, "device-tree", &[("compatible", b"J120AP\0iPad7,1\0AppleARM\0")], 1);
+        node(&mut b, "arm-io", &[("compatible", b"arm-io,t8011\0")], 1);
+        node(&mut b, "disp0", &[("compatible", b"disp0,t8011\0")], 0);
+        let mut t = parse(&b).unwrap();
+        let io = super::super::platform::add(&mut t).unwrap();
+        let disp = super::super::platform::arm_io_nub(&mut t, io, "disp0,t8011").unwrap();
+        super::super::iomfb::add_service(&mut t, disp);
+        add_root(&mut t);
+        let clcd = t.len() as u32 - 2;
+        let mut up = vec![clcd];
+        while let Some(p) = provider(&t, *up.last().unwrap()).unwrap() {
+            up.push(p);
+        }
+        let classes: Vec<&str> = up.iter().map(|&i| class(&t, i).unwrap()).collect();
+        assert_eq!(classes, ["AppleCLCD", "AppleARMIODevice", "AppleT8011IO", "IOPlatformDevice", "AppleARMPE", "IOPlatformExpertDevice", "IORegistryEntry"]);
+        assert_eq!(conforms(&t, clcd, "IOMobileFramebuffer"), Ok(true));
+        // What no image can set is missing, on the service and its nub;
+        // the rest of what the drivers set is not known.
+        assert!(!property_unknown(&t, clcd, "GainMapVersion") && !property_unknown(&t, disp, "canvas-width"));
+        assert!(property_unknown(&t, clcd, "IOMFBSupportsHeadOfLineSwaps") && property_unknown(&t, disp, "IODeviceMemory"));
+        // The personality's dictionary, serialized as OSSerializeBinary.
+        let backlight = &t[clcd as usize].service_props.iter().find(|(k, _)| k == "BacklightMatching").unwrap().1;
+        let bin = serialize_prop(backlight);
+        assert_eq!(&bin[..8], &[0xd3, 0, 0, 0, 1, 0, 0, 0x81]);
         // Without the platform's compatible name, no expert here matches.
         let mut b = Vec::new();
         node(&mut b, "device-tree", &[("compatible", b"Other\0")], 0);

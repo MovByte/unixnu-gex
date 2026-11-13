@@ -819,6 +819,85 @@ pub fn with_bytes<R>(k: &mut Kernel, id: u32, f: impl FnOnce(&mut [u8]) -> R) ->
     })
 }
 
+/// A surface's geometry as a kext reads it through IOSurface's accessors
+/// (0xfffffff005b9ebac and on): its flags (`+0x3b0`), pixel format
+/// (`+0x80`), width and height (`+0x58`, `+0x60`), and its planes, a
+/// surface with none being one plane of its own width, height, offset
+/// (`+0x78`), bytes per row (`+0x68`), size (`+0x90`) and bytes per element
+/// (`+0x70`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Geometry {
+    pub id: u32,
+    pub flags: u32,
+    pub pixel_format: u32,
+    pub width: u64,
+    pub height: u64,
+    pub alloc_size: u64,
+    pub planes: Vec<surface::Plane>,
+    pub plane_count: u32,
+}
+
+impl Geometry {
+    /// The plane accessors (0xfffffff005b9eeb8 and the others): plane `i`
+    /// of a planar surface, or the surface itself as plane 0 of one with
+    /// none; none past them.
+    pub fn plane(&self, i: u32) -> Option<surface::Plane> {
+        if self.plane_count == 0 {
+            return (i == 0).then(|| self.planes[0]);
+        }
+        self.planes.get(i as usize).copied()
+    }
+}
+
+/// `IOSurfaceRoot::lookupSurface(id, task)` as a kext calls it
+/// (0xfffffff005baa72c): the calling task's user client found
+/// (0xfffffff005baa7cc), then the surface in the root's table
+/// (0xfffffff005baa438) if the task created it, or that client holds it
+/// (0xfffffff005bb2220), or a global lookup is allowed for it (the debug
+/// flags; never for a private surface); and a reference taken unless its
+/// count is already zero (0xfffffff005b9c9a0). The kext lets the
+/// reference go with [`kernel_release`].
+pub fn kernel_lookup(k: &mut Kernel, id: u32) -> Option<u32> {
+    let pid = k.pid;
+    root(|r| {
+        if id == 0 || id >= r.table_size {
+            return None;
+        }
+        let client = r.clients.iter().find(|(_, c)| c.pid == pid && c.live).map(|(uc, _)| *uc);
+        let debug = r.params.debug;
+        let held = client.is_some_and(|uc| r.clients.get(&uc).and_then(|c| c.handles.get(id as usize)).is_some_and(|h| h.is_some()));
+        let s = r.surfaces.get_mut(&id)?;
+        if !s.installed {
+            return None;
+        }
+        let found = s.creator == Some(pid) || held || (s.desc.flags & flag::PRIVATE == 0 && ((debug & 4 != 0 && s.desc.flags & flag::GLOBAL != 0) || debug & 1 != 0));
+        if !found || s.refs == 0 {
+            return None;
+        }
+        s.refs += 1;
+        Some(id)
+    })
+}
+
+/// A reference [`kernel_lookup`] took let go.
+pub fn kernel_release(k: &mut Kernel, id: u32) {
+    root(|r| surface_release(k, r, id));
+}
+
+/// Surface `id`'s geometry; none for an id no surface has.
+pub fn geometry(id: u32) -> Option<Geometry> {
+    root(|r| {
+        let s = r.surfaces.get(&id)?;
+        let d = &s.desc;
+        let planes = if d.planes.is_empty() {
+            vec![surface::Plane { width: d.width, height: d.height, base: 0, offset: d.offset, bytes_per_row: d.bytes_per_row, size: d.alloc_size, bytes_per_element: d.bytes_per_element, element_width: d.element_width, element_height: d.element_height, address_format: 0 }]
+        } else {
+            d.planes.clone()
+        };
+        Some(Geometry { id, flags: d.flags, pixel_format: d.pixel_format, width: d.width, height: d.height, alloc_size: d.alloc_size, plane_count: d.planes.len() as u32, planes })
+    })
+}
+
 /// The graphics comm page's first word (IOGPUFamily's selector 3).
 pub fn comm_word() -> u32 {
     root(|r| r.shared.comm_word())

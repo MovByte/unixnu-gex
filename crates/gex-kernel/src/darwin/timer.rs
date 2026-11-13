@@ -24,6 +24,8 @@ pub enum Action {
     Knote(super::kevent::KnId, u32),
     /// The real interval timer's (`realitexpire`).
     RealTimer,
+    /// The framebuffer's vertical blank ([`super::iomfb::swap`]).
+    Iomfb,
 }
 
 /// How the thread-call thread learns that an earlier deadline was armed, or
@@ -155,6 +157,7 @@ impl Kernel {
                 Action::MkTimer(port) => self.mk_timer_expire(m, port, key),
                 Action::Workq(c) => self.darwin_workq_call(m, c),
                 Action::RealTimer => self.darwin_realitexpire(),
+                Action::Iomfb => self.darwin_iomfb_blank(m),
                 Action::Knote(n, state) => {
                     self.filt_timerexpire(n, state);
                     self.darwin_kevent_settle(m);

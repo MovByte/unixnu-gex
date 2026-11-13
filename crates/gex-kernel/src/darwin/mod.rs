@@ -39,6 +39,7 @@ pub mod iokit;
 pub mod iosurface;
 pub mod osserialize;
 pub mod accel;
+pub mod iomfb;
 pub mod platform;
 pub mod guarded;
 pub mod exit;
@@ -179,6 +180,9 @@ pub struct Task {
     pub ulocks: thread::Ulocks,
     pub psynch: psynch::Psynch,
     pub timers: timer::Timers,
+    /// The framebuffer's thread call for the next vertical blank, while
+    /// armed ([`iomfb::swap`]).
+    pub iomfb_call: Option<(std::time::Instant, u64)>,
     /// Threads made by a call (resumed, or the workqueue's) for the host to
     /// start after it ([`crate::syscalls::Kernel::take_spawns`]).
     pub spawns: Vec<crate::syscalls::SpawnRequest>,

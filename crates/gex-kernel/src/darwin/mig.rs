@@ -2137,8 +2137,10 @@ fn connect_routine(k: &mut Kernel, req: &Kmsg, id: u32, n: i32) -> Reply {
             if !is_task {
                 Reply::err(ret::BAD_ARGUMENT)
             } else {
+                // No memory: mapping is kIOReturnBadArgument; unmapping
+                // answers clientMemoryForType's result.
                 match super::iokit::client_memory_for_type(k, &mut c, ty as u32) {
-                    Ok(never) => match never {},
+                    Ok(()) => Reply::err(if n == 2863 { ret::BAD_ARGUMENT } else { ret::SUCCESS }),
                     Err(e) => Reply::err(if n == 2863 { ret::BAD_ARGUMENT } else { e }),
                 }
             }
@@ -2243,6 +2245,13 @@ fn connect_method(k: &mut Kernel, c: &mut super::iokit::UserClient, mut a: super
     let r = super::iokit::external_method(k, c, &mut a);
     if r != ret::SUCCESS {
         return Reply::err(r);
+    }
+    // A method that answers later (IOMobileFramebuffer's swap wait): the
+    // reply waits with it.
+    if let Some(d) = a.deferred.take() {
+        let mut r = Reply::ok(Vec::new());
+        r.defer = Some((k.tid, d));
+        return r;
     }
     if !ool_out_field {
         // io_connect_method_var_output: no client here gives variable

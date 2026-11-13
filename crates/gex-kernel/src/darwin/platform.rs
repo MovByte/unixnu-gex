@@ -10,6 +10,8 @@
 //!         AppleT8011IO    arm-io's driver
 //!           sgx           AppleARMIODevice, a nub of arm-io's sgx
 //!             (the GPU's accelerator, `super::accel`)
+//!           disp0         AppleARMIODevice, a nub of arm-io's disp0
+//!             (the display's framebuffer, `super::iomfb`)
 //! ```
 //!
 //! - The platform expert. `AppleARMPE` (com.apple.driver.AppleARMPlatform)
@@ -147,9 +149,9 @@ fn driver_props(bundle: &str, class: &str, provider: &str, matched: &str, catego
     p
 }
 
-/// Publish the platform expert and arm-io's driver, and make arm-io and its
-/// GPU entry the nubs they are; the GPU's nub, when the device tree has the
-/// path. `t[0]` is the device tree's root, the `IOPlatformExpertDevice`.
+/// Publish the platform expert and arm-io's driver, and make arm-io the
+/// nub it is; arm-io's driver's entry, when the device tree has arm-io.
+/// `t[0]` is the device tree's root, the `IOPlatformExpertDevice`.
 pub fn add(t: &mut Vec<Node>) -> Option<u32> {
     let root = t.first()?;
     if !names(root, "AppleARM") {
@@ -171,7 +173,14 @@ pub fn add(t: &mut Vec<Node>) -> Option<u32> {
         ("IOPlatformActiveAction".to_string(), Prop::Num(80000, 64)),
     ]);
     t.push(driver(ARM_IO, ARM_IO, arm_io, props));
-    let gpu = child(t, arm_io, "gpu,t8011", &[])?;
-    t[gpu as usize].nub = Some((ARM_IO_DEVICE, io));
-    Some(gpu)
+    Some(io)
+}
+
+/// The `AppleARMIODevice` nub arm-io's driver `io` publishes for its
+/// device tree child whose names include `name`, when there is one.
+pub fn arm_io_nub(t: &mut [Node], io: u32, name: &str) -> Option<u32> {
+    let arm_io = t[io as usize].parent?;
+    let nub = child(t, arm_io, name, &[])?;
+    t[nub as usize].nub = Some((ARM_IO_DEVICE, io));
+    Some(nub)
 }
