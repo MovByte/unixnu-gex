@@ -543,8 +543,11 @@ pub struct Ipc {
     pub space: Space,
     /// The other tasks' spaces, by task, while this task holds the table.
     pub others: HashMap<TaskKey, Space>,
-    /// This task's key among the spaces (0: none taken yet).
+    /// This task's key among the spaces (0: none taken yet, or the task
+    /// has ended).
     pub task: TaskKey,
+    /// The task has ended ([`Ipc::space_leave`]).
+    pub ended: bool,
     /// The task is the system's first (`initproc`).
     pub initproc: bool,
     /// The system's table, once this task has taken it.
@@ -789,6 +792,7 @@ impl Ipc {
         self.link = None;
         self.space = Space::new();
         self.task = 0;
+        self.ended = true;
         let cell = self.cell.take();
         self.held = false;
         if let Some(cell) = cell {

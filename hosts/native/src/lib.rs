@@ -3322,10 +3322,11 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
                         stop_other_threads(&cx, false);
                     }
                     gex_kernel::syscalls::outgrow_ending(pid, 127 << 8, &procs);
-                    kernel
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .close_all_fds();
+                    {
+                        let mut k = kernel.lock().unwrap_or_else(|e| e.into_inner());
+                        k.darwin_task_terminate();
+                        k.close_all_fds();
+                    }
                     (127, 127 << 8)
                 }
             };
@@ -3352,10 +3353,14 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
             // (one that exec'd was looked at as its program ended,
             // `report_first_end`).
             gex_kernel::syscalls::outgrow_ending(pid, wstatus, &procs);
-            // Its descriptors close before its parent can see it gone, as on
-            // Linux: a listening socket's port is free once `wait4` returns.
+            // Its task ends (a Darwin child's: its ports die and its pid no
+            // longer finds it), and its descriptors close, before its parent
+            // can see it gone, as on Linux: a listening socket's port is
+            // free once `wait4` returns. (One that exec'd ended its task as
+            // its image did.)
             {
                 let mut k = kernel.lock().unwrap_or_else(|e| e.into_inner());
+                k.darwin_task_terminate();
                 k.close_all_fds();
             }
             procs.exit(pid, wstatus);
@@ -4010,7 +4015,12 @@ fn exec_darwin(
 ) -> Result<(Exit, Stats)> {
     let loaded = match load_darwin_image(&kernel, &img) {
         Ok(l) => l,
-        Err(why) => return darwin_killed(why),
+        Err(why) => {
+            // The process ends, its task with it, as one SIGKILL ended.
+            kernel.darwin_task_terminate();
+            kernel.close_all_fds();
+            return darwin_killed(why);
+        }
     };
     note_exec(kernel.pid, &img.path, &req.argv);
     run_darwin_image(img, loaded, req.argv, req.envp, opts, xlate, kernel, proc_state, wayland)
@@ -4089,7 +4099,10 @@ fn start_darwin_spawn(cx: &SpawnContext, mut child: Kernel) -> std::result::Resu
     let pid = child.pid;
     let procs = Arc::clone(&child.procs);
     let img = child.darwin_exec.take().expect("a spawned child's image");
+    // A child that does not start goes unseen, its task ended (what it
+    // inherited let go) and its descriptors closed.
     let fail = |child: &mut Kernel, e: Errno| {
+        child.darwin_task_terminate();
         child.close_all_fds();
         procs.reap(pid);
         Err(e)
@@ -4126,28 +4139,38 @@ fn start_darwin_spawn(cx: &SpawnContext, mut child: Kernel) -> std::result::Resu
     note_exec(pid, &img.path, &argv);
     let (opts, xlate, wayland) = (cx.opts.clone(), cx.xlate.clone(), cx.wayland.clone());
     let creds = Arc::clone(&child.creds);
+    // The child goes to its thread through a slot, so that one that cannot
+    // be made leaves it here to end.
+    let slot = Arc::new(Mutex::new(Some(child)));
     let started = std::thread::Builder::new()
         .name(format!("gex-pid-{pid}"))
         .stack_size(guest_thread_stack())
-        .spawn(move || {
-            let wstatus = match run_darwin_image(img, loaded, argv, envp, &opts, &xlate, child, child_proc, wayland) {
-                Ok((exit, _)) => {
-                    say_killed(pid, &exit);
-                    exit.wait_status()
-                }
-                Err(e) => {
-                    eprintln!("gexc: child {pid} failed: {e:#}");
-                    127 << 8
-                }
-            };
-            procs.set_uid(pid, creds.uid());
-            procs.exit(pid, wstatus);
-            *status.lock().unwrap_or_else(|e| e.into_inner()) = Some(wstatus);
-            done.notify_all();
+        .spawn({
+            let (slot, procs) = (Arc::clone(&slot), Arc::clone(&procs));
+            move || {
+                let child = slot.lock().unwrap_or_else(|e| e.into_inner()).take().expect("the spawned child's kernel");
+                let wstatus = match run_darwin_image(img, loaded, argv, envp, &opts, &xlate, child, child_proc, wayland) {
+                    Ok((exit, _)) => {
+                        say_killed(pid, &exit);
+                        exit.wait_status()
+                    }
+                    Err(e) => {
+                        eprintln!("gexc: child {pid} failed: {e:#}");
+                        127 << 8
+                    }
+                };
+                procs.set_uid(pid, creds.uid());
+                procs.exit(pid, wstatus);
+                *status.lock().unwrap_or_else(|e| e.into_inner()) = Some(wstatus);
+                done.notify_all();
+            }
         });
     match started {
         Ok(_) => Ok(pid),
-        Err(_) => Err(Errno::EAGAIN),
+        Err(_) => match slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            Some(mut child) => fail(&mut child, Errno::EAGAIN),
+            None => Err(Errno::EAGAIN),
+        },
     }
 }
 
@@ -5029,7 +5052,14 @@ fn place_image(
                     signature: exec.as_ref().map(|i| i.load.clone()),
                     nano: exec.as_ref().and_then(|i| i.spawn.as_ref()).is_some_and(|sp| sp.flags & gex_kernel::darwin::spawn::flag::NANO_ALLOCATOR != 0),
                 };
-                k.darwin_start(exec.map(|i| i.strings), &loaded, opts.darwin_user_stack)
+                let st = k.darwin_start(exec.map(|i| i.strings), &loaded, opts.darwin_user_stack);
+                // An image that cannot start ends its process (`badtoolate`),
+                // its task with it.
+                if st.is_err() {
+                    k.darwin_task_terminate();
+                    k.close_all_fds();
+                }
+                st
             })
             .map_err(|e| anyhow::Error::new(DarwinStartFailed(format!("starting {path}: errno {}", e.0))))?;
         let layout = gex_ld::stack::StackLayout { sp: st.sp, low: st.sp, bytes: st.bytes };
