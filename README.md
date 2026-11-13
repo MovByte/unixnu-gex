@@ -158,6 +158,23 @@ subsystem, most naming in their header the XNU source they port:
     driver `AppleT8011IO`, and the `AppleARMIODevice` nub of arm-io's sgx.
   - The shipped Sandbox profiles decide by those classes and by that
     ancestry.
+- **The display.** The framebuffer presents as the device's,
+  AppleMobileDispH9G's `AppleCLCD` (an `IOMobileFramebuffer`), on the
+  `AppleARMIODevice` nub of arm-io's disp0, with IOMobileGraphicsFamily's
+  `IOMobileFramebufferUserClient` (`iomfb/`).
+  - The panel's mode is the one disp0's `display-timing-info` gives, and its
+    vertical blanks come one frame apart: two subframes of disp0's
+    `subframe-duration-nclks`, counted from boot.
+  - A swap is begun, ended with the transaction IOMobileFramebuffer.framework
+    builds, checked as the family's `swap_submit` and the pipe's
+    `verify_swap` check it, and queued. The vertical blank after it is
+    pending makes it the displayed swap, and the one it replaces retires.
+    Swap waits wait for those steps.
+  - A displayed swap's layers go to the embedder's presentation sink as the
+    surfaces hold them: their bytes, pixel format, plane geometry and
+    rectangles, unconverted. `GEX_DARWIN_FRAMES` makes gexc's sink record
+    them into a directory.
+  - No vertical blank message is sent: on this device the kext sends none.
 - **IOSurface.** `IOSurfaceRoot` and its user client as the device's
   IOSurface kext has them (`iosurface/`): surfaces created, looked up by id
   and by send right, locked with their seeds, their values, use counts and
@@ -360,6 +377,7 @@ What gexc sets up:
 | `GEX_DARWIN_BOOT` | the boot payload (above); the system boots from it once, and an `execve` runs on the same system |
 | `GEX_DARWIN_STRICT=1` | strict mode (above) |
 | `GEX_DARWIN_CACHE` | the shared cache's main file, when it is not at the root's cryptex path |
+| `GEX_DARWIN_FRAMES` | a directory the frames the framebuffer presents are recorded into, one file each (`hosts/native/src/darwin_frames.rs`) |
 | environment | without `--env` or `--host-env`, `PATH=/usr/bin:/bin` and `HOME=/var/mobile` |
 | identity | the host user's ids, or `--uid`; `/sbin/launchd` runs as root and pid 1, and any other program as a child of a pid 1 that is the kernel's own |
 | memory | always a 64-bit guest memory (`--mem32` is refused): Darwin images live above 4 GiB |
@@ -446,7 +464,7 @@ dyld and libSystem from the device's shared cache.
 | kqueue, poll and pipes | `kq-pipe`, `vnode`, `vnextend`, `select`, `poll`, `pipe`, `timeouts` |
 | terminals and `/dev` | `pty`, `ptyjob`, `ptyclose`, `bsdpty`, `ttyinfo`, `ttydead`, `ttydrain`, `fcntltty`, `revoke`, `devfs`, `devattr` |
 | sockets | `sockerr`, `sockevent`, `sockname`, `sockopts`, `halfclose`, `nosigpipe`, `dgrambuf`, `streambuf` |
-| code signing and IOKit | `codesig`, `amfi`, `policy`, `iokit`, `ioreg`, `iosurface`, `iosurfacex`, `iogpudev`, `accel`, `accelr` |
+| code signing and IOKit | `codesig`, `amfi`, `policy`, `iokit`, `ioreg`, `iosurface`, `iosurfacex`, `iogpudev`, `accel`, `accelr`, `iomfb` |
 
 The suite runs single programs and the processes they create. None of it
 boots launchd or runs an app.
@@ -483,8 +501,8 @@ is the reference (search `crates/gex-kernel/src/` for
   `sandbox_check` of another process's operation, and Sandbox's other
   `__mac_syscall` calls.
 - **IOKit.** The registry holds the device tree, the APFS services,
-  IOSurfaceRoot, and the GPU's accelerator with the drivers and nubs on its
-  path to the root.
+  IOSurfaceRoot, the GPU's accelerator and the display's framebuffer, with
+  the drivers and nubs on their paths to the root.
   These are reported:
   - opening any other driver;
   - those drivers' other nubs and clients;
@@ -493,8 +511,24 @@ is the reference (search `crates/gex-kernel/src/` for
   - properties those drivers set in their start or probe;
   - IOGPU selectors and traps that make IOGPU objects, and AGXG9G's own
     selectors;
+  - the framebuffer's user client selectors other than the swap's (begin,
+    end, wait, cancel, cancel all), the display's size, id and main-display
+    query, the default surface, the debug flags, the absolute time and the
+    notification switch, and a displayed surface's send right;
+  - framebuffer frame information and CRC notifications, and its power
+    assertions;
+  - swaps whose layers the pipe would scale, rotate, or read from YCbCr,
+    compressed or passthrough formats, with active or exclusion regions,
+    kept on screen, carrying user data or of kind 9, and swap waits with a
+    timeout;
+  - a swap that reaches the glass with no presentation sink installed, or
+    that the embedder's sink cannot show;
   - WebMetal requests, which have no host executor yet;
   - matching dictionaries of kinds not handled.
+- **The panel.** The IPSW's device tree carries the template's
+  `display-timing-info`, a 1024×600 mode, which iBoot replaces on a device
+  with its panel's; the framebuffer reads it as the kext does, so a boot
+  payload whose device tree holds the panel's mode gives that mode.
 - **Mach.** The traps `clock_sleep` and `debug_control_port_for_pid`; MIG
   routines not in `mig.rs`, and some `task_info`, `thread_info`,
   `host_statistics` and `task_policy_get` flavors; `task_for_pid` and its
