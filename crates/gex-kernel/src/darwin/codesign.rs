@@ -63,7 +63,7 @@ mod der {
 /// One DER element at the start of `b`: its class and constructed bits,
 /// its tag number, its contents and what follows it. Definite lengths
 /// only, in their shortest form.
-fn der_element(b: &[u8]) -> Option<(u8, u32, &[u8], &[u8])> {
+pub(crate) fn der_element(b: &[u8]) -> Option<(u8, u32, &[u8], &[u8])> {
     let (&first, mut rest) = b.split_first()?;
     let mut tag = u32::from(first & 0x1f);
     if tag == 0x1f {

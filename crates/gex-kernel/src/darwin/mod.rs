@@ -90,6 +90,7 @@ pub mod sockopt;
 pub mod sockerr;
 pub mod spawn;
 pub mod kinfo;
+pub mod lwcr;
 pub mod sysctl;
 mod sysctl_nodes;
 pub mod sysno;
