@@ -1,12 +1,18 @@
-// The GPU's accelerator service: found by class as Metal.framework finds it
+// The GPU's accelerator service, as the device's (AGXG9G's
+// AGXAcceleratorG9G_A0): found by class as Metal.framework finds it
 // (IOAcceleratorES) and as RunningBoard does (IOGPU), its registry
 // properties, its providers up the IOService plane to the registry's root,
-// and its user clients: the WebMetal connection (type 0), the
-// IOGPU device client (type 1), the memory information client (type 33),
-// and the types it refuses. For each client: its class and properties,
-// method argument checks as IOUserClient makes them, the asynchronous
-// method and notification port calls, memory mapping, traps, closing, and
-// the client going with its connection's last send right.
+// and its user clients:
+// - the WebMetal connection (type 0), which presents as the device client;
+// - the device client (type 1, AGXG9G's AGXDeviceUserClient);
+// - the memory information client (type 33);
+// - and the types it refuses.
+// For each client it checks:
+// - its class and properties;
+// - method argument checks as IOUserClient makes them;
+// - the asynchronous method and notification port calls;
+// - memory mapping, traps and closing;
+// - the client going with its connection's last send right.
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
@@ -165,15 +171,15 @@ static int wire_client(io_service_t accel, uint64_t accel_id) {
     kern_return_t kr = IOServiceOpen(accel, mach_task_self(), 0, &conn);
     if (kr != KERN_SUCCESS || conn == IO_OBJECT_NULL) return bad("opening type 0", kr, 0);
     io_name_t cls;
-    if (IOObjectGetClass(conn, cls) != KERN_SUCCESS || strcmp(cls, "WebMetalUserClient") != 0) return bad("the WebMetal client's class", 0, 1);
-    if (!IOObjectConformsTo(conn, "IOUserClient") || IOObjectConformsTo(conn, "IOGPU")) return bad("the WebMetal client's superclasses", 0, 1);
+    if (IOObjectGetClass(conn, cls) != KERN_SUCCESS || strcmp(cls, "AGXDeviceUserClient") != 0) return bad("the WebMetal client's class", 0, 1);
+    if (!IOObjectConformsTo(conn, "IOGPUDeviceUserClient") || !IOObjectConformsTo(conn, "IOUserClient") || IOObjectConformsTo(conn, "IOGPU")) return bad("the WebMetal client's superclasses", 0, 1);
     uint64_t id = 0;
     if (IORegistryEntryGetRegistryEntryID(conn, &id) != KERN_SUCCESS || id <= accel_id) return bad("the client's registry entry id", (long)id, (long)accel_id);
     char creator[64];
     snprintf(creator, sizeof creator, "pid %d, %.16s", getpid(), getprogname());
     if (string_prop(conn, "IOUserClientCreator", creator)) return 1;
-    CFTypeRef locking = IORegistryEntryCreateCFProperty(conn, CFSTR("IOUserClientDefaultLocking"), kCFAllocatorDefault, 0);
-    if (locking != kCFBooleanTrue) return bad("IOUserClientDefaultLocking", 0, 1);
+    // AGXG9G depends on IOSurface: no default locking property.
+    if (IORegistryEntryCreateCFProperty(conn, CFSTR("IOUserClientDefaultLocking"), kCFAllocatorDefault, 0) != NULL) return bad("IOUserClientDefaultLocking", 1, 0);
 
     // The checks of each selector's counts, and a selector it has none of.
     uint64_t in[4] = {0, 0, 0, 0}, out[2] = {0, 0};
@@ -256,8 +262,8 @@ static int memory_info_client(io_service_t accel) {
     return 0;
 }
 
-// IOGPU's device client: open with IOGPU.framework's type (1, the options in
-// the high 16 bits), its class, its method gate (a selector past its table,
+// The device client: open with IOGPU.framework's type (1, the options in the
+// high 16 bits), its class (AGXG9G's, an IOGPUDeviceUserClient), its method gate (a selector past its table,
 // an asynchronous call, a count its table does not take), its notification
 // port (only type 0, and only for a notification queue it has), its traps,
 // its memory, and the stamp memory its start maps read-only.
@@ -266,7 +272,7 @@ static int device_client(io_service_t accel) {
     kern_return_t kr = IOServiceOpen(accel, mach_task_self(), 1, &conn);
     if (kr != KERN_SUCCESS) return bad("opening type 1", kr, 0);
     io_name_t cls;
-    if (IOObjectGetClass(conn, cls) != KERN_SUCCESS || strcmp(cls, "IOGPUDeviceUserClient") != 0) return bad("the device client's class", 0, 1);
+    if (IOObjectGetClass(conn, cls) != KERN_SUCCESS || strcmp(cls, "AGXDeviceUserClient") != 0 || !IOObjectConformsTo(conn, "IOGPUDeviceUserClient")) return bad("the device client's class", 0, 1);
     if (IORegistryEntryCreateCFProperty(conn, CFSTR("IOUserClientDefaultLocking"), kCFAllocatorDefault, 0) != NULL) return bad("IOUserClientDefaultLocking", 1, 0);
 
     uint64_t in[4] = {0}, out[2] = {0};
@@ -371,8 +377,9 @@ static int device_client(io_service_t accel) {
     nout = 1;
     kr = IOConnectCallScalarMethod(conn, 35, role, 1, out, &nout);
     if (kr != kIOReturnUnsupported) return bad("getting the app GPU role", kr, kIOReturnUnsupported);
+    // AGXG9G's display parameters, for a task without their entitlement.
     kr = IOConnectCallScalarMethod(conn, 33, role, 2, NULL, NULL);
-    if (kr != kIOReturnUnsupported) return bad("display parameters", kr, kIOReturnUnsupported);
+    if (kr != kIOReturnNotPrivileged) return bad("display parameters", kr, kIOReturnNotPrivileged);
 
     mach_port_mod_refs(mach_task_self(), conn, MACH_PORT_RIGHT_SEND, 1);
     IOServiceClose(conn);
@@ -420,8 +427,8 @@ int main(int argc, char **argv) {
     if (IOIteratorNext(it) != IO_OBJECT_NULL) return bad("one accelerator", 2, 1);
     IOObjectRelease(it);
     io_name_t cls;
-    if (IOObjectGetClass(accel, cls) != KERN_SUCCESS || strcmp(cls, "WebMetalAccelerator") != 0) return bad("the accelerator's class", 0, 1);
-    if (!IOObjectConformsTo(accel, "IOGPU") || !IOObjectConformsTo(accel, "IOAcceleratorES") || !IOObjectConformsTo(accel, "IOService")) return bad("the accelerator's superclasses", 0, 1);
+    if (IOObjectGetClass(accel, cls) != KERN_SUCCESS || strcmp(cls, "AGXAcceleratorG9G_A0") != 0) return bad("the accelerator's class", 0, 1);
+    if (!IOObjectConformsTo(accel, "AGXAcceleratorG9") || !IOObjectConformsTo(accel, "AGXFamilyAccelerator") || !IOObjectConformsTo(accel, "AGXAccelerator") || !IOObjectConformsTo(accel, "IOGPU") || !IOObjectConformsTo(accel, "IOAcceleratorES") || !IOObjectConformsTo(accel, "IOService")) return bad("the accelerator's superclasses", 0, 1);
     uint64_t accel_id = 0;
     IORegistryEntryGetRegistryEntryID(accel, &accel_id);
 
@@ -432,8 +439,13 @@ int main(int argc, char **argv) {
     if (gpu == IO_OBJECT_NULL || gpu_id != accel_id) return bad("the IOGPU", (long)gpu_id, (long)accel_id);
     IOObjectRelease(gpu);
 
-    // What Metal.framework reads, and what IOGPU::start sets.
-    if (string_prop(accel, "MetalPluginName", "WebMetal") || string_prop(accel, "MetalPluginClassName", "WebMetalDevice") || string_prop(accel, "IOMatchCategory", "IOAcceleratorES") || string_prop(accel, "IOClass", "WebMetalAccelerator")) return 1;
+    // What Metal.framework reads (WebMetal's bundle), the personality's and
+    // matching's, and what IOGPU::start sets.
+    if (string_prop(accel, "MetalPluginName", "WebMetal") || string_prop(accel, "MetalPluginClassName", "WebMetalDevice") || string_prop(accel, "IOMatchCategory", "IOAcceleratorES") || string_prop(accel, "IOClass", "AGXAcceleratorG9G_A0")) return 1;
+    if (string_prop(accel, "IOProviderClass", "AppleARMIODevice") || string_prop(accel, "CFBundleIdentifier", "com.apple.AGXG9G") || string_prop(accel, "IONameMatched", "gpu,t8011") || string_prop(accel, "IOGLESBundleName", "AppleMetalGLRenderer")) return 1;
+    CFTypeRef names = IORegistryEntryCreateCFProperty(accel, CFSTR("IONameMatch"), kCFAllocatorDefault, 0);
+    if (names == NULL || CFGetTypeID(names) != CFArrayGetTypeID() || CFArrayGetCount(names) != 1) return bad("IONameMatch", 0, 1);
+    CFRelease(names);
     CFTypeRef kdebug = IORegistryEntryCreateCFProperty(accel, CFSTR("KDebugVersion"), kCFAllocatorDefault, 0);
     long long v = 0;
     if (kdebug == NULL || CFGetTypeID(kdebug) != CFNumberGetTypeID() || !CFNumberGetValue(kdebug, kCFNumberLongLongType, &v) || v != 0x100000000ll) return bad("KDebugVersion", v, 0x100000000ll);

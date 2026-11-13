@@ -288,7 +288,6 @@ fn add_volumes(t: &mut Vec<Node>) {
 /// - The registry's root has only the properties [`root_has`] names.
 /// - A device tree entry that no driver here made a nub of has only its
 ///   own.
-/// - The accelerator's are [`super::accel::property_unknown`]'s.
 /// - Every other entry has properties its drivers set that are not
 ///   modelled. The exception is `IOClassNameOverride` on the entries from
 ///   the platform expert device to the GPU. In the kernelcache, only
@@ -302,10 +301,7 @@ pub fn property_unknown(t: &[Node], i: u32, name: &str) -> bool {
     if n.class.is_empty() && n.nub.is_none() && i != 0 {
         return false;
     }
-    if n.class == super::accel::CLASS {
-        return super::accel::property_unknown(name);
-    }
-    let on_gpu_path = i == 0 || n.nub.is_some() || super::platform::is_driver(n.class);
+    let on_gpu_path = i == 0 || n.nub.is_some() || super::platform::is_driver(n.class) || n.class == super::accel::CLASS;
     !(on_gpu_path && name == "IOClassNameOverride")
 }
 
@@ -851,12 +847,11 @@ pub fn open_user_client(k: &mut crate::syscalls::Kernel, service: u32, ty: u32) 
         // (its personality's), for any type; the apfs kext does not depend
         // on IOSurface.
         "AppleAPFSContainer" => ("AppleAPFSUserClient", Kind::Apfs, true),
+        // AGXG9G and IOGPUFamily, whose classes the accelerator's clients
+        // are, both depend on IOSurface.
         c if c == super::accel::CLASS => {
             let (class, client) = super::accel::new_user_client(k, service, ty)?;
-            // IOGPUFamily depends on IOSurface; the WebMetal client is
-            // the kernel's own and depends on nothing.
-            let locking = class == super::accel::WIRE_CLASS;
-            (class, Kind::Accel(client), locking)
+            (class, Kind::Accel(client), false)
         }
         _ => {
             k.darwin_unimplemented(format!("newUserClient of {} (type {ty:#x})", name(t, service)));
@@ -1165,10 +1160,10 @@ mod tests {
             up.push(p);
         }
         let classes: Vec<&str> = up.iter().map(|&i| class(&t, i).unwrap()).collect();
-        assert_eq!(classes, ["WebMetalAccelerator", "AppleARMIODevice", "AppleT8011IO", "IOPlatformDevice", "AppleARMPE", "IOPlatformExpertDevice", "IORegistryEntry"]);
+        assert_eq!(classes, ["AGXAcceleratorG9G_A0", "AppleARMIODevice", "AppleT8011IO", "IOPlatformDevice", "AppleARMPE", "IOPlatformExpertDevice", "IORegistryEntry"]);
         assert_eq!((up[1], up[3], up[5], up[6]), (sgx, arm_io, 0, root));
         assert_eq!(name(&t, up[2]), "AppleT8011IO");
-        assert_eq!(superclasses("WebMetalAccelerator")[1..], ["IOGPU", "IOAcceleratorES", "IOService", "IORegistryEntry"]);
+        assert_eq!(superclasses("AGXAcceleratorG9G_A0")[5..], ["IOGPU", "IOAcceleratorES", "IOService", "IORegistryEntry"]);
         assert_eq!(conforms(&t, up[4], "IODTPlatformExpert"), Ok(true));
         assert_eq!(conforms(&t, up[2], "AppleARMIO"), Ok(true));
         assert_eq!(links(&t, sgx, Plane::Service, true), Ok(vec![up[2]]));

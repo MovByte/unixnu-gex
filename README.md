@@ -136,12 +136,22 @@ subsystem, most naming in their header the XNU source they port:
 - **IOKit.** The registry's `IODeviceTree` plane, built from the device's
   own device tree, with the APFS volumes its file system table names
   published as services, reached through IOKit's MIG routines (`iokit.rs`).
-  The GPU's accelerator (`accel/`) sits on its providers in the
-  `IOService` plane as the device's kernelcache matches and publishes them
-  over its device tree (`platform.rs`):
-  - the platform expert `AppleARMPE` on the `IOPlatformExpertDevice`;
-  - the `IOPlatformDevice` nub of arm-io and its driver `AppleT8011IO`;
-  - the `AppleARMIODevice` nub of arm-io's sgx.
+  Each open of a service makes its own user client. The GPU's accelerator
+  presents as the device's, AGXG9G's `AGXAcceleratorG9G_A0` (`accel/`).
+  - Its classes and its user clients' are the device's. The device client
+    (type 1) is `AGXDeviceUserClient`, with IOGPUFamily's methods; the
+    memory information client is type 33. The WebMetal connection (type 0)
+    presents as a device client and carries WebMetal's wire protocol.
+  - Its properties are its personality's and matching's, but
+    `MetalPluginName` and `MetalPluginClassName` name the WebMetal
+    bundle.
+  - It sits on its providers in the `IOService` plane, as the device's
+    kernelcache matches and publishes them over its device tree
+    (`platform.rs`): the platform expert `AppleARMPE` on the
+    `IOPlatformExpertDevice`, the `IOPlatformDevice` nub of arm-io, its
+    driver `AppleT8011IO`, and the `AppleARMIODevice` nub of arm-io's sgx.
+  - The shipped Sandbox profiles decide by those classes and by that
+    ancestry.
 - **sysctl.** The kernel's own nodes, read from the device's kernelcache
   (`sysctl_nodes.rs`), and the values this kernel has for them
   (`sysctl.rs`).
@@ -465,7 +475,8 @@ is the reference (search `crates/gex-kernel/src/` for
   - device tree entries no driver here made a nub of, as `IOService`
     entries;
   - properties those drivers set in their start or probe;
-  - IOGPU selectors and traps that make IOGPU objects;
+  - IOGPU selectors and traps that make IOGPU objects, and AGXG9G's own
+    selectors;
   - WebMetal requests, which have no host executor yet;
   - matching dictionaries of kinds not handled.
 - **Mach.** The traps `clock_sleep` and `debug_control_port_for_pid`; MIG
