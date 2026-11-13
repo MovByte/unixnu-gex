@@ -50,6 +50,10 @@ cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/accel" "$HERE/src/acc
 cc -O2 -framework IOKit -framework IOSurface -framework CoreFoundation -o "$OUT/iosurface" "$HERE/src/iosurface.c"
 cc -O2 -framework IOSurface -framework CoreFoundation -o "$OUT/iosurfacex" "$HERE/src/iosurfacex.c"
 cc -O2 -framework IOKit -framework IOSurface -framework CoreFoundation -o "$OUT/iogpudev" "$HERE/src/iogpudev.c"
+# iosurfacesplash and iosurfacexpreboard: iosurface as splashboardd and
+# iosurfacex as PreBoard, outside the container.
+cc -O2 -framework IOKit -framework IOSurface -framework CoreFoundation -o "$OUT/iosurfacesplash" "$HERE/src/iosurface.c"
+cc -O2 -framework IOSurface -framework CoreFoundation -o "$OUT/iosurfacexpreboard" "$HERE/src/iosurfacex.c"
 cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/sbxiokit" "$HERE/src/sbxiokit.c"
 # sbxscrub: sbxfile's directory times, in a task that may run any cdhash.
 cc -O2 -o "$OUT/sbxscrub" "$HERE/src/sbxfile.c"
@@ -73,7 +77,7 @@ xcrun -sdk iphoneos clang -target arm64e-apple-ios17.0 -O2 -o "$OUT/hello-arm64e
 # exec copies of themselves and files they write there. The static programs
 # run from this directory and exec nothing. sbxexec's entitlements and
 # sbxkill's children's are what those tests are about, so they hold only
-# theirs.
+# theirs, and those signed as a system program hold only its.
 for f in "$OUT"/*; do
     [ -f "$f" ] || continue
     case "$(basename "$f")" in
@@ -96,6 +100,14 @@ codesign -s - -f -i com.apple.test.xnu.jitbox --entitlements "$HERE/src/jit.enti
 # workinterval creates work intervals, which PRIV_WORK_INTERVAL grants by
 # its entitlement.
 codesign -s - -f --entitlements "$HERE/src/workinterval.entitlements" "$OUT/workinterval" 2>/dev/null
+# The IOSurface programs outside the container are signed as system
+# programs whose iokit-user-client-class entitlement names
+# IOSurfaceRootUserClient are, with their identifiers and entitlements:
+# /usr/libexec/splashboardd's, and for iosurfacex, which spawns a copy of
+# itself from /private/var, /Applications/PreBoard.app's, which hold
+# no-sandbox.
+codesign -s - -f -i com.apple.splashboardd --entitlements "$HERE/src/splashboardd.entitlements" "$OUT/iosurfacesplash" 2>/dev/null
+codesign -s - -f -i com.apple.PreBoard --entitlements "$HERE/src/preboard.entitlements" "$OUT/iosurfacexpreboard" 2>/dev/null
 # accelr's IOGPU device client is restricted by its entitlement.
 codesign -s - -f --entitlements "$HERE/src/gpurestricted.entitlements" "$OUT/accelr" 2>/dev/null
 # atmflag sets the ATM diagnostic flag, which its entitlement allows.
