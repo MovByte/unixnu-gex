@@ -13,15 +13,26 @@
 // - the asynchronous method and notification port calls;
 // - memory mapping, traps and closing;
 // - the client going with its connection's last send right.
+//
+// It reads the registry unsandboxed, as an app may not, then runs as an app
+// does, in the container profile's sandbox. The platform profile admits a
+// GPU user client to no unsandboxed program but those it names by signing
+// identifier. The container profile admits one whose provider is an IOGPU
+// (iokit-connection) but lets an app read few properties of the GPU's
+// entries. The clients' own properties are read as RunningBoard reads
+// them, in runningboardd's sandbox.
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #include <mach/mach.h>
 #include <mach/mig.h>
 #include <mach/mig_errors.h>
+#include <spawn.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 // IOConnectTrap's own call (libsystem_kernel's mach trap), which the iOS
@@ -35,6 +46,10 @@ static kern_return_t trap0(io_connect_t conn, unsigned int index) {
 static void port_free(mach_port_t port) {
     mach_port_mod_refs(mach_task_self(), port, MACH_PORT_RIGHT_RECEIVE, -1);
 }
+
+#define SANDBOX_NAMED_BUILTIN 2
+
+int sandbox_init(const char *profile, uint64_t flags, char **errorbuf);
 
 static int bad(const char *what, long got, long want) {
     printf("accel: %s: %#lx, want %#lx\n", what, got, want);
@@ -166,20 +181,61 @@ static kern_return_t method_small_ool(mach_port_t conn) {
     return m.error.RetCode;
 }
 
-static int wire_client(io_service_t accel, uint64_t accel_id) {
+// The clients' classes and properties: each type's class and superclasses,
+// its registry entry id, IOUserClientCreator, no IOUserClientDefaultLocking
+// (AGXG9G and IOGPUFamily depend on IOSurface), and the device client's API
+// property once selector 6 sets it. An app's sandbox lets it read none of
+// these, and the platform profile lets an unsandboxed program open none of
+// the clients, so this runs as RunningBoard does, in runningboardd's
+// sandbox, in a copy of this program started with "clients".
+static int client_registry(io_service_t accel, uint64_t accel_id) {
+    static const struct { uint32_t type; const char *cls; } want[] = {
+        {0, "AGXDeviceUserClient"}, {1, "AGXDeviceUserClient"}, {33, "IOGPUMemoryInfoUserClient"},
+    };
+    char creator[64];
+    snprintf(creator, sizeof creator, "pid %d, %.16s", getpid(), getprogname());
+    for (int i = 0; i < 3; i++) {
+        io_connect_t conn = IO_OBJECT_NULL;
+        kern_return_t kr = IOServiceOpen(accel, mach_task_self(), want[i].type, &conn);
+        if (kr != KERN_SUCCESS || conn == IO_OBJECT_NULL) return bad("opening a client", kr, 0);
+        io_name_t cls = "";
+        if (IOObjectGetClass(conn, cls) != KERN_SUCCESS || strcmp(cls, want[i].cls) != 0) {
+            printf("accel: type %u's class: %s, want %s\n", want[i].type, cls, want[i].cls);
+            return 1;
+        }
+        if (!IOObjectConformsTo(conn, "IOUserClient") || IOObjectConformsTo(conn, "IOGPU")) return bad("a client's superclasses", want[i].type, 0);
+        if (want[i].type != 33 && !IOObjectConformsTo(conn, "IOGPUDeviceUserClient")) return bad("a device client's superclasses", want[i].type, 0);
+        uint64_t id = 0;
+        if (IORegistryEntryGetRegistryEntryID(conn, &id) != KERN_SUCCESS || id <= accel_id) return bad("a client's registry entry id", (long)id, (long)accel_id);
+        if (string_prop(conn, "IOUserClientCreator", creator)) return 1;
+        if (IORegistryEntryCreateCFProperty(conn, CFSTR("IOUserClientDefaultLocking"), kCFAllocatorDefault, 0) != NULL) return bad("IOUserClientDefaultLocking", want[i].type, 0);
+        if (want[i].type == 1) {
+            char api[16] = "Metal";
+            kr = IOConnectCallStructMethod(conn, 6, api, sizeof api, NULL, NULL);
+            if (kr != 1) return bad("setting the API", kr, 1);
+            if (string_prop(conn, "API", "Metal")) return 1;
+        }
+        IOServiceClose(conn);
+    }
+    return 0;
+}
+
+static int clients(char *self, uint64_t accel_id) {
+    char id[32];
+    snprintf(id, sizeof id, "%llu", (unsigned long long)accel_id);
+    char *args[] = {self, "clients", id, NULL};
+    pid_t pid = 0;
+    fflush(stdout);
+    if (posix_spawn(&pid, self, NULL, NULL, args, NULL) != 0) return bad("starting the clients' check", 0, 1);
+    int st = 0;
+    if (waitpid(pid, &st, 0) != pid || !WIFEXITED(st) || WEXITSTATUS(st) != 0) return bad("the clients' check", st, 0);
+    return 0;
+}
+
+static int wire_client(io_service_t accel) {
     io_connect_t conn = IO_OBJECT_NULL;
     kern_return_t kr = IOServiceOpen(accel, mach_task_self(), 0, &conn);
     if (kr != KERN_SUCCESS || conn == IO_OBJECT_NULL) return bad("opening type 0", kr, 0);
-    io_name_t cls;
-    if (IOObjectGetClass(conn, cls) != KERN_SUCCESS || strcmp(cls, "AGXDeviceUserClient") != 0) return bad("the WebMetal client's class", 0, 1);
-    if (!IOObjectConformsTo(conn, "IOGPUDeviceUserClient") || !IOObjectConformsTo(conn, "IOUserClient") || IOObjectConformsTo(conn, "IOGPU")) return bad("the WebMetal client's superclasses", 0, 1);
-    uint64_t id = 0;
-    if (IORegistryEntryGetRegistryEntryID(conn, &id) != KERN_SUCCESS || id <= accel_id) return bad("the client's registry entry id", (long)id, (long)accel_id);
-    char creator[64];
-    snprintf(creator, sizeof creator, "pid %d, %.16s", getpid(), getprogname());
-    if (string_prop(conn, "IOUserClientCreator", creator)) return 1;
-    // AGXG9G depends on IOSurface: no default locking property.
-    if (IORegistryEntryCreateCFProperty(conn, CFSTR("IOUserClientDefaultLocking"), kCFAllocatorDefault, 0) != NULL) return bad("IOUserClientDefaultLocking", 1, 0);
 
     // The checks of each selector's counts, and a selector it has none of.
     uint64_t in[4] = {0, 0, 0, 0}, out[2] = {0, 0};
@@ -246,10 +302,6 @@ static int memory_info_client(io_service_t accel) {
     io_connect_t conn = IO_OBJECT_NULL;
     kern_return_t kr = IOServiceOpen(accel, mach_task_self(), 33, &conn);
     if (kr != KERN_SUCCESS) return bad("opening type 33", kr, 0);
-    io_name_t cls;
-    if (IOObjectGetClass(conn, cls) != KERN_SUCCESS || strcmp(cls, "IOGPUMemoryInfoUserClient") != 0) return bad("the memory information client's class", 0, 1);
-    // IOGPUFamily depends on IOSurface: no default locking property.
-    if (IORegistryEntryCreateCFProperty(conn, CFSTR("IOUserClientDefaultLocking"), kCFAllocatorDefault, 0) != NULL) return bad("IOUserClientDefaultLocking", 1, 0);
     uint64_t out = 0;
     uint32_t nout = 1;
     kr = IOConnectCallScalarMethod(conn, 3, NULL, 0, &out, &nout);
@@ -271,9 +323,6 @@ static int device_client(io_service_t accel) {
     io_connect_t conn = IO_OBJECT_NULL;
     kern_return_t kr = IOServiceOpen(accel, mach_task_self(), 1, &conn);
     if (kr != KERN_SUCCESS) return bad("opening type 1", kr, 0);
-    io_name_t cls;
-    if (IOObjectGetClass(conn, cls) != KERN_SUCCESS || strcmp(cls, "AGXDeviceUserClient") != 0 || !IOObjectConformsTo(conn, "IOGPUDeviceUserClient")) return bad("the device client's class", 0, 1);
-    if (IORegistryEntryCreateCFProperty(conn, CFSTR("IOUserClientDefaultLocking"), kCFAllocatorDefault, 0) != NULL) return bad("IOUserClientDefaultLocking", 1, 0);
 
     uint64_t in[4] = {0}, out[2] = {0};
     uint32_t nout = 0;
@@ -312,7 +361,6 @@ static int device_client(io_service_t accel) {
     char api[16] = "Metal";
     kr = IOConnectCallStructMethod(conn, 6, api, sizeof api, NULL, NULL);
     if (kr != 1) return bad("setting the API", kr, 1);
-    if (string_prop(conn, "API", "Metal")) return 1;
     unsigned char st[536];
     size_t nst = sizeof st;
     kr = IOConnectCallStructMethod(conn, 2, NULL, 0, st, &nst);
@@ -418,6 +466,13 @@ static int restricted_client(io_service_t accel) {
 }
 
 int main(int argc, char **argv) {
+    if (argc > 2 && strcmp(argv[1], "clients") == 0) {
+        char *err = NULL;
+        if (sandbox_init("runningboardd", SANDBOX_NAMED_BUILTIN, &err) != 0) return bad("runningboardd's sandbox", 0, 1);
+        io_service_t gpu = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOGPU"));
+        if (gpu == IO_OBJECT_NULL) return bad("the IOGPU, in runningboardd's sandbox", 0, 1);
+        return client_registry(gpu, strtoull(argv[2], NULL, 10));
+    }
     // Metal.framework's _MTLRegisterDevices: every IOAcceleratorES.
     io_iterator_t it = IO_OBJECT_NULL;
     kern_return_t kr = IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOAcceleratorES"), &it);
@@ -439,9 +494,10 @@ int main(int argc, char **argv) {
     if (gpu == IO_OBJECT_NULL || gpu_id != accel_id) return bad("the IOGPU", (long)gpu_id, (long)accel_id);
     IOObjectRelease(gpu);
 
-    // What Metal.framework reads (WebMetal's bundle), the personality's and
-    // matching's, and what IOGPU::start sets.
-    if (string_prop(accel, "MetalPluginName", "WebMetal") || string_prop(accel, "MetalPluginClassName", "WebMetalDevice") || string_prop(accel, "IOMatchCategory", "IOAcceleratorES") || string_prop(accel, "IOClass", "AGXAcceleratorG9G_A0")) return 1;
+    // The registry as the device's kexts make it, which an app's sandbox
+    // lets it read little of: the personality's and matching's properties,
+    // what IOGPU::start sets, and the providers.
+    if (string_prop(accel, "IOMatchCategory", "IOAcceleratorES") || string_prop(accel, "IOClass", "AGXAcceleratorG9G_A0")) return 1;
     if (string_prop(accel, "IOProviderClass", "AppleARMIODevice") || string_prop(accel, "CFBundleIdentifier", "com.apple.AGXG9G") || string_prop(accel, "IONameMatched", "gpu,t8011") || string_prop(accel, "IOGLESBundleName", "AppleMetalGLRenderer")) return 1;
     CFTypeRef names = IORegistryEntryCreateCFProperty(accel, CFSTR("IONameMatch"), kCFAllocatorDefault, 0);
     if (names == NULL || CFGetTypeID(names) != CFArrayGetTypeID() || CFArrayGetCount(names) != 1) return bad("IONameMatch", 0, 1);
@@ -450,6 +506,13 @@ int main(int argc, char **argv) {
     long long v = 0;
     if (kdebug == NULL || CFGetTypeID(kdebug) != CFNumberGetTypeID() || !CFNumberGetValue(kdebug, kCFNumberLongLongType, &v) || v != 0x100000000ll) return bad("KDebugVersion", v, 0x100000000ll);
     CFRelease(kdebug);
+    if (ancestors(accel) || clients(argv[0], accel_id)) return 1;
+
+    // From here on, as an app does: in the container profile's sandbox.
+    char *err = NULL;
+    if (sandbox_init("container", SANDBOX_NAMED_BUILTIN, &err) != 0) return bad("the container sandbox", 0, 1);
+    // What Metal.framework reads: WebMetal's bundle and its device class.
+    if (string_prop(accel, "MetalPluginName", "WebMetal") || string_prop(accel, "MetalPluginClassName", "WebMetalDevice")) return 1;
 
     // The types it does not make: IOGPU refuses them, and the service has
     // no IOUserClientClass.
@@ -459,11 +522,9 @@ int main(int argc, char **argv) {
     kr = IOServiceOpen(accel, mach_task_self(), 0x10000, &conn);
     if (kr != kIOReturnUnsupported) return bad("opening type 0x10000", kr, kIOReturnUnsupported);
 
-    if (ancestors(accel)) return 1;
-
     if (argc > 1 && strcmp(argv[1], "restricted") == 0) {
         if (restricted_client(accel)) return 1;
-    } else if (wire_client(accel, accel_id) || memory_info_client(accel) || device_client(accel)) {
+    } else if (wire_client(accel) || memory_info_client(accel) || device_client(accel)) {
         return 1;
     }
 
