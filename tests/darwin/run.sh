@@ -23,6 +23,14 @@ mkdir -p "$BOOT"
 # (untrusted is the one left out. bin may be a link to where the build
 # keeps them, which find follows with -H.)
 progs=$(find -H "$HERE/bin" -maxdepth 1 -type f ! -name untrusted | sort)
+# The web device's system volume carries WebMetal's bundle, which
+# Metal.framework loads for the accelerator's MetalPluginName from
+# /System/Library/Extensions; its code is the system's, in the static trust
+# cache with the rest of it.
+WEBMETAL=${GEX_DARWIN_ROOT:+$GEX_DARWIN_ROOT/System/Library/Extensions/WebMetal.bundle/WebMetal}
+if [ -n "$WEBMETAL" ] && [ -f "$WEBMETAL" ]; then
+    progs="$progs $WEBMETAL"
+fi
 if [ -n "${GEX_DARWIN_BOOT:-}" ]; then
     # shellcheck disable=SC2086
     python3 -I "$ROOT/tools/darwin-trust-cache.py" -o "$BOOT/TrustCache" --bundle "$GEX_DARWIN_BOOT/TrustCache" $progs || exit 1
@@ -77,6 +85,40 @@ check_root() {
     cp "$HERE/bin/$name" "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$name"
     out=$("$GEXC" run --sysroot "$GEX_DARWIN_ROOT" "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$name" "$@" 2>/dev/null)
     report "$name" "$out" $? "$want_out" "$want_status"
+}
+
+# check_webmetal NAME WANT_OUT WANT_STATUS: a dynamic program that uses the
+# accelerator's GPU, which a gexc built without WebMetal's executor does
+# not have (`gexc webmetal-info` says so): skipped, or failed when it was
+# asked for by name.
+check_webmetal() {
+    if ! "$GEXC" webmetal-info >/dev/null 2>&1; then
+        if [ "$named" -gt 0 ]; then
+            echo "FAIL $1: this gexc has no WebMetal executor (build it with --features webmetal)"
+            fail=1
+        else
+            echo "SKIP $1 (gexc built without WebMetal's executor)"
+        fi
+        return
+    fi
+    check_root "$@"
+}
+
+# check_metal NAME WANT_OUT WANT_STATUS: a program that uses Metal through
+# the root's Metal.framework, which needs WebMetal's executor in gexc and
+# WebMetal's bundle in the root's system volume: skipped without them, or
+# failed when it was asked for by name.
+check_metal() {
+    if [ -n "${GEX_DARWIN_ROOT:-}" ] && [ ! -f "$WEBMETAL" ]; then
+        if [ "$named" -gt 0 ]; then
+            echo "FAIL $1: the root's system volume has no WebMetal.bundle in /System/Library/Extensions"
+            fail=1
+        else
+            echo "SKIP $1 (the root has no /System/Library/Extensions/WebMetal.bundle)"
+        fi
+        return
+    fi
+    check_webmetal "$@"
 }
 
 run() {
@@ -203,6 +245,10 @@ hello from /var/tmp/gex-exec-fat with 1 argument" 0
     ioreg) check_root ioreg "ioreg ok" 0 ;;
     accel) check_root accel "accel ok" 0 ;;
     accelr) check_root accelr "accel ok" 0 restricted ;;
+    metalwire) check_webmetal metalwire "metalwire ok" 0 ;;
+    # The digest WebMetal's macOS test shim prints for the same program
+    # (and the Mac's own Metal device: every output is exact).
+    metal) check_metal metal "metal WebMetalDevice 8dd26b24238872f1" 0 ;;
     iosurface) check_root iosurface "iosurface ok" 0 ;;
     iosurfacex) check_root iosurfacex "iosurfacex ok" 0 ;;
     iogpudev) check_root iogpudev "iogpudev ok" 0 ;;
@@ -281,7 +327,7 @@ if [ "$named" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl iokit ioreg accel accelr iosurface iosurfacex iogpudev xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit sbxinit sbxexec sbxkill cfrunloop xpc-anon layout stackfb; do
+    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl iokit ioreg accel accelr metalwire metal iosurface iosurfacex iogpudev xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit sbxinit sbxexec sbxkill cfrunloop xpc-anon layout stackfb; do
         run "$p"
     done
 fi

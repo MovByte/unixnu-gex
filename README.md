@@ -278,7 +278,10 @@ with Xcode and its iOS SDK (`xcrun -sdk iphoneos clang`), plus `codesign`,
 tests/darwin/build.sh
 ```
 
-They are written to `tests/darwin/bin/` (not tracked).
+`metalwire` is C++ over WebMetal's generated wire header (the submodule's),
+and `metal` is Objective-C with a kernel compiled by Xcode's Metal toolchain
+(`xcrun -sdk iphoneos metal`). They are written to `tests/darwin/bin/` (not
+tracked).
 `GEX_DARWIN_TARGET` sets the clang target (default `arm64-apple-ios17.0`).
 The static ones make raw system calls and need neither dyld nor the shared
 cache; they are linked at the linker's default base, after a 4 GiB
@@ -426,6 +429,17 @@ exits 1 when any fails. It builds the programs first when
 runner discards each program's stderr, so run a failing program directly
 under gexc to see its reports.
 
+`metalwire` and `metal` use the GPU, so they need a gexc built with
+`webmetal` and are skipped without one (or fail, when named). `metal` goes
+through the root's own Metal.framework, which loads the bundle the
+accelerator's `MetalPluginName` names from `/System/Library/Extensions`:
+the web device's system volume carries `WebMetal.bundle` there, and the
+test is skipped for a root that has none. When the root has it, its
+executable's cdhash goes into the run's static trust cache with the
+programs', as the system's own code is in the device's. The line `metal`
+prints ends with a digest of every output, the one the same program prints
+on WebMetal's macOS test shim over the same WebGPU implementation.
+
 The kernel's and loader's unit tests run with `cargo test -p gex-kernel`
 and `cargo test -p gex-ld`.
 
@@ -477,6 +491,7 @@ dyld and libSystem from the device's shared cache.
 | terminals and `/dev` | `pty`, `ptyjob`, `ptyclose`, `bsdpty`, `ttyinfo`, `ttydead`, `ttydrain`, `fcntltty`, `revoke`, `devfs`, `devattr` |
 | sockets | `sockerr`, `sockevent`, `sockname`, `sockopts`, `halfclose`, `nosigpipe`, `dgrambuf`, `streambuf` |
 | code signing and IOKit | `codesig`, `amfi`, `policy`, `iokit`, `ioreg`, `iosurface`, `iosurfacex`, `iogpudev`, `accel`, `accelr` |
+| the GPU (WebMetal) | `metalwire`, `metal` |
 
 The suite runs single programs and the processes they create. None of it
 boots launchd or runs an app.
