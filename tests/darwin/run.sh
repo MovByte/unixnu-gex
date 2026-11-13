@@ -21,14 +21,16 @@ GEXC=${GEXC:-$ROOT/target/release/gexc}
 BOOT=$HERE/bin/boot
 mkdir -p "$BOOT"
 # (untrusted is the one left out. bin may be a link to where the build
-# keeps them, which find follows with -H.)
+# keeps them, which find follows with -H.) launchcon's entry has launch
+# constraint category 5.
 progs=$(find -H "$HERE/bin" -maxdepth 1 -type f ! -name untrusted | sort)
+cats="--category 5:$HERE/bin/launchcon"
 if [ -n "${GEX_DARWIN_BOOT:-}" ]; then
     # shellcheck disable=SC2086
-    python3 -I "$ROOT/tools/darwin-trust-cache.py" -o "$BOOT/TrustCache" --bundle "$GEX_DARWIN_BOOT/TrustCache" $progs || exit 1
+    python3 -I "$ROOT/tools/darwin-trust-cache.py" -o "$BOOT/TrustCache" --bundle "$GEX_DARWIN_BOOT/TrustCache" $cats $progs || exit 1
 else
     # shellcheck disable=SC2086
-    python3 -I "$ROOT/tools/darwin-trust-cache.py" -o "$BOOT/TrustCache" $progs || exit 1
+    python3 -I "$ROOT/tools/darwin-trust-cache.py" -o "$BOOT/TrustCache" $cats $progs || exit 1
 fi
 if [ -n "${GEX_DARWIN_BOOT:-}" ] && [ -f "$GEX_DARWIN_BOOT/DeviceTree" ]; then
     cp "$GEX_DARWIN_BOOT/DeviceTree" "$BOOT/"
@@ -41,6 +43,7 @@ done
 export GEX_DARWIN_BOOT="$BOOT"
 
 fail=0
+as=
 named=$#
 
 report() {
@@ -75,8 +78,18 @@ check_root() {
     fi
     mkdir -p "$GEX_DARWIN_ROOT/var/tmp"
     cp "$HERE/bin/$name" "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$name"
-    out=$("$GEXC" run --sysroot "$GEX_DARWIN_ROOT" "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$name" "$@" 2>/dev/null)
+    # shellcheck disable=SC2086
+    out=$("$GEXC" run --sysroot "$GEX_DARWIN_ROOT" ${as:+--uid "$as"} "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$name" "$@" 2>/dev/null)
     report "$name" "$out" $? "$want_out" "$want_status"
+}
+
+# check_root_as UID:GID NAME WANT_OUT WANT_STATUS [ARGS...]: check_root, the
+# program run as that user and group.
+check_root_as() {
+    as=$1
+    shift
+    check_root "$@"
+    as=
 }
 
 run() {
@@ -203,8 +216,11 @@ hello from /var/tmp/gex-exec-fat with 1 argument" 0
     ioreg) check_root ioreg "ioreg ok" 0 ;;
     accel) check_root accel "accel ok" 0 ;;
     accelr) check_root accelr "accel ok" 0 restricted ;;
-    iosurface) check_root iosurface "iosurface ok" 0 ;;
-    iosurfacex) check_root iosurfacex "iosurfacex ok" 0 ;;
+    iosurface) check_root iosurface "iosurface ok" 0 container ;;
+    iosurfacex) check_root iosurfacex "iosurfacex ok" 0 container ;;
+    # splashboardd and PreBoard run as mobile.
+    iosurfacesplash) check_root_as 501:501 iosurfacesplash "iosurface ok" 0 ;;
+    iosurfacexpreboard) check_root_as 501:501 iosurfacexpreboard "iosurfacex ok" 0 ;;
     iogpudev) check_root iogpudev "iogpudev ok" 0 ;;
     xattr) check_root xattr "xattr ok" 0 ;;
     fileport) check_root fileport "fileport ok" 0 ;;
@@ -256,6 +272,15 @@ hello from /var/tmp/gex-exec-fat with 1 argument" 0
         ;;
     sbxinit) check_root sbxinit "sbxinit ok" 0 ;;
     sbxexec) check_root sbxexec "sbxexec ok" 0 ;;
+    launchcon)
+        if [ -n "${GEX_DARWIN_ROOT:-}" ]; then
+            mkdir -p "$GEX_DARWIN_ROOT/var/tmp"
+            for c in lcself lcparent lcresp lcfact lcok; do
+                cp "$HERE/bin/$c" "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$c"
+            done
+        fi
+        check_root launchcon "launchcon ok" 0
+        ;;
     sbxkill)
         if [ -n "${GEX_DARWIN_ROOT:-}" ]; then
             mkdir -p "$GEX_DARWIN_ROOT/var/tmp"
@@ -265,6 +290,13 @@ hello from /var/tmp/gex-exec-fat with 1 argument" 0
         fi
         check_root sbxkill "sbxkill ok" 0
         ;;
+    hostspecial) check_root_as 0:0 hostspecial "hostspecial ok" 0 ;;
+    sbxmask) check_root sbxmask "sbxmask ok" 0 ;;
+    sbxnet) check_root sbxnet "sbxnet ok" 0 ;;
+    sbxiokit) check_root sbxiokit "sbxiokit ok" 0 ;;
+    sbxpriv) check_root_as 0:0 sbxpriv "sbxpriv ok" 0 ;;
+    sbxfile) check_root sbxfile "sbxfile ok" 0 ;;
+    sbxscrub) check_root sbxscrub "sbxscrub ok" 0 ;;
     cfrunloop) check_root cfrunloop "cfrunloop 3 1" 0 ;;
     xpc-anon) check_root xpc-anon "xpc-anon 42" 0 ;;
     layout) check_root layout "layout ok" 0 ;;
@@ -281,7 +313,7 @@ if [ "$named" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl iokit ioreg accel accelr iosurface iosurfacex iogpudev xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit sbxinit sbxexec sbxkill cfrunloop xpc-anon layout stackfb; do
+    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl iokit ioreg accel accelr iosurface iosurfacex iosurfacesplash iosurfacexpreboard iogpudev xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit sbxinit sbxexec sbxkill hostspecial sbxmask sbxnet sbxiokit sbxpriv sbxfile sbxscrub cfrunloop xpc-anon layout stackfb launchcon; do
         run "$p"
     done
 fi

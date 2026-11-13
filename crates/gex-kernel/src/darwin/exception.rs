@@ -326,6 +326,11 @@ impl Kernel {
             check(self.ipc(), level, mask, new, behavior, flavor, s)?;
             return Err(KERN_FAILURE);
         }
+        // host_set_exception_ports and _swap_: the MAC policies' check of
+        // each exception type, once the arguments are accepted.
+        if level == Level::Host && check(self.ipc(), level, mask, new, behavior, flavor, s) == Ok(true) && self.darwin_mac_check_set_host_exception_ports(mask) != 0 {
+            return Err(KERN_NO_ACCESS);
+        }
         let mut actions = self.exc_actions_take(level, tid);
         let r = set_port(self.ipc(), &mut actions, level, mask, new, behavior, flavor, s, swap);
         self.exc_actions_put(level, tid, actions);

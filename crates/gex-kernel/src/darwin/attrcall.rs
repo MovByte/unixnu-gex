@@ -611,12 +611,12 @@ impl Kernel {
 
     /// `setattrlist(path, alist, attributeBuffer, bufferSize, options)`.
     pub(crate) fn darwin_setattrlist(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
-        self.darwin_setattrlist_at(m, dirfd(super::bsd::AT_FDCWD as u64) as i32, a[0], a[1], a[2], a[3], a[4])
+        self.darwin_setattrlist_at(m, (dirfd(super::bsd::AT_FDCWD as u64) as i32, super::bsd::AT_FDCWD as u64), a[0], a[1], a[2], a[3], a[4])
     }
 
     /// `setattrlistat(fd, path, alist, attributeBuffer, bufferSize, options)`.
     pub(crate) fn darwin_setattrlistat(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
-        self.darwin_setattrlist_at(m, dirfd(a[0]) as i32, a[1], a[2], a[3], a[4], a[5])
+        self.darwin_setattrlist_at(m, (dirfd(a[0]) as i32, a[0]), a[1], a[2], a[3], a[4], a[5])
     }
 
     /// `fsetattrlist(fd, alist, attributeBuffer, bufferSize, options)`.
@@ -625,15 +625,16 @@ impl Kernel {
         if self.darwin_vnode_of(&file).is_none() {
             return Err(Errno::EINVAL);
         }
-        self.darwin_setattrlist_at(m, a[0] as i32, 0, a[1], a[2], a[3], a[4])
+        self.darwin_setattrlist_at(m, (a[0] as i32, a[0]), 0, a[1], a[2], a[3], a[4])
     }
 
     /// `setattrlist_internal`. A `path` of zero means the open descriptor
     /// `dir`.
     #[allow(clippy::too_many_arguments)]
-    fn darwin_setattrlist_at(&mut self, m: &mut GuestMem<'_>, dir: i32, path: u64, alist: u64, buf: u64, size: u64, options: u64) -> Result<u64, Errno> {
+    fn darwin_setattrlist_at(&mut self, m: &mut GuestMem<'_>, (dir, darwin_dir): (i32, u64), path: u64, alist: u64, buf: u64, size: u64, options: u64) -> Result<u64, Errno> {
         let follow = options & (fsopt::NOFOLLOW | fsopt::NOFOLLOW_ANY) == 0;
         // The vnode first, as namei finds it before the attributes are read.
+        let found = if path == 0 { self.darwin_sb_fd_vnode(dir) } else { self.darwin_sb_namei(m, darwin_dir, path, follow, options & fsopt::NOFOLLOW_ANY != 0)?.found() };
         let target = if path == 0 {
             None
         } else {
@@ -661,6 +662,13 @@ impl Kernel {
             return Err(Errno::ENOMEM);
         }
         let bytes = m.read(buf, size as usize)?.to_vec();
+        // Sandbox's check of the list, before it is unpacked.
+        if let Some(f) = &found {
+            let e = self.darwin_mac_check_vnode_setattrlist(super::macvfs::sb_vnode(&f.path, &f.md), alist.bitmapcount, [set.common, set.vol, set.dir, set.file, set.fork]);
+            if e != 0 {
+                return Err(super::errno::errno_of(e as i32));
+            }
+        }
         let attrs = unpack_setattrs(&alist, &bytes)?;
         if let Some(what) = attrs.missing.first() {
             self.darwin_unimplemented(format!("setattrlist of {what} (the filesystems here do not keep it)"));
@@ -697,19 +705,58 @@ impl Kernel {
 
     /// `getattrlist(path, alist, attributeBuffer, bufferSize, options)`.
     pub(crate) fn darwin_getattrlist(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
-        self.attrlist_path(m, -100, a[0], a[1], a[2], a[3], a[4])
+        self.attrlist_path(m, (-100, super::bsd::AT_FDCWD as u64), a[0], a[1], a[2], a[3], a[4])
     }
 
     /// `getattrlistat(fd, path, alist, attributeBuffer, bufferSize, options)`.
     pub(crate) fn darwin_getattrlistat(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
-        self.attrlist_path(m, dirfd(a[0]) as i32 as i64, a[1], a[2], a[3], a[4], a[5])
+        self.attrlist_path(m, (dirfd(a[0]) as i32 as i64, a[0]), a[1], a[2], a[3], a[4], a[5])
+    }
+
+    /// `getattrlist_internal`'s MAC checks of vnode `f`, once the size and
+    /// the list's count are good: the getattrlist check; for a volume's
+    /// attributes, the getattr check of its root's when the common ones
+    /// need it (made once the list is known good, before it is answered:
+    /// what is returned); for a file's, the getattr check of its
+    /// attributes (a descriptor's, `file_cred` given, is let through),
+    /// whether it takes the times out of them.
+    fn darwin_attrlist_mac(&mut self, f: Option<&super::macvfs::Found>, alist: &AttrList, size: u64, by_fd: bool) -> Result<(bool, Option<super::mac::SbVnode>), Errno> {
+        let mac = |e: u32| if e == 0 { Ok(()) } else { Err(super::errno::errno_of(e as i32)) };
+        let Some(f) = f.filter(|_| size >= 4 && alist.bitmapcount == al::BIT_MAP_COUNT) else { return Ok((false, None)) };
+        let v = super::macvfs::sb_vnode(&f.path, &f.md);
+        mac(self.darwin_mac_check_vnode_getattrlist(v.clone()))?;
+        if alist.set.vol != 0 {
+            if alist.set.common & (al::cmn::OWNERID | al::cmn::GRPID | al::cmn::ACCESSMASK | al::cmn::FLAGS | al::cmn::SCRIPT) == 0 {
+                return Ok((false, None));
+            }
+            let on = mount_of(&f.path).on;
+            let md = self.vfs.metadata(on)?;
+            return Ok((false, Some(super::macvfs::sb_vnode(on, &md))));
+        }
+        if by_fd {
+            return Ok((false, None));
+        }
+        let (e, scrub) = self.darwin_mac_check_vnode_getattr(v);
+        mac(e)?;
+        Ok((scrub, None))
+    }
+
+    /// A volume's root's getattr check ([`Kernel::darwin_attrlist_mac`]).
+    fn darwin_attrlist_root(&mut self, root: Option<super::mac::SbVnode>) -> Result<(), Errno> {
+        let Some(v) = root else { return Ok(()) };
+        match self.darwin_mac_check_vnode_getattr(v).0 {
+            0 => Ok(()),
+            e => Err(super::errno::errno_of(e as i32)),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn attrlist_path(&mut self, m: &mut GuestMem<'_>, dir: i64, path: u64, alist: u64, buf: u64, size: u64, options: u64) -> Result<u64, Errno> {
+    fn attrlist_path(&mut self, m: &mut GuestMem<'_>, (dir, darwin_dir): (i64, u64), path: u64, alist: u64, buf: u64, size: u64, options: u64) -> Result<u64, Errno> {
         // The attribute list is read before the path is looked up.
         let alist = read_alist(m, alist)?;
-        let (result, missing) = {
+        let nofollow = options & (fsopt::NOFOLLOW | fsopt::NOFOLLOW_ANY) != 0;
+        let found = self.darwin_sb_namei(m, darwin_dir, path, !nofollow, options & fsopt::NOFOLLOW_ANY != 0)?.found();
+        let (md, resolved) = {
             let pio = self.path_io();
             let raw = m.read_cstr(path, 4096)?;
             if self.trace {
@@ -724,7 +771,6 @@ impl Kernel {
                 let base = if given.starts_with('/') { "/".to_string() } else { pio.at_path_str(dir as i32, ".")? };
                 no_link_on_the_way(&pio, &base, given, false)?;
             }
-            let nofollow = options & (fsopt::NOFOLLOW | fsopt::NOFOLLOW_ANY) != 0;
             let md = if nofollow { pio.ns.metadata_nofollow(&abs)? } else { pio.ns.metadata(&abs)? };
             let resolved = if nofollow {
                 let parent = crate::vfs::parent_of(&abs);
@@ -737,19 +783,26 @@ impl Kernel {
             } else {
                 pio.ns.canonical(&abs)
             };
-            self.attrlist_vnode(&pio, &resolved, &md, None, &alist, size as usize, options)
+            (md, resolved)
+        };
+        let (scrub, root) = self.darwin_attrlist_mac(found.as_ref(), &alist, size, false)?;
+        let (result, missing) = {
+            let pio = self.path_io();
+            self.attrlist_vnode(&pio, &resolved, &md, None, &alist, size as usize, options, scrub)
         };
         for what in missing {
             self.darwin_unimplemented(what);
         }
-        deliver(m, buf, &result?)?;
+        let result = result?;
+        self.darwin_attrlist_root(root)?;
+        deliver(m, buf, &result)?;
         Ok(0)
     }
 
     /// `fgetattrlist(fd, alist, attributeBuffer, bufferSize, options)`.
     pub(crate) fn darwin_fgetattrlist(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
         let fd = a[0] as i32;
-        let (result, missing) = {
+        let (alist, md, path) = {
             let pio = self.path_io();
             let f = pio.map.fds.get(fd)?;
             // A descriptor that is not a vnode (a pipe, a socket, a kqueue)
@@ -760,18 +813,27 @@ impl Kernel {
             let alist = read_alist(m, a[1])?;
             let md = f.metadata()?;
             let path = f.dir_path()?.unwrap_or_else(|| f.path.clone());
-            self.attrlist_vnode(&pio, &path, &md, None, &alist, a[3] as usize, a[4])
+            (alist, md, path)
+        };
+        let found = self.darwin_sb_fd_vnode(fd);
+        let (_, root) = self.darwin_attrlist_mac(found.as_ref(), &alist, a[3], true)?;
+        let (result, missing) = {
+            let pio = self.path_io();
+            self.attrlist_vnode(&pio, &path, &md, None, &alist, a[3] as usize, a[4], false)
         };
         for what in missing {
             self.darwin_unimplemented(what);
         }
-        deliver(m, a[2], &result?)?;
+        let result = result?;
+        self.darwin_attrlist_root(root)?;
+        deliver(m, a[2], &result)?;
         Ok(0)
     }
 
-    /// `getattrlist_internal` and the volume form it hands over to.
+    /// `getattrlist_internal` and the volume form it hands over to; a
+    /// file's times taken out with `scrub` (Sandbox's getattr check).
     #[allow(clippy::too_many_arguments)]
-    fn attrlist_vnode(&self, pio: &PathIo<'_>, path: &str, md: &Metadata, name: Option<&str>, alist: &AttrList, size: usize, options: u64) -> (Result<Reply, Errno>, Vec<String>) {
+    fn attrlist_vnode(&self, pio: &PathIo<'_>, path: &str, md: &Metadata, name: Option<&str>, alist: &AttrList, size: usize, options: u64, scrub: bool) -> (Result<Reply, Errno>, Vec<String>) {
         let use_fork = options & fsopt::ATTR_CMN_EXTENDED != 0;
         let mut missing = Vec::new();
         if alist.bitmapcount == al::BIT_MAP_COUNT && size >= 4 && alist.set.vol != 0 {
@@ -791,6 +853,9 @@ impl Kernel {
         }
         let want_children = alist.set.dir & dir::ENTRYCOUNT != 0;
         let r = vnode(pio, path, md, name, want_children).and_then(|mut vn| {
+            if scrub {
+                (vn.crtime, vn.acctime, vn.modtime, vn.chgtime, vn.bkuptime, vn.addedtime) = ((0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0));
+            }
             if vn.tag == VT_DEVFS {
                 vn.user_access = self.darwin_dac_perms(vn.uid, vn.gid, vn.mode, vn.vtype == al::vtype::VDIR);
             } else {
@@ -865,7 +930,7 @@ impl Kernel {
                     continue;
                 };
                 let isdir = cmd.file_type == FileType::Directory;
-                let (r, missing) = self.attrlist_vnode(&pio, &child, &cmd, Some(&ent.name), &alist, kern_size, options | fsopt::REPORT_FULLSIZE);
+                let (r, missing) = self.attrlist_vnode(&pio, &child, &cmd, Some(&ent.name), &alist, kern_size, options | fsopt::REPORT_FULLSIZE, false);
                 notes.extend(missing);
                 let mut entry: Vec<u8> = match r {
                     Ok(r) => r.bytes[..r.copy].to_vec(),

@@ -282,10 +282,11 @@ impl Kernel {
         if !file.readable || file.handle.metadata().map_err(|_| Kr::Failure)?.file_type != crate::vfs::FileType::Regular {
             return Err(Kr::Failure);
         }
-        // cs_system_enforcement(): every region inside the one signature
-        // that covers its start.
+        // Each region: mac_file_check_mmap of its protections, then
+        // cs_system_enforcement(): inside the one signature that covers
+        // its start.
         for r in &regions {
-            if !super::codesign::range_codesigned(vnode, r.file_offset, r.size) {
+            if self.darwin_sb_mmap(&file, u64::from(r.prot & 7)).is_err() || !super::codesign::range_codesigned(vnode, r.file_offset, r.size) {
                 return Err(Kr::Failure);
             }
         }

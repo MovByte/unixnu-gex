@@ -9,9 +9,11 @@ IPSW's IM4P-wrapped `.trustcache`, a raw module, or another bundle's first
 module), with the cdhashes of the given Mach-O files added (each slice's
 best CodeDirectory), as an owner adds their own code to it. The entries
 are version 2 (cdhash, hash type, flags, constraint category), sorted by
-cdhash; added code has flags 0 and no constraint category.
+cdhash; added code has flags 0 and launch constraint category 0, or the
+category a --category CAT:MACHO names for that file.
 
-usage: darwin-trust-cache.py -o BUNDLE [--static FILE | --bundle FILE] [MACHO...]
+usage: darwin-trust-cache.py -o BUNDLE [--static FILE | --bundle FILE]
+                             [--category CAT:MACHO]... [MACHO...]
 """
 import argparse
 import hashlib
@@ -115,6 +117,7 @@ def main():
     ap.add_argument('-o', required=True, help='the bundle to write')
     ap.add_argument('--static', help='an IM4P trust cache or a raw module')
     ap.add_argument('--bundle', help="another bundle, whose first module is taken")
+    ap.add_argument('--category', action='append', default=[], metavar='CAT:MACHO', help='a Mach-O file whose entries have launch constraint category CAT')
     ap.add_argument('files', nargs='*')
     a = ap.parse_args()
     uuid, entries = bytes(16), {}
@@ -131,6 +134,15 @@ def main():
             if h is None:
                 sys.exit('%s has no code signature' % f)
             entries.setdefault(h[0], (h[1], 0, 0))
+    for spec in a.category:
+        cat, _, f = spec.partition(':')
+        if not f or not cat.isdigit() or int(cat) > 255:
+            sys.exit('--category takes CAT:MACHO, CAT 0 to 255: %s' % spec)
+        for s in slices(open(f, 'rb').read()):
+            h = cdhash(s)
+            if h is None:
+                sys.exit('%s has no code signature' % f)
+            entries[h[0]] = (h[1], 0, int(cat))
     module = struct.pack('<I', 2) + uuid + struct.pack('<I', len(entries))
     for h in sorted(entries):
         hash_type, flags, category = entries[h]

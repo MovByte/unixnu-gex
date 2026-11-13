@@ -5,6 +5,10 @@
 // device's client-shared block), then finds the comm page through
 // IOSurface.framework, which maps the same page and hands back the mapping
 // IOGPU made. Tracing is off, so the page's word is 0.
+//
+// It runs as an app does, in the container profile's sandbox, as accel
+// does: unsandboxed, the platform profile would admit neither user client
+// to this program, which it neither names nor entitles.
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
@@ -15,12 +19,18 @@
 
 extern void *IOSurfaceGetGraphicsCommPageAddress(void);
 
+#define SANDBOX_NAMED_BUILTIN 2
+
+int sandbox_init(const char *profile, uint64_t flags, char **errorbuf);
+
 static int bad(const char *what, long got, long want) {
     printf("iogpudev: %s: %#lx, want %#lx\n", what, got, want);
     return 1;
 }
 
 int main(void) {
+    char *err = NULL;
+    if (sandbox_init("container", SANDBOX_NAMED_BUILTIN, &err) != 0) return bad("the container sandbox", 0, 1);
     void *h = dlopen("/System/Library/PrivateFrameworks/IOGPU.framework/IOGPU", RTLD_NOW);
     if (h == NULL) return bad("loading IOGPU.framework", 0, 1);
     void *(*create)(io_service_t) = dlsym(h, "IOGPUDeviceCreate");

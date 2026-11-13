@@ -42,6 +42,8 @@ pub struct Public {
     pub persona: Option<Arc<super::persona::Persona>>,
     /// `p_csflags`.
     pub csflags: Arc<std::sync::atomic::AtomicU32>,
+    /// The signature on its executable (`p_textvp`'s blob at `p_textoff`).
+    pub codesign: Option<Arc<super::codesign::CodeSign>>,
     /// `p_name`, all of it.
     pub p_name: super::reason::PName,
     /// Its signal dispositions, real timer and accounting flags.
@@ -72,6 +74,7 @@ impl Public {
             pcaction: Default::default(),
             persona: None,
             csflags: Default::default(),
+            codesign: None,
             p_name: Default::default(),
             live: Default::default(),
         }
@@ -289,6 +292,7 @@ impl Kernel {
             pcaction: Arc::clone(&self.dtask.pcaction),
             persona: self.dtask.persona.clone(),
             csflags: Arc::clone(&self.dtask.csflags),
+            codesign: self.dtask.codesign.clone().map(Arc::new),
             p_name: self.dtask.p_name,
             live: Arc::clone(&self.dtask.live),
         }
@@ -723,7 +727,8 @@ impl Kernel {
 
     /// `proc_security_policy`: the MAC policies' `proc_check_proc_info`
     /// (Sandbox's operation for the call), then for most flavors the
-    /// caller's euid the target's, or root.
+    /// caller's euid the target's, or the privilege to see other users'
+    /// processes.
     fn darwin_proc_info_policy(&mut self, target: Option<&Public>, callnum: u64, same_user: bool) -> Result<(), i32> {
         let op = match callnum {
             call::LISTPIDS => 127,
@@ -743,7 +748,9 @@ impl Kernel {
             }
         }
         let Some(target) = target else { return Ok(()) };
-        if same_user && self.dtask.cred.uid != target.cred.uid && self.dtask.cred.uid != 0 {
+        // Another user's process: the caller's PRIV_GLOBAL_PROC_INFO.
+        const PRIV_GLOBAL_PROC_INFO: u32 = 1002;
+        if same_user && self.dtask.cred.uid != target.cred.uid && self.darwin_priv_check_cred(PRIV_GLOBAL_PROC_INFO, 0).is_err() {
             return Err(e::EPERM);
         }
         Ok(())

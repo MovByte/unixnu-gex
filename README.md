@@ -133,8 +133,12 @@ subsystem, most naming in their header the XNU source they port:
   connection is carried by the host.
 - **Security.** The MAC framework's checks, with AMFI and Sandbox as its
   policies (`mac.rs`); AMFI's decisions on code signatures, task ports, JIT
-  and executable mappings (`amfi.rs`); embedded code signatures and
-  entitlements (`codesign.rs`); trust caches (`trustcache.rs`); Sandbox's
+  and executable mappings (`amfi.rs`); AMFI's launch constraints, at exec
+  and spawn, and its library validation and library load constraints
+  (`launchcon.rs`), with the lightweight code requirements they are
+  written in and the CoreEntitlements objects those are (`lwcr.rs`);
+  embedded code signatures and entitlements (`codesign.rs`); trust caches
+  (`trustcache.rs`); Sandbox's
   compiled profiles and their evaluation (`sandbox.rs`), the sandboxes a
   process gets from its exec or `sandbox_init` (`sandboxes.rs`), and
   AppleMatch, the regular expression engine those profiles use
@@ -306,7 +310,9 @@ python3 tools/darwin-trust-cache.py -o <ipados-boot>/TrustCache \
 ```
 
 `--bundle <file>` takes an existing bundle's first module instead of
-`--static`. `tools/darwin-sandbox-blobs.py` writes the three Sandbox blobs
+`--static`. An entry's launch constraint category is 0, which constrains
+nothing; `--category <n>:<file>` gives a file's entries category `n`, whose
+constraints AMFI then applies when it is launched. `tools/darwin-sandbox-blobs.py` writes the three Sandbox blobs
 from a decompressed kernelcache (a prelinked one or a fileset), finding them
 where the Sandbox kext's `policy_init` loads them and checking each as the
 kext's loader does, with each file's SHA-256:
@@ -446,7 +452,7 @@ dyld and libSystem from the device's shared cache.
 | kqueue, poll and pipes | `kq-pipe`, `vnode`, `vnextend`, `select`, `poll`, `pipe`, `timeouts` |
 | terminals and `/dev` | `pty`, `ptyjob`, `ptyclose`, `bsdpty`, `ttyinfo`, `ttydead`, `ttydrain`, `fcntltty`, `revoke`, `devfs`, `devattr` |
 | sockets | `sockerr`, `sockevent`, `sockname`, `sockopts`, `halfclose`, `nosigpipe`, `dgrambuf`, `streambuf` |
-| code signing and IOKit | `codesig`, `amfi`, `policy`, `iokit`, `ioreg`, `iosurface`, `iosurfacex`, `iogpudev`, `accel`, `accelr` |
+| code signing and IOKit | `codesig`, `amfi`, `launchcon`, `policy`, `iokit`, `ioreg`, `iosurface`, `iosurfacex`, `iogpudev`, `accel`, `accelr` |
 
 The suite runs single programs and the processes they create. None of it
 boots launchd or runs an app.
@@ -462,23 +468,34 @@ is the reference (search `crates/gex-kernel/src/` for
 - **Code signing.** Only the static trust cache is consulted; trust caches
   loaded at run time (by AMFI's user client, after a cryptex's manifest is
   checked) are not. CMS signatures (CoreTrust and amfid) are not
-  implemented. AMFI's launch constraints are not implemented: an image
-  whose trust cache entry has a constraint category, or that carries its
-  own constraints, is refused (EPERM). AMFI's `__mac_syscall` calls for
-  local signing, trust cache loading and launch constraints are reported.
+  implemented. AMFI's `__mac_syscall` calls for local signing, trust cache
+  loading and launch constraints are reported.
+- **Launch constraints.** A requirement on a fact this kernel cannot
+  supply is decided only when every value the fact could have gives the
+  same answer; otherwise it is reported and the launch refused. Those
+  facts are `on-authorized-authapfs-volume` (APFS's authorization of a
+  volume is not modelled), `on-system-volume` for a file under a bind
+  mount, and every fact of pid 1 but `is-init-proc` when pid 1 is the
+  kernel's own rather than launchd. The kernel's mount list has no data
+  volume, so a file under `/private/var` is on the system volume here.
+  Library validation of an OOP-JIT mapping is reported.
 - **Sandbox.** A process gets its sandbox as the kext gives it: at exec
   from its `seatbelt-profiles` entitlement, its spawn's Sandbox attributes,
   the platform profile's choice for apps, or its executable's protobox
   profile; or by `sandbox_init` with a builtin profile. The platform
   profile, then the process's, decide the checks that are wired, an exec's
   process-exec* and process-exec-interpreter among them; Sandbox's other
-  hooks (the other vnode checks among them) are not called. Not ported,
-  and reported where the kext would act: the
+  hooks (the other vnode checks among them) are not called. A process's
+  Unix calls, Mach traps and kernel MIG routines are filtered by the masks
+  its sandbox (or, with none, the platform profile) gives it, as XNU
+  filters them; the socket calls, IOKit's opens and its property reads
+  are checked where XNU checks them. A class walk of an IORegistry entry
+  whose class this registry does not know (the device tree's nubs, and
+  the drivers between them) is reported. Not ported, and reported where the kext would act: the
   profiles of the `com.apple.private.sandbox.profile` entitlements,
   containers and containermanagerd's upcall, the extensions of the
   `com.apple.security.exception.*` entitlements, matching an extension
-  filter against an object, Mach message filtering, a profile's own system
-  call masks (nor are the platform profile's masks applied), filters whose
+  filter against an object, Mach message filtering, filters whose
   facts the kernel does not have, some `sandbox_check` filter types,
   `sandbox_check` of another process's operation, and Sandbox's other
   `__mac_syscall` calls.
