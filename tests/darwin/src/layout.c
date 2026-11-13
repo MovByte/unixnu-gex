@@ -145,6 +145,12 @@ static int check_layout(int dyld_on_disk) {
         if (dinfo.all_image_info_addr < REGION_BASE || dinfo.all_image_info_addr >= REGION_BASE + REGION_SIZE) return bad("the image list is not in the shared cache", dinfo.all_image_info_addr);
     }
 
+    // TASK_VM_INFO refuses a count short of its first revision (whose
+    // ledgers this kernel does not keep: a full one is reported).
+    task_vm_info_data_t vi;
+    count = TASK_VM_INFO_REV0_COUNT - 1;
+    if ((kr = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &count)) != KERN_INVALID_ARGUMENT) return bad("TASK_VM_INFO with too small a count", kr);
+
     // The main stack: USRSTACK64 less the slide.
     uint64_t top = 0;
     size_t tn = sizeof top;
