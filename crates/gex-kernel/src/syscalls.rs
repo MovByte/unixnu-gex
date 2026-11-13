@@ -741,9 +741,10 @@ pub struct Kernel {
     /// is in x16, and its errors come back with the carry flag set (see
     /// `crate::darwin`). Set at exec, inherited across fork.
     pub darwin: bool,
-    /// A Darwin process's shared region, `(start, size)`, which the host
-    /// mapped the shared cache into: `(0, 0)` when there is none.
-    pub darwin_region: (u64, u64),
+    /// A Darwin process's shared region (`task->shared_region`): its
+    /// environment's, entered at exec, or its parent's; none once dyld took
+    /// it out.
+    pub darwin_shared_region: Option<crate::darwin::shregion::RegionRef>,
     /// Where a Darwin process's dyld keeps its image list
     /// (`dyld_all_image_infos`), once it has said: 0 before.
     pub darwin_dyld_infos: u64,
@@ -10606,7 +10607,7 @@ impl Kernel {
             sig_tid: 0,
             compat: false,
             darwin: false,
-            darwin_region: (0, 0),
+            darwin_shared_region: None,
             darwin_dyld_infos: 0,
             darwin_dyld_infos_size: 0,
             darwin_dyld_final: false,
@@ -11102,7 +11103,9 @@ impl Kernel {
             sig_tid: 0,
             compat: self.compat,
             darwin: self.darwin,
-            darwin_region: self.darwin_region,
+            // The parent's region, once the child has its pid
+            // (`Kernel::darwin_inherit_region`).
+            darwin_shared_region: None,
             // task_create_internal: a fork's task has its parent's dyld
             // image info range (an exec's replaces it).
             darwin_dyld_infos: self.darwin_dyld_infos,

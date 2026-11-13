@@ -555,8 +555,7 @@ impl Kernel {
     pub(crate) fn darwin_vm_policies(&mut self) {
         // vm_shared_region_enter: one pmap-nested entry over the whole
         // region, read-only and shared with a fork's child.
-        let (base, size) = self.darwin_region;
-        if base != 0 {
+        if let Some((base, size)) = self.darwin_region_range() {
             let attrs = Attrs { kind: kind::SUBMAP, max: prot::READ as u8, alias: vm::tag::SHARED_PMAP, inherit: inherit::SHARE, ..Attrs::default() };
             self.dtask.vm.enter(base, base + size, attrs, 0);
         }

@@ -1041,8 +1041,8 @@ impl Kernel {
         if pieces.is_empty() {
             return kr::SUCCESS;
         }
-        let Some(region) = super::shregion::region() else { return kr::SUCCESS };
-        let permanent = region.permanent();
+        let Some(region) = self.darwin_shared_region.as_ref() else { return kr::SUCCESS };
+        let permanent = region.region().contents().permanent();
         if pieces.iter().any(|&(s, e)| permanent.iter().any(|&(ps, pe)| ps < e && s < pe)) {
             return KERN_PROTECTION_FAILURE;
         }
