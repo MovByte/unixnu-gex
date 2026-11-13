@@ -305,6 +305,17 @@ fn added(vnode: (u64, u64), file_start: i64) -> Option<Added> {
     blobs().lock().unwrap_or_else(|e| e.into_inner()).get(&vnode).and_then(|v| v.iter().find(|a| file_start >= a.base + a.start as i64 && file_start < a.base + a.end as i64).cloned())
 }
 
+/// `ubc_cs_blob_get(vp, -1, -1, offset)`: the signature whose range holds
+/// `offset`.
+pub fn vnode_blob(vnode: (u64, u64), offset: i64) -> Option<std::sync::Arc<CodeSign>> {
+    added(vnode, offset).map(|a| a.sig)
+}
+
+/// `csfg_get_teamid`: the team identifier of the vnode's first blob.
+pub fn vnode_teamid(vnode: (u64, u64)) -> Option<Vec<u8>> {
+    blobs().lock().unwrap_or_else(|e| e.into_inner()).get(&vnode).and_then(|v| v.first()).and_then(|a| a.sig.team_id.clone())
+}
+
 /// Why `ubc_cs_blob_add` refused a blob.
 #[derive(Debug)]
 pub enum AddError {
@@ -438,15 +449,16 @@ impl Kernel {
         Ok(0)
     }
 
-    /// fcntl's F_CHECK_LV: its argument read; library validation is a MAC
-    /// policy's, and none is loaded, so the file may be mapped.
+    /// fcntl's F_CHECK_LV (`fchecklv_t`: the slice's offset, the message
+    /// buffer's size and address): `mac_file_check_library_validation`,
+    /// AMFI's ([`Kernel::darwin_library_validation`]).
     pub(crate) fn darwin_check_lv(&mut self, m: &mut GuestMem<'_>, fd: i32, argp: u64) -> Result<u64, crate::errno::Errno> {
         let file = self.fds.get(fd)?;
-        if self.darwin_vnode_of(&file).is_none() {
-            return Err(crate::errno::Errno::EBADF);
-        }
-        m.read(argp, 24)?;
-        Ok(0)
+        let Some(vnode) = self.darwin_vnode_of(&file) else { return Err(crate::errno::Errno::EBADF) };
+        let file_start = m.read_u64(argp)? as i64;
+        let (msg_size, msg) = (m.read_u64(argp + 8)?, m.read_u64(argp + 16)?);
+        let path = file.path.clone();
+        self.darwin_library_validation(m, vnode, &path, file_start, msg, msg_size)
     }
 
     /// An open file's vnode (its mount and inode), or `None` for what is

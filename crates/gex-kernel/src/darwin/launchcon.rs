@@ -603,19 +603,38 @@ pub struct System {
     pub os_environment: Vec<u8>,
 }
 
-/// A process's encyclopedia with the system's and the launch's after it
-/// (`0xfffffff005ab21dc` builds one for each of the three processes).
+/// What AMFI's library encyclopedia (`0xfffffff005aac54c`) reads of a
+/// file being mapped: its vnode, its signature at the slice
+/// (`csfg_get_csblob`) and the team identifier of its first one
+/// (`csfg_get_teamid`).
+#[derive(Clone, Debug)]
+pub struct Lib {
+    pub exe: (String, Option<bool>),
+    pub sig: Option<Arc<CodeSign>>,
+    pub teamid: Option<Vec<u8>>,
+}
+
+/// Whose facts an encyclopedia gives.
+#[derive(Clone, Copy)]
+enum Subject<'a> {
+    Proc(&'a Proc),
+    Lib(&'a Lib),
+}
+
+/// An encyclopedia with the system's after it, and the launch's for a
+/// process's (`0xfffffff005ab21dc` builds one for each of the three
+/// processes; a library's has no launch type).
 struct Meta<'a> {
-    proc: &'a Proc,
+    subject: Subject<'a>,
     system: &'a System,
-    launch_type: u8,
-    /// The process being launched (`csproc_get_teamid` of
+    launch_type: Option<u8>,
+    /// The process being launched or mapping (`csproc_get_teamid` of
     /// `current_proc()`).
     cur_teamid: Option<&'a [u8]>,
 }
 
-/// `0xfffffff005ab8e14`: the facts of a vnode, a process's executable;
-/// `None` (no vnode) reads as off any volume.
+/// `0xfffffff005ab8e14`: the facts of a vnode, a process's executable or
+/// a mapped file; `None` (no vnode) reads as off any volume.
 fn vnode_fact(exe: Option<&(String, Option<bool>)>, name: &[u8]) -> Option<Fact> {
     use lwcr::ty;
     let k = |v: Value| Some(Fact::Known(v));
@@ -638,7 +657,8 @@ fn vnode_fact(exe: Option<&(String, Option<bool>)>, name: &[u8]) -> Option<Fact>
 }
 
 /// `0xfffffff005aadb34`: a signature's facts; `team` is its owner's team
-/// identifier as its accessor gives it ("N/A" for a process with none).
+/// identifier as its accessor gives it ("N/A" for a process with none,
+/// "none" for a file with none).
 fn blob_fact(sig: &CodeSign, name: &[u8], team: Vec<u8>, cur_teamid: Option<&[u8]>) -> Option<Fact> {
     let k = |v: Value| Some(Fact::Known(v));
     match name {
@@ -714,11 +734,24 @@ impl Meta<'_> {
         }
     }
 
+    /// `0xfffffff005aac68c`: a mapped file's facts.
+    fn library(&self, l: &Lib, name: &[u8]) -> Option<Fact> {
+        if let Some(f) = vnode_fact(Some(&l.exe), name) {
+            return Some(f);
+        }
+        let sig = l.sig.as_ref()?;
+        // 0xfffffff005aac5f0: the vnode's team identifier, "none" with none.
+        blob_fact(sig, name, l.teamid.clone().unwrap_or_else(|| b"none".to_vec()), self.cur_teamid)
+    }
 }
 
 impl Facts for Meta<'_> {
     fn fact(&self, name: &[u8]) -> Fact {
-        if let Some(f) = self.process(self.proc, name) {
+        let own = match self.subject {
+            Subject::Proc(p) => self.process(p, name),
+            Subject::Lib(l) => self.library(l, name),
+        };
+        if let Some(f) = own {
             return f;
         }
         let k = |v: Value| Fact::Known(v);
@@ -728,7 +761,10 @@ impl Facts for Meta<'_> {
             b"developer-mode" => k(Value::Bool(self.system.developer_mode)),
             b"os-environment" => k(Value::Str(self.system.os_environment.clone())),
             // 0xfffffff005aacb88: launch_constraint_data_get_launch_type.
-            b"launch-type" => k(Value::Int(i64::from(self.launch_type))),
+            b"launch-type" => match self.launch_type {
+                Some(lt) => k(Value::Int(i64::from(lt))),
+                None => Fact::Missing,
+            },
             _ => Fact::Missing,
         }
     }
@@ -802,7 +838,7 @@ impl Hook<'_> {
             Proc::Live(l) => l.sig.as_ref().and_then(|s| s.team_id.as_deref()),
             _ => None,
         };
-        Meta { proc: p, system: self.i.system, launch_type: self.i.launch_type, cur_teamid }
+        Meta { subject: Subject::Proc(p), system: self.i.system, launch_type: Some(self.i.launch_type), cur_teamid }
     }
 
     /// `0xfffffff005aac08c`: requirements on one process's facts; false
@@ -1196,6 +1232,91 @@ fn report(h: &Hook<'_>, v: &Viol) -> Result<(String, Option<Vec<u8>>), String> {
     Ok((line, desc))
 }
 
+/// How `mpo_file_check_library_validation` (`0xfffffff005ab0c9c`) ended:
+/// the mapping allowed, or refused with the message it copies out and
+/// what it logged; or turning on what this kernel cannot supply.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LibOutcome {
+    Allowed { log: Vec<String> },
+    Denied { msg: &'static str, log: Vec<String> },
+    Unported(String),
+}
+
+/// A process's or a file's description in the library logs: its path, team
+/// identifier and whether it is platform code.
+fn describe(path: &str, team: &[u8], platform: bool) -> String {
+    format!("'{path}' (Team ID: {}, platform: {})", String::from_utf8_lossy(team), if platform { "yes" } else { "no" })
+}
+
+/// `0xfffffff005ab0c9c`: the process `cur` (live) mapping the file `lib`:
+/// the process's library load constraint (signature slot 11), when it is
+/// signed, then library validation (`cs_require_lv` is 1 on this kernel).
+pub fn library_check(cur: &Proc, lib: &Lib, system: &System) -> LibOutcome {
+    let Proc::Live(p) = cur else { return LibOutcome::Allowed { log: Vec::new() } };
+    let mut log = Vec::new();
+    let cur_team = p.sig.as_ref().and_then(|s| s.team_id.clone()).unwrap_or_else(|| b"N/A".to_vec());
+    let lib_team = lib.teamid.clone().unwrap_or_else(|| b"none".to_vec());
+    let cur_path = p.exe.as_ref().map_or_else(String::new, |e| e.0.clone());
+    let who = |log: &mut Vec<String>, what: &str, reason: &str| {
+        let (lp, cp) = (lib.sig.as_ref().is_some_and(|s| s.platform_binary), p.sig.as_ref().is_some_and(|s| s.platform_binary));
+        log.push(format!("{what}: Rejecting {} for process '{}({})' (Team ID: {}, platform: {}), reason: {reason}", describe(&lib.exe.0, &lib_team, lp), cur_path.rsplit('/').next().unwrap_or(""), p.pid, String::from_utf8_lossy(&cur_team), if cp { "yes" } else { "no" }));
+    };
+    let lib_vc = lib.sig.as_ref().map_or(0, |s| s.category);
+    // 0xfffffff005ab053c: the library load constraint, which platform
+    // code always meets.
+    if p.sig.is_some() && lib_vc != 1 {
+        let (_, reqs) = embedded(cur, 11, &mut log);
+        if let Some(r) = reqs {
+            let meta = Meta { subject: Subject::Lib(lib), system, launch_type: None, cur_teamid: p.sig.as_ref().and_then(|s| s.team_id.as_deref()) };
+            let reason = match lwcr::evaluate(&r, &meta) {
+                Verdict::Matched(true) => None,
+                Verdict::Matched(false) => Some("Constraint not matched".to_string()),
+                Verdict::Build(f) | Verdict::Eval(f) => Some(f.msg),
+                Verdict::Unported(why) => return LibOutcome::Unported(why),
+            };
+            if let Some(reason) = reason {
+                who(&mut log, "Library Load Constraint Rejection", &reason);
+                return LibOutcome::Denied { msg: "Library violates process' library load contraint", log };
+            }
+        }
+    }
+    // 0xfffffff005ab07ac: library validation. A signature here is either
+    // a trust cache's or none (no signer type is set, so none is
+    // CS_SIGNER_TYPE_LEGACYVPN's 5).
+    let fail = |log: &mut Vec<String>, msg: &'static str| {
+        // 0xfffffff005ab0e18: overridden only for a cdhash the compilation
+        // service registered, of which there are none.
+        who(log, "Library Validation failed", msg);
+        LibOutcome::Denied { msg, log: std::mem::take(log) }
+    };
+    let Some(ls) = &lib.sig else {
+        return fail(&mut log, "mapped file has no cdhash, completely unsigned? Code has to be at least ad-hoc signed.");
+    };
+    if ls.category == 9 {
+        return LibOutcome::Unported("AMFI library validation of an OOP-JIT mapping".into());
+    }
+    if !ls.platform_binary {
+        if cur.vc().unwrap_or(0) == 1 {
+            return fail(&mut log, "mapping process is a platform binary, but mapped file is not");
+        }
+        if cur_team != lib_team {
+            return fail(&mut log, "mapping process and mapped file (non-platform) have different Team IDs");
+        }
+        // 0xfffffff005ab0ff0: development and production code do not mix.
+        let (pv, lv) = (cur.vc().unwrap_or(0), i64::from(ls.category));
+        let same = match (p.platform, pv) {
+            (7 | 8 | 9 | 12, _) => true,
+            (1 | 6, _) => return LibOutcome::Unported("AMFI library validation for a macOS process".into()),
+            (_, 2..=5 | 7) => pv == lv,
+            _ => return LibOutcome::Unported(format!("AMFI library validation of a process of validation category {pv} (the kext panics)")),
+        };
+        if !same {
+            return fail(&mut log, "not allowing mapping of development code into production process");
+        }
+    }
+    LibOutcome::Allowed { log }
+}
+
 /// The description's buffer (`0xfffffff005ab8954`'s allocation).
 pub const DESC_LEN: usize = 0x400;
 
@@ -1304,6 +1425,46 @@ impl crate::syscalls::Kernel {
         }
     }
 
+    /// `mac_file_check_library_validation` (`security/mac_file.c`): AMFI's
+    /// hook for this process mapping the file on `vnode` at `path`, its
+    /// slice at `file_start`; a refusal copies its message out
+    /// (`copyoutstr`: at most `msg_size` bytes, its NUL with them when they
+    /// hold it) and is EPERM.
+    pub(crate) fn darwin_library_validation(&mut self, m: &mut crate::GuestMem<'_>, vnode: (u64, u64), path: &str, file_start: i64, msg: u64, msg_size: u64) -> Result<u64, crate::errno::Errno> {
+        use std::sync::atomic::Ordering;
+        let csflags = self.dtask.csflags.load(Ordering::Acquire);
+        let cur = Proc::Live(Live {
+            pid: self.pid,
+            is_init: self.pid == crate::proc::INIT_PID,
+            platform: self.dtask.platform.0,
+            csflags,
+            exe: Some(self.darwin_lc_exe(&self.exe_path.clone())),
+            sig: (csflags & super::amfi::cs::SIGNED != 0).then(|| self.dtask.codesign.clone().map(Arc::new)).flatten(),
+        });
+        let lib = Lib { exe: self.darwin_lc_exe(path), sig: super::codesign::vnode_blob(vnode, file_start), teamid: super::codesign::vnode_teamid(vnode) };
+        let system = System { apple_internal: super::sysctl::os_release_type() == b"Internal", developer_mode: super::amfi::DEVELOPER_MODE, os_environment: Vec::new() };
+        match library_check(&cur, &lib, &system) {
+            LibOutcome::Allowed { log } => {
+                self.darwin_lc_log(&log);
+                Ok(0)
+            }
+            LibOutcome::Denied { msg: text, log } => {
+                self.darwin_lc_log(&log);
+                if msg != 0 && msg_size != 0 {
+                    let mut b = text.as_bytes().to_vec();
+                    b.push(0);
+                    b.truncate(msg_size.min(b.len() as u64) as usize);
+                    // A copy that faults is logged by the kext, not failed.
+                    let _ = m.write(msg, &b);
+                }
+                Err(crate::errno::Errno::EPERM)
+            }
+            LibOutcome::Unported(what) => {
+                self.darwin_unimplemented(what);
+                Err(crate::errno::Errno::EPERM)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1327,6 +1488,19 @@ mod tests {
 
     fn live(pid: i32, sig: Option<CodeSign>) -> Proc {
         Proc::Live(Live { pid, is_init: pid == 1, platform: 2, csflags: super::super::amfi::cs::VALID | super::super::amfi::cs::SIGNED, exe: Some((format!("/bin/p{pid}"), Some(true))), sig: sig.map(Arc::new) })
+    }
+
+    #[test]
+    fn a_platform_library_meets_library_validation_and_an_unsigned_one_does_not() {
+        let cur = live(5, None);
+        let s = sys();
+        let signed = Lib { exe: ("/usr/lib/x.dylib".into(), Some(true)), sig: Some(Arc::new(CodeSign { platform_binary: true, category: 1, ..Default::default() })), teamid: None };
+        assert!(matches!(library_check(&cur, &signed, &s), LibOutcome::Allowed { .. }));
+        let unsigned = Lib { sig: None, ..signed };
+        match library_check(&cur, &unsigned, &s) {
+            LibOutcome::Denied { msg, .. } => assert_eq!(msg, "mapped file has no cdhash, completely unsigned? Code has to be at least ad-hoc signed."),
+            o => panic!("{o:?}"),
+        }
     }
 
     #[test]
