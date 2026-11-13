@@ -60,6 +60,49 @@
 //! What each driver's start then sets is its own and not modelled: such a
 //! property is reported when read. So are these drivers' other nubs and
 //! clients, which are their children in the `IOService` plane.
+//!
+//! The resources nub. `IOService::initialize` makes `IOResources` (its
+//! `resources()`, inlined at 0xfffffff0077c8ec0, keeps it in gIOResources,
+//! 0xfffffff007974520). `IOService::setPlatform` attaches it to the root in
+//! the `IOService` plane. `IOResources::init` (0xfffffff0077c479c) sets no
+//! property: the PAL's resource property is x86's. Its properties are the
+//! resources published with `IOService::publishResource` (the `const char *`
+//! form 0xfffffff0077cb108, the `const OSSymbol *` form 0xfffffff0077ca428,
+//! and their inlined copies): a resource published with no value has
+//! gIOServiceKey, "IOService". The kernelcache's publishers and keys:
+//! - The kernel: "IOKit" (`publishPMRootDomain`, 0xfffffff0077c9d60),
+//!   "IOBSD" (0xfffffff0075eb650, 0xfffffff007850d58), "IONVRAM"
+//!   (0xfffffff00780bda8, 0xfffffff00780d038), "IOPlatformUUID"
+//!   (0xfffffff00780c494), "boot-uuid" (0xfffffff007851b94,
+//!   0xfffffff007852584), "com.apple.AppleDiskImageController.load"
+//!   (0xfffffff00785317c), "OSKextReceiptQueried" (0xfffffff00730bce0),
+//!   "com.apple.AppleFSCompression.Type%u" for each decompressor a kext
+//!   registers (0xfffffff0073b68b0), and "IOConsoleUsersSeed"
+//!   (`updateConsoleUsers`, 0xfffffff0077c5110).
+//! - `IOResources::setProperties` (0xfffffff007860960): any key a task
+//!   with com.apple.private.iokit.ioresources.setproperty, or an
+//!   administrator's, sets.
+//! - The kexts: "kdp" (IONetworkingFamily); "AppleARMCPU-BootCPU-Initialized",
+//!   "AppleARMCPU-AllCPU-Initialized", "IOAllCPUInitialized" and "IORTC"
+//!   (AppleARMPlatform); "AppleUSBCableDetect" and "AppleUSBCableType"
+//!   (IOAccessoryManager, AppleEmbeddedUSB); "IOPMU" (AppleD2400PMU);
+//!   "IOTimeSyncTime" and "IOTimeSyncClockManager" (IOTimeSyncFamily);
+//!   "IOTimeSyncDaemonService" (IOgPTPPlugin); "CoreAnalyticsMessenger"
+//!   (CoreAnalyticsFamily); "DieTempControllerResource"
+//!   (AppleEmbeddedTempSensor); "AppleSMCEmbeddedResource" (AppleSMC);
+//!   "SEP" (AppleSEPManager); "AKSFileSystemKeyServices",
+//!   "AKSKernelServices" and "AKSFileVaultServices" (AppleSEPKeyStore);
+//!   "KeyboardBacklight" (AppleHIDKeyboard); "CCCapture", "CCPipe" and its
+//!   own objects' names (corecapture); and a name AppleSEPCredentialManager
+//!   formats.
+//! - `IOService` itself sets "IOResourceMatched", the resources' keys when
+//!   it last matched drivers on the nub.
+//!
+//! Of these, the nub here has the two the kernel publishes on every boot
+//! before any process runs: "IOKit" (IOPMrootDomain's start) and "IOBSD"
+//! (`bsd_init`; IOSurfaceRoot's `IOResourceMatch`). Whether the others are
+//! published, and with what, is the kexts', the hardware's and user
+//! space's, so they are reported when read.
 
 use super::iokit::{Node, Prop};
 
@@ -68,6 +111,9 @@ pub const PE: &str = "AppleARMPE";
 
 /// arm-io's driver's class.
 pub const ARM_IO: &str = "AppleT8011IO";
+
+/// The resources nub's class.
+pub const RESOURCES: &str = "IOResources";
 
 /// The class of a nub the platform expert publishes.
 pub const PLATFORM_DEVICE: &str = "IOPlatformDevice";
@@ -86,8 +132,11 @@ pub const ARM_IO_DEVICE: &str = "AppleARMIODevice";
 /// - The kernel's: `IODTPlatformExpert` 0xfffffff007941798,
 ///   `IOPlatformExpert` 0xfffffff007941760, `IOPlatformIO`
 ///   0xfffffff007941850 and `IOPlatformDevice` 0xfffffff007941800.
+/// - The kernel's `IOResources` 0xfffffff007940e38, whose superclass is
+///   `IOService` 0xfffffff007942cb8 (0xfffffff0077c77cc).
 pub fn superclasses(class: &str) -> &'static [&'static str] {
     match class {
+        RESOURCES => &[RESOURCES, "IOService", "IORegistryEntry"],
         PE => &[PE, "IODTPlatformExpert", "IOPlatformExpert", "IOService", "IORegistryEntry"],
         ARM_IO => &[ARM_IO, "AppleT801xIO", "AppleARMIO", "IOPlatformIO", "IOService", "IORegistryEntry"],
         PLATFORM_DEVICE => &[PLATFORM_DEVICE, "IOService", "IORegistryEntry"],
@@ -174,4 +223,13 @@ pub fn add(t: &mut Vec<Node>) -> Option<u32> {
     let gpu = child(t, arm_io, "gpu,t8011", &[])?;
     t[gpu as usize].nub = Some((ARM_IO_DEVICE, io));
     Some(gpu)
+}
+
+/// Publish the resources nub, whose provider is the registry's root (see
+/// the module's documentation): its index.
+pub fn add_resources(t: &mut Vec<Node>) -> u32 {
+    let published = |key: &str| (key.to_string(), Prop::Sym("IOService".to_string()));
+    let at = t.len() as u32;
+    t.push(Node { name: RESOURCES.to_string(), props: Vec::new(), class: RESOURCES, service_props: vec![published("IOKit"), published("IOBSD")], parent: None, children: Vec::new(), kernel_only: false, nub: None });
+    at
 }
