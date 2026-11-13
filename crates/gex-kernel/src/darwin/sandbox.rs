@@ -259,11 +259,12 @@ pub struct SocketType {
 
 /// What an IOKit operation's filters read of its object (kind 8): the
 /// class chains (each class with its superclasses, to OSObject) of the
-/// object and then of each of its IOService-plane ancestors, to the
-/// registry's root, none for an entry whose class this registry does not
-/// know; the property the operation names (`+0xe0`); the user client type
-/// an open asks for (`+0xf0`); and, for a user client, its provider's USB
-/// device class and subclass (`OSNumber`s: value and size in bits).
+/// object and then of each of its providers (its IOService-plane parents),
+/// to the registry's root, none for an entry whose class or provider this
+/// registry does not know; the property the operation names (`+0xe0`);
+/// the user client type an open asks for (`+0xf0`); and, for a user
+/// client, its provider's USB device class and subclass (`OSNumber`s:
+/// value and size in bits).
 #[derive(Clone, Debug, Default)]
 pub struct IoKitObject {
     pub chains: Vec<Option<Vec<&'static str>>>,
@@ -1332,7 +1333,7 @@ fn filter(b: &[u8], p: &Profile, ty: u8, flag: bool, arg: u16, facts: &mut dyn F
                 let mut last = Ok(false);
                 for chain in o.chains.iter().take(walks) {
                     let Some(chain) = chain else {
-                        return Err(facts.unported("the class of an IORegistry entry this registry does not know".into()));
+                        return Err(facts.unported("the class or the provider of an IORegistry entry this registry does not know".into()));
                     };
                     last = class_walk(b, p, flag, arg, chain, facts);
                     if matches!(last, Ok(true)) {

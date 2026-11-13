@@ -928,15 +928,23 @@ fn class_chain(class: &str) -> Option<Vec<&'static str>> {
     Some(v)
 }
 
-/// The class chains from entry `at` up the IOService plane: its own, each
-/// ancestor's, then the registry's root's (an IORegistryEntry).
+/// The class chains from entry `at` up the IOService plane, as Sandbox's
+/// iokit-connection walk (`0x...9f2564`) takes them with
+/// `getParentEntry(gIOServicePlane)`: its own, each provider's, to the
+/// registry's root (an IORegistryEntry). An entry whose provider this
+/// registry does not know ends the chains with none.
 fn chains_from(t: &[Node], mut at: Option<u32>) -> Vec<Option<Vec<&'static str>>> {
     let mut out = Vec::new();
     while let Some(i) = at {
         out.push(class(t, i).ok().and_then(class_chain));
-        at = t.get(i as usize).and_then(|n| n.parent);
+        match provider(t, i) {
+            Ok(p) => at = p,
+            Err(_) => {
+                out.push(None);
+                break;
+            }
+        }
     }
-    out.push(Some(vec!["IORegistryEntry", "OSObject"]));
     out
 }
 
