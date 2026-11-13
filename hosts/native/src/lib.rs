@@ -3269,9 +3269,19 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         provider_stacks: Mutex::new(cx.provider_stacks.lock().unwrap_or_else(|e| e.into_inner()).clone()),
     });
     note_live_process(&child_cx);
-    // A Darwin child's thread calls (its timers, its knotes' and its
-    // workqueue's) are its own, as a new image's are.
-    if child_cx.kernel.lock().unwrap_or_else(|e| e.into_inner()).darwin {
+    // A Darwin child's task is enabled before its parent's fork returns
+    // (fork's ipc_task_enable): its pid finds it, and its ports are made,
+    // whether or not it has run yet. Its thread calls (its timers, its
+    // knotes' and its workqueue's, other tasks' requests to its ports) are
+    // its own, as a new image's are.
+    let darwin = {
+        let mut k = child_cx.kernel.lock().unwrap_or_else(|e| e.into_inner());
+        if k.darwin {
+            k.darwin_task_enable();
+        }
+        k.darwin
+    };
+    if darwin {
         start_darwin_thread_calls(Arc::downgrade(&child_cx.kernel), child_cx.memory.clone());
     }
     let status = {
@@ -4112,8 +4122,10 @@ fn run_darwin_image(
 /// A Darwin `posix_spawn`'s child (`Kernel::darwin_spawned`), started:
 /// its image loaded here, in its parent's call, so that a load that fails
 /// is that call's error (EBADMACHO, EBADEXEC for a bad signature, EIO for
-/// a file that cannot be read) and the child goes unseen; then run on a
-/// thread of its own, its end recorded for its parent's `wait4`.
+/// a file that cannot be read) and the child goes unseen; then switched
+/// over to it, the image activated and its task enabled, before the call
+/// returns; then run on a thread of its own, its end recorded for its
+/// parent's `wait4`.
 fn start_darwin_spawn(cx: &SpawnContext, mut child: Kernel) -> std::result::Result<i32, gex_kernel::errno::Errno> {
     use gex_kernel::errno::Errno;
     let pid = child.pid;
@@ -4150,9 +4162,12 @@ fn start_darwin_spawn(cx: &SpawnContext, mut child: Kernel) -> std::result::Resu
     switch_to_darwin_image(&mut child, &img);
     child.dtask.platform = loaded.platform;
     child.darwin_activate(&darwin_loaded(&img, &loaded));
-    // exec_mach_imgact's P_EXEC and posix_spawn's NOTE_EXEC for the child,
-    // before the call returns.
+    // exec_mach_imgact's P_EXEC; then, the image in (exec_resettextvp),
+    // posix_spawn's ipc_task_enable of the child and its NOTE_EXEC, before
+    // the call returns: its pid finds its task, and its ports are made,
+    // before it has run (whether or not a policy's refusal is to kill it).
     procs.set_execed(pid);
+    child.darwin_task_enable();
     gex_kernel::procnote::post(pid, gex_kernel::procnote::note::EXEC);
     let child_proc = Arc::new(ProcCell::default());
     child.vfs.mount("/proc", Arc::new(ProcFs::new(Arc::new(KernelProcSource(Arc::clone(&child_proc))))));

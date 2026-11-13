@@ -1698,6 +1698,12 @@ fn task_get_special_port(k: &mut Kernel, which: i32, f: u8) -> Reply {
     if !allowed {
         return Reply::err(KERN_INVALID_CAPABILITY);
     }
+    // A task whose IPC is not active (an exec's new task before its image
+    // is in) gives none of them.
+    let me = k.ipc().task;
+    if !k.ipc().task_ipc_active(me) {
+        return Reply::err(KERN_FAILURE);
+    }
     match which {
         TASK_KERNEL_PORT => {
             let p = k.darwin_task_port();
@@ -1712,7 +1718,7 @@ fn task_get_special_port(k: &mut Kernel, which: i32, f: u8) -> Reply {
         TASK_NAME_PORT => {
             let ipc = k.ipc();
             let me = ipc.task;
-            let p = ipc.task_name_port(me).expect("a task holding the table has its link");
+            let p = ipc.task_name_port(me).expect("a task whose IPC is active has its link");
             k.ipc().make_send(p);
             Reply::port(Carried::Port(p))
         }

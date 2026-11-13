@@ -559,6 +559,10 @@ impl Kernel {
             }
         }
         self.darwin_publish();
+        // exec_resettextvp, then ipc_task_enable: the task as its image left
+        // it (an exec's new task, the run's first, or a spawn's child, which
+        // its spawn enabled) is what other tasks reach.
+        self.darwin_task_enable();
         // The image's entitlements that raise its default memory limit.
         self.darwin_jetsam_entitlements();
         self.darwin_vm_policies();

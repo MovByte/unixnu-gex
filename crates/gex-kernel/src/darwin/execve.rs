@@ -466,12 +466,17 @@ impl Kernel {
     /// The new image takes the process over, once it is loaded: what
     /// `fdt_exec`, `proc_exec_switch_task` and `execsigs` keep of the old.
     /// Its knotes go and its close-on-exec descriptors close, and its
-    /// record locks stay only on the files still open; its task's and
-    /// threads' ports die and its IPC space ends, every right in it with
-    /// its notifications; the new task keeps the host and special ports
-    /// the old one held, its signal actions as execsigs leaves them, its
-    /// limits, app type and dispatch queue offsets.
+    /// record locks stay only on the files still open. An exec (`execve`,
+    /// POSIX_SPAWN_SETEXEC) has a new task: the old task's IPC is disabled,
+    /// its and its threads' ports die and its IPC space ends, every right
+    /// in it with its notifications; the new task keeps the host and
+    /// special ports the old one held, and its IPC is enabled once its
+    /// image is in ([`Self::darwin_task_enable`]). A spawn's child keeps
+    /// the task its spawn made and enabled, and its ports. Each keeps its
+    /// signal actions as execsigs leaves them, its limits, app type and
+    /// dispatch queue offsets.
     fn darwin_exec_switch_body(&mut self, spawn: Option<&super::spawn::After>) {
+        let new_task = spawn.is_none_or(|s| s.flags & super::spawn::flag::SETEXEC != 0);
         // exec_mach_imgact: P_EXEC.
         self.procs.set_execed(self.pid);
         // knotes_dealloc, then the descriptors and the kqueues they held.
@@ -494,38 +499,46 @@ impl Kernel {
         self.darwin_kqueue_reap();
         let keep = self.darwin_lock_vnodes_open();
         super::lockf::exec_keep(self.pid, &keep);
-        // ipc_thread_terminate, ipc_task_terminate.
-        let tids: Vec<i32> = self.dtask.kports.threads.keys().copied().collect();
-        for t in tids {
-            self.darwin_thread_ports_terminate(t);
-        }
-        let name = self.ipc().task_name_port_take();
-        let flavored = self.darwin_flavor_ports_take();
-        let k = &mut self.dtask.kports;
-        let task_ports: Vec<_> = k.task.take().map(|(a, b)| vec![a, b]).unwrap_or_default().into_iter().chain(name).chain(flavored).collect();
-        let ipc = &mut self.ipc();
-        for p in task_ports {
-            ipc.port_mut(p).kobject = None;
-            ipc.port_mut(p).pinned = false;
-            ipc.port_destroy(p);
-        }
-        ipc.space_terminate();
-        // The notifications it owed, while the old task's objects are there
-        // to hear of their ports.
-        self.darwin_ipc_notify_drain();
-        // The old threads' exception handlers go with them.
-        for a in std::mem::take(&mut self.dtask.kports.thread_exc).into_values() {
-            super::exception::release_all(self.ipc(), &a);
+        if new_task {
+            // ipc_task_disable of the old task: the process is found by its
+            // pid from here on with the new one, whose IPC is not enabled
+            // yet.
+            self.ipc().task_disable();
+            // ipc_thread_terminate, ipc_task_terminate.
+            let tids: Vec<i32> = self.dtask.kports.threads.keys().copied().collect();
+            for t in tids {
+                self.darwin_thread_ports_terminate(t);
+            }
+            let name = self.ipc().task_name_port_take();
+            let flavored = self.darwin_flavor_ports_take();
+            let k = &mut self.dtask.kports;
+            let task_ports: Vec<_> = k.task.take().map(|(a, b)| vec![a, b]).unwrap_or_default().into_iter().chain(name).chain(flavored).collect();
+            let ipc = &mut self.ipc();
+            for p in task_ports {
+                ipc.port_mut(p).kobject = None;
+                ipc.port_mut(p).pinned = false;
+                ipc.port_destroy(p);
+            }
+            ipc.space_terminate();
+            // The notifications it owed, while the old task's objects are
+            // there to hear of their ports.
+            self.darwin_ipc_notify_drain();
+            // The old threads' exception handlers go with them.
+            for a in std::mem::take(&mut self.dtask.kports.thread_exc).into_values() {
+                super::exception::release_all(self.ipc(), &a);
+            }
         }
         // The old task's threads' vouchers and its bank context go with it;
-        // its importance goes on with the new task once its legacy
+        // an exec's importance goes on with the new task once its legacy
         // assertions are reset (ipc_importance_exec_switch_task). The
         // linkage that switch makes between the two tasks is for watch
         // ports, which spawn refuses, and is gone when the exec ends.
         self.darwin_threads_vouchers_release();
         self.darwin_bank_task_destroy();
-        let me = self.ipc().task;
-        self.ipc().imp_task_reset(me);
+        if new_task {
+            let me = self.ipc().task;
+            self.ipc().imp_task_reset(me);
+        }
         let old = std::mem::take(&mut self.dtask);
         let (realtimer, vtimers) = (old.realtimer, old.vtimers);
         // task_copy_fields_for_exec.
@@ -533,7 +546,7 @@ impl Kernel {
         let kp = old.kports;
         self.dtask = super::Task {
             ipc_raw: old.ipc_raw,
-            kports: super::kobject::Kports { special: kp.special, special_dead: kp.special_dead, registered: kp.registered, exc: kp.exc, ..Default::default() },
+            kports: if new_task { super::kobject::Kports { special: kp.special, special_dead: kp.special_dead, registered: kp.registered, exc: kp.exc, ..Default::default() } } else { kp },
             strict: old.strict,
             // proc_resetregister: libpthread registers again.
             pthread: super::thread::Registration { registered: false, ..old.pthread },
@@ -566,6 +579,9 @@ impl Kernel {
             // What the exec's launch constraints hook is to be given, for
             // the image's start.
             exec_launch: old.exec_launch,
+            // A spawn's watch ports, which its spawn binds to the task as it
+            // enables it.
+            pending_watchports: old.pending_watchports,
             // Written over by the image's name once it is accepted.
             p_name: old.p_name,
             user_faults: old.user_faults,

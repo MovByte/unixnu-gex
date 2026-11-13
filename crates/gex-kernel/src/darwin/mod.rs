@@ -223,7 +223,8 @@ pub struct Task {
     /// The process's vouchers and their attribute managers' state.
     pub vouchers: voucher::Vouchers,
     /// A spawned task's watch ports, with their send rights, and whether it
-    /// is an adaptive daemon: bound once the task is in the IPC table.
+    /// is an adaptive daemon: bound when its spawn enables the task
+    /// ([`crate::syscalls::Kernel::darwin_task_enable`]).
     pub pending_watchports: Option<(Vec<Option<ipc::ObjId>>, bool)>,
     /// The program's code signature, when it has one, with the entitlements
     /// its credential carries.
@@ -422,38 +423,48 @@ impl crate::syscalls::Kernel {
         let ipc = &mut self.dtask.ipc_raw;
         if !ipc.held {
             ipc.check_out(&self.procs.darwin_ipc);
-            // Other tasks reach this one through its link: its mailbox, and
-            // the bell of its thread calls, which empty it.
-            let bell = self.dtask.timers.bell();
-            let policy = self.dtask.policy.clone().or_else(|| self.procs.task_policy(self.pid));
-            let ipc = &mut self.dtask.ipc_raw;
-            if !ipc.link.as_ref().is_some_and(|l| std::sync::Arc::ptr_eq(&l.bell, &bell)) {
-                // What other tasks left for the link it replaces (an exec's
-                // new task has a new bell) goes on to the new one, with a
-                // name port made since the exec ended the old task's.
-                let old = ipc.link.take();
-                let pending = old.as_ref().map(|l| std::mem::take(&mut *l.mailbox.lock().unwrap_or_else(|e| e.into_inner()))).unwrap_or_default();
-                let name_port = old.and_then(|l| l.name_port.lock().unwrap_or_else(|e| e.into_inner()).take());
-                let ring = !pending.is_empty();
-                let link = std::sync::Arc::new(ipc::TaskLink { mailbox: std::sync::Mutex::new(pending), bell, pid: self.pid, name_port: std::sync::Mutex::new(name_port), codesign: self.dtask.codesign.clone(), sandbox: std::sync::Arc::clone(&self.dtask.sandbox), csflags: std::sync::Arc::clone(&self.dtask.csflags), pidversion: self.dtask.pidversion, textoff: self.dtask.textoff, uniqueid: self.dtask.uniqueid, policy });
-                ipc.links.insert(ipc.task, std::sync::Arc::clone(&link));
-                if ring {
-                    link.bell.ring();
-                }
-                ipc.link = Some(link);
-            }
-            // proc_set_task_spawnpolicy's watch ports, the spawn's rights
-            // to them let go after.
-            if let Some((ports, adaptive)) = self.dtask.pending_watchports.take() {
-                let ipc = &mut self.dtask.ipc_raw;
-                let key = ipc.task;
-                ipc.imp_add_watchports(key, &ports, adaptive);
-                for p in ports.into_iter().flatten() {
-                    ipc.release_send(p);
-                }
+        }
+        ipc
+    }
+
+    /// `ipc_task_enable`: other tasks reach this task from here on, by its
+    /// pid and through its ports. Its link (its mailbox, the bell of its
+    /// thread calls, which empty it, and what other tasks read of its
+    /// process) goes in the system's table under its key, made with its
+    /// space if it has none yet; a spawn's watch ports are bound to it
+    /// (`proc_set_task_spawnpolicy`, the spawn's rights to them let go
+    /// after). `fork` and `posix_spawn` enable the new task before they
+    /// return to the parent, an exec its new task once the image is in
+    /// (and the run's first process its own), each before it runs; that
+    /// image's start enables a spawned task again with what it set.
+    pub fn darwin_task_enable(&mut self) {
+        let held = self.dtask.ipc_raw.held;
+        let link = ipc::TaskLink {
+            mailbox: std::sync::Mutex::new(Vec::new()),
+            bell: self.dtask.timers.bell(),
+            pid: self.pid,
+            ipc_active: Default::default(),
+            name_port: std::sync::Mutex::new(None),
+            codesign: self.dtask.codesign.clone(),
+            sandbox: std::sync::Arc::clone(&self.dtask.sandbox),
+            csflags: std::sync::Arc::clone(&self.dtask.csflags),
+            pidversion: self.dtask.pidversion,
+            textoff: self.dtask.textoff,
+            uniqueid: self.dtask.uniqueid,
+            policy: self.dtask.policy.clone().or_else(|| self.procs.task_policy(self.pid)),
+        };
+        self.ipc().task_enable(link);
+        if let Some((ports, adaptive)) = self.dtask.pending_watchports.take() {
+            let ipc = self.ipc();
+            let key = ipc.task;
+            ipc.imp_add_watchports(key, &ports, adaptive);
+            for p in ports.into_iter().flatten() {
+                ipc.release_send(p);
             }
         }
-        &mut self.dtask.ipc_raw
+        if !held {
+            self.darwin_ipc_leave();
+        }
     }
 
     /// The kernel call is done with IPC: the system's table goes back for

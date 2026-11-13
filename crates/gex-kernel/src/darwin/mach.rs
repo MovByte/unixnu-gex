@@ -602,7 +602,9 @@ impl Kernel {
     /// caller is root, or both have the same uid (and real uid: a process
     /// has one uid here), or the caller has the
     /// com.apple.system-task-ports.name.safe entitlement; else null and
-    /// KERN_FAILURE.
+    /// KERN_FAILURE. A live process whose task's IPC is not active (an
+    /// exec's new task before its image is in, a task that has ended)
+    /// gives null and KERN_SUCCESS.
     fn task_name_for_pid(&mut self, m: &mut GuestMem<'_>, target: u32, pid: i32, at: u64) -> u64 {
         let ipc = self.ipc();
         // port_name_to_task: any task's control port.
@@ -625,14 +627,15 @@ impl Kernel {
         // proc_task: the process's task, if it has one here; the policies'
         // say on its name port.
         let ipc = self.ipc();
-        let task = if pid == me { Some(ipc.task) } else { ipc.links.iter().find(|(_, l)| l.pid == pid).map(|(&t, _)| t) };
+        let task = if pid == me { Some(ipc.task) } else { ipc.task_of_pid(pid) };
         if task.is_some() && self.darwin_mac_check_get_task(pid, super::amfi::flavor::NAME) != 0 {
             let _ = m.write_u32(at, 0);
             return kr::FAILURE;
         }
         let ipc = self.ipc();
         let port = task.and_then(|t| ipc.task_name_port(t));
-        // convert_task_name_to_port, ipc_port_copyout_send.
+        // convert_task_name_to_port (null for a task whose IPC is not
+        // active), ipc_port_copyout_send.
         let name = match port {
             Some(p) => {
                 self.ipc().make_send(p);
@@ -693,10 +696,12 @@ impl Kernel {
 
     /// `task_for_pid(target_tport, pid, t)` (vm_unix.c): process `pid`'s
     /// task control port, for a caller holding some task's control port,
-    /// that passes the POSIX check and the policies' (AMFI allows it only
-    /// with Developer Mode); the caller's own is its pinned self port,
-    /// another's is dead without Developer Mode (task_conversion_eval).
-    /// The name, or null, is copied out either way.
+    /// that passes the POSIX check, whose task's IPC is active (not an
+    /// exec's new task before its image is in, nor a task that has ended),
+    /// and that passes the policies' check (AMFI allows it only with
+    /// Developer Mode); the caller's own is its pinned self port, another's
+    /// is dead without Developer Mode (task_conversion_eval). The name, or
+    /// null, is copied out either way.
     fn task_for_pid(&mut self, m: &mut GuestMem<'_>, target: u32, pid: i32, at: u64) -> u64 {
         let fail = |m: &mut GuestMem<'_>, r: u64| {
             let _ = m.write_u32(at, 0);
@@ -706,6 +711,11 @@ impl Kernel {
             return fail(m, kr::FAILURE);
         }
         if self.procs.live_nice(pid).is_none() || !self.darwin_tfp_posix_check(pid) {
+            return fail(m, kr::FAILURE);
+        }
+        // proc_task, and task_is_ipc_active: before the policies are asked.
+        let task = if pid == self.pid { Some(self.ipc().task) } else { self.ipc().task_of_pid(pid) };
+        if !task.is_some_and(|t| self.ipc().task_ipc_active(t)) {
             return fail(m, kr::FAILURE);
         }
         if self.darwin_mac_check_get_task(pid, super::amfi::flavor::CONTROL) != 0 {
@@ -1447,5 +1457,208 @@ impl Kernel {
             Ok(r) => r,
             Err(_) => Err(Errno::EINVAL),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::darwin::ipc::{name_valid, Remote};
+
+    /// Where the calls copy out.
+    const AT: u64 = 0x8000;
+
+    /// The note a policy check leaves without the Sandbox's platform
+    /// profile, which these tests have none of.
+    const NO_PROFILE: &str = "the Sandbox's platform profile";
+
+    /// A Darwin process (pid 1) with its task enabled, and the name of its
+    /// own control port (`mach_task_self`) for the calls' target.
+    fn parent() -> (Vec<u8>, Kernel, u32) {
+        let mut buf = vec![0u8; 0x10000];
+        let mut k = Kernel::new(0x1000, 0x10000, "/prog".into());
+        k.darwin = true;
+        k.darwin_task_enable();
+        let mut m = GuestMem::new(&mut buf);
+        let me = k.mach_trap_simple(&mut m, trap::TASK_SELF, &[0; 6]).unwrap() as u32;
+        k.darwin_ipc_leave();
+        (buf, k, me)
+    }
+
+    /// A child of `k`'s as fork1 makes it, of the same user, its task not
+    /// enabled yet.
+    fn child(k: &Kernel) -> Kernel {
+        let mut c = k.fork_kernel();
+        c.pid = k.procs.spawn(k.pid);
+        c.tid = c.pid;
+        k.procs.set_uid(c.pid, k.creds.uid());
+        c
+    }
+
+    fn name_for_pid(k: &mut Kernel, buf: &mut [u8], target: u32, pid: i32) -> (u64, u32) {
+        let mut m = GuestMem::new(buf);
+        m.write_u32(AT, 0x1234).unwrap();
+        let r = k.task_name_for_pid(&mut m, target, pid, AT);
+        let n = m.read_u32(AT).unwrap();
+        k.darwin_ipc_leave();
+        (r, n)
+    }
+
+    fn task_for(k: &mut Kernel, buf: &mut [u8], target: u32, pid: i32) -> (u64, u32) {
+        let mut m = GuestMem::new(buf);
+        m.write_u32(AT, 0x1234).unwrap();
+        let r = k.task_for_pid(&mut m, target, pid, AT);
+        let n = m.read_u32(AT).unwrap();
+        k.darwin_ipc_leave();
+        (r, n)
+    }
+
+    fn pid_for(k: &mut Kernel, buf: &mut [u8], name: u32) -> (u64, i32) {
+        let mut m = GuestMem::new(buf);
+        let r = k.mach_trap_simple(&mut m, trap::PID_FOR_TASK, &[u64::from(name), AT, 0, 0, 0, 0]).unwrap();
+        let pid = m.read_u32(AT).unwrap() as i32;
+        k.darwin_ipc_leave();
+        (r, pid)
+    }
+
+    /// Process `pid`'s task in `k`'s view of the table, and whether its IPC
+    /// is active.
+    fn task_of(k: &mut Kernel, pid: i32) -> Option<(u64, bool)> {
+        let ipc = k.ipc();
+        let t = ipc.task_of_pid(pid).map(|t| (t, ipc.task_ipc_active(t)));
+        k.darwin_ipc_leave();
+        t
+    }
+
+    /// What task_name_for_pid gives once the policies allow it
+    /// (`convert_task_name_to_port`, `ipc_port_copyout_send`): the name of
+    /// a send right to task `task`'s name port in `k`'s space, or none.
+    fn name_port(k: &mut Kernel, task: u64) -> Option<u32> {
+        let p = k.ipc().task_name_port(task);
+        let n = p.map(|p| {
+            k.ipc().make_send(p);
+            k.darwin_copyout_send(p)
+        });
+        k.darwin_ipc_leave();
+        n
+    }
+
+    fn policies_asked(k: &Kernel) -> bool {
+        k.dtask.said.iter().any(|s| s.contains(NO_PROFILE))
+    }
+
+    /// A child's pid finds its task once its creation has enabled it, and
+    /// not before, while the process is being made (null, KERN_SUCCESS,
+    /// the policies not asked): its name port names it. Once its task has
+    /// ended the port names no task, and its pid gives null with
+    /// KERN_SUCCESS while the process is still live, then KERN_FAILURE for
+    /// its zombie, for its reaped pid, and for a pid that never was.
+    #[test]
+    fn a_new_task_is_found_by_its_pid_once_enabled() {
+        let (mut buf, mut k, me) = parent();
+        let mut c = child(&k);
+        let pid = c.pid;
+        assert_eq!(name_for_pid(&mut k, &mut buf, me, pid), (kr::SUCCESS, 0));
+        assert_eq!(task_of(&mut k, pid), None);
+        assert!(!policies_asked(&k));
+        c.darwin_task_enable();
+        let key = c.dtask.ipc_raw.task;
+        assert_eq!(task_of(&mut k, pid), Some((key, true)));
+        let n = name_port(&mut k, key).unwrap();
+        assert!(name_valid(n));
+        assert_eq!(pid_for(&mut k, &mut buf, n), (kr::SUCCESS, pid));
+        assert_eq!(name_port(&mut k, key), Some(n), "the same port, under the same name");
+        c.darwin_task_terminate();
+        assert_eq!(task_of(&mut k, pid), None);
+        assert_eq!(pid_for(&mut k, &mut buf, n), (kr::FAILURE, -1));
+        assert_eq!(name_for_pid(&mut k, &mut buf, me, pid), (kr::SUCCESS, 0), "a dying task");
+        k.procs.exit(pid, 0);
+        assert_eq!(name_for_pid(&mut k, &mut buf, me, pid), (kr::FAILURE, 0), "a zombie");
+        k.procs.reap(pid);
+        assert_eq!(name_for_pid(&mut k, &mut buf, me, pid), (kr::FAILURE, 0), "a reaped pid");
+        assert_eq!(name_for_pid(&mut k, &mut buf, me, 9999), (kr::FAILURE, 0), "a pid that never was");
+        assert!(!policies_asked(&k));
+    }
+
+    /// task_for_pid of a live process whose task's IPC is not active fails
+    /// before the policies are asked; once it is, they decide.
+    #[test]
+    fn task_for_pid_wants_an_active_task() {
+        let (mut buf, mut k, me) = parent();
+        let mut c = child(&k);
+        let pid = c.pid;
+        c.darwin_publish();
+        assert_eq!(task_for(&mut k, &mut buf, me, pid), (kr::FAILURE, 0));
+        assert!(!policies_asked(&k));
+        c.darwin_task_enable();
+        assert_eq!(task_for(&mut k, &mut buf, me, pid), (kr::FAILURE, 0));
+        assert!(policies_asked(&k));
+    }
+
+    /// An exec keeps the pid with a new task: from its switch the old
+    /// task's name port names nothing and none is made until the new task
+    /// is enabled (what other tasks left for it meanwhile goes on to it);
+    /// then a new name port.
+    #[test]
+    fn an_exec_gives_its_pid_a_new_task() {
+        let (mut buf, mut k, _) = parent();
+        let mut c = child(&k);
+        let pid = c.pid;
+        c.darwin_task_enable();
+        let key = c.dtask.ipc_raw.task;
+        let old = name_port(&mut k, key).unwrap();
+        c.darwin_exec_switch(None, 0);
+        assert_eq!(pid_for(&mut k, &mut buf, old), (kr::FAILURE, -1));
+        assert_eq!(task_of(&mut k, pid), Some((key, false)));
+        assert_eq!(name_port(&mut k, key), None);
+        assert!(k.ipc().remote(key, Remote::Wake(7)));
+        k.darwin_ipc_leave();
+        c.darwin_task_enable();
+        let pending = std::mem::take(&mut *c.dtask.ipc_raw.link.as_ref().unwrap().mailbox.lock().unwrap());
+        assert!(matches!(pending[..], [Remote::Wake(7)]));
+        assert_eq!(task_of(&mut k, pid), Some((key, true)));
+        let new = name_port(&mut k, key).unwrap();
+        assert!(name_valid(new) && new != old);
+        assert_eq!(pid_for(&mut k, &mut buf, new), (kr::SUCCESS, pid));
+    }
+
+    /// A spawn's child keeps the task its spawn made and enabled through
+    /// its image's switch: the name port its parent got goes on naming it.
+    #[test]
+    fn a_spawned_child_keeps_its_task_through_its_image() {
+        let (mut buf, mut k, _) = parent();
+        let mut c = child(&k);
+        let pid = c.pid;
+        c.darwin_task_enable();
+        let key = c.dtask.ipc_raw.task;
+        let n = name_port(&mut k, key).unwrap();
+        c.darwin_exec_switch(Some(&crate::darwin::spawn::After::default()), 0);
+        assert_eq!(task_of(&mut k, pid), Some((key, true)));
+        assert_eq!(pid_for(&mut k, &mut buf, n), (kr::SUCCESS, pid));
+        assert_eq!(name_port(&mut k, key), Some(n));
+        c.darwin_task_enable();
+        assert_eq!(name_port(&mut k, key), Some(n));
+        assert_eq!(pid_for(&mut k, &mut buf, n), (kr::SUCCESS, pid));
+    }
+
+    /// A child whose spawn failed before its task was enabled lets go of
+    /// the send rights it inherited when it ends, once, and is never found.
+    #[test]
+    fn a_child_never_enabled_ends_with_its_rights() {
+        let (mut buf, mut k, me) = parent();
+        let (_, port) = k.ipc().port_alloc(true).unwrap();
+        let mut c = child(&k);
+        let pid = c.pid;
+        k.ipc().copy_send(port);
+        c.dtask.kports.special.insert(4, port);
+        assert_eq!(k.ipc().port(port).srights, 2);
+        k.darwin_ipc_leave();
+        c.darwin_task_terminate();
+        assert_eq!(k.ipc().port(port).srights, 1);
+        k.darwin_ipc_leave();
+        assert_eq!(name_for_pid(&mut k, &mut buf, me, pid), (kr::SUCCESS, 0));
+        c.darwin_task_terminate();
+        assert_eq!(k.ipc().port(port).srights, 1, "once");
+        k.darwin_ipc_leave();
     }
 }
