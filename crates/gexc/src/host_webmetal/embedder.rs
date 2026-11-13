@@ -24,13 +24,15 @@ use webmetal_wire::{Event, Handle, SurfaceId};
 
 use super::surfaces::{Miss, Surfaces};
 
+/// Events posted and not yet fetched, per connection and command queue
+/// (`None`: device-level events), in the order they were posted.
+type Posted = HashMap<(TaskId, Option<Handle>), Vec<Event>>;
+
 /// The embedder of the executor's thread.
 pub struct GexEmbedder {
     /// Each open connection's task memory.
     tasks: RefCell<HashMap<TaskId, TaskMemory>>,
-    /// Events posted and not yet fetched, per connection and command queue
-    /// (`None`: device-level events), in the order they were posted.
-    events: RefCell<HashMap<(TaskId, Option<Handle>), Vec<Event>>>,
+    events: RefCell<Posted>,
     surfaces: Arc<Surfaces>,
 }
 
