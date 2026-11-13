@@ -20,6 +20,7 @@
 //! providers up to the root ([`super::platform`]), each with its
 //! superclasses. Their class filters walk an entry's own classes.
 
+pub mod host;
 pub mod iogpu;
 pub mod wire;
 
@@ -128,7 +129,7 @@ pub enum Client {
 /// driver opens there (`AGXDeviceUserClient`); its methods are WebMetal's.
 pub fn new_user_client(k: &mut Kernel, service: u32, ty: u32) -> Result<(&'static str, Client), i32> {
     if ty == wire::TYPE {
-        return Ok((DEVICE_CLIENT, Client::Wire(wire::Wire::new())));
+        return Ok((DEVICE_CLIENT, Client::Wire(wire::Wire::new(k))));
     }
     match ty & 0xffff {
         1 => iogpu::Device::open(k, service, ty >> 16).map(|d| (DEVICE_CLIENT, Client::Device(d))),

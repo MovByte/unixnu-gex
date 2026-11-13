@@ -500,6 +500,10 @@ pub enum Deferred {
     /// (`held`: a stop hold was put on it for this.)
     GetState { flavor: i32, count: u32, held: bool },
     SetState { flavor: i32, state: Vec<u32>, held: bool },
+    /// A user client's method that answers later, by its token
+    /// ([`super::mig::later_reply`]); answered by
+    /// [`Kernel::darwin_answer_later`], not by a thread stopping.
+    Later(u64),
 }
 
 /// A request answered once a thread is off its CPU.
@@ -549,6 +553,7 @@ impl Kernel {
     /// every other thread.
     fn pending_is_ready(&self, p: &PendingReply) -> bool {
         match p.op {
+            Deferred::Later(_) => false,
             Deferred::TaskWait { .. } => self.thread_signals.tids_in_order().into_iter().filter(|&t| t != p.target).all(|t| self.darwin_offcpu(t)),
             _ => p.target == self.tid || !self.darwin_thread_alive(p.target) || self.darwin_offcpu(p.target),
         }
@@ -570,6 +575,7 @@ impl Kernel {
                 Deferred::TaskWait { token: Some(port) } => Reply { ret: 0, defer: None, out: Vec::new(), ports: vec![PortOut::Right(Carried::Port(port), msgt::PORT_SEND_ONCE)], unimplemented: None },
                 Deferred::GetState { flavor, count, .. } => self.darwin_thread_state_now(m, tid, flavor, count, None),
                 Deferred::SetState { flavor, ref state, .. } => self.darwin_thread_state_now(m, tid, flavor, 0, Some(state.clone())),
+                Deferred::Later(_) => unreachable!("a method's later reply is never ready by itself"),
             };
             if matches!(p.op, Deferred::GetState { held: true, .. } | Deferred::SetState { held: true, .. }) {
                 // thread_unstop, thread_release.
@@ -586,6 +592,17 @@ impl Kernel {
         }
         self.darwin_ipc_settle(m);
         true
+    }
+
+    /// Answer the routine whose method answers later with `token`: `reply`
+    /// sent to its reply port. Nothing when no routine waits for it (it
+    /// had no reply port).
+    pub(crate) fn darwin_answer_later(&mut self, m: &mut crate::GuestMem<'_>, token: u64, reply: Reply) {
+        let Some(i) = self.dtask.pending_replies.iter().position(|p| p.op == Deferred::Later(token)) else { return };
+        let p = self.dtask.pending_replies.remove(i);
+        let k = reply.message(p.id, p.rport, p.rtype);
+        self.darwin_kernel_send(Box::new(k));
+        self.darwin_ipc_settle(m);
     }
 
     /// The replies whose thread is off its CPU now, or is the caller: what
