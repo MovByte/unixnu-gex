@@ -9,6 +9,10 @@
 // device (phase 4 of the WebMetal plan) over the same WebGPU
 // implementation.
 //
+// In the guest it runs as an app does, in the container profile's sandbox
+// (the platform profile admits a GPU user client to no unsandboxed program
+// but those it names by signing identifier).
+//
 // The kernel is linked in as a metallib (section __DATA,__metallib). On
 // macOS the shim's device comes from its provider, named by the first
 // argument (WMRefProvideDevice in a dylib); with none, the Mac's own.
@@ -20,6 +24,11 @@
 #include <mach-o/ldsyms.h>
 #include <stdio.h>
 #include <string.h>
+
+#if !TARGET_OS_OSX
+#define SANDBOX_NAMED_BUILTIN 2
+int sandbox_init(const char *profile, uint64_t flags, char **errorbuf);
+#endif
 
 static uint64_t digest = 0xcbf29ce484222325ull;
 
@@ -45,6 +54,11 @@ static id<MTLDevice> device_for(int argc, char **argv) {
 #else
     (void)argc;
     (void)argv;
+    // The main bundle is found first: an app's is in a place its sandbox
+    // lets it read, this program's (in /var/tmp) is not.
+    (void)[NSBundle mainBundle];
+    char *err = NULL;
+    if (sandbox_init("container", SANDBOX_NAMED_BUILTIN, &err) != 0) return nil;
     return MTLCreateSystemDefaultDevice();
 #endif
 }

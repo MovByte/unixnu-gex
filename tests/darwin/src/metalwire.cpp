@@ -10,6 +10,9 @@
 //   IOUserClient::sendAsyncResult64 sends for a 64-bit task, with the queue
 //   handle its argument), then FetchEvents' records: the command buffer
 //   scheduled and completed, and the GPU's write in this task's memory.
+// It runs as an app does, in the container profile's sandbox: the platform
+// profile admits a GPU user client to no unsandboxed program but those it
+// names by signing identifier.
 #include <IOKit/IOKitLib.h>
 #include <mach/mach.h>
 #include <stdio.h>
@@ -21,6 +24,9 @@
 #include "WebMetalWire.h"
 
 namespace wire = webmetal::wire;
+
+#define SANDBOX_NAMED_BUILTIN 2
+extern "C" int sandbox_init(const char *profile, uint64_t flags, char **errorbuf);
 
 static io_connect_t conn;
 
@@ -69,6 +75,8 @@ static int call(const char *what, const Request &r, wire::Reply<ReplyFields> &re
 }
 
 int main(void) {
+    char *err = NULL;
+    if (sandbox_init("container", SANDBOX_NAMED_BUILTIN, &err) != 0) return bad("the container sandbox", 0, 1);
     io_service_t accel = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOAcceleratorES"));
     if (!accel) return bad("the accelerator", 0, 1);
     kern_return_t kr = IOServiceOpen(accel, mach_task_self(), 0, &conn);
