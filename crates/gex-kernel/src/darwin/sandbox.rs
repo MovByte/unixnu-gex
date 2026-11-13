@@ -233,6 +233,8 @@ pub mod kind {
     pub const SOCKET: u32 = 2;
     pub const PROCESS: u32 = 4;
     pub const FSCTL: u32 = 5;
+    pub const PRIVILEGE: u32 = 0x10;
+    pub const MEMORYSTATUS: u32 = 0x1b;
     pub const SYSCTL: u32 = 0xf;
     pub const POSIX_IPC: u32 = 6;
     pub const HOST_SPECIAL_PORT: u32 = 7;
@@ -1246,6 +1248,8 @@ fn filter(b: &[u8], p: &Profile, ty: u8, flag: bool, arg: u16, facts: &mut dyn F
         // A socket option's level and name.
         79 => k == kind::SOCKET && int_match(b, p, flag, arg, u64::from(facts.socket_option().0))?,
         80 => k == kind::SOCKET && int_match(b, p, flag, arg, u64::from(facts.socket_option().1))?,
+        // A memorystatus_control command.
+        84 => k == kind::MEMORYSTATUS && int_match(b, p, flag, arg, u64::from(facts.syscall_number()))?,
         // An NECP client action's number.
         83 => k == kind::NECP_ACTION && int_match(b, p, flag, arg, u64::from(facts.syscall_number()))?,
         // iokit-registry-entry-class (and iokit-user-client-class): the

@@ -23,6 +23,7 @@ const KERN_FAILURE: i32 = 5;
 const KERN_TERMINATED: i32 = 37;
 const KERN_RESOURCE_SHORTAGE: i32 = 6;
 const KERN_NO_ACCESS: i32 = 8;
+const KERN_DENIED: i32 = 53;
 const KERN_INVALID_RIGHT: i32 = 17;
 const KERN_INVALID_VALUE: i32 = 18;
 const KERN_INVALID_TASK: i32 = 16;
@@ -889,6 +890,8 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         },
         // task_get_special_port(task, which) -> port
         (Kobject::Task | Kobject::TaskRead | Kobject::TaskInspect, 3409) => match arg(req, 0) {
+            // The MAC policies' check of the task's process, first.
+            Some(which) if k.darwin_mac_check_task_special_port(k.pid, which, false) != 0 => Reply::err(KERN_DENIED),
             Some(which) => {
                 let f = match obj {
                     Kobject::TaskRead => flavor::READ,
@@ -911,6 +914,9 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         }
         // task_set_special_port(task, which, port)
         (Kobject::Task, 3410) => match (desc_port(req, 0), arg_after(req, 1, 0)) {
+            // The MAC policies' check of the task's process, first (a
+            // failed request's right goes with its descriptors).
+            (Some(_), Some(which)) if k.darwin_mac_check_task_special_port(k.pid, which, true) != 0 => Reply::err(KERN_DENIED),
             (Some((right, _)), Some(which)) => task_set_special_port(k, which, right),
             _ => bad(),
         },

@@ -57,12 +57,15 @@ pub mod op {
     pub const IOKIT_OPEN_USER_CLIENT: usize = 63;
     pub const IOKIT_OPEN_SERVICE: usize = 64;
     pub const FILE_REVOKE: usize = 25;
+    pub const MACH_HOST_EXCEPTION_PORT_SET: usize = 92;
     pub const MACH_HOST_SPECIAL_PORT_SET: usize = 93;
     pub const MACH_PRIV_HOST_PORT: usize = 98;
     pub const MACH_PRIV_TASK_PORT: usize = 99;
     pub const MACH_TASK_INSPECT: usize = 102;
     pub const MACH_TASK_NAME: usize = 103;
     pub const MACH_TASK_READ: usize = 104;
+    pub const MACH_TASK_SPECIAL_PORT_GET: usize = 106;
+    pub const MACH_TASK_SPECIAL_PORT_SET: usize = 107;
     pub const PROCESS_CODESIGNING: usize = 119;
     pub const PROCESS_EXEC: usize = 120;
     pub const PROCESS_EXEC_INTERPRETER: usize = 121;
@@ -87,6 +90,7 @@ pub mod op {
     pub const SYSTEM_FSCTL: usize = 164;
     pub const SYSTEM_KAS_INFO: usize = 166;
     pub const SYSTEM_MAC_SYSCALL: usize = 173;
+    pub const SYSTEM_MEMORYSTATUS_CONTROL: usize = 174;
     pub const SYSTEM_SCHED: usize = 180;
     pub const SYSTEM_SOCKET: usize = 182;
     pub const SYSTEM_SUSPEND_RESUME: usize = 183;
@@ -460,7 +464,7 @@ impl Facts for KernelFacts<'_> {
         self.a.number
     }
     fn object_number(&mut self) -> Result<Option<u32>, Stop> {
-        Ok((self.a.kind == sandbox::kind::FSCTL).then_some(self.a.number))
+        Ok(matches!(self.a.kind, sandbox::kind::FSCTL | sandbox::kind::PRIVILEGE).then_some(self.a.number))
     }
     fn mac_call(&self) -> u32 {
         self.a.number2
@@ -1069,6 +1073,41 @@ impl Kernel {
         so.command = command;
         let a = SbArgs { kind: sandbox::kind::SOCKET, socket: Some(so), ..Default::default() };
         self.darwin_sb_evaluate(op::SOCKET_IOCTL, &a)
+    }
+
+    /// `mac_task_check_get_task_special_port` and `_set_` (Sandbox's hooks,
+    /// slots 74 and 75): mach-task-special-port-get or -set of process
+    /// `pid`'s task, for a port number that fits 16 bits (ENOTSUP for
+    /// another).
+    pub(crate) fn darwin_mac_check_task_special_port(&mut self, pid: i32, which: i32, set: bool) -> u32 {
+        if (which as u32) >> 16 != 0 {
+            return e::ENOTSUP;
+        }
+        let a = SbArgs { kind: sandbox::kind::PROCESS, target: Some(pid), ..Default::default() };
+        self.darwin_sb_evaluate(if set { op::MACH_TASK_SPECIAL_PORT_SET } else { op::MACH_TASK_SPECIAL_PORT_GET }, &a)
+    }
+
+    /// `mac_task_check_set_host_exception_ports`: Sandbox's hook (slot 127,
+    /// mach-host-exception-port-set) for each exception type of `mask`, the
+    /// first refusal the answer.
+    pub(crate) fn darwin_mac_check_set_host_exception_ports(&mut self, mask: u32) -> u32 {
+        const EXC_TYPES_COUNT: u32 = 14;
+        for exception in 1..EXC_TYPES_COUNT {
+            if mask & (1 << exception) != 0 {
+                let e = self.darwin_sb_evaluate(op::MACH_HOST_EXCEPTION_PORT_SET, &SbArgs::default());
+                if e != 0 {
+                    return e;
+                }
+            }
+        }
+        0
+    }
+
+    /// `mac_proc_check_memorystatus_control` (slot 198):
+    /// system-memorystatus-control of the command.
+    pub(crate) fn darwin_mac_check_memorystatus_control(&mut self, command: u32) -> u32 {
+        let a = SbArgs { kind: sandbox::kind::MEMORYSTATUS, number: command, ..Default::default() };
+        self.darwin_sb_evaluate(op::SYSTEM_MEMORYSTATUS_CONTROL, &a)
     }
 
     pub(crate) fn darwin_mac_check_fork(&mut self) -> u32 {
