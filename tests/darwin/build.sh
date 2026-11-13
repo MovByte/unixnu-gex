@@ -21,7 +21,7 @@ for p in hello-static bsd-carry commpage exclusive-pair aes; do
         -Wl,-e,_start -o "$OUT/$p" "$HERE/src/$p.c"
 done
 
-for p in hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit xpc-anon sbxinit sbxexec sbxkill layout; do
+for p in hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit xpc-anon sbxinit sbxexec sbxkill layout launchcon; do
     cc -O2 -o "$OUT/$p" "$HERE/src/$p.c"
 done
 cc -O2 -framework CoreFoundation -o "$OUT/cfrunloop" "$HERE/src/cfrunloop.c"
@@ -58,6 +58,10 @@ cc -O2 -o "$OUT/gta" "$HERE/src/hello.c"
 # sbxkill's children, which their entitlements have Sandbox kill.
 for p in sbxstacked sbxnotstr sbxunknown; do
     cc -O2 -o "$OUT/$p" "$HERE/src/sbxchild.c"
+done
+# launchcon's children, each to carry launch constraints of its own.
+for p in lcself lcparent lcresp lcfact lcok; do
+    cc -O2 -o "$OUT/$p" "$HERE/src/lcchild.c"
 done
 # exec's images: an arm64e slice (no pointer authentication on this CPU).
 xcrun -sdk iphoneos clang -target arm64e-apple-ios17.0 -O2 -o "$OUT/hello-arm64e" "$HERE/src/hello.c"
@@ -105,6 +109,19 @@ done
 # (a hardened one) may only with the entitlement that allows it.
 for p in excports excdeliver readports; do
     codesign -s - -f --entitlements "$HERE/src/exc.entitlements" "$OUT/$p" 2>/dev/null
+done
+# launchcon names its signing identifier, which lcok's parent constraint
+# names; its children carry their constraints on themselves, their parent
+# and their responsible process (src/<name>.<which>.plist).
+codesign -s - -f -i gex.test.launchcon --entitlements "$HERE/src/default.entitlements" "$OUT/launchcon" 2>/dev/null
+for p in lcself lcparent lcresp lcfact lcok; do
+    set --
+    for w in self parent responsible; do
+        if [ -f "$HERE/src/$p.$w.plist" ]; then
+            set -- "$@" --launch-constraint-$w "$HERE/src/$p.$w.plist"
+        fi
+    done
+    codesign -s - -f --entitlements "$HERE/src/default.entitlements" "$@" "$OUT/$p" 2>/dev/null
 done
 # A fat file of the arm64e slice and the arm64 one exec picks.
 lipo -create "$OUT/hello" "$OUT/hello-arm64e" -output "$OUT/hello-fat"

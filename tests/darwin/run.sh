@@ -21,14 +21,16 @@ GEXC=${GEXC:-$ROOT/target/release/gexc}
 BOOT=$HERE/bin/boot
 mkdir -p "$BOOT"
 # (untrusted is the one left out. bin may be a link to where the build
-# keeps them, which find follows with -H.)
+# keeps them, which find follows with -H.) launchcon's entry has launch
+# constraint category 5.
 progs=$(find -H "$HERE/bin" -maxdepth 1 -type f ! -name untrusted | sort)
+cats="--category 5:$HERE/bin/launchcon"
 if [ -n "${GEX_DARWIN_BOOT:-}" ]; then
     # shellcheck disable=SC2086
-    python3 -I "$ROOT/tools/darwin-trust-cache.py" -o "$BOOT/TrustCache" --bundle "$GEX_DARWIN_BOOT/TrustCache" $progs || exit 1
+    python3 -I "$ROOT/tools/darwin-trust-cache.py" -o "$BOOT/TrustCache" --bundle "$GEX_DARWIN_BOOT/TrustCache" $cats $progs || exit 1
 else
     # shellcheck disable=SC2086
-    python3 -I "$ROOT/tools/darwin-trust-cache.py" -o "$BOOT/TrustCache" $progs || exit 1
+    python3 -I "$ROOT/tools/darwin-trust-cache.py" -o "$BOOT/TrustCache" $cats $progs || exit 1
 fi
 if [ -n "${GEX_DARWIN_BOOT:-}" ] && [ -f "$GEX_DARWIN_BOOT/DeviceTree" ]; then
     cp "$GEX_DARWIN_BOOT/DeviceTree" "$BOOT/"
@@ -256,6 +258,15 @@ hello from /var/tmp/gex-exec-fat with 1 argument" 0
         ;;
     sbxinit) check_root sbxinit "sbxinit ok" 0 ;;
     sbxexec) check_root sbxexec "sbxexec ok" 0 ;;
+    launchcon)
+        if [ -n "${GEX_DARWIN_ROOT:-}" ]; then
+            mkdir -p "$GEX_DARWIN_ROOT/var/tmp"
+            for c in lcself lcparent lcresp lcfact lcok; do
+                cp "$HERE/bin/$c" "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$c"
+            done
+        fi
+        check_root launchcon "launchcon ok" 0
+        ;;
     sbxkill)
         if [ -n "${GEX_DARWIN_ROOT:-}" ]; then
             mkdir -p "$GEX_DARWIN_ROOT/var/tmp"
@@ -281,7 +292,7 @@ if [ "$named" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl iokit ioreg accel accelr iosurface iosurfacex iogpudev xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit sbxinit sbxexec sbxkill cfrunloop xpc-anon layout stackfb; do
+    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl iokit ioreg accel accelr iosurface iosurfacex iogpudev xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit sbxinit sbxexec sbxkill cfrunloop xpc-anon layout stackfb launchcon; do
         run "$p"
     done
 fi
