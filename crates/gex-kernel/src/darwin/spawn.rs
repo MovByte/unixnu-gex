@@ -50,6 +50,11 @@ const PORT_ACTION_SIZE: u64 = 24;
 const PORT_HDR: u64 = 8;
 const MAC_EXT_SIZE: u64 = 144;
 const MAC_HDR: u64 = 8;
+
+/// The `Sandbox` and the `AMFI` extensions' data from a spawn's MAC policy
+/// information.
+type MacPolicyData = (Option<Vec<u8>>, Option<Vec<u8>>);
+
 const PERSONA_INFO_SIZE: u64 = 88;
 const POSIX_CRED_INFO_SIZE: u64 = 340;
 /// `PATH_MAX`, and `NGROUPS_MAX`.
@@ -983,7 +988,7 @@ impl Kernel {
     /// their data copied in; the data of the first named `Sandbox`, for
     /// that policy's exec hook, and of the first named `AMFI`, for its
     /// launch constraints hook (`exec_spawnattr_getmacpolicyinfo`).
-    fn darwin_spawn_macpolicyinfo(&mut self, m: &GuestMem<'_>, size: u64, at: u64) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>), Errno> {
+    fn darwin_spawn_macpolicyinfo(&mut self, m: &GuestMem<'_>, size: u64, at: u64) -> Result<MacPolicyData, Errno> {
         if size < MAC_HDR + MAC_EXT_SIZE || size > super::exec::PAGE_SIZE {
             return Err(Errno::EINVAL);
         }

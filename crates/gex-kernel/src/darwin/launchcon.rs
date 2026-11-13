@@ -373,6 +373,9 @@ const CC_E5D22: &[u8] = &[
     0x01, 0x01, 0xff,
 ];
 
+/// A category table: a category's requirement blob, if it has one.
+type CategoryTable = fn(i32, &mut Vec<String>) -> Option<&'static [u8]>;
+
 /// `CC_Self` (`0xfffffff005aaccd0`): what a category requires of the
 /// launched process. None for category 0; an unknown category is logged
 /// and requires nothing.
@@ -872,7 +875,7 @@ impl Hook<'_> {
     /// process, its parent and its responsible process; on a failure `c`
     /// is `source`, `p` the process, and `e` the category when unset.
     fn category(&mut self, cat: i32, source: u8, v: &mut Viol) -> Step<bool> {
-        let tables: [(fn(i32, &mut Vec<String>) -> Option<&'static [u8]>, u8); 3] = [(cc_self, 1), (cc_parent, 2), (cc_responsible, 3)];
+        let tables: [(CategoryTable, u8); 3] = [(cc_self, 1), (cc_parent, 2), (cc_responsible, 3)];
         for (table, p) in tables {
             let Some(blob) = table(cat, &mut self.log) else { continue };
             let proc = [self.i.cur, self.i.parent, self.i.resp][p as usize - 1];

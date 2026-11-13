@@ -201,10 +201,13 @@ enum Param {
     Num(i64),
 }
 
+/// A key and its value.
+type Pair<'a> = (&'a [u8], &'a Ent);
+
 /// A dictionary's or a sequence's entries as the VM walks them for a key:
 /// a dictionary's pairs, or a sequence's elements that are key and value
 /// pairs. `None` where an element is not a pair (the walk stops there).
-fn pairs(v: &Ent) -> Option<Vec<Option<(&[u8], &Ent)>>> {
+fn pairs(v: &Ent) -> Option<Vec<Option<Pair<'_>>>> {
     match v {
         Ent::Dict(d) => Some(d.iter().map(|(k, v)| Some((k.as_slice(), v))).collect()),
         Ent::Array(a) => Some(
