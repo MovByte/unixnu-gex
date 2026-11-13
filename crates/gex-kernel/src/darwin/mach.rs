@@ -1598,7 +1598,7 @@ mod tests {
     /// An exec keeps the pid with a new task: from its switch the old
     /// task's name port names nothing and none is made until the new task
     /// is enabled (what other tasks left for it meanwhile goes on to it);
-    /// then a new name port.
+    /// then a new name port, and a new identity version.
     #[test]
     fn an_exec_gives_its_pid_a_new_task() {
         let (mut buf, mut k, _) = parent();
@@ -1607,7 +1607,9 @@ mod tests {
         c.darwin_task_enable();
         let key = c.dtask.ipc_raw.task;
         let old = name_port(&mut k, key).unwrap();
+        let version = c.dtask.pidversion;
         c.darwin_exec_switch(None, 0);
+        assert_ne!(c.dtask.pidversion, version);
         assert_eq!(pid_for(&mut k, &mut buf, old), (kr::FAILURE, -1));
         assert_eq!(task_of(&mut k, pid), Some((key, false)));
         assert_eq!(name_port(&mut k, key), None);
@@ -1622,8 +1624,9 @@ mod tests {
         assert_eq!(pid_for(&mut k, &mut buf, new), (kr::SUCCESS, pid));
     }
 
-    /// A spawn's child keeps the task its spawn made and enabled through
-    /// its image's switch: the name port its parent got goes on naming it.
+    /// A spawn's child keeps the task its spawn made through its image's
+    /// switch, with a new identity version: a name port made for it goes
+    /// on naming it.
     #[test]
     fn a_spawned_child_keeps_its_task_through_its_image() {
         let (mut buf, mut k, _) = parent();
@@ -1632,7 +1635,9 @@ mod tests {
         c.darwin_task_enable();
         let key = c.dtask.ipc_raw.task;
         let n = name_port(&mut k, key).unwrap();
+        let version = c.dtask.pidversion;
         c.darwin_exec_switch(Some(&crate::darwin::spawn::After::default()), 0);
+        assert_ne!(c.dtask.pidversion, version);
         assert_eq!(task_of(&mut k, pid), Some((key, true)));
         assert_eq!(pid_for(&mut k, &mut buf, n), (kr::SUCCESS, pid));
         assert_eq!(name_port(&mut k, key), Some(n));

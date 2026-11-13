@@ -1295,8 +1295,10 @@ fn run_program_with(
     kernel.darwin_dyld_final = false;
     kernel.dtask.strict = opts.darwin_strict;
     kernel.dtask.platform = opts.darwin_platform;
-    // An exec takes the next pidversion (`proc_setpidversion`).
-    if opts.darwin {
+    // The run's first program is exec'd as XNU execs its first process: it
+    // takes the next pidversion (`proc_setpidversion`). An exec's and a
+    // spawn's came with their switch to the image.
+    if opts.darwin && fresh {
         kernel.dtask.pidversion = gex_kernel::darwin::next_pidversion();
     }
     // A Darwin program other than launchd is not pid 1: dyld treats pid 1

@@ -434,9 +434,9 @@ impl crate::syscalls::Kernel {
     /// space if it has none yet; a spawn's watch ports are bound to it
     /// (`proc_set_task_spawnpolicy`, the spawn's rights to them let go
     /// after). `fork` and `posix_spawn` enable the new task before they
-    /// return to the parent, an exec its new task once the image is in
-    /// (and the run's first process its own), each before it runs; that
-    /// image's start enables a spawned task again with what it set.
+    /// return to the parent (a spawn's once its image is activated), an
+    /// exec its new task once the image is in (and the run's first process
+    /// its own), each before it runs.
     pub fn darwin_task_enable(&mut self) {
         let held = self.dtask.ipc_raw.held;
         let link = ipc::TaskLink {

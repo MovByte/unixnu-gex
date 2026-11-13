@@ -472,9 +472,9 @@ impl Kernel {
     /// in it with its notifications; the new task keeps the host and
     /// special ports the old one held, and its IPC is enabled once its
     /// image is in ([`Self::darwin_task_enable`]). A spawn's child keeps
-    /// the task its spawn made and enabled, and its ports. Each keeps its
-    /// signal actions as execsigs leaves them, its limits, app type and
-    /// dispatch queue offsets.
+    /// the task its spawn made, and its ports. Each takes a new identity
+    /// version, and keeps its signal actions as execsigs leaves them, its
+    /// limits, app type and dispatch queue offsets.
     fn darwin_exec_switch_body(&mut self, spawn: Option<&super::spawn::After>) {
         let new_task = spawn.is_none_or(|s| s.flags & super::spawn::flag::SETEXEC != 0);
         // exec_mach_imgact: P_EXEC.
@@ -550,7 +550,9 @@ impl Kernel {
             strict: old.strict,
             // proc_resetregister: libpthread registers again.
             pthread: super::thread::Registration { registered: false, ..old.pthread },
-            pidversion: old.pidversion,
+            // exec_handle_sugid's proc_setpidversion, as the image is
+            // activated (in a spawn's, its parent's call).
+            pidversion: super::next_pidversion(),
             ladvlock: old.ladvlock,
             sigacts: old.sigacts,
             // exec's vm_map_set_user_wire_limit.
