@@ -105,8 +105,9 @@ subsystem, most naming in their header the XNU source they port:
 - **Memory.** The task's VM map entries (`vm.rs`); `mmap`, `madvise` and
   `mach_vm_behavior_set` (`mman.rs`); `map_with_linking_np` and the dyld
   pager's fixups (`mwl.rs`); the commpage (`commpage.rs`); the
-  `phys_footprint` ledger (`footprint.rs`); memorystatus and the jetsam
-  bands (`memorystatus.rs`); POSIX shared memory (`shm.rs`).
+  `phys_footprint` ledger and `TASK_VM_INFO` (`footprint.rs`);
+  memorystatus and the jetsam bands (`memorystatus.rs`); POSIX shared
+  memory (`shm.rs`).
 - **Files.** Name, mode and time changes and `getdirentries64`
   (`fsops.rs`); the `getattrlist` family (`attrlist.rs`, `attrcall.rs`);
   `clonefile` and `exchangedata` (`clonefile.rs`); extended attributes
@@ -507,10 +508,13 @@ is the reference (search `crates/gex-kernel/src/` for
   `posix_spawn` with a subsystem root path or an audit session port action.
 - **Accounting.** What needs ledgers the kernel does not keep: a
   coalition's resource usage, the CPU monitor's actions on a violation, the
-  task-wide CPU limit, the wakeups monitor, workloop CPU limits. On a host
-  without per-thread clocks, the virtual timers, `RLIMIT_CPU`, the CPU
-  monitor, the workqueue's quantum and `getrusage`'s times are reported; on
-  one that cannot say which pages are a task's, `phys_footprint` is.
+  task-wide CPU limit, the wakeups monitor, workloop CPU limits, and the
+  pmap's and compressor's ledgers in `TASK_VM_INFO` (resident, internal,
+  external, reusable and compressed sizes and their peaks, the footprint's
+  peak, decompressions, swap-ins). On a host without per-thread clocks,
+  the virtual timers, `RLIMIT_CPU`, the CPU monitor, the workqueue's
+  quantum and `getrusage`'s times are reported; on one that cannot say
+  which pages are a task's, `phys_footprint` is.
 - **Terminals.** Terminal `ioctl`s not handled, an `fcntl` that would sleep
   in the driver, calls that would wait for a revoke to finish, and parts of
   `revoke` itself.
