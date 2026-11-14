@@ -866,6 +866,19 @@ impl Kernel {
         }
     }
 
+    /// `exit()`'s `proc_prepareexit`: a crash report owed (a code signing
+    /// kill's, or an exit reason's that asks for one) tells the EXC_CRASH
+    /// handlers, waited for, before the process ends with status `code`;
+    /// none owed is `None`, the exit going on as it is.
+    pub(crate) fn darwin_exit_prepare(&mut self, m: &mut GuestMem<'_>, code: i32) -> Option<crate::syscalls::SyscallOutcome> {
+        let was = std::mem::replace(&mut self.dtask.syscall_exit, true);
+        self.darwin_prepareexit(0);
+        self.dtask.syscall_exit = was;
+        let (c, sub) = self.dtask.crash_notify.take()?;
+        self.map_io().flush_all_shared(m);
+        Some(self.darwin_task_exception_notify(m, super::exception::EXC_CRASH, &[c, sub], super::triage::Then::Exited(code)))
+    }
+
     /// psignal's `si_pid`, `si_uid` for a caught signal (but SIGCHLD): the
     /// sender, or the process the kernel posted it from (an interval
     /// timer's SIGALRM, from the kernel's own thread call).

@@ -11475,8 +11475,13 @@ impl Kernel {
             if raw == crate::darwin::sysno::EXIT {
                 self.darwin_workq_mark_exiting();
                 // exit(): the value, for `p_xstat` and the parent's record;
-                // then exit1's proc_prepareexit (P_REF_DEAD).
+                // then exit1's proc_prepareexit: a crash report a code
+                // signing kill owes, its EXC_CRASH handlers told first;
+                // P_REF_DEAD.
                 self.procs.set_end(self.pid, a[0] as u32, self.creds.uid());
+                if let Some(out) = self.darwin_exit_prepare(m, (a[0] & 0xff) as i32) {
+                    return out;
+                }
                 self.procs.set_exited(self.pid);
             }
             if crate::darwin::thread::CANCEL_POINTS.contains(&raw) && self.darwin_testcancel(true) {
