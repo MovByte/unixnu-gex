@@ -341,6 +341,8 @@ pub enum Effect {
     Release(Request),
     /// A surface the glass held let go.
     ReleaseSurface(u32),
+    /// The default temporary surface let go (0xfffffff00679437c).
+    ReleaseDefaultTemp,
     /// The glass after swap `.0` at the blank (its count and time): the
     /// layers on it, by index.
     Present(u32, u64, u64, Vec<(u32, LayerReq)>),
@@ -467,6 +469,7 @@ fn perform(k: &mut Kernel, effects: Vec<Effect>) {
         match e {
             Effect::Release(r) => release_request(k, r),
             Effect::ReleaseSurface(id) => super::super::iosurface::kernel_release(k, id),
+            Effect::ReleaseDefaultTemp => super::super::iosurface::release_default_temp(),
             Effect::Present(swap, vbl, time, layers) => present(k, swap, vbl, time, &layers),
             Effect::Answer { link, token, ret } => {
                 link.mailbox.lock().unwrap_or_else(|e| e.into_inner()).push(super::super::ipc::Remote::Later { token, ret, scalars: Vec::new() });
@@ -1316,6 +1319,11 @@ impl Display {
                 for n in 0..4 {
                     if req.enabled & (1 << n) == 0 {
                         continue;
+                    }
+                    // Layer 0's retire lets the default temporary surface
+                    // (`+0x1620`) go, once.
+                    if n == 0 {
+                        self.effects.push(Effect::ReleaseDefaultTemp);
                     }
                     if let Some(old) = self.glass[n].take().and_then(|l| l.surface) {
                         self.effects.push(Effect::ReleaseSurface(old));

@@ -421,6 +421,11 @@ fn lookup(k: &mut Kernel, uc: u32, a: &mut MethodArgs) -> i32 {
             return Err(ret::BAD_ARGUMENT);
         }
         let debug = r.params.debug;
+        // The framebuffer's default temporary surface, the kernel's (not
+        // global, not private), is found only when every lookup is allowed.
+        if r.default_temp == Some(id) && debug & 1 != 0 {
+            return Err(UNMODELLED);
+        }
         let Some(mut s) = r.surfaces.remove(&id) else { return Err(ret::BAD_ARGUMENT) };
         let found = s.installed
             && (s.creator == Some(pid)
@@ -440,9 +445,16 @@ fn lookup(k: &mut Kernel, uc: u32, a: &mut MethodArgs) -> i32 {
             a.struct_out.copy_from_slice(&out);
             ret::SUCCESS
         }
+        Err(UNMODELLED) => {
+            k.darwin_unimplemented(format!("looking up the framebuffer's default temporary surface {id} (its description follows the bootloader's /vram region)"));
+            ret::UNSUPPORTED
+        }
         Err(e) => e,
     }
 }
+
+/// A lookup's result for what is not modelled (no IOReturn has this value).
+const UNMODELLED: i32 = 1;
 
 /// Selector 34 (0xfffffff005bae798, 0xfffffff005bafb60): a surface by a
 /// send right to it (`copyObjectForPortNameInTask`: a send right in the

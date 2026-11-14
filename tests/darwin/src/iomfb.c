@@ -13,6 +13,9 @@
 //   (frame-check.py).
 // - Before it, on a connection of its own, a swap of kind 0x13, which the
 //   kick drops unshown until a client's swap was shown.
+// - Surface ids: the framebuffer's default temporary surface holds id 1
+//   from boot, so the first surface is 2; the first shown swap that
+//   enables layer 0 lets it go, and the next surface takes 1.
 // - On a connection of its own, the user client's refusals: the selector
 //   range, the dispatch counts, reserved and empty entries, unknown swaps,
 //   a source rectangle outside its surface, the debug flags a production
@@ -251,6 +254,7 @@ int main(void) {
     CFDictionaryRef props = CFDictionaryCreate(NULL, keys, vals, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     IOSurfaceRef s = IOSurfaceCreate(props);
     if (s == NULL) return bad("IOSurfaceCreate", 0, 1);
+    if (IOSurfaceGetID(s) != 2) return bad("the first surface's id", IOSurfaceGetID(s), 2);
     if (IOSurfaceLock(s, 0, NULL) != KERN_SUCCESS) return bad("locking the surface", 0, 1);
     fill(IOSurfaceGetBaseAddress(s), IOSurfaceGetBytesPerRow(s), pw, ph);
     if (IOSurfaceUnlock(s, 0, NULL) != KERN_SUCCESS) return bad("unlocking the surface", 0, 1);
@@ -458,6 +462,7 @@ int main(void) {
     CFDictionaryRef props2 = CFDictionaryCreate(NULL, keys, vals2, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     IOSurfaceRef s2 = IOSurfaceCreate(props2);
     if (s2 == NULL) return bad("IOSurfaceCreate of the small surface", 0, 1);
+    if (IOSurfaceGetID(s2) != 1) return bad("the small surface's id", IOSurfaceGetID(s2), 1);
     if (IOSurfaceLock(s2, 0, NULL) != KERN_SUCCESS) return bad("locking the small surface", 0, 1);
     memset(IOSurfaceGetBaseAddress(s2), 0x40, IOSurfaceGetAllocSize(s2));
     if (IOSurfaceUnlock(s2, 0, NULL) != KERN_SUCCESS) return bad("unlocking the small surface", 0, 1);
