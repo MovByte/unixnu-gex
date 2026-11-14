@@ -598,10 +598,15 @@ is the reference (search `crates/gex-kernel/src/` for
   `display-timing-info`, a 1024×600 mode, which iBoot replaces on a device
   with its panel's; the framebuffer reads it as the kext does, so a boot
   payload whose device tree holds the panel's mode gives that mode.
-- **Mach.** The traps `clock_sleep` and `debug_control_port_for_pid`; MIG
-  routines not in `mig.rs`, and some `task_info`, `thread_info`,
-  `host_statistics` and `task_policy_get` flavors; `task_for_pid` and its
-  read and inspect forms on another process; a fault's exception
+- **Mach.** The trap `clock_sleep`; MIG routines not in `mig.rs`
+  (`processor_set_tasks` among them, with the processor set ports), and
+  some `task_info`, `thread_info`, `host_statistics` and `task_policy_get`
+  flavors; another process's task ports by its pid where the policies
+  allow them: `task_for_pid`'s and `debug_control_port_for_pid`'s (past
+  AMFI only with Developer Mode, or for `debug_control_port_for_pid` with
+  `com.apple.private.debug_port`), and `task_read_for_pid`'s and
+  `task_inspect_for_pid`'s (another task's task access port, its upcall,
+  and its read and inspect ports); a fault's exception
   (`EXC_BAD_ACCESS` and the like) sent to a handler the program set, which
   is reported and taken as a signal instead; telling an `EXC_CRASH` handler
   of a death outside a system call; corpses

@@ -588,7 +588,8 @@ impl Kernel {
             trap::TASK_NAME_FOR_PID => self.task_name_for_pid(m, w(0), a[1] as i32, a[2]),
             trap::TASK_FOR_PID => self.task_for_pid(m, w(0), a[1] as i32, a[2]),
             trap::IOKIT_USER_CLIENT => self.darwin_iokit_user_client_trap(a) as u32 as u64,
-            trap::CLOCK_SLEEP | trap::DEBUG_CONTROL_PORT_FOR_PID => {
+            trap::DEBUG_CONTROL_PORT_FOR_PID => self.debug_control_port_for_pid(m, w(0), a[1] as i32, a[2]),
+            trap::CLOCK_SLEEP => {
                 self.darwin_unimplemented(format!("Mach trap {t}"));
                 kr::FAILURE
             }
@@ -740,6 +741,62 @@ impl Kernel {
         } else {
             self.darwin_unimplemented("task_for_pid of another process under Developer Mode (its task access port's check and its control port)".into());
             return fail(m, kr::FAILURE);
+        };
+        let _ = m.write_u32(at, name);
+        kr::SUCCESS
+    }
+
+    /// `debug_control_port_for_pid(target_tport, pid, t)` (vm_unix.c): the
+    /// debug control port process `pid`'s task set (TASK_DEBUG_CONTROL_PORT),
+    /// for a caller holding some task's control port, when `proc_find`
+    /// finds the process and it passes the POSIX check. A caller without
+    /// com.apple.private.debug_port is asked of as task_for_pid's caller:
+    /// the policies' check of the control port (AMFI allows another's only
+    /// with Developer Mode), then the target's task access port's for one
+    /// not root and not the target. `task_get_debug_control_port` is
+    /// KERN_FAILURE for a task whose IPC is not active, else a copy of the
+    /// right: null for none set, dead for one that died. The name, or
+    /// null, is copied out either way.
+    fn debug_control_port_for_pid(&mut self, m: &mut GuestMem<'_>, target: u32, pid: i32, at: u64) -> u64 {
+        const TASK_DEBUG_CONTROL_PORT: i32 = 10;
+        let fail = |m: &mut GuestMem<'_>, r: u64| {
+            let _ = m.write_u32(at, 0);
+            r
+        };
+        if pid == 0 || !self.darwin_name_is_some_task(target) {
+            return fail(m, kr::FAILURE);
+        }
+        let Some(p) = self.darwin_proc_find(pid) else { return fail(m, kr::FAILURE) };
+        let current = pid == self.pid;
+        if !self.darwin_tfp_posix_check(pid) {
+            return fail(m, kr::FAILURE);
+        }
+        if !self.darwin_task_entitled("com.apple.private.debug_port") && self.darwin_mac_check_get_task(p.ident(pid), super::amfi::flavor::CONTROL) != 0 {
+            return fail(m, kr::FAILURE);
+        }
+        // Past here for another process: its task access port's check (for
+        // a caller not root), then its task's port.
+        if !current {
+            self.darwin_unimplemented("debug_control_port_for_pid of another process (its task access port's check and its TASK_DEBUG_CONTROL_PORT)".into());
+            return fail(m, kr::FAILURE);
+        }
+        // task_get_special_port_internal of this task.
+        let ipc = self.ipc();
+        let me = ipc.task;
+        if !ipc.task_ipc_active(me) {
+            return fail(m, kr::FAILURE);
+        }
+        let name = if self.dtask.kports.special_dead.contains(&TASK_DEBUG_CONTROL_PORT) {
+            super::ipc::PORT_DEAD
+        } else {
+            match self.dtask.kports.special.get(&TASK_DEBUG_CONTROL_PORT).copied() {
+                Some(p) if self.ipc().port(p).active => {
+                    self.ipc().copy_send(p);
+                    self.darwin_copyout_send(p)
+                }
+                Some(_) => super::ipc::PORT_DEAD,
+                None => 0,
+            }
         };
         let _ = m.write_u32(at, name);
         kr::SUCCESS
