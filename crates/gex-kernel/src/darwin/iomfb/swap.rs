@@ -176,6 +176,9 @@ pub struct Request {
     /// `+0xa60 + 8 * n`: whether layer `n` would show a surface once this
     /// swap is shown (0xfffffff006799c68).
     pub shows: [bool; 4],
+    /// `+0x310` bit 0: the swap was dropped (0xfffffff00679cf6c) rather
+    /// than programmed.
+    pub dropped: bool,
 }
 
 /// A notification record a client listed for a type (`+0x118 + type *
@@ -675,23 +678,26 @@ pub fn submit(k: &mut Kernel, record: &[u8]) -> i32 {
         k.darwin_unimplemented("an IOMobileFramebuffer swap's 0x20c bytes of user data (the transaction's +0x38, read from the task)".to_string());
         return give_back(k, id, req, ret::ERROR);
     }
-    if req.kind == 9 {
-        k.darwin_unimplemented("an IOMobileFramebuffer swap of kind 9, which shows the framebuffer's own surface on every layer".to_string());
-        return give_back(k, id, req, ret::ERROR);
-    }
-    // The kick has paths of its own for kinds 8 (the idle buffer
-    // IOMobileFramebufferSetIdleBuffer makes: the pipe's idle surfaces,
-    // 0xfffffff006bfbbc4, or the swap dropped by the pipe's slot 0x3e8) and
-    // 0x13 (dropped until a client's swap was shown, `+0x1787`, or taken
-    // with slot 323), which are not modelled.
-    if req.kind == 8 || req.kind == 0x13 {
-        k.darwin_unimplemented(format!("an IOMobileFramebuffer swap of kind {:#x}, which the kick (0xfffffff006bfb384) takes by a path of its own", req.kind));
-        return give_back(k, id, req, ret::ERROR);
-    }
+    // The kind is the record's, unchecked: swap_submit and the pipe's
+    // verify_swap look at it only for kind 9 (below), and the queue, the
+    // kick and the completion for their own kinds ([`Display::enqueue`],
+    // [`Display::kick`], [`Display::complete_pending`]).
     let mut valid = true;
     for n in 0..4usize {
         if req.enabled & (1 << n) == 0 {
             continue;
+        }
+        // A swap of kind 9 shows the framebuffer's idle surface (`+0x1660`)
+        // on each layer it enables in place of the record's: swap_submit
+        // retains it (its vtable's +0x20) unless the record names the
+        // default surface (`+0x1618`). Only AppleCLCD's idle path
+        // (0xfffffff006bfbbc4, for the pipe in run mode 4, which
+        // `NormalModeEnable` asks for and which is off here) sets the idle
+        // surface, and nothing sets the default one, so the retain reads
+        // through a null pointer: the kernel panics.
+        if req.kind == 9 {
+            k.darwin_unimplemented(format!("an IOMobileFramebuffer swap of kind 9 enabling layer {n}: swap_submit (0xfffffff00678f224) retains the framebuffer's idle surface, which is null here, and the kernel would panic"));
+            return give_back(k, id, req, ret::ERROR);
         }
         let rect = |at: usize| [i32_at(record, at), i32_at(record, at + 4), i32_at(record, at + 8), i32_at(record, at + 12)];
         let l = &mut req.layers[n];
@@ -1112,20 +1118,38 @@ impl Display {
     ///   through dropped (0xfffffff00679d584, slot 314).
     /// - Every cancelled request removed (0xfffffff00679c5ac, slot 309).
     ///
-    /// Then the head is taken unless some of its enabled layers are not
-    /// yet completed (`+0x318 != +0x31c`, "swap was not completed": it
-    /// waits for its swap signals), status 2. The pipe's readiness check
-    /// (0xfffffff006bd2f24) passes with `AOTEnable` off; the kinds with a
-    /// path of their own here (8, 0x13) are reported at submission.
+    /// Then the head:
+    /// - Of kind 0x13 before a client's swap was shown (`+0x1787`): dropped
+    ///   unshown (0xfffffff00679cf6c), and the kick ends.
+    /// - Not taken while some of its enabled layers are not yet completed
+    ///   (`+0x318 != +0x31c`, "swap was not completed": it waits for its
+    ///   swap signals). The display's `+0x18dc` would let a swap the pipe
+    ///   caches go regardless only in the pipe's run mode 4.
+    /// - Else made pending. Of kind 8 (the idle buffer
+    ///   `IOMobileFramebufferSetIdleBuffer` makes), the pipe's slot 0x3e8
+    ///   (0xfffffff006bbd08c: its run mode, `+0x1d38`, not 4) has it
+    ///   cancelled and dropped unshown, and the kick ends: only in run mode
+    ///   4 would its surface become the pipe's idle surface
+    ///   (0xfffffff006bfbbc4), and the pipe enters that mode only when
+    ///   `NormalModeEnable` (runtime property 0x6a, false from the pipe's
+    ///   start, `+0x1d30` being 2) asks for it (0xfffffff006bbc2b4).
+    /// - Any other kind is programmed, status 2. A kind 0 head would be
+    ///   checked against the replay surface, and kinds 0, 6, 7 and 0x13 go
+    ///   through the idle state (0xfffffff006bf86f0), only with the idle
+    ///   surface or state (`+0x1660`, `+0x1dd8`) set, which only the idle
+    ///   path sets.
+    ///
+    /// The pipe's readiness check (0xfffffff006bd2f24) passes with
+    /// `AOTEnable` off, and its head-of-line check (slot 0xb20) answers no.
     fn kick(&mut self, pid: i32, now: u64) {
         if self.pending.is_some() || self.power.soft == 0 || !self.power.controller || !self.power.timing {
             return;
         }
         if self.queue.front().is_some_and(|h| h.enabled == h.completed && self.noop(h)) {
-            let mut r = self.queue.pop_front().expect("a queued request");
-            r.status = 8;
-            self.pending = Some(r);
-            self.complete_pending(Shown::NoOp, pid, now);
+            // 0xfffffff00679d228 shows a dropped kind 0, 6 or 7 as a no-op;
+            // [`Display::noop`] holds only for kind 0.
+            let r = self.queue.pop_front().expect("a queued request");
+            self.drop_request(r, true, pid, now);
         }
         self.drop_ahead_of_kind(pid, now);
         let mut i = 0;
@@ -1138,12 +1162,34 @@ impl Display {
             }
         }
         let Some(head) = self.queue.front() else { return };
+        if head.kind == 0x13 && !self.swapped {
+            let r = self.queue.pop_front().expect("a queued request");
+            self.drop_request(r, false, pid, now);
+            return;
+        }
         if head.enabled != head.completed {
             return;
         }
         let mut r = self.queue.pop_front().expect("a queued request");
+        if r.kind == 8 {
+            r.cancelled = true;
+            self.drop_request(r, false, pid, now);
+            return;
+        }
         r.status = 2;
         self.pending = Some(r);
+    }
+
+    /// 0xfffffff00679cf6c: `r` dropped (status 8, `+0x310` bit 0) and
+    /// completed as the pending swap, shown as a no-op (0xfffffff006795b88)
+    /// or not (0xfffffff00678a96c with no display). A dropped kind 8's
+    /// layers showing the idle surface would have their mapping let go
+    /// first; no idle surface is set here.
+    fn drop_request(&mut self, mut r: Request, show: bool, pid: i32, now: u64) {
+        r.status = 8;
+        r.dropped = true;
+        self.pending = Some(r);
+        self.complete_pending(if show { Shown::NoOp } else { Shown::Flush }, pid, now);
     }
 
     /// Slot 314 (0xfffffff00679d584): the first queued request of a kind
@@ -1167,11 +1213,9 @@ impl Display {
                 i += 1;
                 continue;
             }
-            let mut r = self.queue.remove(i).expect("a queued request");
+            let r = self.queue.remove(i).expect("a queued request");
             end -= 1;
-            r.status = 8;
-            self.pending = Some(r);
-            self.complete_pending(Shown::Flush, pid, now);
+            self.drop_request(r, false, pid, now);
         }
     }
 
@@ -1229,7 +1273,9 @@ impl Display {
     /// controller on the power states are evaluated again once the pending
     /// swap is gone (0xfffffff006795b18). The residency counts kept for
     /// statistics (0xfffffff006795208, 0xfffffff006794ad4, slot 343) are
-    /// read by nothing here.
+    /// read by nothing here, nor are the counts AppleCLCD's swap-complete
+    /// interrupt (0xfffffff006bfbf8c) keeps of shown swaps of kind 0x13
+    /// (`+0x1f38`, and its IOReporting reporter's, `+0x2080`).
     fn complete_pending(&mut self, shown: Shown, pid: i32, now: u64) {
         let Some(mut req) = self.pending.take() else { return };
         match shown {

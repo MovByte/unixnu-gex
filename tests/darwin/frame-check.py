@@ -1,13 +1,14 @@
 # Check the frames the iomfb program swapped, as the test embedder recorded
-# them (hosts/native/src/darwin_frames.rs): the first, of swap 1, one layer
-# (layer 0) of a BGRA surface the panel's size, its source and destination
-# the whole panel, untransformed, one plane, and every pixel the pattern
-# the program wrote (iomfb.c's fill), the rows' padding zero; the second,
-# its layer 1 swap (its no-op swap makes none). Then the panel going dark,
-# the glass blanked (no layers) by the kernel's request the controller made
-# for its last frame as it went off, the panel lighting again (the swap made
-# while off is never shown), and the glass blanked by the kernel's swap of
-# kind 7 as the last swap client closed.
+# them (hosts/native/src/darwin_frames.rs): the first, of swap 2 (swap 1, of
+# kind 0x13, is dropped unshown), one layer (layer 0) of a BGRA surface the
+# panel's size, its source and destination the whole panel, untransformed,
+# one plane, and every pixel the pattern the program wrote (iomfb.c's fill),
+# the rows' padding zero; the second, its layer 1 swap (its idle buffer and
+# no-op swap make none). Then the panel going dark, the glass blanked (no
+# layers) by the kernel's request the controller made for its last frame as
+# it went off, the panel lighting again (the swap made while off is never
+# shown), and the glass blanked by the kernel's swap of kind 7 as the last
+# swap client closed.
 import struct
 import sys
 from pathlib import Path
@@ -35,7 +36,7 @@ def take(fmt):
 magic, version, swap_id, vbl, time, pw, ph, layers = take("4sIIQQIII")
 if magic != b"GEXF" or version != 1:
     fail("not a recorded frame")
-if swap_id != 1 or layers != 1 or vbl == 0 or time == 0:
+if swap_id != 2 or layers != 1 or vbl == 0 or time == 0:
     fail(f"swap {swap_id}, {layers} layers, blank {vbl} at {time}")
 index, surface, fmt, w, h = take("IIIQQ")
 src = take("4i")

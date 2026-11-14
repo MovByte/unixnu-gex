@@ -11,6 +11,8 @@
 //   layer 0 and waited for until it is on the glass. The test embedder
 //   records the frame; run.sh checks its bytes and geometry
 //   (frame-check.py).
+// - Before it, on a connection of its own, a swap of kind 0x13, which the
+//   kick drops unshown until a client's swap was shown.
 // - On a connection of its own, the user client's refusals: the selector
 //   range, the dispatch counts, reserved and empty entries, unknown swaps,
 //   a source rectangle outside its surface, the debug flags a production
@@ -24,6 +26,8 @@
 //   priority entitlement): layer 0 holds the swapped surface and layer 1
 //   nothing; a second swap that sets only layer 1 leaves layer 0 as it
 //   was, and the test embedder records both layers (frame-check.py).
+// - An idle buffer (IOMobileFramebufferSetIdleBuffer, a swap of kind 8),
+//   which the kick drops unshown, the glass as it was.
 // - A swap that changes nothing on the glass completes at once, with no
 //   new frame; swap signals (selector 20) for a begun swap, a queued one,
 //   a layer it does not enable, and none.
@@ -140,6 +144,23 @@ static kern_return_t submit_masks(io_connect_t c, uint32_t id, uint32_t surface,
     return IOConnectCallStructMethod(c, 5, rec, sizeof rec, NULL, NULL);
 }
 
+// A raw transaction of kind `kind`, layer 0 enabled and completed, showing
+// the whole of `surface`.
+static kern_return_t submit_kind(io_connect_t c, uint32_t id, uint32_t surface, int w, int h, uint32_t kind) {
+    uint8_t rec[1288];
+    memset(rec, 0, sizeof rec);
+    int32_t src[4] = {0, 0, w, h};
+    uint32_t one = 1;
+    memcpy(rec + 0x98, &id, 4);
+    memcpy(rec + 0x9c, &surface, 4);
+    memcpy(rec + 0xac, src, 16);
+    memcpy(rec + 0x10c, src, 16);
+    memcpy(rec + 0x14c, &one, 4);
+    memcpy(rec + 0x150, &one, 4);
+    memcpy(rec + 0x17c, &kind, 4);
+    return IOConnectCallStructMethod(c, 5, rec, sizeof rec, NULL, NULL);
+}
+
 static volatile sig_atomic_t alarmed;
 
 static void on_alarm(int sig) {
@@ -202,11 +223,30 @@ int main(void) {
     fill(IOSurfaceGetBaseAddress(s), IOSurfaceGetBytesPerRow(s), pw, ph);
     if (IOSurfaceUnlock(s, 0, NULL) != KERN_SUCCESS) return bad("unlocking the surface", 0, 1);
 
+    // A connection of its own, for the raw calls below and the user
+    // client's refusals.
+    io_connect_t c = IO_OBJECT_NULL;
+    if ((kr = IOServiceOpen(clcd, mach_task_self(), 7, &c)) != KERN_SUCCESS) return bad("IOServiceOpen of any type", kr, 0);
+    uint64_t in[4] = {0, 0, 0, 0}, out[2] = {0, 0};
+    uint32_t outn = 1;
+    uint32_t sid = IOSurfaceGetID(s);
+    // A swap of kind 0x13 before any client's swap was shown: queued, and
+    // dropped unshown by the kick (gone at once), the glass still empty.
+    if ((kr = IOConnectCallScalarMethod(c, 4, NULL, 0, out, &outn)) != KERN_SUCCESS || out[0] != 1) return bad("the first swap id", out[0], 1);
+    if ((kr = submit_kind(c, 1, sid, (int)pw, (int)ph, 0x13)) != KERN_SUCCESS) return bad("submitting a swap of kind 0x13", kr, 0);
+    in[0] = 1;
+    in[1] = 0x80000001;
+    in[2] = 0;
+    if ((kr = IOConnectCallScalarMethod(c, 6, in, 3, NULL, NULL)) != KERN_SUCCESS) return bad("the swap of kind 0x13, dropped", kr, 0);
+    in[0] = 0;
+    outn = 1;
+    if ((kr = IOConnectCallScalarMethod(c, 83, in, 1, out, &outn)) != kIOReturnError) return bad("the glass after the swap of kind 0x13", kr, kIOReturnError);
+
     // The swap: begun, layer 0 the whole surface onto the whole panel,
     // ended, and waited for until it is displayed (option 1).
     int token = 0;
     kr = swap_begin(fb, &token);
-    if (kr != KERN_SUCCESS || token != 1) return bad("SwapBegin's first swap id", token, 1);
+    if (kr != KERN_SUCCESS || token != 2) return bad("SwapBegin's swap id", token, 2);
     // The first swap client turned the console mode off.
     if (console_mode(clcd, 0)) return 1;
     FbRect whole = {0, 0, pw, ph};
@@ -227,11 +267,7 @@ int main(void) {
     if ((kr = swap_wait(fb, token, 4)) != kIOReturnBadArgument) return bad("SwapWait option 4", kr, kIOReturnBadArgument);
     if ((kr = swap_wait(fb, token, 0x80000000)) != kIOReturnBusy) return bad("a SwapWait that would wait, not blocking", kr, kIOReturnBusy);
 
-    // A connection of its own for the user client's refusals.
-    io_connect_t c = IO_OBJECT_NULL;
-    if ((kr = IOServiceOpen(clcd, mach_task_self(), 7, &c)) != KERN_SUCCESS) return bad("IOServiceOpen of any type", kr, 0);
-    uint64_t in[4] = {0, 0, 0, 0}, out[2] = {0, 0};
-    uint32_t outn = 1;
+    // The user client's refusals.
     if ((kr = IOConnectCallScalarMethod(c, 90, NULL, 0, NULL, NULL)) != (kern_return_t)0xe0000001) return bad("selector 90", kr, 0xe0000001);
     if ((kr = IOConnectCallScalarMethod(c, 6, in, 2, NULL, NULL)) != kIOReturnBadArgument) return bad("selector 6 with two scalars", kr, kIOReturnBadArgument);
     uint8_t shortrec[1287] = {0};
@@ -247,15 +283,15 @@ int main(void) {
     // swap left begun and handed over; submitting it again is lost, and it
     // cancels.
     outn = 1;
-    if ((kr = IOConnectCallScalarMethod(c, 4, NULL, 0, out, &outn)) != KERN_SUCCESS || out[0] != 2) return bad("the second swap id", out[0], 2);
-    uint32_t sid = IOSurfaceGetID(s), id2 = (uint32_t)out[0];
+    if ((kr = IOConnectCallScalarMethod(c, 4, NULL, 0, out, &outn)) != KERN_SUCCESS || out[0] != 3) return bad("the third swap id", out[0], 3);
+    uint32_t id2 = (uint32_t)out[0];
     if ((kr = submit(c, id2, sid, 1, 0, (int)pw, (int)ph)) != kIOReturnBadArgument) return bad("a source rectangle past its surface", kr, kIOReturnBadArgument);
     if ((kr = submit(c, id2, sid, 0, 0, (int)pw, (int)ph)) != kIOReturnError) return bad("submitting a swap twice", kr, kIOReturnError);
     in[0] = id2;
     if ((kr = IOConnectCallScalarMethod(c, 52, in, 1, NULL, NULL)) != KERN_SUCCESS) return bad("cancelling the refused swap", kr, 0);
     // A surface that does not exist: kIOReturnBadArgument.
     outn = 1;
-    if ((kr = IOConnectCallScalarMethod(c, 4, NULL, 0, out, &outn)) != KERN_SUCCESS || out[0] != 3) return bad("the third swap id", out[0], 3);
+    if ((kr = IOConnectCallScalarMethod(c, 4, NULL, 0, out, &outn)) != KERN_SUCCESS || out[0] != 4) return bad("the fourth swap id", out[0], 4);
     if ((kr = submit(c, (uint32_t)out[0], 0xfff0, 0, 0, 32, 32)) != kIOReturnBadArgument) return bad("a layer of no surface", kr, kIOReturnBadArgument);
     in[0] = 0;
     in[1] = 0;
@@ -384,6 +420,23 @@ int main(void) {
         IOSurfaceRef on = IOSurfaceLookupFromMachPort((mach_port_t)out[0]);
         IOSurfaceRef want = layer == 0 ? s : s2;
         if (on == NULL || IOSurfaceGetID(on) != IOSurfaceGetID(want)) return bad("a layer's surface after layer 1's swap", on ? IOSurfaceGetID(on) : 0, IOSurfaceGetID(want));
+        CFRelease(on);
+        mach_port_deallocate(mach_task_self(), (mach_port_t)out[0]);
+    }
+
+    // An idle buffer: a swap of kind 8 of layer 0, queued at the head and
+    // dropped unshown by the kick (gone at once); the glass is as it was.
+    kern_return_t (*set_idle_buffer)(Framebuffer, IOSurfaceRef) = dlsym(h, "IOMobileFramebufferSetIdleBuffer");
+    if (set_idle_buffer == NULL) return bad("IOMobileFramebufferSetIdleBuffer", 0, 1);
+    if ((kr = set_idle_buffer(fb, s)) != KERN_SUCCESS) return bad("SetIdleBuffer", kr, 0);
+    if ((kr = swap_wait(fb, second + 1, 0x80000001)) != KERN_SUCCESS) return bad("the idle buffer's swap, dropped", kr, 0);
+    for (int layer = 0; layer < 2; layer++) {
+        in[0] = layer;
+        outn = 1;
+        if ((kr = IOConnectCallScalarMethod(c, 83, in, 1, out, &outn)) != KERN_SUCCESS) return bad("CopyLayerDisplayedSurface after the idle buffer", kr, 0);
+        IOSurfaceRef on = IOSurfaceLookupFromMachPort((mach_port_t)out[0]);
+        IOSurfaceRef want = layer == 0 ? s : s2;
+        if (on == NULL || IOSurfaceGetID(on) != IOSurfaceGetID(want)) return bad("a layer's surface after the idle buffer", on ? IOSurfaceGetID(on) : 0, IOSurfaceGetID(want));
         CFRelease(on);
         mach_port_deallocate(mach_task_self(), (mach_port_t)out[0]);
     }
