@@ -180,10 +180,29 @@ pub fn add_loaded(m: Module) {
     }
 }
 
+/// A trust cache query's type (libTrustCache's `TCQueryType_t`, as AMFI
+/// uses it: its platform test, 0x...ab3e10, asks 1 and then, where loaded
+/// caches count, 2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Query {
+    /// The static trust cache (1).
+    Static,
+    /// The loaded ones (2).
+    Loadable,
+}
+
+/// `query_trust_cache` of one type: its entry for `cdhash`.
+pub fn query(q: Query, cdhash: &[u8; 20]) -> Option<Entry> {
+    match q {
+        Query::Static => STATIC.get().and_then(Option::as_ref).and_then(|m| m.lookup(cdhash)),
+        Query::Loadable => LOADED.lock().unwrap_or_else(|e| e.into_inner()).iter().find_map(|m| m.lookup(cdhash)),
+    }
+}
+
 /// AMFI's platform test (`0x...ab3e10`): a query of the static trust cache,
 /// then of the loaded ones.
 pub fn platform(cdhash: &[u8; 20]) -> Option<Entry> {
-    STATIC.get().and_then(Option::as_ref).and_then(|m| m.lookup(cdhash)).or_else(|| LOADED.lock().unwrap_or_else(|e| e.into_inner()).iter().find_map(|m| m.lookup(cdhash)))
+    query(Query::Static, cdhash).or_else(|| query(Query::Loadable, cdhash))
 }
 
 #[cfg(test)]

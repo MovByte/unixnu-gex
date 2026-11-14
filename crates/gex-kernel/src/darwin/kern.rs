@@ -1784,8 +1784,10 @@ impl Kernel {
                 };
                 m.write_u64(out, p).map_err(fault)
             }
-            // {cdhash, ..., result at 0x18}: in the static trust cache (1),
-            // in a loaded one (2); for an entitled caller.
+            // {cdhash, ..., result at 0x18} (0xfffffff005ab73a8): the
+            // result zeroed, then bit 0 if the static trust cache has the
+            // cdhash (query type 1) and bit 1 if a loaded one has it (type
+            // 2); for an entitled caller.
             amfi_call::CHECK_TRUST_CACHE => {
                 if !self.darwin_task_entitled("com.apple.private.amfi.can-check-trust-cache") {
                     return Err(13);
@@ -1793,7 +1795,8 @@ impl Kernel {
                 let mut q = [0u8; 0x20];
                 q.copy_from_slice(m.read(arg, 0x20).map_err(fault)?);
                 let cdhash: [u8; 20] = q[..20].try_into().unwrap();
-                let found = u64::from(super::trustcache::platform(&cdhash).is_some());
+                use super::trustcache::{query, Query};
+                let found = u64::from(query(Query::Static, &cdhash).is_some()) | u64::from(query(Query::Loadable, &cdhash).is_some()) << 1;
                 q[0x18..0x20].copy_from_slice(&found.to_le_bytes());
                 m.write(arg, &q).map_err(fault)
             }
