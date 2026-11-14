@@ -1,12 +1,14 @@
-//! The owners, modes and file flags of the system volume's files, as the
-//! device's system volume has them. A host's extraction of the root keeps
-//! its files' contents but none of these: they come from the boot
-//! payload's `SystemVolume.attrs`, which `tools/darwin-volume-attrs.py`
-//! writes from the IPSW's root filesystem image (an mtree(5)-style
-//! specification; its `flags` are `st_flags` in hexadecimal).
+//! The owners, modes and file flags of the files of the device's sealed
+//! volumes, as their images have them: the system volume, and the SystemOS
+//! cryptex the shared cache is in. A host's extraction of the root keeps
+//! its files' contents but not these: they come from the boot payload's
+//! `SystemVolume.attrs` and `SystemOS.attrs`, which
+//! `tools/darwin-volume-attrs.py` writes from the IPSW's root filesystem
+//! image and its SystemOS cryptex image (mtree(5)-style specifications;
+//! their `flags` are `st_flags` in hexadecimal).
 //!
-//! [`lookup`] answers for a path of the system volume as the guest names it
-//! below the volume's root, its components taken as they are (no link
+//! [`lookup`] answers for a path of a volume as the guest names it below
+//! the volume's root, its components taken as they are (no link
 //! followed): the stat of a file of the root, and the overlay's files
 //! presented as the volume's own.
 
@@ -217,35 +219,75 @@ impl Volume {
     }
 }
 
-/// The boot payload's specification of the system volume until it is
-/// read, and what it read as.
-static SPEC: Mutex<Option<Vec<u8>>> = Mutex::new(None);
-static SYSTEM: OnceLock<Result<Volume, String>> = OnceLock::new();
+/// A volume whose attributes the boot payload carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Vol {
+    /// The system volume, `/`.
+    System,
+    /// The SystemOS cryptex (`os.dmg`), which the device grafts at
+    /// `/private/preboot/Cryptexes/OS` and this root has at
+    /// `/System/Cryptexes/OS`.
+    OsCryptex,
+}
 
-/// The boot payload's `SystemVolume.attrs`, read when first looked in.
-pub fn set_system(spec: Vec<u8>) -> Result<(), String> {
-    let mut g = SPEC.lock().unwrap_or_else(|e| e.into_inner());
-    if g.is_some() || SYSTEM.get().is_some() {
-        return Err("the system volume's attributes are set already".into());
+impl Vol {
+    /// The payload's file of its specification.
+    pub fn file(self) -> &'static str {
+        match self {
+            Vol::System => "SystemVolume.attrs",
+            Vol::OsCryptex => "SystemOS.attrs",
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Vol::System => "the device's system volume",
+            Vol::OsCryptex => "the device's SystemOS cryptex",
+        }
+    }
+
+    fn slot(self) -> &'static Slot {
+        static SYSTEM: Slot = Slot { spec: Mutex::new(None), read: OnceLock::new() };
+        static OS_CRYPTEX: Slot = Slot { spec: Mutex::new(None), read: OnceLock::new() };
+        match self {
+            Vol::System => &SYSTEM,
+            Vol::OsCryptex => &OS_CRYPTEX,
+        }
+    }
+}
+
+/// A volume's specification until it is read, and what it read as.
+struct Slot {
+    spec: Mutex<Option<Vec<u8>>>,
+    read: OnceLock<Result<Volume, String>>,
+}
+
+/// The boot payload's specification of `vol`, read when first looked in.
+pub fn set(vol: Vol, spec: Vec<u8>) -> Result<(), String> {
+    let slot = vol.slot();
+    let mut g = slot.spec.lock().unwrap_or_else(|e| e.into_inner());
+    if g.is_some() || slot.read.get().is_some() {
+        return Err(format!("the attributes of {} are set already", vol.name()));
     }
     *g = Some(spec);
     Ok(())
 }
 
-/// The attributes of file `path` of the system volume (its path below the
-/// volume's root, as the guest names it, no link followed). `Err` says why
-/// there are none: no specification was booted with, it does not read, or
-/// the volume has no such file.
-pub fn lookup(path: &str) -> Result<Attrs, String> {
-    let v = SYSTEM.get_or_init(|| {
-        let spec = SPEC.lock().unwrap_or_else(|e| e.into_inner()).take();
+/// The attributes of file `path` of `vol` (its path below the volume's
+/// root, as the guest names it, no link followed). `Err` says why there are
+/// none: no specification was booted with, it does not read, or the volume
+/// has no such file.
+pub fn lookup(vol: Vol, path: &str) -> Result<Attrs, String> {
+    let slot = vol.slot();
+    let v = slot.read.get_or_init(|| {
+        let spec = slot.spec.lock().unwrap_or_else(|e| e.into_inner()).take();
         match spec {
-            Some(s) => parse(&s).map_err(|e| format!("the boot payload's SystemVolume.attrs: {e}")),
-            None => Err("the system volume's owners, modes and flags (the boot payload's SystemVolume.attrs)".into()),
+            Some(s) => parse(&s).map_err(|e| format!("the boot payload's {}: {e}", vol.file())),
+            None => Err(format!("the owners, modes and flags of {} (the boot payload's {})", vol.name(), vol.file())),
         }
     });
     let v = v.as_ref().map_err(Clone::clone)?;
-    v.lookup(path).ok_or_else(|| format!("{path}, which the device's system volume does not have"))
+    v.lookup(path).ok_or_else(|| format!("{path}, which {} does not have", vol.name()))
 }
 
 #[cfg(test)]
@@ -294,6 +336,19 @@ x
         assert_eq!(v.lookup("/bin/ps"), a(Kind::File, 0, 0, 0o4755, 0x20));
         assert_eq!(v.lookup("/var"), a(Kind::Link, 0, 80, 0o755, 0));
         assert_eq!(v.lookup("/System/Cryptexes/OS/System"), None);
+    }
+
+    /// The SystemOS cryptex's, from the same payload: the shared cache is
+    /// root's, group admin.
+    #[test]
+    #[ignore = "needs the boot payload's SystemOS.attrs"]
+    fn reads_the_device_os_cryptex() {
+        let dir = std::env::var("GEX_DARWIN_BOOT").expect("GEX_DARWIN_BOOT");
+        let v = parse(&std::fs::read(format!("{dir}/SystemOS.attrs")).unwrap()).unwrap();
+        let a = |kind, uid, gid, mode, flags| Some(Attrs { kind, uid, gid, mode, flags });
+        assert_eq!(v.lookup("/"), a(Kind::Dir, 0, 0, 0o755, 0));
+        assert_eq!(v.lookup("/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64"), a(Kind::File, 0, 80, 0o755, 0));
+        assert_eq!(v.lookup("/sbin/launchd"), None);
     }
 
     #[test]

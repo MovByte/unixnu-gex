@@ -129,13 +129,15 @@ const MAC_MAX_POLICY_NAME: usize = 32;
 /// `ENOPOLICY`, `ENOSYS` and `ENOTSUP` as Darwin numbers them.
 const ENOPOLICY: i32 = 103;
 
-/// A mount, as `getfsstat64` reports it.
+/// A mount, as `getfsstat64` reports it, and the sealed volume whose
+/// image gives its files' owners, modes and flags, if one does.
 pub struct Mount {
     pub on: &'static str,
     pub from: &'static str,
     pub fsid: u64,
     pub flags: u32,
     pub fs: Fs,
+    pub vol: Option<super::volattrs::Vol>,
 }
 
 /// The filesystem a mount is of.
@@ -167,9 +169,9 @@ pub const DEVFS_FSID: u32 = 0x9a3c_51e7;
 /// from its MACF `vfc_flags`), and the SystemOS cryptex the shared cache
 /// is in, by the filesystem id its dynamic data names.
 pub const MOUNTS: &[Mount] = &[
-    Mount { on: "/", from: "/dev/disk0s1s1", fsid: 0x0100_0002, flags: MNT_RDONLY | MNT_ROOTFS, fs: Fs::Apfs },
-    Mount { on: "/dev", from: "devfs", fsid: DEVFS_FSID as u64, flags: MNT_LOCAL | MNT_DONTBROWSE | MNT_MULTILABEL, fs: Fs::Devfs },
-    Mount { on: "/System/Cryptexes/OS", from: "/dev/disk3s1", fsid: super::CACHE_FS_ID, flags: MNT_RDONLY | MNT_DONTBROWSE, fs: Fs::Apfs },
+    Mount { on: "/", from: "/dev/disk0s1s1", fsid: 0x0100_0002, flags: MNT_RDONLY | MNT_ROOTFS, fs: Fs::Apfs, vol: Some(super::volattrs::Vol::System) },
+    Mount { on: "/dev", from: "devfs", fsid: DEVFS_FSID as u64, flags: MNT_LOCAL | MNT_DONTBROWSE | MNT_MULTILABEL, fs: Fs::Devfs, vol: None },
+    Mount { on: "/System/Cryptexes/OS", from: "/dev/disk3s1", fsid: super::CACHE_FS_ID, flags: MNT_RDONLY | MNT_DONTBROWSE, fs: Fs::Apfs, vol: Some(super::volattrs::Vol::OsCryptex) },
 ];
 
 /// The volume the preboot cryptexes are on: what `vnode_lookup` of
