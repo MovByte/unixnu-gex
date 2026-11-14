@@ -149,7 +149,7 @@ pub fn value(path: &str) -> Option<Value> {
         "hw.osenvironment" => Data(&[0; 32]),
         // /chosen/ephemeral-storage.
         "hw.ephemeral_storage" => I32(0),
-        "security.mac.amfi.developer_mode_status" => I32(1),
+        "security.mac.amfi.developer_mode_status" => I32(super::amfi::developer_mode_status()),
         _ => return None,
     })
 }

@@ -56,8 +56,8 @@ pub mod flavor {
     pub const NAME: u8 = 3;
 }
 
-/// `developer_mode_state()`: off, as an iPad leaves it.
-pub const DEVELOPER_MODE: bool = false;
+/// `developer_mode_state()`.
+pub const DEVELOPER_MODE: bool = super::amfi::DEVELOPER_MODE;
 
 /// `MIG_NO_REPLY`, `MIG_BAD_ID`.
 pub const MIG_NO_REPLY: i32 = -305;

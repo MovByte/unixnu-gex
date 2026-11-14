@@ -102,6 +102,13 @@ int main(void) {
     len = sizeof w;
     if (sysctlbyname("hw.optional.armv8_1_atomics", &w, &len, NULL, 0) != 0 || w != 0) return bad("armv8_1_atomics", w, 0);
 
+    // AMFI's Developer Mode status: off, as the device has it; read-only.
+    w = -1;
+    len = sizeof w;
+    if (sysctlbyname("security.mac.amfi.developer_mode_status", &w, &len, NULL, 0) != 0 || len != 4 || w != 0) return bad("security.mac.amfi.developer_mode_status", w, 0);
+    errno = 0;
+    if (sysctlbyname("security.mac.amfi.developer_mode_status", NULL, NULL, &w, sizeof w) != -1 || errno != EPERM) return bad("setting developer_mode_status", errno, EPERM);
+
     // The name of a node that does not exist.
     errno = 0;
     len = sizeof buf;
