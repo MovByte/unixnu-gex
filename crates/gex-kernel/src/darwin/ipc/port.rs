@@ -71,7 +71,7 @@ impl Ipc {
                 None => self.pset_alloc().map(|(n, _)| n),
             },
             port_right::DEAD_NAME => {
-                let n = self.space.alloc(None).ok_or(kr::NO_SPACE)?;
+                let n = self.space.alloc(None)?;
                 self.space.lookup_mut_any(n).bits |= ty::DEAD_NAME | 1;
                 Ok(n)
             }

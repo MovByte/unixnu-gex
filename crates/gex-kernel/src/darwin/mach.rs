@@ -1684,6 +1684,36 @@ mod tests {
         assert_eq!(pid_for(&mut k, &mut buf, n), (kr::SUCCESS, pid));
     }
 
+    /// A task that has ended takes no key and no space when its kernel
+    /// reaches IPC again: its space is the inactive one its end left (no
+    /// name is given out: KERN_INVALID_TASK), and the system's table keeps
+    /// no space for it.
+    #[test]
+    fn an_ended_task_takes_no_new_space() {
+        let (_buf, mut k, _) = parent();
+        let mut c = child(&k);
+        c.darwin_publish();
+        c.darwin_task_enable();
+        let spaces = |k: &mut Kernel| {
+            let n = k.ipc().others.len();
+            k.darwin_ipc_leave();
+            n
+        };
+        let live = spaces(&mut k);
+        c.darwin_task_terminate();
+        let ended = spaces(&mut k);
+        assert_eq!(ended, live - 1);
+        for _ in 0..2 {
+            let ipc = c.ipc();
+            assert_eq!(ipc.task, 0);
+            assert!(!ipc.space.active);
+            assert_eq!(ipc.port_alloc(true).err(), Some(kr::INVALID_TASK));
+            assert_eq!(ipc.pset_alloc().err(), Some(kr::INVALID_TASK));
+            c.darwin_ipc_leave();
+            assert_eq!(spaces(&mut k), ended);
+        }
+    }
+
     /// A child whose spawn failed before its task was enabled lets go of
     /// the send rights it inherited when it ends, once, and is never found.
     #[test]
