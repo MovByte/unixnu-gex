@@ -377,11 +377,78 @@ const ELSEWHERE: [u8; 4] = [0x05, 0x4d, 0x78, 0x90];
 ///   (0xfffffff006bbd2c0, false), which the block manager's setup
 ///   registers (`FUN_fffffff006bd0b2c`).
 ///
-/// At start nothing else sets them: a runtime property changes through the
-/// framebuffer's slot at +0x9e8 (0xfffffff006bf4568), which only the
+/// - The block manager's setup (0xfffffff006bd0b2c) registers in the pipe's
+///   table with constants, or with what this boot gives: no boot-arg it
+///   reads is set (each `iomfb_*` read fails), the pipe's slots +0x498,
+///   +0x4f0, +0x4f8 and +0x368 answer 0 and +0x358 answers 1, and of its
+///   components (+0xd0 to +0x108) the 2D temperature correction (+0xe8),
+///   the temperature compensation (+0x100) and the brightness compensation
+///   (+0x108) are made. So: 0x21 `enable2DTemperatureCorrection` and 0x22
+///   `enableDefaultTemperatureCorrection` false whatever 0x20 is; 0x24
+///   `use0DSensorFor2DTemp` false (slot +0x4f8); 0x25
+///   `TemperatureStructVersion2D` 1 (slot +0x358); 0x28 `uniformity2D`
+///   false (no +0xd8 component); 0xe3 `ADCLLoadAll` true; the APT switches
+///   0x60 false, 0x61 and 0x63 true (no boot-arg), 0x62 true (slot +0x498
+///   false, negated), 0x6f false, 0x68 false, 0x69 0, 0x5e and 0x5f false,
+///   0x6b true, 0x6c 0xff; 0x9d true; 0x9e and 0xa1 1; 0xa2 and 0xa3 false;
+///   0xe5 false; 0x5b and 0x5c 0 and 0x5d 1 (no boot-arg); 0x70 to 0x75 and
+///   0x6e false; 0xb0 0xffffffff and 0xb1 0.
+///
+/// At start nothing else sets these: a boolean or 32-bit runtime property
+/// changes through the framebuffer's slot at +0x9e8 (0xfffffff006bf4568,
+/// the only caller of the setter 0xfffffff006bea2dc), which only the
 /// `iomfb_RuntimeProperty_*` boot-args (none on this boot) and
-/// `AppleCLCD::setProperties` reach.
-const START: [(u8, u32); 3] = [(0x00, 0), (0xad, 0), (0xb5, 0)];
+/// `AppleCLCD::setProperties` reach. The 64-bit ones have other setters
+/// (0xfffffff006bea1f8's callers), and are left out until those are worked
+/// out.
+const START: [(u8, u32); 38] = [
+    (0x00, 0),
+    (0x21, 0),
+    (0x22, 0),
+    (0x24, 0),
+    (0x25, 1),
+    (0x28, 0),
+    (0x5b, 0),
+    (0x5c, 0),
+    (0x5d, 1),
+    (0x5e, 0),
+    (0x5f, 0),
+    (0x60, 0),
+    (0x61, 1),
+    (0x62, 1),
+    (0x63, 1),
+    (0x68, 0),
+    (0x69, 0),
+    (0x6b, 1),
+    (0x6c, 0xff),
+    (0x6e, 0),
+    (0x6f, 0),
+    (0x70, 0),
+    (0x71, 0),
+    (0x72, 0),
+    (0x73, 0),
+    (0x74, 0),
+    (0x75, 0),
+    (0x9d, 1),
+    (0x9e, 1),
+    (0xa1, 1),
+    (0xa2, 0),
+    (0xa3, 0),
+    (0xad, 0),
+    (0xb0, 0xffff_ffff),
+    (0xb1, 0),
+    (0xb5, 0),
+    (0xe3, 1),
+    (0xe5, 0),
+];
+
+/// The registered ids whose only registration needs a component of the
+/// pipe that this kernelcache never makes (its `+0xd0`, `+0xe0` and `+0xf0`
+/// are only ever cleared): 0x2c `enableLatLeakComp` (with `+0xe0`), 0x2f
+/// `enableGamutMapper` (with `+0xd0`), and 0x2d `enableHighGrayOD` and 0xac
+/// `hgodCutoff` (with `+0xf0`), all in 0xfffffff006bd0b2c. They are never
+/// published, and read are answered missing.
+const NOT_MADE: [u8; 4] = [0x2c, 0x2d, 0x2f, 0xac];
 
 /// The id of the runtime property `name`.
 pub fn id_of(name: &str) -> Option<u8> {
@@ -396,7 +463,7 @@ fn registered(id: u8) -> Option<u8> {
 /// Whether `name` is a runtime property's name that the framebuffer has no
 /// property of.
 pub fn absent(name: &str) -> bool {
-    id_of(name).is_some_and(|id| registered(id).is_none() && !ELSEWHERE.contains(&id))
+    id_of(name).is_some_and(|id| (registered(id).is_none() || NOT_MADE.contains(&id)) && !ELSEWHERE.contains(&id))
 }
 
 /// The value of registered property `id` now, if worked out.
@@ -431,7 +498,13 @@ mod tests {
         // Published with their starting values; unworked ones are not.
         assert_eq!(published("SupportsAOTPowerSaving"), Some(Prop::Bool(false)));
         assert_eq!(published("BlendOutputCSCMethod"), Some(Prop::Num(0, 32)));
+        assert_eq!(published("ADCLLoadAll"), Some(Prop::Bool(true)));
+        assert_eq!(published("ProxScanPlan"), Some(Prop::Num(0xffff_ffff, 32)));
+        assert_eq!(published("APTDefaultGrayValue"), Some(Prop::Num(0xff, 32)));
         assert_eq!(published("QoSDebug"), None);
+        // Registered only with a component the pipe never makes: missing.
+        assert!(absent("enableGamutMapper") && absent("hgodCutoff") && absent("enableLatLeakComp") && absent("enableHighGrayOD"));
+        assert_eq!(published("enableGamutMapper"), None);
         assert_eq!(published("VRRIdleEnabled"), None);
     }
 }

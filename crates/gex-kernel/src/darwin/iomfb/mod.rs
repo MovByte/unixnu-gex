@@ -105,6 +105,14 @@ pub fn add_service(t: &mut Vec<Node>, nub: u32) {
 ///   IOUSBDeviceFamily compares a model string with (0xfffffff00617c0c0),
 ///   and `hdcp-hoover-protocol`, which AUC reads from the framebuffer
 ///   (0xfffffff00655fb8c) and nothing sets.
+/// - Names QuartzCore reads from the framebuffer that its kexts never set
+///   here: `CursorPlane` and `VirtualDisplayMode`, which no image of the
+///   kernelcache has as a string; `SupportsRotation`, whose only setter
+///   (0xfffffff006bd15ec) runs when the pipe's slot +0xcb0 answers true,
+///   which it does not, and goes through 0xfffffff006bf3e3c, which sets
+///   no name but `NormalModeActive`; and `GPBandwidth`, set only on a hot
+///   plug (0xfffffff006c01334) when the pipe's slot +0x8b8 (a dual pipe)
+///   answers true, which it does not.
 /// - The names of the pipe's runtime properties that it never registers,
 ///   which only IOMobileGraphicsFamily's name tables form
 ///   ([`rtprop::absent`]; `IOMFBIntDcpUsedForExtWhenLidClose`, runtime
@@ -114,7 +122,7 @@ pub fn add_service(t: &mut Vec<Node>, nub: u32) {
 ///   0xfffffff006bf5a54) only when its provider's device tree entry has
 ///   `external`.
 pub fn property_absent(t: &[Node], i: u32, name: &str) -> bool {
-    if matches!(name, "GainMapVersion" | "canvas-width" | "canvas-height" | "dfr" | "AppleTV" | "hdcp-hoover-protocol") || rtprop::absent(name) {
+    if matches!(name, "GainMapVersion" | "canvas-width" | "canvas-height" | "dfr" | "AppleTV" | "hdcp-hoover-protocol" | "CursorPlane" | "VirtualDisplayMode" | "SupportsRotation" | "GPBandwidth") || rtprop::absent(name) {
         return true;
     }
     let Some(n) = t.get(i as usize) else { return false };
