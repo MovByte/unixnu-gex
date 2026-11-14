@@ -18,6 +18,7 @@
 //!   framebuffer counts at the panel's rate ([`swap::Panel`]).
 
 pub mod methods;
+pub mod rtprop;
 pub mod sink;
 pub mod swap;
 
@@ -102,17 +103,16 @@ pub fn add_service(t: &mut Vec<Node>, nub: u32) {
 ///   IOUSBDeviceFamily compares a model string with (0xfffffff00617c0c0),
 ///   and `hdcp-hoover-protocol`, which AUC reads from the framebuffer
 ///   (0xfffffff00655fb8c) and nothing sets.
-/// - `IOMFBIntDcpUsedForExtWhenLidClose`, the name of the pipe's runtime
-///   property 0x7f (IOMobileGraphicsFamily's names, 0xfffffff00677d36c).
-///   The pipe publishes each runtime property it registers in its table
-///   (`FUN_fffffff006bde66c`) as the framebuffer's registry property of
-///   that name (the table's publisher, 0xfffffff006bea4e4), and
-///   AppleMobileDispH9G registers no property 0x7f.
+/// - The names of the pipe's runtime properties that it never registers,
+///   which only IOMobileGraphicsFamily's name tables form
+///   ([`rtprop::absent`]; `IOMFBIntDcpUsedForExtWhenLidClose`, runtime
+///   property 0x7f, is one): the pipe publishes the runtime properties it
+///   registers, on the service, and nothing sets the others.
 /// - On the service, `external`: AppleCLCD sets it (0xfffffff006bf55ec,
 ///   0xfffffff006bf5a54) only when its provider's device tree entry has
 ///   `external`.
 pub fn property_absent(t: &[Node], i: u32, name: &str) -> bool {
-    if matches!(name, "GainMapVersion" | "canvas-width" | "canvas-height" | "dfr" | "AppleTV" | "hdcp-hoover-protocol" | "IOMFBIntDcpUsedForExtWhenLidClose") {
+    if matches!(name, "GainMapVersion" | "canvas-width" | "canvas-height" | "dfr" | "AppleTV" | "hdcp-hoover-protocol") || rtprop::absent(name) {
         return true;
     }
     let Some(n) = t.get(i as usize) else { return false };

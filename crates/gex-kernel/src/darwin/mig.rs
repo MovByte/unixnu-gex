@@ -321,7 +321,8 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             let name = String::from_utf8_lossy(name);
             // An OSString's bytes and its NUL, an OSBoolean's "Yes" or "No",
             // an OSNumber's or OSData's bytes; a collection is not bytes.
-            let typed = node.service_props.iter().find(|(k, _)| *k == name).map(|(_, p)| super::iokit::prop_bytes(p));
+            let live = super::iokit::live_prop(super::iokit::tree(), *i, &name);
+            let typed = live.as_ref().or_else(|| node.service_props.iter().find(|(k, _)| *k == name).map(|(_, p)| p)).map(super::iokit::prop_bytes);
             let value = match (typed, node.props.iter().find(|(k, _)| *k == name)) {
                 (Some(Some(v)), _) => v,
                 (Some(None), _) => return Reply::err(K_IO_RETURN_BAD_ARGUMENT),
@@ -364,7 +365,9 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
                 r.unimplemented = Some(format!("io_registry_entry_get_property_bin_buf of {name} (recursion or the property keys)"));
                 return r;
             }
-            let bin = if let Some((_, p)) = node.service_props.iter().find(|(k, _)| *k == name) {
+            let bin = if let Some(p) = super::iokit::live_prop(super::iokit::tree(), *i, &name) {
+                super::iokit::serialize_prop(&p)
+            } else if let Some((_, p)) = node.service_props.iter().find(|(k, _)| *k == name) {
                 super::iokit::serialize_prop(p)
             } else if let Some((_, value)) = node.props.iter().find(|(k, _)| *k == name) {
                 super::iokit::serialize_data(if node.kernel_only { &[] } else { value })

@@ -333,6 +333,16 @@ pub fn property_unknown(t: &[Node], i: u32, name: &str) -> bool {
     !(on_gpu_path && name == "IOClassNameOverride")
 }
 
+/// A property entry `i`'s driver keeps and may change while it runs,
+/// ahead of its fixed ones: the framebuffer's published runtime properties
+/// ([`super::iomfb::rtprop`]).
+pub fn live_prop(t: &[Node], i: u32, name: &str) -> Option<Prop> {
+    if t.get(i as usize)?.class != super::iomfb::CLASS {
+        return None;
+    }
+    super::iomfb::rtprop::published(name)
+}
+
 /// The services a matching dictionary asks for: `IOProviderClass` by class
 /// (and its superclasses), any other string by the service's property of
 /// that name; `Err` for what is not a string.
