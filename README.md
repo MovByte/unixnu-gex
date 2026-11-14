@@ -333,6 +333,36 @@ the guest sees its files through host passthrough. gexc reads from it:
 The test runner copies its programs into `<ipados-root>/var/tmp/`, so the
 directory must be writable.
 
+### An overlay, `<overlay>`
+
+A directory whose tree `gexc run --overlay <overlay>` lays over the root,
+as part of it (`crates/gex-kernel/src/vfs/overlay.rs`): what the web device
+adds to the system volume, such as its GPU driver's bundle, without a copy
+of the root. Its files are the root volume's own. They are on the root's
+filesystem (no mount of their own, the root's device and `statfs`), numbered
+among its files (inode numbers at the top of APFS's 60-bit object id space,
+which a volume's never reach), listed in their directories with the root's
+entries, and found by `fsgetpath` by their object ids. What it holds is
+read-only, as the system volume is: a call that would change it fails with
+EROFS.
+
+Its layout is Linux overlayfs's, with the `user.overlay.` attributes: a
+directory merges with the root's directory of its name, and its entries
+shadow the root's of theirs; a directory whose `user.overlay.opaque` is `y`
+hides the root's entirely. Whiteouts and overlayfs's other attributes are
+refused, and so are devices, FIFOs and sockets. An entry that shadows a file
+of the root must be of the same type and mode and carry the same extended
+attributes, or gexc refuses the overlay; what the root has nothing at is
+the overlay's own, which gexc says on stderr when it lays it.
+
+```sh
+mkdir -p <overlay>/System/Library/Extensions
+cp -Rp WebMetal.bundle <overlay>/System/Library/Extensions/
+xattr -w user.overlay.opaque y <overlay>/System/Library/Extensions/WebMetal.bundle
+```
+
+Its code, like the root's, runs only from the static trust cache (below).
+
 ### The boot payload, `<ipados-boot>`
 
 A directory named by `GEX_DARWIN_BOOT`, holding what the boot loader and

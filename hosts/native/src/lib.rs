@@ -153,6 +153,10 @@ pub struct RunOptions {
     /// Host directory presented as the guest's root. Without one the guest
     /// sees the host filesystem directly.
     pub sysroot: Option<std::path::PathBuf>,
+    /// `--overlay DIR`: a host directory whose tree is laid over the root
+    /// as part of it ([`gex_kernel::vfs::OverlayFs`]): no mount of its own,
+    /// its files the root volume's.
+    pub overlay: Option<std::path::PathBuf>,
     /// A native wasm32 busybox presented as
     /// `/bin/sh` and the common coreutils in `/bin` and `/usr/bin`, so a
     /// script's shell and tools run natively instead of being translated.
@@ -280,6 +284,7 @@ impl Default for RunOptions {
             trace: false,
             verbose: false,
             sysroot: None,
+            overlay: None,
             busybox: None,
             binds: Vec::new(),
             exe: None,
@@ -4297,15 +4302,30 @@ fn mount_filesystems(
     opts: &RunOptions,
     proc_state: Arc<ProcCell>,
 ) -> Result<()> {
-    match &opts.sysroot {
+    let root: Arc<dyn gex_kernel::vfs::FileSystem> = match &opts.sysroot {
         Some(root) => {
             if !root.is_dir() {
                 bail!("sysroot {} is not a directory", root.display());
             }
-            kernel.vfs.mount("/", Arc::new(HostFs::new(root)));
+            Arc::new(HostFs::new(root))
         }
-        None => kernel.vfs.mount("/", Arc::new(HostFs::new("/"))),
-    }
+        None => Arc::new(HostFs::new("/")),
+    };
+    // The overlay is part of the root: the one filesystem at `/`.
+    let root = match &opts.overlay {
+        Some(dir) => {
+            if !dir.is_dir() {
+                bail!("overlay {} is not a directory", dir.display());
+            }
+            let (fs, notes) = gex_kernel::vfs::OverlayFs::new(root, Arc::new(HostFs::read_only(dir))).map_err(|e| anyhow!("overlay {}: {e}", dir.display()))?;
+            for n in notes {
+                eprintln!("gex: overlay: {n}");
+            }
+            Arc::new(fs)
+        }
+        None => root,
+    };
+    kernel.vfs.mount("/", root);
     if let Some(bb) = &opts.busybox {
         // Each name a file mount of the one binary: busybox picks its
         // applet by argv[0]. GEX_BUSYBOX_APPLETS replaces the list.
