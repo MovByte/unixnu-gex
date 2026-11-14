@@ -434,6 +434,8 @@ pub fn external_method(k: &mut Kernel, id: u32, c: &mut Client, a: &mut MethodAr
         }
         // s_get_block (0xfffffff0067799b4).
         79 => get_block(k, a),
+        // s_set_block (0xfffffff006779834).
+        78 => set_block(k, c, a),
         // s_swap_cancel_all (0xfffffff0067795b0): slot 218 with the time
         // `scalar[0] << 32 | scalar[1]`.
         81 => swap::cancel_all(k, (sc(0) << 32) | (sc(1) & 0xffff_ffff)),
@@ -506,6 +508,54 @@ fn get_block(k: &mut Kernel, a: &MethodArgs) -> i32 {
         return ret::UNSUPPORTED;
     }
     k.darwin_unimplemented(format!("IOMobileFramebufferUserClient selector 79 (GetBlock) of block type {ty} ({} bytes, {} extra scalars): its registration and handler", a.struct_out.len(), a.scalar_in.len() - 2));
+    ret::UNSUPPORTED
+}
+
+/// The block types each block client profile 1 index may set
+/// (0xfffffff006f35470: a pointer and a count for each of backboardd,
+/// windowserver, iomfb_fdr_loader, iomfb_bics_daemon and thermal_monitor).
+const SET_BLOCK_TYPES: [&[u32]; 5] = [
+    &[78, 77, 64, 50, 51, 61, 107, 115, 119],
+    &[78, 77, 64, 50, 51, 61, 97, 22, 107, 115, 119],
+    &[9, 11, 10, 27, 26, 36, 46, 47, 38, 52, 8, 65, 67, 68, 54, 53, 5, 3, 82, 84, 83, 85, 35, 98, 99, 89, 90, 92, 94, 101, 103, 111, 112, 113, 95, 116, 117],
+    &[13, 14, 58, 59],
+    &[1, 2],
+];
+
+/// Selector 78, SetBlock (0xfffffff006779834): at least two scalars, the
+/// block type and a word that must be zero, then any extra scalars, and
+/// the block as the structure input (inband, so never missing): fewer
+/// scalars is kIOReturnBadArgument. The task must be allowed the type
+/// (0xfffffff006776eb4, the global override at 0xfffffff007b4d973 being
+/// clear): a client of block profile 1 for the types its index lists, one
+/// of profile 2 (a development kernel's) for any, and then only with
+/// com.apple.private.iomfb.set-block; else kIOReturnNotPrivileged. Then the
+/// framebuffer's slot 0x6f8 (0xfffffff006bfea00) to the pipe's
+/// 0xfffffff006bd691c: the second scalar's low word nonzero is
+/// kIOReturnBadArgument, and the block manager's set (0xfffffff006775dc8,
+/// the lookup of 0xfffffff006775618) is kIOReturnUnsupported for a type
+/// with no handler, as for GetBlock ([`get_block`]); a type that has one is
+/// not modelled.
+fn set_block(k: &mut Kernel, c: &Client, a: &MethodArgs) -> i32 {
+    if a.scalar_in.len() < 2 {
+        return ret::BAD_ARGUMENT;
+    }
+    let ty = a.scalar_in[0] as u32;
+    let listed = match c.block_profile {
+        1 => SET_BLOCK_TYPES.get(c.block_profile_index as usize).is_some_and(|t| t.contains(&ty)),
+        2 => true,
+        _ => false,
+    };
+    if !listed || !k.darwin_entitled("com.apple.private.iomfb.set-block") {
+        return ret::NOT_PRIVILEGED;
+    }
+    if a.scalar_in[1] as u32 != 0 {
+        return ret::BAD_ARGUMENT;
+    }
+    if !BLOCK_TYPES.contains(&ty) || ty == 77 || ty == 78 {
+        return ret::UNSUPPORTED;
+    }
+    k.darwin_unimplemented(format!("IOMobileFramebufferUserClient selector 78 (SetBlock) of block type {ty} ({} bytes, {} extra scalars): its registration and handler", a.struct_in.len(), a.scalar_in.len() - 2));
     ret::UNSUPPORTED
 }
 

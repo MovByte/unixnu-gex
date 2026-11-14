@@ -16,7 +16,8 @@
 //   a source rectangle outside its surface, the debug flags a production
 //   device refuses, the parameters SetParameter does not take (a power
 //   assertion among them) and the gain map's without its entitlement,
-//   three QuartzCore sets (3 and 6, taken; 7, unsupported), the
+//   three QuartzCore sets (3 and 6, taken; 7, unsupported), a block set
+//   by a task no block client profile allows, the
 //   frame information the pipe names and the options only it takes, the
 //   notification types, and memory of no type.
 // - The glass, on that connection (selector 83, with backboardd's graphics
@@ -281,6 +282,14 @@ int main(void) {
     if ((kr = IOConnectCallMethod(c, 68, in, 1, sp, 8, NULL, NULL, NULL, NULL)) != KERN_SUCCESS) return bad("SetParameter 6", kr, 0);
     in[0] = 7;
     if ((kr = IOConnectCallMethod(c, 68, in, 1, sp, 8, NULL, NULL, NULL, NULL)) != kIOReturnUnsupported) return bad("SetParameter 7", kr, kIOReturnUnsupported);
+    // SetBlock: two scalars at least; a block QuartzCore sets (0x4d) only
+    // for a block client profile that lists it, which this program has not.
+    uint8_t block[0x62c];
+    memset(block, 0, sizeof block);
+    in[0] = 0x4d;
+    in[1] = 0;
+    if ((kr = IOConnectCallMethod(c, 78, in, 1, block, sizeof block, NULL, NULL, NULL, NULL)) != kIOReturnBadArgument) return bad("SetBlock with one scalar", kr, kIOReturnBadArgument);
+    if ((kr = IOConnectCallMethod(c, 78, in, 2, block, sizeof block, NULL, NULL, NULL, NULL)) != kIOReturnNotPrivileged) return bad("SetBlock 0x4d unprofiled", kr, kIOReturnNotPrivileged);
     in[0] = 0;
     if ((kr = IOConnectCallMethod(c, 68, in, 1, sp, 24, NULL, NULL, NULL, NULL)) != kIOReturnBadArgument) return bad("SetParameter 0 with three values", kr, kIOReturnBadArgument);
     in[0] = 4;
