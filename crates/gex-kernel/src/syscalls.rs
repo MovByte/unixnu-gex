@@ -770,6 +770,9 @@ pub struct Kernel {
     /// The Darwin call in progress is a stat whose attributes Sandbox's
     /// getattr check took the times out of.
     pub darwin_stat_scrub: bool,
+    /// The file the Darwin call in progress is to make, and its attributes,
+    /// once its checks have passed: recorded when the call has made it.
+    pub darwin_creation: Option<crate::darwin::macvfs::Creating>,
     /// A parked Darwin `wait4`'s status address, for its status in Darwin's
     /// encoding ([`crate::darwin::exit`]).
     pub darwin_wait4: Option<u64>,
@@ -4068,8 +4071,10 @@ impl PathIo<'_> {
     pub fn fstat(&self, m: &mut GuestMem<'_>, fd: i32, buf: u64) -> SysResult {
         let file = self.map.fds.get(fd)?;
         let md = file.metadata()?;
-        let at = self.darwin.then(|| self.ns.canonical(&file.path));
-        m.write(buf, &self.encode_stat(&self.stat_owned(&md), &md, at.as_deref()))?;
+        // (a descriptor of a link itself, O_SYMLINK's, is the link's)
+        let at = self.darwin.then(|| crate::darwin::vattr::vnode_path(self.ns, &file.path, &md));
+        let st = self.stat_owned(&md, at.as_deref(), Some(file.handle.as_ref()))?;
+        m.write(buf, &self.encode_stat(&st, &md, at.as_deref()))?;
         Ok(0)
     }
 
@@ -4109,21 +4114,28 @@ impl PathIo<'_> {
     /// with `getuid` (Wine's prefix check) sees itself. Before, `stat` and
     /// `fstat` said root, so only 32-bit programs (whose libc stats through
     /// `statx`) passed.
-    fn stat_owned(&self, md: &crate::vfs::Metadata) -> Stat {
-        // A Darwin terminal node's owner is devfs's: its own. Its device is
-        // the node's, makedev(0, 0) (the console's) included.
+    ///
+    /// A Darwin vnode (`at`, its canonical path, its last link not
+    /// followed; `handle`, the file open) has its own owner, group, mode
+    /// and flags ([`crate::darwin::vattr`]); what is in no namespace (a
+    /// pipe's, and the host's standard streams, whatever their names) is
+    /// the caller's, as `pipe_stat` gives it.
+    fn stat_owned(&self, md: &crate::vfs::Metadata, at: Option<&str>, handle: Option<&dyn crate::vfs::FileHandle>) -> Result<Stat, Errno> {
         if self.darwin {
-            if let Some((uid, gid)) = crate::darwin::ttydev::node_owner(md) {
-                return Stat { uid, gid, rdev: md.rdev, ..Kernel::stat_from(md) };
-            }
+            // A terminal node's device is the node's, makedev(0, 0) (the
+            // console's) included.
             if let Some(n) = crate::darwin::devfs::node_of(md) {
                 if n.major.is_none() {
                     crate::darwin::note_unimplemented(format!("st_rdev of /dev/{}: its major is the one cdevsw_add(-1) gave it at the device's boot", n.name));
                 }
-                return Stat { uid: n.uid, gid: n.gid, rdev: md.rdev, ..Kernel::stat_from(md) };
+            }
+            if let Some(p) = at.filter(|p| p.starts_with('/') && !handle.is_some_and(|h| h.is_host_stdio())) {
+                let o = crate::darwin::vattr::get(self.ns, p, md, handle)?;
+                let rdev = if crate::darwin::ttydev::node_owner(md).is_some() || crate::darwin::devfs::node_of(md).is_some() { md.rdev } else { Kernel::stat_from(md).rdev };
+                return Ok(Stat { uid: o.uid, gid: o.gid, mode: md.file_type.mode_bits() | o.mode, flags: o.flags, rdev, ..Kernel::stat_from(md) });
             }
         }
-        Stat { uid: self.creds.uid(), gid: self.creds.gid(), ..Kernel::stat_from(md) }
+        Ok(Stat { uid: self.creds.uid(), gid: self.creds.gid(), ..Kernel::stat_from(md) })
     }
 
     pub fn fstatat(
@@ -4171,7 +4183,8 @@ impl PathIo<'_> {
                 self.ns.canonical(&p)
             }
         });
-        m.write(buf, &self.encode_stat(&self.stat_owned(&md), &md, at.as_deref()))?;
+        let st = self.stat_owned(&md, at.as_deref(), None)?;
+        m.write(buf, &self.encode_stat(&st, &md, at.as_deref()))?;
         crate::phase::mark(9);
         Ok(0)
     }
@@ -10620,6 +10633,7 @@ impl Kernel {
             darwin_pipe_sigpipe: None,
             darwin_stat_ino32: false,
             darwin_stat_scrub: false,
+            darwin_creation: None,
             darwin_wait4: None,
             darwin_retry: None,
             darwin_exec: None,
@@ -11121,6 +11135,7 @@ impl Kernel {
             darwin_pipe_sigpipe: None,
             darwin_stat_ino32: false,
             darwin_stat_scrub: false,
+            darwin_creation: None,
             darwin_wait4: None,
             darwin_retry: None,
             darwin_exec: None,

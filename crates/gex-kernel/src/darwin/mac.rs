@@ -253,6 +253,11 @@ pub struct SbVnode {
     /// `va_flags` and `va_rdev` (a name's, its directory's).
     pub flags: u32,
     pub rdev: u32,
+    /// The file whose `va_mode` and `va_flags` these are (the vnode's, a
+    /// name's directory's): its canonical path and metadata, for its
+    /// owner, mode and flags to be read when a filter asks
+    /// ([`super::vattr`]), in place of `mode` and `flags`.
+    pub of: Option<(String, crate::vfs::Metadata)>,
     /// Its filesystem's name (`vfs_name`).
     pub fs: &'static [u8],
     /// An extended attribute's name (`args[0xe8]`), an ioctl's command
@@ -581,10 +586,21 @@ impl Facts for KernelFacts<'_> {
         Ok(Some((path, mount_len)))
     }
     fn vnode_mode(&mut self) -> Result<Option<u16>, Stop> {
-        Ok(self.a.vnode.as_ref().and_then(|v| v.mode))
+        let Some(v) = self.a.vnode.as_ref() else { return Ok(None) };
+        if v.mode.is_none() {
+            return Ok(None);
+        }
+        match self.k.darwin_sb_attrs(v).map_err(Stop::Unported)? {
+            Some(o) => Ok(Some((o.mode & 0xfff) as u16)),
+            None => Ok(v.mode),
+        }
     }
     fn vnode_flags(&mut self) -> Result<Option<u32>, Stop> {
-        Ok(self.a.vnode.as_ref().map(|v| v.flags))
+        let Some(v) = self.a.vnode.as_ref() else { return Ok(None) };
+        match self.k.darwin_sb_attrs(v).map_err(Stop::Unported)? {
+            Some(o) => Ok(Some(o.flags)),
+            None => Ok(Some(v.flags)),
+        }
     }
     fn xattr_name(&mut self) -> Option<Vec<u8>> {
         self.a.vnode.as_ref().and_then(|v| v.xattr.clone())
@@ -610,8 +626,11 @@ impl Facts for KernelFacts<'_> {
     fn storage_class(&mut self) -> Result<Option<Vec<u8>>, Stop> {
         let Some(v) = self.a.vnode.clone() else { return Ok(None) };
         // (a name is classed by the map alone)
-        if !v.named && v.flags & 0x0018_0080 != 0 {
-            return Err(Stop::Unported(format!("sandbox: the storage class of a file with flags {:#x}", v.flags)));
+        if !v.named {
+            let flags = self.k.darwin_sb_attrs(&v).map_err(Stop::Unported)?.map_or(v.flags, |o| o.flags);
+            if flags & 0x0018_0080 != 0 {
+                return Err(Stop::Unported(format!("sandbox: the storage class of a file with flags {flags:#x}")));
+            }
         }
         let Some(Some((blob, profile))) = PLATFORM.get() else {
             return Err(Stop::Unported("the Sandbox's platform profile (the boot payload's Sandbox/Platform)".into()));

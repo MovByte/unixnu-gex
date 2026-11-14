@@ -4160,7 +4160,7 @@ fn switch_to_darwin_image(kernel: &mut Kernel, img: &gex_kernel::darwin::execve:
     let tid = if kernel.sig_tid != 0 { kernel.sig_tid } else { kernel.tid };
     kernel.exec_signals(tid);
     kernel.exe_path = img.path.clone();
-    kernel.darwin_exec_switch(img.spawn.as_ref(), img.thread_id);
+    kernel.darwin_exec_switch(img.spawn.as_ref(), img.thread_id, img.setid);
 }
 
 /// What `darwin_start` is told of a loaded image: its header's address,

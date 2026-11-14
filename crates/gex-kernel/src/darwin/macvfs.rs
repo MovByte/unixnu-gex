@@ -144,6 +144,7 @@ pub fn sb_vnode(path: &str, md: &Metadata) -> SbVnode {
         flags: file_flags(path),
         rdev: if md.file_type == FileType::CharDevice { super::attrcall::darwin_dev(md.rdev) } else { 0 },
         fs: super::kern::fs_name(mnt),
+        of: Some((path.to_string(), md.clone())),
         ..Default::default()
     }
 }
@@ -172,6 +173,15 @@ fn sb_lookup(dir: &Found, name: &str) -> SbVnode {
 }
 
 impl Kernel {
+    /// The owner, group, mode and flags of the file Sandbox's vnode `v`
+    /// reads them of ([`SbVnode::of`]); none where `v` gives its own.
+    pub(crate) fn darwin_sb_attrs(&self, v: &SbVnode) -> Result<Option<super::vattr::Owned>, String> {
+        match &v.of {
+            Some((path, md)) => super::vattr::of(&self.vfs, path, md, None).map(Some),
+            None => Ok(None),
+        }
+    }
+
     fn darwin_sb_vnode_eval(&mut self, op: usize, v: SbVnode, quiet: bool) -> (u32, u32) {
         let sb = self.darwin_sandbox();
         let a = SbArgs { kind: sandbox::kind::VNODE, quiet, vnode: Some(v), ..Default::default() };
@@ -204,7 +214,7 @@ impl Kernel {
         let file = self.fds.get(fd).ok()?;
         self.darwin_vnode_of(&file)?;
         let md = file.handle.metadata().ok()?;
-        Some(Found { path: self.vfs.canonical(&file.path), md, parent: None })
+        Some(Found { path: super::vattr::vnode_path(&self.vfs, &file.path, &md), md, parent: None })
     }
 
     /// `namei` of the path at guest `path` from descriptor `dirfd`
@@ -639,12 +649,37 @@ impl Kernel {
     /// file-write-setugid too.
     pub(crate) fn darwin_mac_check_vnode_setmode(&mut self, v: SbVnode, mode: u32) -> u32 {
         let sandboxed = self.darwin_sandbox().is_some();
-        let old = u32::from(v.mode.unwrap_or(0));
+        let old = match self.darwin_sb_attrs(&v) {
+            Ok(Some(o)) => o.mode,
+            Ok(None) => u32::from(v.mode.unwrap_or(0)),
+            Err(why) => {
+                // (the old mode is read only for a sandboxed process)
+                if sandboxed {
+                    self.darwin_unimplemented(why);
+                    return 1;
+                }
+                0
+            }
+        };
         let e = self.darwin_sb_vnode_check(op::FILE_WRITE_MODE, v.clone());
         if e != 0 || !sandboxed || (old ^ mode) & 0o6000 == 0 {
             return e;
         }
         self.darwin_sb_vnode_check(op::FILE_WRITE_SETUGID, v)
+    }
+
+    /// `mpo_vnode_check_setflags` (`0x...9fe8ec`) to flags `flags`:
+    /// file-write-flags with the process's sandbox; allowed, a change that
+    /// sets SF_RESTRICTED, SF_NOUNLINK or UF_DATAVAULT is file-write-flags
+    /// again, the platform profile's alone, of the vnode with the new
+    /// flags (`args[0x138]`, `args[0x190]` 0x42).
+    pub(crate) fn darwin_mac_check_vnode_setflags(&mut self, v: SbVnode, flags: u32) -> u32 {
+        let e = self.darwin_sb_vnode_check(op::FILE_WRITE_FLAGS, v.clone());
+        if e != 0 || flags & 0x0018_0080 == 0 {
+            return e;
+        }
+        let a = SbArgs { kind: sandbox::kind::VNODE, vnode: Some(SbVnode { flags, of: None, ..v }), ..Default::default() };
+        self.darwin_sb_evaluate_with(None, op::FILE_WRITE_FLAGS, &a).0
     }
 
     /// `mpo_vnode_check_setowner`, `mpo_vnode_check_setutimes`,
@@ -838,6 +873,7 @@ impl Kernel {
     /// is left to report it.
     pub(crate) fn darwin_sb_file_call(&mut self, m: &GuestMem<'_>, raw: u64, a: &[u64; 6]) -> Option<Errno> {
         self.darwin_stat_scrub = false;
+        self.darwin_creation = None;
         let cwd = super::bsd::AT_FDCWD as u64;
         let flag = |i: usize| a[i] as u32 as u64;
         let r = match raw {
@@ -880,9 +916,9 @@ impl Kernel {
             sys::LINKAT if a[4] & !at::SYMLINK_FOLLOW == 0 => self.darwin_sb_link_call(m, [a[0], a[1], a[2], a[3]], a[4] & at::SYMLINK_FOLLOW != 0),
             // mkdir1at; mkdir_extended's, with no owner or list to set (the
             // others are refused).
-            sys::MKDIR => self.darwin_sb_mkdir_call(m, cwd, a[0]),
-            sys::MKDIRAT => self.darwin_sb_mkdir_call(m, a[0], a[1]),
-            sys::MKDIR_EXTENDED if a[1] as u32 == NO_ID && a[2] as u32 == NO_ID && a[4] == 0 => self.darwin_sb_mkdir_call(m, cwd, a[0]),
+            sys::MKDIR => self.darwin_sb_mkdir_call(m, cwd, a[0], self.darwin_mkdir_mode(a[1])),
+            sys::MKDIRAT => self.darwin_sb_mkdir_call(m, a[0], a[1], self.darwin_mkdir_mode(a[2])),
+            sys::MKDIR_EXTENDED if a[1] as u32 == NO_ID && a[2] as u32 == NO_ID && a[4] == 0 => self.darwin_sb_mkdir_call(m, cwd, a[0], self.darwin_mkdir_mode(a[3])),
             // chmod_extended and fchmod_extended with no owner to set and no
             // list but the one that removes it (the others are refused):
             // chmod_vnode's checks, of the mode (-1 leaves it) and the list.
@@ -914,6 +950,16 @@ impl Kernel {
                 Some(f) => refused(self.darwin_mac_check_vnode_setmode(sb_vnode(&f.path, &f.md), a[1] as u32 & 0o7777)),
                 None => Ok(()),
             },
+            // chflags and fchflags: chflags0's check.
+            sys::CHFLAGS => match self.darwin_sb_namei(m, cwd, a[0], true, false) {
+                Ok(Lookup::Found(f)) => refused(self.darwin_mac_check_vnode_setflags(sb_vnode(&f.path, &f.md), a[1] as u32)),
+                Ok(_) => Ok(()),
+                Err(e) => Err(e),
+            },
+            sys::FCHFLAGS => match self.darwin_sb_fd_vnode(a[0] as i32) {
+                Some(f) => refused(self.darwin_mac_check_vnode_setflags(sb_vnode(&f.path, &f.md), a[1] as u32)),
+                None => Ok(()),
+            },
             // truncate: its length checked, then truncate_internal's check.
             sys::TRUNCATE if (a[1] as i64) >= 0 => match self.darwin_sb_namei(m, cwd, a[0], true, false) {
                 Ok(Lookup::Found(f)) => refused(self.darwin_mac_check_vnode_truncate(sb_vnode(&f.path, &f.md))),
@@ -940,6 +986,16 @@ impl Kernel {
         r.err()
     }
 
+    /// The process's file creation mask (`fd_cmask`): the calling thread's.
+    pub(crate) fn darwin_umask(&self) -> u32 {
+        self.path_io().fs.umask()
+    }
+
+    /// `mkdir1at`'s mode: its access permissions under the umask.
+    fn darwin_mkdir_mode(&self, mode: u64) -> u32 {
+        (mode as u32 & super::fsops::ACCESSPERMS as u32) & !self.darwin_umask()
+    }
+
     /// A stat of the path at `path` from `dirfd`: the stat check, then the
     /// getattr check of its attributes, whose decision may take the times
     /// out of what the call writes.
@@ -953,11 +1009,55 @@ impl Kernel {
         Ok(())
     }
 
-    /// `faccessat_internal`'s lookup and `access1`'s check of mode `amode`.
+    /// `faccessat_internal`'s lookup and `access1`'s checks of mode
+    /// `amode`: Sandbox's, then `vnode_authorize` of what the mode asks
+    /// (its R_OK, W_OK and X_OK as the rights they are of a file or a
+    /// directory; an extended mode's own bits as rights), by the real user
+    /// and group unless AT_EACCESS. F_OK asks nothing.
     fn darwin_sb_access_call(&mut self, m: &GuestMem<'_>, dirfd: u64, path: u64, amode: u64, flag: u64) -> Result<(), Errno> {
+        use super::vauth::kauth;
+        const X_OK: u32 = 1;
+        const W_OK: u32 = 2;
+        const R_OK: u32 = 4;
+        const DELETE_OK: u32 = 1 << 12;
+        const ACCESS_EXTENDED_MASK: u32 = 0x003f_fe00;
         let follow = flag & (at::SYMLINK_NOFOLLOW | at::SYMLINK_NOFOLLOW_ANY) == 0;
         let Lookup::Found(f) = self.darwin_sb_namei(m, dirfd, path, follow, flag & at::SYMLINK_NOFOLLOW_ANY != 0)? else { return Ok(()) };
-        refused(self.darwin_mac_check_vnode_access(sb_vnode(&f.path, &f.md), (amode as u32) << 6))
+        refused(self.darwin_mac_check_vnode_access(sb_vnode(&f.path, &f.md), (amode as u32) << 6))?;
+        let uflags = amode as u32;
+        let dir = f.is_dir();
+        let action = if uflags & ACCESS_EXTENDED_MASK == 0 {
+            let mut a = 0;
+            if uflags & R_OK != 0 {
+                a |= kauth::READ_DATA;
+            }
+            if uflags & W_OK != 0 {
+                a |= if dir { kauth::ADD_FILE | kauth::ADD_SUBDIRECTORY } else { kauth::WRITE_DATA };
+            }
+            if uflags & X_OK != 0 {
+                a |= if dir { kauth::SEARCH } else { kauth::EXECUTE };
+            }
+            a
+        } else {
+            uflags >> 8
+        };
+        if action == 0 {
+            return Ok(());
+        }
+        let cred = if flag & at::EACCESS != 0 { self.dtask.cred.clone() } else { self.dtask.cred.copy_real() };
+        let node = self.darwin_vnode_node(&f.path, &f.md, None);
+        let dnode = if uflags & DELETE_OK != 0 {
+            match self.darwin_sb_parent(&f) {
+                Some((d, _)) => Some(self.darwin_vnode_node(&d.path, &d.md, None)),
+                None => {
+                    self.darwin_unimplemented(format!("access _DELETE_OK of {}, which has no directory to be deleted from", f.path));
+                    return Err(Errno::EIO);
+                }
+            }
+        } else {
+            None
+        };
+        self.darwin_authorize(&cred, &node, dnode.as_ref(), action | kauth::ACCESS)
     }
 
     fn darwin_sb_readlink_call(&mut self, m: &GuestMem<'_>, dirfd: u64, path: u64) -> Result<(), Errno> {
@@ -976,7 +1076,29 @@ impl Kernel {
         if f.parent.is_none() || super::kern::mount_of(&f.path).on == f.path || f.is_dir() != rmdir {
             return Ok(());
         }
-        refused(self.darwin_mac_check_vnode_unlink(sb_vnode(&f.path, &f.md)))
+        refused(self.darwin_mac_check_vnode_unlink(sb_vnode(&f.path, &f.md)))?;
+        // vnode_authorize(vp, dvp, KAUTH_VNODE_DELETE).
+        let Some((dir, _)) = self.darwin_sb_parent(&f) else { return Ok(()) };
+        let cred = self.dtask.cred.clone();
+        let (vp, dvp) = (self.darwin_vnode_node(&f.path, &f.md, None), self.darwin_vnode_node(&dir.path, &dir.md, None));
+        self.darwin_authorize(&cred, &vp, Some(&dvp), super::vauth::kauth::DELETE)
+    }
+
+    /// A file about to take another name (a link, a rename): its attributes
+    /// recorded on it where they are not yet, as what its old name gave it
+    /// (the image's for a Data volume file of its own), for its new name
+    /// to keep.
+    pub(crate) fn darwin_keep_attrs(&mut self, f: &Found) {
+        if super::kern::mount_of(&f.path).fs == super::kern::Fs::Devfs {
+            return;
+        }
+        if let Ok(None) = super::vattr::recorded(&self.vfs, &f.path, None) {
+            if let Ok(o) = super::vattr::of(&self.vfs, &f.path, &f.md, None) {
+                if let Err(why) = super::vattr::record_new(&self.vfs, &f.path, None, &o) {
+                    self.darwin_unimplemented(why);
+                }
+            }
+        }
     }
 
     /// The directory a found file's name is in.
@@ -1020,6 +1142,10 @@ impl Kernel {
         if let (true, Some(t)) = (swap, to.as_ref()) {
             refused(self.darwin_mac_check_vnode_rename(t, &from_dir, &from_name, Some(&from)))?;
         }
+        self.darwin_keep_attrs(&from);
+        if let (true, Some(t)) = (swap, to.as_ref()) {
+            self.darwin_keep_attrs(t);
+        }
         Ok(())
     }
 
@@ -1040,14 +1166,33 @@ impl Kernel {
             Lookup::Missing { dir, name } if !name.ends_with('/') => (dir, name),
             _ => return Ok(()),
         };
-        refused(self.darwin_mac_check_vnode_link(&vp, &dir, &name))
+        refused(self.darwin_mac_check_vnode_link(&vp, &dir, &name))?;
+        // vnode_authorize of the file as a link's target; a name there is
+        // EEXIST, another volume EXDEV, before adding to the directory is.
+        use super::vauth::kauth;
+        let cred = self.dtask.cred.clone();
+        let node = self.darwin_vnode_node(&vp.path, &vp.md, None);
+        self.darwin_authorize(&cred, &node, None, kauth::LINKTARGET)?;
+        if self.vfs.metadata_nofollow(&join(&dir.path, &name)).is_ok() || super::kern::mount_of(&dir.path).on != super::kern::mount_of(&vp.path).on {
+            return Ok(());
+        }
+        let dnode = self.darwin_vnode_node(&dir.path, &dir.md, None);
+        self.darwin_authorize(&cred, &dnode, None, kauth::ADD_FILE)?;
+        self.darwin_keep_attrs(&vp);
+        Ok(())
     }
 
     /// `mkdir1at`: a name already there is EEXIST; else the create check
-    /// of a directory.
-    fn darwin_sb_mkdir_call(&mut self, m: &GuestMem<'_>, dirfd: u64, path: u64) -> Result<(), Errno> {
+    /// of a directory, then `vn_authorize_mkdir`'s authorization; what it
+    /// is made with (mode `mode`, the umask applied) is left for the call
+    /// to record.
+    fn darwin_sb_mkdir_call(&mut self, m: &GuestMem<'_>, dirfd: u64, path: u64, mode: u32) -> Result<(), Errno> {
         match self.darwin_sb_namei(m, dirfd, path, false, false)? {
-            Lookup::Missing { dir, name } => refused(self.darwin_mac_check_vnode_create(&dir, &name, Some(vt::VDIR))),
+            Lookup::Missing { dir, name } => {
+                refused(self.darwin_mac_check_vnode_create(&dir, &name, Some(vt::VDIR)))?;
+                self.darwin_creation = Some(self.darwin_creating(&dir, &name, super::vauth::kauth::ADD_SUBDIRECTORY, mode)?);
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -1067,7 +1212,14 @@ impl Kernel {
             Lookup::Missing { dir, name } if !name.ends_with('/') => (dir, name),
             _ => return Ok(()),
         };
-        refused(self.darwin_mac_check_vnode_create(&dir, &name, Some(vt::VLNK)))
+        refused(self.darwin_mac_check_vnode_create(&dir, &name, Some(vt::VLNK)))?;
+        // (a name there is EEXIST before the authorization) The link's mode
+        // is every access permission the umask leaves.
+        if self.vfs.metadata_nofollow(&join(&dir.path, &name)).is_err() {
+            let mode = super::fsops::ACCESSPERMS as u32 & !self.darwin_umask();
+            self.darwin_creation = Some(self.darwin_creating(&dir, &name, super::vauth::kauth::ADD_FILE, mode)?);
+        }
+        Ok(())
     }
 
     /// `chmodat`'s lookup (its last component not followed with
@@ -1080,17 +1232,54 @@ impl Kernel {
     }
 }
 
+/// A file a call is about to make: its canonical path and the attributes
+/// `vnode_authattr_new` gives it, recorded once it is made.
+#[derive(Clone, Debug)]
+pub struct Creating {
+    pub path: String,
+    pub owned: super::vattr::Owned,
+}
+
 impl Kernel {
+    /// The authorization of a file to make as `name` in directory `dir`
+    /// (`vn_authorize_create`'s, `vn_authorize_mkdir`'s: `action` on the
+    /// directory, KAUTH_VNODE_ADD_FILE or KAUTH_VNODE_ADD_SUBDIRECTORY),
+    /// and the attributes it is made with, mode `mode`.
+    pub(crate) fn darwin_creating(&mut self, dir: &Found, name: &str, action: u32, mode: u32) -> Result<Creating, Errno> {
+        let cred = self.dtask.cred.clone();
+        let d = self.darwin_vnode_node(&dir.path, &dir.md, None);
+        self.darwin_authorize(&cred, &d, None, action)?;
+        let owned = match d.attrs {
+            Ok(o) => super::vattr::new_file(cred.uid, &o, mode),
+            Err(why) => {
+                self.darwin_unimplemented(why);
+                return Err(Errno::EIO);
+            }
+        };
+        Ok(Creating { path: join(&dir.path, name.trim_end_matches('/')), owned })
+    }
+
+    /// The record of what a call made, once it has made it; reported if
+    /// the filesystem cannot keep it.
+    pub(crate) fn darwin_created(&mut self, c: &Creating, handle: Option<&dyn crate::vfs::FileHandle>) {
+        if let Err(why) = super::vattr::record_new(&self.vfs, &c.path, handle, &c.owned) {
+            self.darwin_unimplemented(why);
+        }
+    }
+
     /// `vn_open_auth`'s lookup and checks for an open of the path at guest
     /// `path` from `dirfd` with Darwin's open flags `flags`, after `open1`'s
     /// own: an O_CREAT lookup follows a link at the end unless O_EXCL or
     /// O_NOFOLLOW, any other unless O_NOFOLLOW or O_SYMLINK. A name to make
     /// (with no slash after it, ENOENT otherwise) has the create check of a
-    /// regular file. A file there (EEXIST with O_CREAT and O_EXCL) has
-    /// `vn_authorize_open_existing`'s errors first (a directory to write,
-    /// O_DIRECTORY on another file, a socket, a link with O_NOFOLLOW), then
-    /// the open check of its open mode.
-    pub(crate) fn darwin_sb_open_check(&mut self, m: &GuestMem<'_>, dirfd: u64, path: u64, flags: u64) -> Result<(), Errno> {
+    /// regular file, then `vn_authorize_create`'s authorization; what it is
+    /// made with (mode `cmode`) is returned. A file there (EEXIST with
+    /// O_CREAT and O_EXCL) has `vn_authorize_open_existing`'s errors first
+    /// (a directory to write, O_DIRECTORY on another file, a socket, a link
+    /// with O_NOFOLLOW), then the open check of its open mode, then
+    /// `vnode_authorize` of what the mode does: read, write (append, when
+    /// appending without truncating).
+    pub(crate) fn darwin_sb_open_check(&mut self, m: &GuestMem<'_>, dirfd: u64, path: u64, flags: u64, cmode: u32) -> Result<Option<Creating>, Errno> {
         const O_NOFOLLOW: u64 = 0x100;
         const O_CREAT: u64 = 0x200;
         const O_TRUNC: u64 = 0x400;
@@ -1098,15 +1287,21 @@ impl Kernel {
         const O_DIRECTORY: u64 = 0x10_0000;
         const O_SYMLINK: u64 = 0x20_0000;
         const O_NOFOLLOW_ANY: u64 = 0x2000_0000;
+        const O_APPEND: u64 = 0x8;
+        const FREAD: u32 = 1;
+        const FWRITE: u32 = 2;
         if (flags & O_NOFOLLOW_ANY != 0 && flags & (O_SYMLINK | O_NOFOLLOW) != 0) || (flags & O_CREAT != 0 && flags & O_DIRECTORY != 0) {
-            return Ok(());
+            return Ok(None);
         }
         let create = flags & O_CREAT != 0;
         let follow = if create { flags & (O_EXCL | O_NOFOLLOW) == 0 } else { flags & (O_NOFOLLOW | O_SYMLINK) == 0 };
         let f = match self.darwin_sb_namei(m, dirfd, path, follow, flags & O_NOFOLLOW_ANY != 0)? {
-            Lookup::Missing { dir, name } if create && !name.ends_with('/') => return refused(self.darwin_mac_check_vnode_create(&dir, &name, Some(vt::VREG))),
+            Lookup::Missing { dir, name } if create && !name.ends_with('/') => {
+                refused(self.darwin_mac_check_vnode_create(&dir, &name, Some(vt::VREG)))?;
+                return self.darwin_creating(&dir, &name, super::vauth::kauth::ADD_FILE, cmode).map(Some);
+            }
             Lookup::Found(f) if !(create && flags & O_EXCL != 0) => f,
-            _ => return Ok(()),
+            _ => return Ok(None),
         };
         // FFLAGS: the access mode's FREAD and FWRITE.
         let fmode = ((flags & !3) | ((flags & 3) + 1)) as u32;
@@ -1117,9 +1312,21 @@ impl Kernel {
             flags & O_DIRECTORY != 0 || t == FileType::Socket || (t == FileType::Symlink && flags & O_NOFOLLOW != 0)
         };
         if refused_first {
-            return Ok(());
+            return Ok(None);
         }
-        refused(self.darwin_mac_check_vnode_open(sb_vnode(&f.path, &f.md), fmode))
+        refused(self.darwin_mac_check_vnode_open(sb_vnode(&f.path, &f.md), fmode))?;
+        use super::vauth::kauth;
+        let mut action = 0;
+        if fmode & FREAD != 0 {
+            action |= kauth::READ_DATA;
+        }
+        if fmode & FWRITE != 0 || flags & O_TRUNC != 0 {
+            action |= if flags & O_APPEND != 0 && flags & O_TRUNC == 0 { kauth::APPEND_DATA } else { kauth::WRITE_DATA };
+        }
+        let cred = self.dtask.cred.clone();
+        let node = self.darwin_vnode_node(&f.path, &f.md, None);
+        self.darwin_authorize(&cred, &node, None, action)?;
+        Ok(None)
     }
 }
 
@@ -1177,7 +1384,12 @@ impl Kernel {
         match (self.darwin_sb_lookup(start, path, true, false)?, bind) {
             (Lookup::Missing { dir, name }, true) => {
                 refused(self.darwin_mac_check_vnode_create(&dir, &name, Some(vt::VSOCK)))?;
-                refused(self.darwin_mac_check_vnode_uipc_bind(&dir, &name))
+                refused(self.darwin_mac_check_vnode_uipc_bind(&dir, &name))?;
+                // vnode_authorize of adding it to the directory; the socket
+                // made with every access permission the umask leaves.
+                let mode = super::fsops::ACCESSPERMS as u32 & !self.darwin_umask();
+                self.darwin_creation = Some(self.darwin_creating(&dir, &name, super::vauth::kauth::ADD_FILE, mode)?);
+                Ok(())
             }
             (Lookup::Found(f), false) if f.md.file_type == FileType::Socket => refused(self.darwin_mac_check_vnode_uipc_connect(sb_vnode(&f.path, &f.md))),
             _ => Ok(()),

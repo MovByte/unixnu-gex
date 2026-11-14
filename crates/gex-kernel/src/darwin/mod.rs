@@ -43,6 +43,8 @@ pub mod accel;
 pub mod iomfb;
 pub mod platform;
 pub mod pe;
+pub mod vattr;
+pub mod vauth;
 pub mod volattrs;
 pub mod guarded;
 pub mod exit;

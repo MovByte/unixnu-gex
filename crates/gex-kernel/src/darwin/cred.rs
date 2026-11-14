@@ -131,6 +131,32 @@ impl Cred {
         displaced
     }
 
+    /// `kauth_cred_copy_real`: the credential with the real user and group
+    /// as its effective ones (a supplementary group the real group
+    /// displaces opts it out of memberd), as `access` checks.
+    pub fn copy_real(&self) -> Cred {
+        let mut c = self.clone();
+        if c.ruid == c.uid && c.rgid == c.gid() {
+            return c;
+        }
+        c.uid = c.ruid;
+        if c.change_egid(c.rgid) {
+            c.flags |= CRF_NOMEMBERD;
+            c.gmuid = UID_NONE;
+        }
+        if c.gmuid != UID_NONE {
+            c.gmuid = c.ruid;
+        }
+        c
+    }
+
+    /// `kauth_cred_ismember_gid`: the credential's own group list, which
+    /// is the whole answer on a kernel without an external resolver
+    /// (iOS's has none: no `CONFIG_EXT_RESOLVER`).
+    pub fn is_member(&self, gid: u32) -> bool {
+        self.groups.contains(&gid)
+    }
+
     /// `kauth_cred_model_setgroups`.
     pub fn setgroups(&mut self, groups: &[u32], gmuid: u32) -> bool {
         let groups = &groups[..groups.len().min(NGROUPS)];

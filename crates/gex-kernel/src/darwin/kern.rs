@@ -349,7 +349,7 @@ fn darwin_gettimeofday(m: &mut GuestMem<'_>, tp: u64, tzp: u64, abs: u64) -> Res
 const MAXPATHLEN: usize = 1024;
 
 /// `securelevel`: the system never raises it.
-const DARWIN_SECURELEVEL: i32 = 0;
+pub(crate) const DARWIN_SECURELEVEL: i32 = 0;
 
 /// A sysctl's numbers, as `int`s.
 fn oid_bytes(oid: &[i32]) -> Vec<u8> {
@@ -464,6 +464,15 @@ impl Kernel {
             }
         }
         Some(match raw {
+            // A unix socket's bind, which makes its name's socket file: its
+            // record once made.
+            sys::BIND if self.darwin_creation.is_some() => {
+                let r = self.canonical(m, nr::BIND, *a);
+                if let (Ok(_), Some(c)) = (&r, self.darwin_creation.take()) {
+                    self.darwin_created(&c, None);
+                }
+                res(r)
+            }
             sys::SHARED_REGION_CHECK_NP => res(self.darwin_shared_region_check_np(m, a[0])),
             sys::SHARED_REGION_MAP_AND_SLIDE_2_NP => res(self.darwin_shared_region_map_and_slide_2_np(m, a)),
             sys::MAP_WITH_LINKING_NP => res(self.darwin_map_with_linking(m, a)),
@@ -971,6 +980,8 @@ impl Kernel {
 
     /// `faccessat(fd, path, amode, flag)`: its flags checked; with
     /// AT_SYMLINK_NOFOLLOW_ANY no link on the way, the last not followed.
+    /// What the mode asks was authorized with Sandbox's check
+    /// (`darwin_sb_access_call`): the lookup is what is left to fail.
     fn darwin_faccessat(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
         const AT_EACCESS: u64 = 0x10;
         const AT_SYMLINK_NOFOLLOW: u64 = 0x20;
@@ -986,7 +997,7 @@ impl Kernel {
         if flag & AT_SYMLINK_NOFOLLOW_ANY != 0 {
             f |= AT_SYMLINK_NOFOLLOW;
         }
-        self.canonical(m, nr::FACCESSAT, [super::bsd::dirfd(a[0]), a[1], a[2], super::bsd::at_flags(f), 0, 0])
+        self.canonical(m, nr::FACCESSAT, [super::bsd::dirfd(a[0]), a[1], 0, super::bsd::at_flags(f), 0, 0])
     }
 
     /// `kill(pid, signum, posix)`: one process (a zombie succeeds unsignalled),

@@ -66,6 +66,10 @@ impl StdStream {
 }
 
 impl FileHandle for StdStream {
+    fn is_host_stdio(&self) -> bool {
+        true
+    }
+
     fn poll_readable(&self) -> bool {
         self.stream != Stream::In || STDIN_READY.get().is_none_or(|f| f())
     }

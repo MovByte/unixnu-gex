@@ -4,7 +4,9 @@
 //! access, modification and creation times, its mode and extended
 //! attributes; a directory's access and creation times, its entries cloned
 //! and its modification time new; a new file number and change time. The
-//! filesystems here have no shared extents, so the bytes are copied.
+//! filesystems here have no shared extents, so the bytes are copied. Its
+//! owner, group, mode and flags are `clonefile_internal`'s, recorded
+//! ([`super::vattr`]).
 
 use super::bsd::dirfd;
 use crate::errno::Errno;
@@ -50,7 +52,7 @@ impl Kernel {
             return Err(Errno::EBADF);
         }
         let md = file.metadata()?;
-        let path = self.vfs.canonical(&file.path);
+        let path = super::vattr::vnode_path(&self.vfs, &file.path, &md);
         let found = self.darwin_sb_fd_vnode(a[0] as i32);
         self.darwin_clone_internal(m, &path, Some(Arc::clone(&file.handle)), md, found, a[1], a[2], flags)
     }
@@ -87,11 +89,74 @@ impl Kernel {
                 return Err(super::errno::errno_of(e as i32));
             }
         }
-        let done = self.darwin_clone_tree(src, handle, &md, &to);
+        // Its authorization: adding to the directory, then reading the
+        // file (its data unless a descriptor open for reading names it).
+        use super::vauth::kauth;
+        let cred = self.dtask.cred.clone();
+        let dir_canon = self.vfs.canonical(&parent);
+        let dnode = self.darwin_vnode_node(&dir_canon, &dir, None);
+        let add = if md.file_type == FileType::Directory { kauth::ADD_SUBDIRECTORY } else { kauth::ADD_FILE };
+        self.darwin_authorize(&cred, &dnode, None, add)?;
+        let read = kauth::READ_DATA | kauth::READ_ATTRIBUTES | kauth::READ_EXTATTRIBUTES | kauth::READ_SECURITY;
+        let read = if handle.is_some() { read & !kauth::READ_DATA } else { read };
+        let fnode = self.darwin_vnode_node(src, &md, handle.as_deref());
+        self.darwin_authorize(&cred, &fnode, None, read)?;
+        // The clone's owner, group, mode and flags: the maker's and the
+        // directory's group (vnode_authattr_new), or for root without
+        // CLONE_NOOWNERCOPY the file's; the file's mode; its flags, but
+        // for the directory's SF_RESTRICTED and UF_DATAVAULT in place of
+        // its own.
+        let (fo, d) = match (&fnode.attrs, &dnode.attrs) {
+            (Ok(f), Ok(d)) => (*f, *d),
+            (Err(why), _) | (_, Err(why)) => {
+                self.darwin_unimplemented(why.clone());
+                return Err(Errno::EIO);
+            }
+        };
+        use super::vattr::flags as vf;
+        let keep = vf::UF_DATAVAULT | vf::SF_RESTRICTED;
+        let mut root = super::vattr::new_file(cred.uid, &d, fo.mode);
+        if flags & CLONE_NOOWNERCOPY == 0 && cred.uid == 0 {
+            (root.uid, root.gid) = (fo.uid, fo.gid);
+        }
+        root.flags = (fo.flags & !keep) | (d.flags & keep);
+        let to_canon = format!("{}/{}", dir_canon.trim_end_matches('/'), crate::vfs::basename(&to));
+        let done = self.darwin_clone_tree(src, handle, &md, &to).and_then(|()| {
+            super::vattr::record(&self.vfs, &to_canon, None, &root).map_err(|why| {
+                self.darwin_unimplemented(why);
+                Errno::EIO
+            })
+        });
         if done.is_err() {
             self.darwin_clone_remove(&to);
         }
         done.map(|()| 0)
+    }
+
+    /// The record of a directory clone's entry `into`: its source's
+    /// attributes, which APFS's clone of the hierarchy keeps (what APFS
+    /// does with an entry the maker does not own, when it takes no owner
+    /// from the source, is not modelled).
+    fn darwin_clone_child_record(&mut self, from: &str, child: &Metadata, into: &str) -> Result<(), Errno> {
+        let canon_from = self.vfs.canonical(&crate::vfs::parent_of(from));
+        let canon_from = format!("{}/{}", canon_from.trim_end_matches('/'), crate::vfs::basename(from));
+        let o = match super::vattr::of(&self.vfs, &canon_from, child, None) {
+            Ok(o) => o,
+            Err(why) => {
+                self.darwin_unimplemented(why);
+                return Err(Errno::EIO);
+            }
+        };
+        if o.uid != self.dtask.cred.uid && self.dtask.cred.uid != 0 {
+            self.darwin_unimplemented(format!("clonefile of {from}, another user's, in a directory clone (APFS's owner of the clone's entry)"));
+            return Err(Errno::EIO);
+        }
+        let canon_into = self.vfs.canonical(&crate::vfs::parent_of(into));
+        let canon_into = format!("{}/{}", canon_into.trim_end_matches('/'), crate::vfs::basename(into));
+        super::vattr::record(&self.vfs, &canon_into, None, &o).map_err(|why| {
+            self.darwin_unimplemented(why);
+            Errno::EIO
+        })
     }
 
     fn darwin_clone_tree(&mut self, src: &str, handle: Option<Arc<dyn FileHandle>>, md: &Metadata, to: &str) -> Result<(), Errno> {
@@ -138,6 +203,7 @@ impl Kernel {
                     let (from, into) = (format!("{}/{}", src.trim_end_matches('/'), e.name), format!("{}/{}", to.trim_end_matches('/'), e.name));
                     let child = self.vfs.metadata_nofollow(&from)?;
                     self.darwin_clone_tree(&from, None, &child, &into)?;
+                    self.darwin_clone_child_record(&from, &child, &into)?;
                 }
                 self.vfs.chmod(to, md.mode)?;
                 self.vfs.set_times(to, atime, None, true)
@@ -158,7 +224,9 @@ impl Kernel {
         let n = self.vfs.xattr(src, follow, XattrOp::List { buf: &mut names })?;
         for name in names[..n].split(|&b| b == 0).filter(|b| !b.is_empty()) {
             let name = std::str::from_utf8(name).map_err(|_| Errno::EINVAL)?;
-            if !name.starts_with(NATIVE_XATTR_PREFIX) {
+            // (the record of the source's owner, group, mode and flags is
+            // no attribute of the guest's: the clone has its own)
+            if !name.starts_with(NATIVE_XATTR_PREFIX) || name == super::vattr::RECORD {
                 continue;
             }
             let len = self.vfs.xattr(src, follow, XattrOp::Get { name, buf: &mut [] })?;

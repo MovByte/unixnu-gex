@@ -566,6 +566,13 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         false
     }
 
+    /// Whether this is one of the host's own standard streams, which the
+    /// host attaches as it starts a program: no file of the guest's
+    /// filesystems, whatever name it goes by.
+    fn is_host_stdio(&self) -> bool {
+        false
+    }
+
     /// This handle as a unix socket, when it is one: the syscalls that need
     /// the concrete type (descriptor passing, `listen`, `accept`) recover it
     /// from the handle, whichever process made it.

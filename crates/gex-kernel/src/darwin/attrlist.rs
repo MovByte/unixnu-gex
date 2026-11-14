@@ -140,6 +140,7 @@ pub mod fsopt {
     pub const ATTR_CMN_EXTENDED: u64 = 0x20;
     pub const LIST_SNAPSHOT: u64 = 0x40;
     pub const RETURN_REALDEV: u64 = 0x200;
+    pub const UTIMES_NULL: u64 = 0x400;
     pub const NOFOLLOW_ANY: u64 = 0x800;
 }
 

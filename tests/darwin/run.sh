@@ -118,6 +118,41 @@ for f in sandbox_profile.bin sandbox_builtin.bin sandbox_protobox.bin os.dmg.tru
 done
 export GEX_DARWIN_BOOT="$BOOT"
 
+# place SRC DST: a program copied into the root, as the device's owner
+# installing it as root would leave it: root's, group wheel, mode 0755, no
+# flags. gex reads a file's owner, group, mode and flags from its record
+# (crates/gex-kernel/src/darwin/vattr.rs, RECORD) where the system's images
+# do not describe the file, as for a program put in place from outside.
+place() {
+    cp "$1" "$2" && chmod 755 "$2" || return 1
+    if command -v xattr >/dev/null 2>&1; then
+        xattr -w user.gex.darwin.attrs "uid=0 gid=0 mode=0755 flags=0" "$2"
+    else
+        setfattr -n user.gex.darwin.attrs -v "uid=0 gid=0 mode=0755 flags=0" "$2"
+    fi
+}
+
+# record_of FILE: whether FILE has gex's record of its owner, group, mode
+# and flags (its own, not what a link names).
+record_of() {
+    if command -v xattr >/dev/null 2>&1; then
+        xattr -s -p user.gex.darwin.attrs "$1" >/dev/null 2>&1
+    else
+        getfattr -h -n user.gex.darwin.attrs "$1" >/dev/null 2>&1
+    fi
+}
+
+# What earlier runs of these programs left in the root's /private/var/tmp,
+# made before gex kept the owners of the files a program makes there:
+# with no record, nothing says whose they are, and a run that meets one
+# stops. Those ten minutes old are removed (a run in progress makes its
+# own afresh).
+if [ -n "${GEX_DARWIN_ROOT:-}" ] && [ -d "$GEX_DARWIN_ROOT/private/var/tmp" ]; then
+    find "$GEX_DARWIN_ROOT/private/var/tmp" -mindepth 1 -maxdepth 1 -name 'gex-*' -mmin +10 | while read -r f; do
+        record_of "$f" || rm -rf "$f"
+    done
+fi
+
 fail=0
 as=
 overlay=
@@ -154,7 +189,7 @@ check_root() {
         return
     fi
     mkdir -p "$GEX_DARWIN_ROOT/var/tmp"
-    cp "$HERE/bin/$name" "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$name"
+    place "$HERE/bin/$name" "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$name"
     # shellcheck disable=SC2086
     out=$("$GEXC" run --sysroot "$GEX_DARWIN_ROOT" ${overlay:+--overlay "$overlay"} ${as:+--uid "$as"} "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$name" "$@" 2>/dev/null)
     report "$name" "$out" $? "$want_out" "$want_status"
@@ -231,8 +266,8 @@ run() {
     exec)
         if [ -n "${GEX_DARWIN_ROOT:-}" ]; then
             mkdir -p "$GEX_DARWIN_ROOT/var/tmp"
-            cp "$HERE/bin/hello-fat" "$GEX_DARWIN_ROOT/var/tmp/gex-exec-fat"
-            cp "$HERE/bin/hello-arm64e" "$GEX_DARWIN_ROOT/var/tmp/gex-exec-arm64e"
+            place "$HERE/bin/hello-fat" "$GEX_DARWIN_ROOT/var/tmp/gex-exec-fat"
+            place "$HERE/bin/hello-arm64e" "$GEX_DARWIN_ROOT/var/tmp/gex-exec-arm64e"
         fi
         check_root exec "exec ok
 hello from /var/tmp/gex-exec-fat with 1 argument" 0
@@ -240,7 +275,7 @@ hello from /var/tmp/gex-exec-fat with 1 argument" 0
     spawn)
         if [ -n "${GEX_DARWIN_ROOT:-}" ]; then
             mkdir -p "$GEX_DARWIN_ROOT/var/tmp"
-            cp "$HERE/bin/hello-fat" "$GEX_DARWIN_ROOT/var/tmp/gex-spawn-fat"
+            place "$HERE/bin/hello-fat" "$GEX_DARWIN_ROOT/var/tmp/gex-spawn-fat"
         fi
         check_root spawn "spawn ok" 0
         ;;
@@ -403,8 +438,8 @@ hello from /var/tmp/gex-exec-fat with 1 argument" 0
     amfi)
         if [ -n "${GEX_DARWIN_ROOT:-}" ]; then
             mkdir -p "$GEX_DARWIN_ROOT/var/tmp"
-            cp "$HERE/bin/untrusted" "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-untrusted"
-            cp "$HERE/bin/gta" "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-gta"
+            place "$HERE/bin/untrusted" "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-untrusted"
+            place "$HERE/bin/gta" "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-gta"
         fi
         check_root amfi "amfi ok" 0
         ;;
@@ -414,7 +449,7 @@ hello from /var/tmp/gex-exec-fat with 1 argument" 0
         if [ -n "${GEX_DARWIN_ROOT:-}" ]; then
             mkdir -p "$GEX_DARWIN_ROOT/var/tmp"
             for c in lcself lcparent lcresp lcfact lcok; do
-                cp "$HERE/bin/$c" "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$c"
+                place "$HERE/bin/$c" "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$c"
             done
         fi
         check_root launchcon "launchcon ok" 0
@@ -423,7 +458,7 @@ hello from /var/tmp/gex-exec-fat with 1 argument" 0
         if [ -n "${GEX_DARWIN_ROOT:-}" ]; then
             mkdir -p "$GEX_DARWIN_ROOT/var/tmp"
             for c in sbxstacked sbxnotstr sbxunknown sbxexec; do
-                cp "$HERE/bin/$c" "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$c"
+                place "$HERE/bin/$c" "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$c"
             done
         fi
         check_root sbxkill "sbxkill ok" 0
