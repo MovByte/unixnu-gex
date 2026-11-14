@@ -14,6 +14,8 @@
 //   primary display, and there is no secondary one.
 // - The main display opens like any framebuffer, and its service and size
 //   are the panel's.
+// - It answers what QuartzCore's display reads first: the color remap mode
+//   and the pipe's runtime properties, published or never registered.
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
@@ -58,6 +60,24 @@ int main(void) {
     FbSize size = {0, 0};
     if ((kr = display_size(fb, &size)) != KERN_SUCCESS) return bad("the main display's size", kr, 0);
     if (size.w != (words[0] & 0xffff) || size.h != (words[4] & 0xffff)) return bad("the main display's width", (long)size.w, words[0] & 0xffff);
+
+    // What QuartzCore's display reads as it starts: the color remap mode
+    // (the pipe's runtime property BlendOutputCSCMethod, 0, which the
+    // framebuffer also publishes), SupportsAOTPowerSaving (false), and
+    // neither IOMFBSupportsGPLite nor VRRIdleEnabled, which the pipe never
+    // registers.
+    kern_return_t (*color_remap)(Framebuffer, uint32_t *) = dlsym(h, "IOMobileFramebufferGetColorRemapMode");
+    CFTypeRef (*copy_property)(Framebuffer, CFStringRef) = dlsym(h, "IOMobileFramebufferCopyProperty");
+    if (!color_remap || !copy_property) return bad("the framework's property functions", 0, 1);
+    uint32_t mode = 9;
+    if ((kr = color_remap(fb, &mode)) != KERN_SUCCESS || mode != 0) return bad("the color remap mode", kr ? kr : mode, 0);
+    CFTypeRef aot = copy_property(fb, CFSTR("SupportsAOTPowerSaving"));
+    if (aot != kCFBooleanFalse) return bad("SupportsAOTPowerSaving", (long)aot, (long)kCFBooleanFalse);
+    CFNumberRef csc = copy_property(fb, CFSTR("BlendOutputCSCMethod"));
+    int csc_value = -1;
+    if (csc == NULL || CFGetTypeID(csc) != CFNumberGetTypeID() || !CFNumberGetValue(csc, kCFNumberIntType, &csc_value) || csc_value != 0) return bad("BlendOutputCSCMethod", csc_value, 0);
+    if (copy_property(fb, CFSTR("IOMFBSupportsGPLite")) != NULL) return bad("IOMFBSupportsGPLite", 1, 0);
+    if (IORegistryEntryCreateCFProperty(s, CFSTR("VRRIdleEnabled"), NULL, 0) != NULL) return bad("VRRIdleEnabled", 1, 0);
 
     // No other display: kIOReturnNoDevice.
     Framebuffer other = NULL;
