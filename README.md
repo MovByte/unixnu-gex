@@ -300,6 +300,17 @@ target/release/gexc webmetal-info
 feature, Metal's requests to the accelerator are reported as having no
 executor to run them.
 
+In the page, the same executor runs in one Worker that owns the guest
+system's `GPUDevice`, on the browser's WebGPU (`hosts/metal`, a workspace
+of its own because WebMetal's browser binding pins its wasm-bindgen). The
+guest's Workers reach it over a ring in a `SharedArrayBuffer`
+(`hosts/browser/js/metal-ring.mjs`): one message for each call the kernel
+makes on its executor, its IOSurface table and its presentation sink. The
+display is a canvas the same Worker draws the framebuffer's frames on.
+`hosts/metal/tests/check_page.py` checks it in a browser from where a
+process's kernel stands (it needs `wasm-bindgen` at the version WebMetal
+pins).
+
 ### The Darwin test programs
 
 The test programs are C, built with Xcode's iOS toolchain: you need macOS
@@ -530,6 +541,7 @@ The Darwin work, beside upstream's tree:
 | `crates/gex-abi/src/crypto.rs` | the A64 cryptographic extension |
 | `crates/gexc/src/darwin_run.rs`, `dsc_info.rs` | `gexc run` for Mach-O; `gexc dsc-info` |
 | `crates/gexc/src/host_webmetal/` | WebMetal's executor on its host thread, its embedder over the kernel, and the executor's IOSurface table |
+| `hosts/metal/`, `hosts/browser/js/metal-*.mjs` | the page's GPU Worker: WebMetal's executor on the browser's WebGPU, the ring the guest's Workers reach it by, and the display's canvas |
 | `third_party/WebMetal`, `third_party/AirWgsl` | WebMetal (guest plugin, wire protocol, host executor) and AirWgsl, submodules at pinned commits |
 | `hosts/native/src/darwin_image.rs` | a Darwin program's image, as exec loads it |
 | `tests/darwin/src/` | the test programs, and the entitlements some are signed with |
@@ -576,7 +588,14 @@ the limits its comments state. It is a summary, not the full list: the code
 is the reference (search `crates/gex-kernel/src/` for
 `darwin_unimplemented`, `note_unimplemented` and `Unported`).
 
-- **The browser.** The page runs no Darwin process yet.
+- **The browser.** The page runs no Darwin process yet. Its GPU Worker
+  serves the ring, but no kernel in the page sends on it yet: the browser
+  host's side of the accelerator, the IOSurface table and the
+  presentation sink waits for Darwin processes in the page. The display's
+  canvas shows a frame of one layer covering the panel, `BGRA` exactly and
+  `b3a8` on an `rgba16float` canvas (each 10-bit code as its nearest half
+  float); it refuses other formats, blending, scaling and transforms, and
+  a browser without `rgba16float` canvases (Firefox 151) refuses `b3a8`.
 - **Code signing.** Besides the static trust cache, only the OS cryptex's
   is loaded, at a boot pid 1 stands in for; loading one at run time (AMFI's
   user client, after a cryptex's manifest is checked) is not implemented.
