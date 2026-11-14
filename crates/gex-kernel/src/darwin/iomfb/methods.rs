@@ -558,6 +558,14 @@ fn notification_options(k: &mut Kernel, ty: u32, options: u32) -> i32 {
     ret::UNSUPPORTED
 }
 
+/// SetParameter 3's value as the pipe's component at `+0xc8` keeps it
+/// (`+0x198`), for the pipe's programming of its block.
+static PIPE_C8_198: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// SetParameter 6's EDR scale (`+0x187c`, 1.0 at start) and whether one is
+/// set (`+0x1879`).
+static EDR_SCALE: std::sync::Mutex<(f32, bool)> = std::sync::Mutex::new((1.0, false));
+
 /// A power assertion the client holds let go at its stop: the
 /// framebuffer's `SetParameter(11, 0)` (slot 228), whose answer the stop
 /// does not look at.
@@ -570,7 +578,8 @@ pub fn release_power_assertion(k: &mut Kernel) {
 /// a gated action when given the count of values it takes (0: four; 1 to
 /// 3, 6, 7 and 23: one; 4: one below 101; 5 and 9: none; 10: one or two;
 /// 22: any), and any other parameter or count is kIOReturnBadArgument.
-/// Parameter 11, the power assertions, is not one of them.
+/// Parameter 11, the power assertions, is not one of them. QuartzCore sets
+/// 3, 6, 7, 8 and 19.
 fn set_parameter(k: &mut Kernel, param: u32, values: &[u64], count: u32) -> i32 {
     let known = match param {
         0 => count == 4,
@@ -583,6 +592,38 @@ fn set_parameter(k: &mut Kernel, param: u32, values: &[u64], count: u32) -> i32 
     };
     if !known {
         return ret::BAD_ARGUMENT;
+    }
+    match param {
+        // Gated slot 276 (AppleCLCD 0xfffffff006bfab28) to the pipe's
+        // 0xfffffff006bd3b64: its component at `+0xc8` (made at the pipe's
+        // start, 0xfffffff006bb5be0) takes the value at `+0x198` and clears
+        // `+0x108`; success.
+        3 => {
+            PIPE_C8_198.store(values[0] as u32, std::sync::atomic::Ordering::Relaxed);
+            return ret::SUCCESS;
+        }
+        // Gated 0xfffffff0067a0e84 (EDR scaling, `+0x1878`, on unless the
+        // `iomfb_enable_edr_scaling` boot-arg turns it off, and this boot
+        // passes none): a nonzero value is the scale in 16.16 (`+0x187c`),
+        // and whether one is set is `+0x1879`; then slot 326 (AppleCLCD
+        // 0xfffffff006bfec98: the family's part is empty, and the pipe's
+        // 0xfffffff006bd6d30 reaches only its components at `+0xf0`,
+        // `+0xf8` and `+0x110`, which it never makes, and slot 0xcb8, which
+        // needs the first); success.
+        6 => {
+            let v = values[0] as u32 as i32;
+            let mut edr = EDR_SCALE.lock().unwrap_or_else(|e| e.into_inner());
+            if v != 0 {
+                edr.0 = v as f32 / 65536.0;
+            }
+            edr.1 = v != 0;
+            return ret::SUCCESS;
+        }
+        // Gated 0xfffffff0067a10e0: slot 330 (AppleCLCD 0xfffffff006bfeff8)
+        // to the pipe's 0xfffffff006bd6db0, which needs its component at
+        // `+0xf8` (only ever cleared): kIOReturnUnsupported.
+        7 => return ret::UNSUPPORTED,
+        _ => {}
     }
     k.darwin_unimplemented(format!("IOMobileFramebuffer SetParameter {param} with {count} values {:x?} (the framebuffer's gated action)", &values[..values.len().min(count as usize)]));
     ret::UNSUPPORTED

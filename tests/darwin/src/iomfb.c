@@ -15,7 +15,8 @@
 //   range, the dispatch counts, reserved and empty entries, unknown swaps,
 //   a source rectangle outside its surface, the debug flags a production
 //   device refuses, the parameters SetParameter does not take (a power
-//   assertion among them) and the gain map's without its entitlement, the
+//   assertion among them) and the gain map's without its entitlement,
+//   three QuartzCore sets (3 and 6, taken; 7, unsupported), the
 //   frame information the pipe names and the options only it takes, the
 //   notification types, and memory of no type.
 // - The glass, on that connection (selector 83, with backboardd's graphics
@@ -272,6 +273,14 @@ int main(void) {
     if ((kr = IOConnectCallMethod(c, 68, in, 1, sp, 8, NULL, NULL, NULL, NULL)) != kIOReturnBadArgument) return bad("SetParameter 11", kr, kIOReturnBadArgument);
     in[0] = 8;
     if ((kr = IOConnectCallMethod(c, 68, in, 1, sp, 8, NULL, NULL, NULL, NULL)) != kIOReturnBadArgument) return bad("SetParameter 8", kr, kIOReturnBadArgument);
+    // QuartzCore's: 3 goes to the pipe's block that takes it, 6 is the EDR
+    // scale; 7 needs a block the pipe never makes.
+    in[0] = 3;
+    if ((kr = IOConnectCallMethod(c, 68, in, 1, sp, 8, NULL, NULL, NULL, NULL)) != KERN_SUCCESS) return bad("SetParameter 3", kr, 0);
+    in[0] = 6;
+    if ((kr = IOConnectCallMethod(c, 68, in, 1, sp, 8, NULL, NULL, NULL, NULL)) != KERN_SUCCESS) return bad("SetParameter 6", kr, 0);
+    in[0] = 7;
+    if ((kr = IOConnectCallMethod(c, 68, in, 1, sp, 8, NULL, NULL, NULL, NULL)) != kIOReturnUnsupported) return bad("SetParameter 7", kr, kIOReturnUnsupported);
     in[0] = 0;
     if ((kr = IOConnectCallMethod(c, 68, in, 1, sp, 24, NULL, NULL, NULL, NULL)) != kIOReturnBadArgument) return bad("SetParameter 0 with three values", kr, kIOReturnBadArgument);
     in[0] = 4;
