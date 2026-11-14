@@ -11,6 +11,11 @@
 # cache bundle and the Sandbox's platform profile and profile collections)
 # with these programs' cdhashes added to its static trust cache, as an
 # owner adds their own code: AMFI runs only trusted code.
+#
+# The web device's GPU driver is WebMetal's plugin (GEX_DARWIN_WEBMETAL: the
+# bundle UniXNU's scripts/build-web-metal-plugin.py builds, ios/*.bundle),
+# installed in the system volume through an overlay. Without it the
+# programs that load it are skipped, or fail when asked for by name.
 set -u
 
 HERE=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
@@ -25,17 +30,6 @@ mkdir -p "$BOOT"
 # constraint category 5.
 progs=$(find -H "$HERE/bin" -maxdepth 1 -type f ! -name untrusted | sort)
 cats="--category 5:$HERE/bin/launchcon"
-# The web device's system volume carries WebMetal's bundle, which
-# Metal.framework loads for the accelerator's MetalPluginName from
-# /System/Library/Extensions; its code is the system's, in the static trust
-# cache with the rest of it, with the entry the device's trust cache gives
-# its own plugin bundles on the system volume (SHA-256, flags 0, launch
-# constraint category 2, as AppleUVDMLib.plugin's and IOUSBLib.bundle's).
-WEBMETAL=${GEX_DARWIN_ROOT:+$GEX_DARWIN_ROOT/System/Library/Extensions/WebMetal.bundle/WebMetal}
-if [ -n "$WEBMETAL" ] && [ -f "$WEBMETAL" ]; then
-    progs="$progs $WEBMETAL"
-    cats="$cats --category 2:$WEBMETAL"
-fi
 
 # opaque DIR: overlayfs's mark (in its user.overlay. form) of an overlay
 # directory that hides the root's of its name entirely.
@@ -57,12 +51,22 @@ machos() {
 }
 
 # The overlays (gexc run --overlay), host trees laid over the root as part
-# of its system volume. overlay's check overlay (src/overlay.c) holds a
+# of its system volume. Metal.framework loads the bundle the accelerator's
+# MetalPluginName names (PLUGIN) from /System/Library/Extensions: WebMetal's
+# is installed there, opaque, so that a bundle of the root's of that name
+# is hidden entirely. overlay's check overlay (src/overlay.c) holds a
 # bundle that shadows the root's AGXMetalA10.bundle, with the root's own
 # Info.plist and a program as its executable, and a bundle the root has no
 # bundle of that name beside.
+PLUGIN=WebMetal
+METAL=$HERE/bin/overlay-metal
 CHECK=$HERE/bin/overlay-check
-rm -rf "$CHECK"
+rm -rf "$METAL" "$CHECK"
+if [ -n "${GEX_DARWIN_WEBMETAL:-}" ] && [ -d "$GEX_DARWIN_WEBMETAL" ]; then
+    mkdir -p "$METAL/System/Library/Extensions"
+    cp -Rp "$GEX_DARWIN_WEBMETAL" "$METAL/System/Library/Extensions/$PLUGIN.bundle"
+    opaque "$METAL/System/Library/Extensions/$PLUGIN.bundle"
+fi
 EXT=${GEX_DARWIN_ROOT:-}/System/Library/Extensions
 if [ -n "${GEX_DARWIN_ROOT:-}" ] && [ -f "$EXT/AGXMetalA10.bundle/Info.plist" ] && [ -f "$EXT/AGXGPURawCounterBundle.bundle/Info.plist" ]; then
     mkdir -p "$CHECK/System/Library/Extensions/AGXMetalA10.bundle" "$CHECK/System/Library/Extensions/GexOverlay.bundle"
@@ -76,7 +80,7 @@ fi
 # rest of it, with the entry the device's trust cache gives its own plugin
 # bundles on the system volume (SHA-256, flags 0, launch constraint
 # category 2, as AppleUVDMLib.plugin's and IOUSBLib.bundle's).
-for o in "$CHECK"; do
+for o in "$METAL" "$CHECK"; do
     [ -d "$o" ] || continue
     for f in $(machos "$o"); do
         progs="$progs $f"
@@ -161,19 +165,21 @@ check_webmetal() {
 
 # check_metal NAME WANT_OUT WANT_STATUS: a program that uses Metal through
 # the root's Metal.framework, which needs WebMetal's executor in gexc and
-# WebMetal's bundle in the root's system volume: skipped without them, or
-# failed when it was asked for by name.
+# WebMetal's bundle in the system volume, through its overlay: skipped
+# without them, or failed when it was asked for by name.
 check_metal() {
-    if [ -n "${GEX_DARWIN_ROOT:-}" ] && [ ! -f "$WEBMETAL" ]; then
+    if [ -n "${GEX_DARWIN_ROOT:-}" ] && [ ! -d "$METAL" ]; then
         if [ "$named" -gt 0 ]; then
-            echo "FAIL $1: the root's system volume has no WebMetal.bundle in /System/Library/Extensions"
+            echo "FAIL $1: no WebMetal bundle to install (set GEX_DARWIN_WEBMETAL to the built bundle)"
             fail=1
         else
-            echo "SKIP $1 (the root has no /System/Library/Extensions/WebMetal.bundle)"
+            echo "SKIP $1 (set GEX_DARWIN_WEBMETAL to the built WebMetal bundle)"
         fi
         return
     fi
+    overlay=$METAL
     check_webmetal "$@"
+    overlay=
 }
 
 # check_root_as UID:GID NAME WANT_OUT WANT_STATUS [ARGS...]: check_root, the

@@ -478,6 +478,7 @@ exits 1 when any fails. It builds the programs first when
 | `GEXC` | the gexc to run (default `target/release/gexc`) |
 | `GEX_DARWIN_ROOT` | the root for the dynamic programs, which run from its `/var/tmp`. Without it they are skipped, or fail when named |
 | `GEX_DARWIN_BOOT` | the device's boot payload. Its trust cache, with the test programs' cdhashes added, goes to `tests/darwin/bin/boot/TrustCache`, with its `DeviceTree` and Sandbox blobs beside it, and gexc boots from there. Without it, the trust cache holds the test programs only |
+| `GEX_DARWIN_WEBMETAL` | WebMetal's plugin bundle, as UniXNU's `scripts/build-web-metal-plugin.py` builds it (`<out>/ios/WebMetal.bundle`), which `metal` loads. Without it `metal` is skipped, or fails when named |
 
 `GEX_DARWIN_STRICT=1` reaches gexc from the environment as well. The
 runner discards each program's stderr, so run a failing program directly
@@ -487,9 +488,12 @@ under gexc to see its reports.
 `webmetal` and are skipped without one (or fail, when named). `metal` goes
 through the root's own Metal.framework, which loads the bundle the
 accelerator's `MetalPluginName` names from `/System/Library/Extensions`:
-the web device's system volume carries `WebMetal.bundle` there, and the
-test is skipped for a root that has none. When the root has it, its
-executable's cdhash goes into the run's static trust cache with the
+the runner installs `GEX_DARWIN_WEBMETAL`'s bundle there, under the name
+`MetalPluginName` gives (`WebMetal.bundle`), through an overlay
+(`tests/darwin/bin/overlay-metal`), its directory opaque. `overlay` checks
+that an overlay's files cannot be told from the root's, with an overlay of
+its own (`tests/darwin/bin/overlay-check`) made from the root's files. Each
+overlay's Mach-O files go into the run's static trust cache with the
 programs', with the entry the device's trust cache gives its own plugin
 bundles on the system volume (launch constraint category 2): AMFI's library
 validation lets a platform process map only trusted code. The line `metal`
