@@ -823,11 +823,17 @@ impl Kernel {
 
     /// `exit_with_reason` for a death by Darwin signal `d`'s default action
     /// on this thread: the thread's exit reason is the process's unless
-    /// its exit has begun; then `proc_prepareexit`'s report of a crash.
+    /// its exit has begun; then `proc_prepareexit`'s report of a crash,
+    /// and its end (`P_REF_DEAD`): here, or once the EXC_CRASH handler a
+    /// report is sent to has answered (on the call's way out), as the
+    /// process stays found while its handler looks at it.
     fn darwin_signal_exit(&mut self, d: u32) {
         let reason = self.thread_signals.get(self.tid).and_then(|t| t.exit_reason());
         self.procs.begin_exit(self.pid, reason);
         self.darwin_prepareexit(d);
+        if self.dtask.crash_notify.is_none() {
+            self.procs.set_exited(self.pid);
+        }
     }
 
     /// `proc_prepareexit`'s crash report for an end by Darwin signal `d`

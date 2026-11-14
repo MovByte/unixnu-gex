@@ -27,6 +27,7 @@ pub mod ctty;
 pub mod devfs;
 pub mod tty;
 pub mod ttydev;
+pub mod km;
 pub mod cpumon;
 pub mod cred;
 pub mod errno;
@@ -41,6 +42,8 @@ pub mod osserialize;
 pub mod accel;
 pub mod iomfb;
 pub mod platform;
+pub mod pe;
+pub mod volattrs;
 pub mod guarded;
 pub mod exit;
 pub mod exception;
@@ -128,9 +131,12 @@ pub struct SandboxProfiles {
 /// the static trust cache (`load_static_trust_cache`; one that does not
 /// load is the kernel's panic), without which there are no trust caches;
 /// and the Sandbox kext's profiles. Once per system.
-pub fn boot(trust_cache: Option<&[u8]>, sandbox: SandboxProfiles, device_tree: Option<&[u8]>) -> Result<(), String> {
+pub fn boot(trust_cache: Option<&[u8]>, sandbox: SandboxProfiles, device_tree: Option<&[u8]>, system_attrs: Option<Vec<u8>>) -> Result<(), String> {
     if let Some(t) = device_tree {
         iokit::set_tree(t)?;
+    }
+    if let Some(a) = system_attrs {
+        volattrs::set_system(a)?;
     }
     let m = match trust_cache {
         Some(b) => Some(trustcache::load_bundle(b).map_err(|e| format!("failed to load static trust cache module: 0 ({e:?})"))?),
@@ -451,11 +457,6 @@ impl crate::syscalls::Kernel {
             ipc_active: Default::default(),
             name_port: std::sync::Mutex::new(None),
             codesign: self.dtask.codesign.clone(),
-            sandbox: std::sync::Arc::clone(&self.dtask.sandbox),
-            csflags: std::sync::Arc::clone(&self.dtask.csflags),
-            pidversion: self.dtask.pidversion,
-            textoff: self.dtask.textoff,
-            uniqueid: self.dtask.uniqueid,
             policy: self.dtask.policy.clone().or_else(|| self.procs.task_policy(self.pid)),
         };
         self.ipc().task_enable(link);
@@ -572,10 +573,9 @@ pub fn next_pidversion() -> i32 {
 /// Where iOS 17 keeps the shared cache, inside the SystemOS cryptex.
 pub const CACHE_PATH: &str = "/System/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64";
 
-/// The ids the shared cache's dynamic data names it by, which
-/// `fsgetpath` answers with [`CACHE_PATH`].
+/// `f_fsid.val[0]` of the volume the OS cryptex is on (its files'
+/// `st_dev`).
 pub const CACHE_FS_ID: u64 = 0x0100_0004;
-pub const CACHE_OBJ_ID: u64 = 0x0dcc_0001;
 
 /// Where a Darwin thread puts its system call number.
 pub const NR_SLOT: usize = ctx::x(16);

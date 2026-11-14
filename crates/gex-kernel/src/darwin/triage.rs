@@ -147,6 +147,8 @@ impl Kernel {
                 if kr != kr::SUCCESS && self.darwin_task_exc_handled(exc::EXC_CORPSE_NOTIFY) {
                     self.darwin_unimplemented("a corpse of a crashed task for its EXC_CORPSE_NOTIFY handler (corpses)".into());
                 }
+                // The rest of proc_prepareexit: P_REF_DEAD.
+                self.procs.set_exited(self.pid);
                 SyscallOutcome::Killed { signal, core }
             }
         }

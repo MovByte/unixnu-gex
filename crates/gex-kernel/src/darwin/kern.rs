@@ -172,6 +172,15 @@ pub const MOUNTS: &[Mount] = &[
     Mount { on: "/System/Cryptexes/OS", from: "/dev/disk3s1", fsid: super::CACHE_FS_ID, flags: MNT_RDONLY | MNT_DONTBROWSE, fs: Fs::Apfs },
 ];
 
+/// The volume the preboot cryptexes are on: what `vnode_lookup` of
+/// `/private/preboot/Cryptexes` finds the mount of, for the shared region's
+/// check of where a cache is (devices without SIP). This root has the OS
+/// cryptex at `/System/Cryptexes/OS`, the mount above standing for the
+/// Preboot volume's graft of it, and no `/private/preboot/Cryptexes`.
+pub fn preboot_cryptex_volume() -> Option<&'static str> {
+    MOUNTS.iter().find(|m| m.on == "/System/Cryptexes/OS").map(|m| m.on)
+}
+
 /// A mount's `vfsstatfs` counts and type: `f_bsize`, `f_iosize`,
 /// `f_blocks`, `f_bfree`, `f_bavail`, `f_files`, `f_ffree`, its
 /// `vfs_typenum`, its name.
@@ -453,28 +462,8 @@ impl Kernel {
             }
         }
         Some(match raw {
-            // dyld asks where the shared cache is mapped; the kernel mapped
-            // it before the process started.
-            // DYLD_VM_END_MWL ends map_with_linking_np for the process; a
-            // null address takes the shared region out of the task.
-            sys::SHARED_REGION_CHECK_NP if a[0] == super::mwl::DYLD_VM_END_MWL => {
-                self.dtask.disallow_mwl = true;
-                0
-            }
-            // The task's region (none once removed: EINVAL); its first
-            // mapping, or ENOMEM while nothing has mapped it.
-            sys::SHARED_REGION_CHECK_NP => match self.darwin_region {
-                (0, _) => neg(Errno::EINVAL),
-                (start, size) if a[0] == 0 => {
-                    self.darwin_shared_region_remove(m, start, size);
-                    self.darwin_region = (0, 0);
-                    0
-                }
-                _ => match super::shregion::region().and_then(|r| r.start()) {
-                    Some(start) => res(m.write_u64(a[0], start).map(|_| 0)),
-                    None => neg(Errno::ENOMEM),
-                },
-            },
+            sys::SHARED_REGION_CHECK_NP => res(self.darwin_shared_region_check_np(m, a[0])),
+            sys::SHARED_REGION_MAP_AND_SLIDE_2_NP => res(self.darwin_shared_region_map_and_slide_2_np(m, a)),
             sys::MAP_WITH_LINKING_NP => res(self.darwin_map_with_linking(m, a)),
             sys::GETENTROPY => res(self.canonical(m, nr::GETRANDOM, [a[0], a[1], 0, 0, 0, 0]).map(|_| 0)),
             sys::FCNTL | sys::FCNTL_NOCANCEL => self.darwin_fcntl(m, a),
@@ -1126,7 +1115,10 @@ impl Kernel {
     }
 
     /// `fsgetpath(buf, size, fsid, objid)`: the path of a file named by its
-    /// filesystem and object ids. Only the shared cache is named so.
+    /// filesystem and object ids: a volume's root, the shared cache, the
+    /// task's images, and a file the root filesystem finds by number (an
+    /// overlay's, `OverlayFs`); the root's other files are looked up by
+    /// name only, and reported.
     fn darwin_fsgetpath(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
         const FSGETPATH_MAXBUFLEN: u64 = 8192;
         const ROOT_OBJID: u64 = 2;
@@ -1141,9 +1133,11 @@ impl Kernel {
         let image = self.dtask.image_files.iter().find(|f| (f.0, f.1) == (fs, a[3])).map(|f| f.2.clone());
         let path = if a[3] == ROOT_OBJID {
             mnt.on.to_string()
-        } else if (fs, a[3]) == (super::CACHE_FS_ID, super::CACHE_OBJ_ID) && self.darwin_region.0 != 0 && super::shregion::region().is_some() {
-            super::CACHE_PATH.to_string()
+        } else if let Some(path) = super::shregion::file_path(fs as u32, a[3]) {
+            path
         } else if let Some(path) = image {
+            path
+        } else if let Some(path) = self.vfs.root_path_of_ino(a[3]).filter(|p| mount_of(p).fsid as u32 == fs as u32) {
             path
         } else {
             self.darwin_unimplemented(format!("fsgetpath of object {:#x} (VFS_VGET: the filesystems here look files up by name only)", a[3]));
@@ -1585,13 +1579,13 @@ impl Kernel {
         if !reads && !forself && self.creds.uid() != 0 {
             return Err(Errno::EPERM);
         }
-        // proc_find: this process, or another's task's link.
+        // proc_find: this process, or another that has not exited (one
+        // being spawned is found, with what its spawn has made of it).
         let (sig, flags, pidversion, textoff) = if forself {
-            (self.dtask.codesign.clone(), std::sync::Arc::clone(&self.dtask.csflags), self.dtask.pidversion, self.dtask.textoff)
+            (self.dtask.codesign.clone().map(std::sync::Arc::new), std::sync::Arc::clone(&self.dtask.csflags), self.dtask.pidversion, self.dtask.textoff)
         } else {
-            let ipc = self.ipc();
-            let Some(l) = ipc.links.values().find(|l| l.pid == pid).cloned() else { return Err(Errno::ESRCH) };
-            (l.codesign.clone(), std::sync::Arc::clone(&l.csflags), l.pidversion, l.textoff)
+            let Some(p) = self.darwin_proc_find(pid) else { return Err(Errno::ESRCH) };
+            (p.codesign, p.csflags, p.pidversion, p.textoff)
         };
         if let Some(t) = token {
             let tok = m.read(t, 32)?;
@@ -1802,17 +1796,17 @@ impl Kernel {
                 let p = if pid == self.pid {
                     self.darwin_dyld_policy()
                 } else {
-                    // proc_find: its task's link, while it lives.
-                    let ipc = self.ipc();
-                    let Some(l) = ipc.links.values().find(|l| l.pid == pid).cloned() else { return Err(3) };
-                    let ents = l.codesign.as_ref().map(|c| c.ents.clone()).unwrap_or_default();
-                    let sugid = self.darwin_public(pid).is_some_and(|(p, _)| p.sugid);
-                    super::amfi::dyld_policy(sugid, l.csflags.load(std::sync::atomic::Ordering::Acquire), &ents)
+                    // proc_find: one that has not exited.
+                    let Some(t) = self.darwin_proc_find(pid) else { return Err(3) };
+                    let ents = t.codesign.as_ref().map(|c| c.ents.clone()).unwrap_or_default();
+                    super::amfi::dyld_policy(t.sugid, t.csflags.load(std::sync::atomic::Ordering::Acquire), &ents)
                 };
                 m.write_u64(out, p).map_err(fault)
             }
-            // {cdhash, ..., result at 0x18}: in the static trust cache (1),
-            // in a loaded one (2); for an entitled caller.
+            // {cdhash, ..., result at 0x18} (0xfffffff005ab73a8): the
+            // result zeroed, then bit 0 if the static trust cache has the
+            // cdhash (query type 1) and bit 1 if a loaded one has it (type
+            // 2); for an entitled caller.
             amfi_call::CHECK_TRUST_CACHE => {
                 if !self.darwin_task_entitled("com.apple.private.amfi.can-check-trust-cache") {
                     return Err(13);
@@ -1820,7 +1814,8 @@ impl Kernel {
                 let mut q = [0u8; 0x20];
                 q.copy_from_slice(m.read(arg, 0x20).map_err(fault)?);
                 let cdhash: [u8; 20] = q[..20].try_into().unwrap();
-                let found = u64::from(super::trustcache::platform(&cdhash).is_some());
+                use super::trustcache::{query, Query};
+                let found = u64::from(query(Query::Static, &cdhash).is_some()) | u64::from(query(Query::Loadable, &cdhash).is_some()) << 1;
                 q[0x18..0x20].copy_from_slice(&found.to_le_bytes());
                 m.write(arg, &q).map_err(fault)
             }
@@ -1870,8 +1865,8 @@ impl Kernel {
             let (v, u, sb) = if pid == k.pid {
                 (k.dtask.pidversion, k.dtask.uniqueid, k.darwin_sandbox())
             } else {
-                let ipc = k.ipc();
-                ipc.links.values().find(|l| l.pid == pid).map(|l| (l.pidversion, l.uniqueid, super::sandboxes::of(&l.sandbox)))?
+                let p = k.darwin_proc_find(pid)?;
+                (p.pidversion, p.uniqueid, super::sandboxes::of(&p.sandbox))
             };
             (version.is_none_or(|w| i64::from(v) == w as i64) && unique.is_none_or(|w| u == w)).then_some(sb)
         };
@@ -2016,6 +2011,40 @@ impl Kernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// csops finds a process as `proc_find` does: not while its fork makes
+    /// it, then (with what that made of it) until it has exited; ESRCH
+    /// before the policies are asked, which here, with no Sandbox profile,
+    /// refuse what it finds.
+    #[test]
+    fn csops_finds_what_proc_find_finds() {
+        const STATUS: u32 = 0;
+        let mut buf = vec![0u8; 0x10000];
+        let mut k = Kernel::new(0x1000, 0x10000, "/prog".into());
+        k.darwin = true;
+        k.darwin_task_enable();
+        let mut c = k.fork_kernel();
+        c.pid = k.procs.spawn(k.pid);
+        c.tid = c.pid;
+        let pid = c.pid;
+        let mut csops = |k: &mut Kernel, pid: i32| {
+            let mut m = GuestMem::new(&mut buf);
+            let r = k.darwin_csops(&mut m, pid, STATUS, 0x8000, 4, None);
+            k.darwin_ipc_leave();
+            r
+        };
+        assert_eq!(csops(&mut k, pid), Err(Errno::ESRCH), "being made");
+        c.darwin_publish();
+        let found = csops(&mut k, pid);
+        assert!(found.is_err_and(|e| e != Errno::ESRCH), "found, then judged: {found:?}");
+        assert_eq!(csops(&mut k, 0), csops(&mut k, 1), "pid 0 is the caller");
+        k.procs.set_exited(pid);
+        assert_eq!(csops(&mut k, pid), Err(Errno::ESRCH), "exited");
+        k.procs.exit(pid, 0);
+        assert_eq!(csops(&mut k, pid), Err(Errno::ESRCH), "a zombie");
+        k.procs.reap(pid);
+        assert_eq!(csops(&mut k, pid), Err(Errno::ESRCH), "reaped");
+    }
 
     #[test]
     fn signal_masks_round_trip() {

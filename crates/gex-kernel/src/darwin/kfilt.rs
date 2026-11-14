@@ -1680,13 +1680,16 @@ impl Kernel {
                 self.knote(n).set_error(Errno::EINVAL);
                 return 0;
             }
-            super::ttydev::Node::Ctty => {
+            // Neither cdevsw entry is kqueue-ok: filt_specattach, which
+            // takes only a NOTE_LOWAT of 1.
+            super::ttydev::Node::Ctty | super::ttydev::Node::Console => {
                 let k = self.knote(n);
                 if k.sfflags & NOTE_LOWAT == 0 || k.sdata != 1 {
                     k.set_error(Errno::EINVAL);
                     return 0;
                 }
-                self.darwin_unimplemented("kevent on /dev/tty by NOTE_LOWAT of 1 (filt_specattach's select fallback through cttyselect)".into());
+                let what = if dev.node == super::ttydev::Node::Ctty { "/dev/tty by NOTE_LOWAT of 1 (filt_specattach's select fallback through cttyselect)" } else { "/dev/console by NOTE_LOWAT of 1 (filt_specattach's select fallback through cnselect)" };
+                self.darwin_unimplemented(format!("kevent on {what}"));
                 self.knote(n).set_error(Errno::EOPNOTSUPP);
                 return 0;
             }

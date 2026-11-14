@@ -104,6 +104,8 @@ pub struct Space {
     /// `is_table_free`.
     free: u32,
     rng: u64,
+    /// `is_active`: false once `ipc_space_terminate` has ended it.
+    pub active: bool,
 }
 
 impl Default for Space {
@@ -163,9 +165,16 @@ impl Space {
         let count = (size / ENTRY_SIZE) as u32;
         let mut seed = [0u8; 8];
         let _ = getrandom_fill(&mut seed);
-        let mut s = Space { table: vec![Entry::default(); count as usize], size, hashed: 0, rev: Default::default(), free: count - 1, rng: u64::from_le_bytes(seed) | 1 };
+        let mut s = Space { table: vec![Entry::default(); count as usize], size, hashed: 0, rev: Default::default(), free: count - 1, rng: u64::from_le_bytes(seed) | 1, active: true };
         s.rand_freelist(0, count);
         s
+    }
+
+    /// The space `ipc_space_terminate` leaves a task that has ended:
+    /// inactive, its table gone, so no name is in it and none is given out
+    /// (KERN_INVALID_TASK).
+    pub fn terminated() -> Space {
+        Space { table: vec![Entry::default()], size: 0, hashed: 0, rev: Default::default(), free: 0, rng: 1, active: false }
     }
 
     /// `random_bool_gen_bits`: `n` random bits.
@@ -267,14 +276,19 @@ impl Space {
     }
 
     /// `ipc_entry_alloc`: a new name for `object`, the table growing as it
-    /// must. `None` is `KERN_NO_SPACE`.
-    pub fn alloc(&mut self, object: Option<ObjId>) -> Option<u32> {
+    /// must. `Err` is the `kern_return_t`: KERN_INVALID_TASK for a space
+    /// that has ended, KERN_NO_SPACE at the table's limit.
+    pub fn alloc(&mut self, object: Option<ObjId>) -> Result<u32, u64> {
+        use super::kr;
+        if !self.active {
+            return Err(kr::INVALID_TASK);
+        }
         loop {
             if self.hold(1) {
-                return Some(self.claim(object));
+                return Ok(self.claim(object));
             }
             if !self.grow(None) {
-                return None;
+                return Err(kr::NO_SPACE);
             }
         }
     }
@@ -292,6 +306,9 @@ impl Space {
         }
         if i == 0 {
             return Err(kr::FAILURE);
+        }
+        if !self.active {
+            return Err(kr::INVALID_TASK);
         }
         loop {
             let Some(e) = self.table.get(i as usize).copied() else {
@@ -440,5 +457,16 @@ mod tests {
             s.table[index(n) as usize].bits |= 0x1_0000;
         }
         assert_eq!(s.table.len(), 42);
+    }
+
+    #[test]
+    fn a_terminated_space_names_nothing_and_gives_no_name() {
+        use super::super::kr;
+        let mut s = Space::terminated();
+        assert_eq!(s.alloc(None), Err(kr::INVALID_TASK));
+        assert_eq!(s.alloc_name(0x103), Err(kr::INVALID_TASK));
+        assert_eq!(s.alloc_name(0x3), Err(kr::FAILURE), "the name's own checks first");
+        assert!(s.lookup(0x103).is_none());
+        assert_eq!(s.names().count(), 0);
     }
 }

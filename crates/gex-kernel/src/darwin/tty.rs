@@ -122,6 +122,7 @@ pub mod ts {
     pub const CARR_ON: u32 = 0x00008;
     pub const ISOPEN: u32 = 0x00020;
     pub const TBLOCK: u32 = 0x00040;
+    pub const TIMEOUT: u32 = 0x00080;
     pub const TTSTOP: u32 = 0x00100;
     pub const XCLUDE: u32 = 0x00400;
     pub const BKSL: u32 = 0x00800;
@@ -581,12 +582,12 @@ pub trait Env {
 static CONSTTY: Mutex<Option<Arc<TtyCell>>> = Mutex::new(None);
 
 /// `copy_constty`.
-fn copy_constty() -> Option<Arc<TtyCell>> {
+pub fn copy_constty() -> Option<Arc<TtyCell>> {
     CONSTTY.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// `set_constty`.
-fn set_constty(tp: Option<Arc<TtyCell>>) {
+pub fn set_constty(tp: Option<Arc<TtyCell>>) {
     *CONSTTY.lock().unwrap_or_else(|e| e.into_inner()) = tp;
 }
 
@@ -630,8 +631,8 @@ pub struct Tty {
     pub wsel_revokes: u64,
     pub termios: Termios,
     pub winsize: Winsize,
-    /// `t_oproc` is set: the pty's primary is open (`ptsstart`).
-    pub oproc: bool,
+    /// `t_oproc`: what starts its output.
+    pub oproc: Oproc,
     pub column: i32,
     pub rocount: i32,
     pub rocol: i32,
@@ -650,6 +651,18 @@ pub struct Tty {
     woken: std::collections::HashMap<u64, Vnode>,
     /// The revokes draining one of its vnodes.
     draining: u32,
+}
+
+/// A terminal's `t_oproc`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Oproc {
+    /// NULL: a pty whose primary is closed, or a terminal no driver has
+    /// opened.
+    None,
+    /// `ptsstart`: a pty whose primary is open.
+    Ptsstart,
+    /// `kmstart`: the kernel's console terminal ([`super::km`]).
+    Kmstart,
 }
 
 /// A terminal and its lock.
@@ -742,7 +755,7 @@ impl Tty {
             wsel_revokes: 0,
             termios: Termios::default(),
             winsize: Winsize::default(),
-            oproc: false,
+            oproc: Oproc::None,
             column: 0,
             rocount: 0,
             rocol: 0,
@@ -904,8 +917,10 @@ impl Tty {
 
     /// `ttstart`: the driver's `t_oproc`.
     pub fn ttstart(&mut self) -> i32 {
-        if self.oproc {
-            super::ptmx::ptsstart(self);
+        match self.oproc {
+            Oproc::None => {}
+            Oproc::Ptsstart => super::ptmx::ptsstart(self),
+            Oproc::Kmstart => super::km::kmstart(self),
         }
         0
     }
@@ -1674,7 +1689,7 @@ impl Tty {
                     break;
                 }
             }
-            if !((!self.outq.is_empty() || self.state & ts::BUSY != 0) && self.state & ts::CONNECTED != 0 && self.oproc) {
+            if !((!self.outq.is_empty() || self.state & ts::BUSY != 0) && self.state & ts::CONNECTED != 0 && self.oproc != Oproc::None) {
                 break;
             }
             self.ttstart();
@@ -1742,6 +1757,20 @@ impl Tty {
             }
         }
         nread
+    }
+
+    /// `ttyselect` (a driver's `d_select` through `ttselect`): what is
+    /// ready to read (`rw` FREAD) or room to write (FWRITE), or for 0 an
+    /// exceptional condition; a hung-up terminal is ready for all three.
+    pub fn ttyselect(&mut self, rw: i32, env: &mut dyn Env) -> i32 {
+        if self.state & ts::ZOMBIE != 0 {
+            return 1;
+        }
+        match rw {
+            FREAD => self.ttnread(env),
+            FWRITE if self.outq.len() as i32 <= self.lowat && self.state & ts::CONNECTED != 0 => self.hiwat - self.outq.len() as i32,
+            _ => 0,
+        }
     }
 
     // --- Read.

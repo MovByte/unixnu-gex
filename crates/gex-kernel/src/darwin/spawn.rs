@@ -624,6 +624,7 @@ impl Kernel {
         crate::procnote::post(self.pid, crate::procnote::note::FORK | pid as u32);
         child.pid = pid;
         child.tid = pid;
+        child.darwin_inherit_region(self.darwin_shared_region.as_ref());
         // Its thread is in its task's list before it first runs.
         child.thread_sig(pid);
         child.forget_own_pidfds();
@@ -637,7 +638,9 @@ impl Kernel {
             Ok(()) => Ok(Spawned::Child(Box::new(child))),
             Err(e) => {
                 // exit1 with P_LIST_DEADPARENT: gone, unseen by its parent,
-                // and the rights it inherited with it.
+                // and the rights it inherited with it; past
+                // proc_prepareexit first, so proc_find no longer finds it.
+                self.procs.set_exited(pid);
                 let k = std::mem::take(&mut child.dtask.kports);
                 for p in k.special.into_values().chain(k.registered.into_iter().flatten()) {
                     self.ipc().release_send(p);

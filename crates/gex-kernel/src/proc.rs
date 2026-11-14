@@ -421,6 +421,11 @@ struct Proc {
     /// Darwin's `P_LEXIT`: its exit has begun (`exit()`, or a jetsam
     /// kill's `exit_with_reason`).
     lexit: bool,
+    /// Darwin's `P_REF_DEAD` (`proc_list_exited`): its exit is past
+    /// `proc_prepareexit`, which moves it to `zombproc` before its task is
+    /// terminated. `proc_find` no longer finds it; `proc_find_zombref`
+    /// does, until it is reaped.
+    exited: bool,
     /// Darwin's `p_exit_reason`: why it ended, set as its exit began.
     exit_reason: Option<crate::signal::Note>,
     /// The user and system time of its threads that have ended
@@ -466,8 +471,9 @@ struct Proc {
     /// A Darwin process's own record (`crate::darwin::procinfo::Public`),
     /// which other processes read until it is reaped.
     darwin: Option<Arc<dyn std::any::Any + Send + Sync>>,
-    /// When it became a zombie, in the order processes did (XNU's
-    /// `zombproc` list has the latest first); 0 while it lives.
+    /// When it went on `zombproc` (its `P_REF_DEAD`, or its end), in the
+    /// order processes did (XNU's `zombproc` list has the latest first); 0
+    /// while it is on `allproc`.
     zseq: u64,
     /// See [`ProcTable::set_usage`].
     usage: Usage,
@@ -734,6 +740,20 @@ impl Table {
     fn cpu_total(&self) -> u64 {
         self.gone_cpu_ns + self.procs.iter().map(|p| p.usage.cpu_ns).sum::<u64>()
     }
+
+    /// `proc_prepareexit`'s move of process `pid` from `allproc` to
+    /// `zombproc` with `P_REF_DEAD`, once.
+    fn mark_exited(&mut self, pid: i32) {
+        let Some(i) = self.procs.iter().position(|p| p.pid == pid) else { return };
+        if self.procs[i].exited {
+            return;
+        }
+        self.zseq += 1;
+        let zs = self.zseq;
+        let p = &mut self.procs[i];
+        p.exited = true;
+        p.zseq = zs;
+    }
 }
 
 /// Moved after every signal left in a process's inbox (`kill`, a group's
@@ -828,6 +848,7 @@ impl ProcTable {
                     rval: None,
                     xstat: 0,
                     lexit: false,
+                    exited: false,
                     exit_reason: None,
                     dead_cpu: (0, 0),
                     children_cpu: (0, 0),
@@ -922,6 +943,7 @@ impl ProcTable {
             rval: None,
             xstat: 0,
             lexit: false,
+            exited: false,
             exit_reason: None,
             dead_cpu: (0, 0),
             children_cpu: (0, 0),
@@ -1240,11 +1262,7 @@ impl ProcTable {
         let mut jobc_orphaned = Vec::new();
         let (cell, done, was_ppid, own_q, orphans) = {
             let mut t = self.lock();
-            t.zseq += 1;
-            let zs = t.zseq;
-            if let Some(p) = t.procs.iter_mut().find(|p| p.pid == pid) {
-                p.zseq = zs;
-            }
+            t.mark_exited(pid);
             let ppid = t.procs.iter().find(|p| p.pid == pid).map(|p| p.ppid);
             // proc_exit's fixjobc, before its children go to init.
             if let Some((pgid, sid)) = t.procs.iter().find(|p| p.pid == pid).map(|p| (p.pgid, p.sid)) {
@@ -1771,12 +1789,16 @@ impl ProcTable {
         }
     }
 
-    /// Process `pid`'s Darwin record, a zombie's too, and whether it is one.
+    /// Process `pid`'s Darwin record, and whether it has exited
+    /// (`proc_list_exited`: past `proc_prepareexit`, or a zombie). None
+    /// before its record is first set (`P_REF_NEW`: its fork or spawn has
+    /// not made it yet) and once it is reaped. `proc_find` finds the
+    /// process only when it has not exited; `proc_find_zombref` only when
+    /// it has.
     pub fn darwin(&self, pid: i32) -> Option<(Arc<dyn std::any::Any + Send + Sync>, bool)> {
         let t = self.lock();
         let p = t.procs.iter().find(|p| p.pid == pid)?;
-        let zombie = !p.child.status.lock().map(|s| s.is_none()).unwrap_or(false);
-        p.darwin.clone().map(|r| (r, zombie))
+        p.darwin.clone().map(|r| (r, p.exited))
     }
 
     pub fn live_nice(&self, pid: i32) -> Option<(u32, i32)> {
@@ -1896,8 +1918,10 @@ impl ProcTable {
 
     /// `jetsam_do_kill`'s `exit_with_reason(p, W_EXITCODE(0, SIGKILL))`:
     /// unless `pid`'s exit has begun already, `reason` is its exit reason,
-    /// its `p_lflag` gains `flags` (the jetsam bits) and it ends as SIGKILL
-    /// ends it. No signal is posted, so its knotes hear no NOTE_SIGNAL.
+    /// its `p_lflag` gains `flags` (the jetsam bits), it is past
+    /// `proc_prepareexit` ([`ProcTable::set_exited`]) and it ends as
+    /// SIGKILL ends it. No signal is posted, so its knotes hear no
+    /// NOTE_SIGNAL.
     pub fn jetsam_kill(&self, pid: i32, flags: u32, reason: crate::signal::Note) {
         let mut t = self.lock();
         let Some(p) = t.procs.iter_mut().find(|p| p.pid == pid) else { return };
@@ -1910,6 +1934,18 @@ impl ProcTable {
         p.pending.fetch_or(1u64 << (SIGKILL - 1), Ordering::AcqRel);
         SIGNAL_SEQ.fetch_add(1, Ordering::Release);
         p.queue.notify();
+        // exit_with_reason's proc_prepareexit, in the killer's context.
+        t.mark_exited(pid);
+    }
+
+    /// `proc_prepareexit`'s end for `pid`: `P_REF_DEAD`, and its move to
+    /// `zombproc`, before its task is terminated. From here `proc_find`
+    /// does not find it, and `proc_find_zombref` does until it is reaped.
+    pub fn set_exited(&self, pid: i32) {
+        if self.remote.is_some() {
+            return;
+        }
+        self.lock().mark_exited(pid);
     }
 
     /// `exit_with_reason`'s commitment to an exit for a signal's default
@@ -2475,6 +2511,48 @@ fn errno_or(v: i32) -> Result<i32, Errno> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Darwin process has no record while its fork makes it
+    /// (`P_REF_NEW`); from `proc_prepareexit` (`P_REF_DEAD`) it has exited,
+    /// and goes to the zombies' part of the listing in that order, before
+    /// its end; once reaped it is gone.
+    #[test]
+    fn a_process_exits_at_proc_prepareexit_and_lists_with_the_zombies() {
+        let t = ProcTable::new();
+        let (a, b, c) = (t.spawn(INIT_PID), t.spawn(INIT_PID), t.spawn(INIT_PID));
+        let record = || Arc::new(()) as Arc<dyn std::any::Any + Send + Sync>;
+        assert!(t.darwin(a).is_none(), "being made");
+        for p in [a, b, c] {
+            t.set_darwin(p, record());
+        }
+        assert!(matches!(t.darwin(a), Some((_, false))));
+        t.set_exited(b);
+        t.set_exited(a);
+        assert!(matches!(t.darwin(a), Some((_, true))));
+        assert!(matches!(t.darwin(b), Some((_, true))));
+        assert!(matches!(t.darwin(c), Some((_, false))));
+        let order: Vec<(i32, bool)> = t.listing().into_iter().map(|(p, _, _, z)| (p, z)).collect();
+        assert_eq!(order, vec![(c, false), (INIT_PID, false), (a, true), (b, true)], "zombproc, the latest first");
+        // Its end leaves it where it went.
+        t.exit(b, 0);
+        t.exit(c, 0);
+        let order: Vec<(i32, bool)> = t.listing().into_iter().map(|(p, _, _, z)| (p, z)).collect();
+        assert_eq!(order, vec![(INIT_PID, false), (c, true), (a, true), (b, true)]);
+        assert!(matches!(t.darwin(c), Some((_, true))));
+        t.reap(b);
+        assert!(t.darwin(b).is_none());
+    }
+
+    /// A jetsam kill is `exit_with_reason`'s `proc_prepareexit`, in the
+    /// killer's context: its target has exited at once.
+    #[test]
+    fn a_jetsam_kill_exits_its_target() {
+        let t = ProcTable::new();
+        let a = t.spawn(INIT_PID);
+        t.set_darwin(a, Arc::new(()));
+        t.jetsam_kill(a, 0, Arc::new(crate::darwin::reason::OsReason::new(1, 2)));
+        assert!(matches!(t.darwin(a), Some((_, true))));
+    }
 
     #[test]
     fn a_crash_is_reported_once_with_what_the_process_said() {

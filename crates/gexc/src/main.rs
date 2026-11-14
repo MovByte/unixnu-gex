@@ -285,6 +285,11 @@ run options:
   --host-env      start from gexc's own environment (default: PATH, HOME)
   --sysroot DIR   present DIR as the guest's root filesystem
   --bind H=G      mount host file or directory H at guest path G (repeatable)
+  --overlay DIR   lay host directory DIR's tree over the guest's root, as part
+                  of the root's filesystem (no mount of its own): a directory
+                  merges with the root's of its name, unless it is opaque
+                  (user.overlay.opaque = y), and its entries shadow the
+                  root's; what it holds is read-only
   --busybox FILE  present FILE (a wasm32 busybox) as /bin/sh and the common
                   coreutils in /bin and /usr/bin (GEX_BUSYBOX_APPLETS: the list)
   --pin FILE      place each object where FILE says, as written by
@@ -442,6 +447,12 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
                 anyhow::ensure!(guest.starts_with('/'), "--bind {v}: the guest path must be absolute");
                 let host = std::fs::canonicalize(host).with_context(|| format!("--bind {v}"))?;
                 opts.binds.push((host, guest.to_string()));
+            }
+            "--overlay" => {
+                i += 1;
+                let v = args.get(i).context("--overlay needs a directory")?;
+                anyhow::ensure!(opts.overlay.is_none(), "--overlay {v}: one overlay only");
+                opts.overlay = Some(std::fs::canonicalize(v).with_context(|| format!("--overlay {v}"))?);
             }
             "--busybox" => {
                 i += 1;

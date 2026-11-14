@@ -11,6 +11,11 @@
 # cache bundle and the Sandbox's platform profile and profile collections)
 # with these programs' cdhashes added to its static trust cache, as an
 # owner adds their own code: AMFI runs only trusted code.
+#
+# The web device's GPU driver is WebMetal's plugin (GEX_DARWIN_WEBMETAL: the
+# bundle UniXNU's scripts/build-web-metal-plugin.py builds, ios/*.bundle),
+# installed in the system volume through an overlay. Without it the
+# programs that load it are skipped, or fail when asked for by name.
 set -u
 
 HERE=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
@@ -25,17 +30,63 @@ mkdir -p "$BOOT"
 # constraint category 5.
 progs=$(find -H "$HERE/bin" -maxdepth 1 -type f ! -name untrusted | sort)
 cats="--category 5:$HERE/bin/launchcon"
-# The web device's system volume carries WebMetal's bundle, which
-# Metal.framework loads for the accelerator's MetalPluginName from
-# /System/Library/Extensions; its code is the system's, in the static trust
-# cache with the rest of it, with the entry the device's trust cache gives
-# its own plugin bundles on the system volume (SHA-256, flags 0, launch
-# constraint category 2, as AppleUVDMLib.plugin's and IOUSBLib.bundle's).
-WEBMETAL=${GEX_DARWIN_ROOT:+$GEX_DARWIN_ROOT/System/Library/Extensions/WebMetal.bundle/WebMetal}
-if [ -n "$WEBMETAL" ] && [ -f "$WEBMETAL" ]; then
-    progs="$progs $WEBMETAL"
-    cats="$cats --category 2:$WEBMETAL"
+
+# opaque DIR: overlayfs's mark (in its user.overlay. form) of an overlay
+# directory that hides the root's of its name entirely.
+opaque() {
+    if command -v xattr >/dev/null 2>&1; then
+        xattr -w user.overlay.opaque y "$1"
+    else
+        setfattr -n user.overlay.opaque -v y "$1"
+    fi
+}
+
+# machos DIR: the Mach-O files under DIR, thin or fat, by their magic.
+machos() {
+    find "$1" -type f | while read -r f; do
+        case $(od -An -N4 -tx1 "$f" | tr -d ' \n') in
+        cffaedfe | cefaedfe | cafebabe) echo "$f" ;;
+        esac
+    done
+}
+
+# The overlays (gexc run --overlay), host trees laid over the root as part
+# of its system volume. Metal.framework loads the bundle the accelerator's
+# MetalPluginName names (PLUGIN) from /System/Library/Extensions: WebMetal's
+# is installed there, opaque, so that a bundle of the root's of that name
+# is hidden entirely. overlay's check overlay (src/overlay.c) holds a
+# bundle that shadows the root's AGXMetalA10.bundle, with the root's own
+# Info.plist and a program as its executable, and a bundle the root has no
+# bundle of that name beside.
+PLUGIN=WebMetal
+METAL=$HERE/bin/overlay-metal
+CHECK=$HERE/bin/overlay-check
+rm -rf "$METAL" "$CHECK"
+if [ -n "${GEX_DARWIN_WEBMETAL:-}" ] && [ -d "$GEX_DARWIN_WEBMETAL" ]; then
+    mkdir -p "$METAL/System/Library/Extensions"
+    cp -Rp "$GEX_DARWIN_WEBMETAL" "$METAL/System/Library/Extensions/$PLUGIN.bundle"
+    opaque "$METAL/System/Library/Extensions/$PLUGIN.bundle"
 fi
+EXT=${GEX_DARWIN_ROOT:-}/System/Library/Extensions
+if [ -n "${GEX_DARWIN_ROOT:-}" ] && [ -f "$EXT/AGXMetalA10.bundle/Info.plist" ] && [ -f "$EXT/AGXGPURawCounterBundle.bundle/Info.plist" ]; then
+    mkdir -p "$CHECK/System/Library/Extensions/AGXMetalA10.bundle" "$CHECK/System/Library/Extensions/GexOverlay.bundle"
+    chmod 755 "$CHECK/System/Library/Extensions/AGXMetalA10.bundle" "$CHECK/System/Library/Extensions/GexOverlay.bundle"
+    cp -p "$EXT/AGXMetalA10.bundle/Info.plist" "$CHECK/System/Library/Extensions/AGXMetalA10.bundle/"
+    cp -p "$HERE/bin/overlayexe" "$CHECK/System/Library/Extensions/AGXMetalA10.bundle/AGXMetalA10"
+    opaque "$CHECK/System/Library/Extensions/AGXMetalA10.bundle"
+    cp -p "$EXT/AGXGPURawCounterBundle.bundle/Info.plist" "$CHECK/System/Library/Extensions/GexOverlay.bundle/"
+fi
+# The overlays' code is the system's, in the static trust cache with the
+# rest of it, with the entry the device's trust cache gives its own plugin
+# bundles on the system volume (SHA-256, flags 0, launch constraint
+# category 2, as AppleUVDMLib.plugin's and IOUSBLib.bundle's).
+for o in "$METAL" "$CHECK"; do
+    [ -d "$o" ] || continue
+    for f in $(machos "$o"); do
+        progs="$progs $f"
+        cats="$cats --category 2:$f"
+    done
+done
 if [ -n "${GEX_DARWIN_BOOT:-}" ]; then
     # shellcheck disable=SC2086
     python3 -I "$ROOT/tools/darwin-trust-cache.py" -o "$BOOT/TrustCache" --bundle "$GEX_DARWIN_BOOT/TrustCache" $cats $progs || exit 1
@@ -46,7 +97,7 @@ fi
 if [ -n "${GEX_DARWIN_BOOT:-}" ] && [ -f "$GEX_DARWIN_BOOT/DeviceTree" ]; then
     cp "$GEX_DARWIN_BOOT/DeviceTree" "$BOOT/"
 fi
-for f in sandbox_profile.bin sandbox_builtin.bin sandbox_protobox.bin; do
+for f in sandbox_profile.bin sandbox_builtin.bin sandbox_protobox.bin os.dmg.trustcache SystemVolume.attrs; do
     if [ -n "${GEX_DARWIN_BOOT:-}" ] && [ -f "$GEX_DARWIN_BOOT/$f" ]; then
         cp "$GEX_DARWIN_BOOT/$f" "$BOOT/"
     fi
@@ -55,6 +106,7 @@ export GEX_DARWIN_BOOT="$BOOT"
 
 fail=0
 as=
+overlay=
 named=$#
 
 report() {
@@ -90,7 +142,7 @@ check_root() {
     mkdir -p "$GEX_DARWIN_ROOT/var/tmp"
     cp "$HERE/bin/$name" "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$name"
     # shellcheck disable=SC2086
-    out=$("$GEXC" run --sysroot "$GEX_DARWIN_ROOT" ${as:+--uid "$as"} "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$name" "$@" 2>/dev/null)
+    out=$("$GEXC" run --sysroot "$GEX_DARWIN_ROOT" ${overlay:+--overlay "$overlay"} ${as:+--uid "$as"} "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$name" "$@" 2>/dev/null)
     report "$name" "$out" $? "$want_out" "$want_status"
 }
 
@@ -113,19 +165,21 @@ check_webmetal() {
 
 # check_metal NAME WANT_OUT WANT_STATUS: a program that uses Metal through
 # the root's Metal.framework, which needs WebMetal's executor in gexc and
-# WebMetal's bundle in the root's system volume: skipped without them, or
-# failed when it was asked for by name.
+# WebMetal's bundle in the system volume, through its overlay: skipped
+# without them, or failed when it was asked for by name.
 check_metal() {
-    if [ -n "${GEX_DARWIN_ROOT:-}" ] && [ ! -f "$WEBMETAL" ]; then
+    if [ -n "${GEX_DARWIN_ROOT:-}" ] && [ ! -d "$METAL" ]; then
         if [ "$named" -gt 0 ]; then
-            echo "FAIL $1: the root's system volume has no WebMetal.bundle in /System/Library/Extensions"
+            echo "FAIL $1: no WebMetal bundle to install (set GEX_DARWIN_WEBMETAL to the built bundle)"
             fail=1
         else
-            echo "SKIP $1 (the root has no /System/Library/Extensions/WebMetal.bundle)"
+            echo "SKIP $1 (set GEX_DARWIN_WEBMETAL to the built WebMetal bundle)"
         fi
         return
     fi
+    overlay=$METAL
     check_webmetal "$@"
+    overlay=
 }
 
 # check_root_as UID:GID NAME WANT_OUT WANT_STATUS [ARGS...]: check_root, the
@@ -195,6 +249,8 @@ hello from /var/tmp/gex-exec-fat with 1 argument" 0
     spawnports) check_root spawnports "spawnports ok" 0 ;;
     taskname) check_root taskname "taskname ok" 0 ;;
     taskreg) check_root taskreg "taskreg ok" 0 ;;
+    procfind) check_root procfind "procfind ok" 0 ;;
+    debugport) check_root debugport "debugport ok" 0 ;;
     excports) check_root excports "excports ok" 0 ;;
     pages) check_root pages "pages ok" 0 ;;
     mmapflags) check_root mmapflags "mmapflags ok" 0 ;;
@@ -368,6 +424,15 @@ hello from /var/tmp/gex-exec-fat with 1 argument" 0
     cfrunloop) check_root cfrunloop "cfrunloop 3 1" 0 ;;
     xpc-anon) check_root xpc-anon "xpc-anon 42" 0 ;;
     layout) check_root layout "layout ok" 0 ;;
+    overlay)
+        # Without the root's bundles to shadow and stand beside, there is
+        # no check overlay: the program then finds nothing laid over it.
+        [ -d "$CHECK" ] && overlay=$CHECK
+        check_root overlay "overlay ok" 0
+        overlay=
+        ;;
+    shregion) check_root shregion "shregion ok" 0 ;;
+    console) check_root console "console ok" 0 ;;
     stackfb) check_root stackfb "stackfb ok" 0 ;;
     *)
         echo "FAIL $1: no such program"
@@ -381,7 +446,7 @@ if [ "$named" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname taskreg excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl iokit ioreg accel accelr metalwire metal iosurface iosurfacex iosurfacesplash iosurfacexpreboard iogpudev iomfb iomfbmain xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit sbxinit sbxexec sbxkill hostspecial sbxmask sbxnet sbxiokit sbxpriv sbxfile sbxscrub cfrunloop xpc-anon layout stackfb launchcon; do
+    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname taskreg procfind debugport excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl iokit ioreg accel accelr metalwire metal iosurface iosurfacex iosurfacesplash iosurfacexpreboard iogpudev iomfb iomfbmain xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit sbxinit sbxexec sbxkill hostspecial sbxmask sbxnet sbxiokit sbxpriv sbxfile sbxscrub cfrunloop xpc-anon layout overlay stackfb launchcon shregion console; do
         run "$p"
     done
 fi

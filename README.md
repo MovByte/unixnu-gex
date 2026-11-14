@@ -54,12 +54,19 @@ moves itself into its copy in the shared cache); the main stack's top is
 `USRSTACK64` (`0x1_6fe0_0000`) less the main image's slide. A release
 kernel slides every image: `_POSIX_SPAWN_DISABLE_ASLR` is ignored. The
 shared region, `0x1_8000_0000` for `0x1_8000_0000`, is one read-only
-entry, the system's: the first dyld to find it empty (launchd's, at boot)
+entry, the system's, one per environment (`shregion.rs`): a task enters
+its environment's at exec, made empty if there is none, and a fork's child
+its parent's. The first dyld to find its region empty (launchd's, at boot)
 maps the dyld shared cache into it with `shared_region_map_and_slide_2_np`,
-passing the cache's `maxSlide`, and the kernel slides the cache once a
-boot below it, on a 16 KiB boundary, relocating the slid mappings by their
-slide info; every task after enters it as it is. A run's region is made as
-launchd's dyld makes it, before the run's first program. libmalloc's nano
+passing the cache's `maxSlide`, and the kernel slides the cache once below
+it, on a 16 KiB boundary, relocating the slid mappings by their slide
+info; every task in the region sees it, and every task after enters it as
+it is. An unused region is kept two minutes. When pid 1 is the kernel's
+own, standing in for launchd, the boot's region holds what launchd's dyld
+mapped at boot: the OS cryptex's trust cache loaded (as libignition loads
+it), the cache's files preflighted and their code signatures added as
+dyld does, and the same mapping call made with dyld's arguments.
+`/sbin/launchd` as the first program finds its region empty. libmalloc's nano
 allocator, in a process exec engages it for (a spawn with
 `_POSIX_SPAWN_NANO_ALLOCATOR`, as an app's is), takes the 512 MiB after
 the shared region.
@@ -124,7 +131,11 @@ subsystem, most naming in their header the XNU source they port:
 - **Terminals.** `struct tty`, its character lists and the termios line
   discipline (`tty.rs`, `clist.rs`); `/dev/ptmx` and its replicas, the BSD
   ptys and `/dev/tty` (`ptmx.rs`, `ttydev.rs`); sessions and controlling
-  terminals (`ctty.rs`).
+  terminals (`ctty.rs`); `/dev/console`, which goes to the terminal
+  `TIOCCONS` made the console's or to the kernel's console terminal `km`,
+  whose output is the console's (`km.rs`). The host's standard error shows
+  that output as the device's serial port carries it with the `serial`
+  boot-arg's output on; the device boots with no boot-args (`pe.rs`).
 - **Sockets.** Darwin's address structures, flags and option numbers
   (`sockaddr.rs`); socket-level options (`sockopt.rs`); the socket layer's
   refusals (`sockerr.rs`); Unix-domain stream sockets' sends and receives
@@ -333,6 +344,36 @@ the guest sees its files through host passthrough. gexc reads from it:
 The test runner copies its programs into `<ipados-root>/var/tmp/`, so the
 directory must be writable.
 
+### An overlay, `<overlay>`
+
+A directory whose tree `gexc run --overlay <overlay>` lays over the root,
+as part of it (`crates/gex-kernel/src/vfs/overlay.rs`): what the web device
+adds to the system volume, such as its GPU driver's bundle, without a copy
+of the root. Its files are the root volume's own. They are on the root's
+filesystem (no mount of their own, the root's device and `statfs`), numbered
+among its files (inode numbers at the top of APFS's 60-bit object id space,
+which a volume's never reach), listed in their directories with the root's
+entries, and found by `fsgetpath` by their object ids. What it holds is
+read-only, as the system volume is: a call that would change it fails with
+EROFS.
+
+Its layout is Linux overlayfs's, with the `user.overlay.` attributes: a
+directory merges with the root's directory of its name, and its entries
+shadow the root's of theirs; a directory whose `user.overlay.opaque` is `y`
+hides the root's entirely. Whiteouts and overlayfs's other attributes are
+refused, and so are devices, FIFOs and sockets. An entry that shadows a file
+of the root must be of the same type and mode and carry the same extended
+attributes, or gexc refuses the overlay; what the root has nothing at is
+the overlay's own, which gexc says on stderr when it lays it.
+
+```sh
+mkdir -p <overlay>/System/Library/Extensions
+cp -Rp WebMetal.bundle <overlay>/System/Library/Extensions/
+xattr -w user.overlay.opaque y <overlay>/System/Library/Extensions/WebMetal.bundle
+```
+
+Its code, like the root's, runs only from the static trust cache (below).
+
 ### The boot payload, `<ipados-boot>`
 
 A directory named by `GEX_DARWIN_BOOT`, holding what the boot loader and
@@ -346,6 +387,8 @@ missing has effects:
 | `sandbox_builtin.bin` | the Sandbox kext's builtin profile collection (its named profiles), a compiled collection blob from the kernelcache | a process that would get a builtin profile is reported and its exec killed (or its `sandbox_init` refused, EPERM) |
 | `sandbox_protobox.bin` | the Sandbox kext's protobox profile collection (profiles named by executable path), a compiled collection blob from the kernelcache | every exec is reported and killed, since its protobox profile cannot be looked up |
 | `DeviceTree` | the flattened device tree: the payload of the IPSW's device tree image (an IM4P) for this device | the IOKit registry has no device tree, which is reported |
+| `os.dmg.trustcache` | the SystemOS cryptex's trust cache, an IM4P (in the IPSW, the `Firmware/<os cryptex>.dmg.trustcache` whose cdhashes are the shared cache's files'), which libignition loads at boot | with pid 1 standing in for launchd, the boot's shared region cannot be mapped: the cache's ad-hoc signatures are in no trust cache |
+| `SystemVolume.attrs` | the system volume's owners, modes and file flags, which an extracted root does not keep: an mtree(5)-layout specification (flags in hexadecimal) that `tools/darwin-volume-attrs.py` writes from the IPSW's root filesystem image mounted read-only with its owners honoured (`hdiutil attach -readonly -nobrowse -owners on`); read when first looked in (`volattrs::lookup`) | a lookup of a system volume file's attributes says the payload has none |
 
 A `TrustCache` that does not load stops the boot. `tools/darwin-trust-cache.py`
 makes the bundle from the IPSW's static trust cache (its IM4P-wrapped
@@ -448,6 +491,7 @@ exits 1 when any fails. It builds the programs first when
 | `GEXC` | the gexc to run (default `target/release/gexc`) |
 | `GEX_DARWIN_ROOT` | the root for the dynamic programs, which run from its `/var/tmp`. Without it they are skipped, or fail when named |
 | `GEX_DARWIN_BOOT` | the device's boot payload. Its trust cache, with the test programs' cdhashes added, goes to `tests/darwin/bin/boot/TrustCache`, with its `DeviceTree` and Sandbox blobs beside it, and gexc boots from there. Without it, the trust cache holds the test programs only |
+| `GEX_DARWIN_WEBMETAL` | WebMetal's plugin bundle, as UniXNU's `scripts/build-web-metal-plugin.py` builds it (`<out>/ios/WebMetal.bundle`), which `metal` loads. Without it `metal` is skipped, or fails when named |
 
 `GEX_DARWIN_STRICT=1` reaches gexc from the environment as well. The
 runner discards each program's stderr, so run a failing program directly
@@ -457,9 +501,12 @@ under gexc to see its reports.
 `webmetal` and are skipped without one (or fail, when named). `metal` goes
 through the root's own Metal.framework, which loads the bundle the
 accelerator's `MetalPluginName` names from `/System/Library/Extensions`:
-the web device's system volume carries `WebMetal.bundle` there, and the
-test is skipped for a root that has none. When the root has it, its
-executable's cdhash goes into the run's static trust cache with the
+the runner installs `GEX_DARWIN_WEBMETAL`'s bundle there, under the name
+`MetalPluginName` gives (`WebMetal.bundle`), through an overlay
+(`tests/darwin/bin/overlay-metal`), its directory opaque. `overlay` checks
+that an overlay's files cannot be told from the root's, with an overlay of
+its own (`tests/darwin/bin/overlay-check`) made from the root's files. Each
+overlay's Mach-O files go into the run's static trust cache with the
 programs', with the entry the device's trust cache gives its own plugin
 bundles on the system volume (launch constraint category 2): AMFI's library
 validation lets a platform process map only trusted code. The line `metal`
@@ -511,10 +558,10 @@ dyld and libSystem from the device's shared cache.
 | policy and resources | `taskpolicy`, `priority`, `procpolicy`, `cpumon`, `rlimit`, `rlimitctl`, `cputime`, `vtimer`, `itimer`, `memlimit` |
 | signals and exceptions | `sighandler`, `sigthread`, `sigwait`, `sigio`, `procmask`, `excports`, `excdeliver`, `efault`, `protect` |
 | Mach IPC | `portrefs`, `crosstask`, `taskname`, `readports`, `extractright`, `sonce`, `rcvlarge`, `guardesc`, `circular`, `voucherx`, `importance`, `lockimp`, `watchport` |
-| memory | `layout`, `stackfb`, `mmapflags`, `madvise`, `msync`, `mlock`, `vmregion`, `vmcopy`, `vmwx`, `jit` |
+| memory | `layout`, `shregion`, `stackfb`, `mmapflags`, `madvise`, `msync`, `mlock`, `vmregion`, `vmcopy`, `vmwx`, `jit` |
 | files | `fsops`, `pathrules`, `pathconf`, `statino`, `statfsino`, `dirino`, `setattr`, `xattr`, `clone`, `renameswap`, `lockf`, `lastclose`, `guarded`, `fileport`, `filesec`, `openmode`, `vectored`, `aio`, `fixedcalls`, `ioctl`, `realdev` |
 | kqueue, poll and pipes | `kq-pipe`, `vnode`, `vnextend`, `select`, `poll`, `pipe`, `timeouts` |
-| terminals and `/dev` | `pty`, `ptyjob`, `ptyclose`, `bsdpty`, `ttyinfo`, `ttydead`, `ttydrain`, `fcntltty`, `revoke`, `devfs`, `devattr` |
+| terminals and `/dev` | `pty`, `ptyjob`, `ptyclose`, `bsdpty`, `ttyinfo`, `ttydead`, `ttydrain`, `fcntltty`, `revoke`, `devfs`, `devattr`, `console` |
 | sockets | `sockerr`, `sockevent`, `sockname`, `sockopts`, `halfclose`, `nosigpipe`, `dgrambuf`, `streambuf` |
 | code signing and IOKit | `codesig`, `amfi`, `launchcon`, `policy`, `iokit`, `ioreg`, `iosurface`, `iosurfacex`, `iogpudev`, `accel`, `accelr`, `iomfb`, `iomfbmain` |
 | the GPU (WebMetal) | `metalwire`, `metal` |
@@ -530,9 +577,10 @@ is the reference (search `crates/gex-kernel/src/` for
 `darwin_unimplemented`, `note_unimplemented` and `Unported`).
 
 - **The browser.** The page runs no Darwin process yet.
-- **Code signing.** Only the static trust cache is consulted; trust caches
-  loaded at run time (by AMFI's user client, after a cryptex's manifest is
-  checked) are not. CMS signatures (CoreTrust and amfid) are not
+- **Code signing.** Besides the static trust cache, only the OS cryptex's
+  is loaded, at a boot pid 1 stands in for; loading one at run time (AMFI's
+  user client, after a cryptex's manifest is checked) is not implemented.
+  CMS signatures (CoreTrust and amfid) are not
   implemented. AMFI's `__mac_syscall` calls for local signing, trust cache
   loading and launch constraints are reported.
 - **Launch constraints.** A requirement on a fact this kernel cannot
@@ -602,10 +650,15 @@ is the reference (search `crates/gex-kernel/src/` for
   `display-timing-info`, a 1024×600 mode, which iBoot replaces on a device
   with its panel's; the framebuffer reads it as the kext does, so a boot
   payload whose device tree holds the panel's mode gives that mode.
-- **Mach.** The traps `clock_sleep` and `debug_control_port_for_pid`; MIG
-  routines not in `mig.rs`, and some `task_info`, `thread_info`,
-  `host_statistics` and `task_policy_get` flavors; `task_for_pid` and its
-  read and inspect forms on another process; a fault's exception
+- **Mach.** The trap `clock_sleep`; MIG routines not in `mig.rs`
+  (`processor_set_tasks` among them, with the processor set ports), and
+  some `task_info`, `thread_info`, `host_statistics` and `task_policy_get`
+  flavors; another process's task ports by its pid where the policies
+  allow them: `task_for_pid`'s and `debug_control_port_for_pid`'s (past
+  AMFI only with Developer Mode, or for `debug_control_port_for_pid` with
+  `com.apple.private.debug_port`), and `task_read_for_pid`'s and
+  `task_inspect_for_pid`'s (another task's task access port, its upcall,
+  and its read and inspect ports); a fault's exception
   (`EXC_BAD_ACCESS` and the like) sent to a handler the program set, which
   is reported and taken as a signal instead; telling an `EXC_CRASH` handler
   of a death outside a system call; corpses
@@ -619,10 +672,10 @@ is the reference (search `crates/gex-kernel/src/` for
   and the device has unmapped space), and the memory's end. A fixed
   mapping that reaches past `0x3_ffff_4000`, and an anywhere one with no
   room below it, is reported and fails; a random address (`MAP_JIT`,
-  `VM_FLAGS_RANDOM_ADDR`) is drawn below it. `shared_region_map_and_slide_2_np`
-  itself is not implemented: a run's shared region is made before its first
-  program, so `/sbin/launchd` as the first program finds it made, which is
-  reported.
+  `VM_FLAGS_RANDOM_ADDR`) is drawn below it. The shared region pager's
+  slide info versions 1 and 4 are reported; a region's root directory is
+  always the root vnode's (no `chroot`); and the owner the mapping call
+  requires to be root is the caller, as `stat` reports every file's.
 - **Memory.** Purgeable memory, 4 GB chunks and other `mach_vm_allocate`
   and `mach_vm_map` flags not handled, `MAP_TPRO`, reuse advice on a
   region a fork left copy-on-write, the freezer, and the
@@ -658,7 +711,9 @@ is the reference (search `crates/gex-kernel/src/` for
   which pages are a task's, `phys_footprint` is.
 - **Terminals.** Terminal `ioctl`s not handled, an `fcntl` that would sleep
   in the driver, calls that would wait for a revoke to finish, and parts of
-  `revoke` itself.
+  `revoke` itself. The console's window size (`km`'s, from the boot video
+  console's size, which iBoot's boot arguments give), and a `TIOCCONS` that
+  reaches `km` (XNU locks its terminal twice and panics).
 - **Other.** `EVFILT_FS`, `NOTE_WL_SYNC_IPC` on a workloop, writes to the
   `sysctl` nodes that only have a fixed value here, the nodes this kernel
   has no value for, and some `proc_info` flavors and `iopolicysys` types.
