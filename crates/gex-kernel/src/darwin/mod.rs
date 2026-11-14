@@ -456,11 +456,6 @@ impl crate::syscalls::Kernel {
             ipc_active: Default::default(),
             name_port: std::sync::Mutex::new(None),
             codesign: self.dtask.codesign.clone(),
-            sandbox: std::sync::Arc::clone(&self.dtask.sandbox),
-            csflags: std::sync::Arc::clone(&self.dtask.csflags),
-            pidversion: self.dtask.pidversion,
-            textoff: self.dtask.textoff,
-            uniqueid: self.dtask.uniqueid,
             policy: self.dtask.policy.clone().or_else(|| self.procs.task_policy(self.pid)),
         };
         self.ipc().task_enable(link);

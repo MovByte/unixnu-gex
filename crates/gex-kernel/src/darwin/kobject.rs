@@ -302,12 +302,16 @@ impl Kernel {
     /// rights it held (special, registered, a spawn's watch ports not yet
     /// bound) released, and its space ended (`ipc_space_terminate`), every
     /// right in it with the notifications that owes; then its space and
-    /// its link leave the system's table, and its pid no longer finds it.
-    /// Once for a task: a spawn's child that never ran is ended so too.
+    /// its link leave the system's table. Once for a task: a spawn's child
+    /// that never ran is ended so too. Its process is past
+    /// `proc_prepareexit` first (`P_REF_DEAD`, if its end did not say so
+    /// already), so `proc_find` no longer finds it, as XNU's exit
+    /// terminates the task only after that.
     pub fn darwin_task_terminate(&mut self) {
         if !self.darwin || self.dtask.ipc_raw.ended {
             return;
         }
+        self.procs.set_exited(self.pid);
         // coalitions_remove_task, launchd told of those it emptied.
         self.darwin_coalitions_task_end();
         // Its threads' vouchers, its importance (ipc_importance_disconnect_task)

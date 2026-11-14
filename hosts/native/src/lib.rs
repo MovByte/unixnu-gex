@@ -990,13 +990,59 @@ fn new_engine() -> Result<Engine> {
     Engine::new(&config).context("creating the wasm engine")
 }
 
+/// The process a run is for, wherever the run has got to: the kernel it
+/// inherited (an exec's, a spawn's), until the run takes it, then the
+/// run's own, with its threads.
+struct RunProcess {
+    inherited: Option<Inherited>,
+    kernel: Option<Arc<Mutex<Kernel>>>,
+    spawn: Option<Arc<SpawnContext>>,
+}
+
+impl RunProcess {
+    /// The run failed on the host's side: the process dies as XNU's does
+    /// (its other threads stopped, `proc_exit`'s task termination and its
+    /// descriptors closed), rather than leaving its task in the system's
+    /// table. Each step is done once however many ends get here.
+    fn died(&mut self) {
+        if let Some(spawn) = self.spawn.take() {
+            stop_other_threads(&spawn, false);
+        }
+        if let Some(i) = self.inherited.as_mut() {
+            i.kernel.darwin_task_terminate();
+            i.kernel.close_all_fds();
+        }
+        if let Some(k) = self.kernel.take() {
+            let mut k = k.lock().unwrap_or_else(|e| e.into_inner());
+            k.darwin_task_terminate();
+            k.close_all_fds();
+        }
+    }
+}
+
 fn run_program_with(
     program: &Program,
     opts: &RunOptions,
     xlate: &Options,
     inherited: Option<Inherited>,
 ) -> Result<(Exit, Stats)> {
-    let fresh_process = inherited.is_none();
+    let mut process = RunProcess { inherited, kernel: None, spawn: None };
+    let r = run_process(program, opts, xlate, &mut process);
+    if r.is_err() {
+        process.died();
+    }
+    r
+}
+
+/// [`run_program_with`]'s run, which keeps `process` up to date with where
+/// the process is.
+fn run_process(
+    program: &Program,
+    opts: &RunOptions,
+    xlate: &Options,
+    process: &mut RunProcess,
+) -> Result<(Exit, Stats)> {
+    let fresh_process = process.inherited.is_none();
     gex_kernel::syscalls::set_thread_runners(gex_kernel::syscalls::ThreadRunners { take: take_runner, give: give_runner });
     let image = &program.exe;
     // Before anything is translated: a 32-bit (i386) program's code is
@@ -1215,11 +1261,11 @@ fn run_program_with(
         }
         _ => exe_path,
     };
-    let fresh = inherited.is_none();
+    let fresh = process.inherited.is_none();
     // Taken before the kernel is moved out, because the setup below uses them
     // to decide whether to build a device or keep the one already bound.
-    let kept_wayland = inherited.as_ref().and_then(|i| i.wayland.clone());
-    let (kernel, proc_state) = match inherited {
+    let kept_wayland = process.inherited.as_ref().and_then(|i| i.wayland.clone());
+    let (kernel, proc_state) = match process.inherited.take() {
         Some(Inherited {
             kernel: mut k,
             proc_state: ps,
@@ -1452,6 +1498,7 @@ fn run_program_with(
             repl: None,
         },
     );
+    process.kernel = Some(Arc::clone(&store.data().kernel));
     // Without this the store keeps wasmtime's default of ten thousand
     // instances, and gex spends one per runtime translation.
     store.limiter(|s| &mut s.store_limits);
@@ -1662,6 +1709,7 @@ fn run_program_with(
         provider_stacks: Mutex::new(Vec::new()),
     });
     note_live_process(&spawn);
+    process.spawn = Some(Arc::clone(&spawn));
     store.data_mut().spawn = Some(Arc::clone(&spawn));
 
     // The interpreter is placed by gex's own loader, not by a guest `mmap`,
@@ -1759,7 +1807,9 @@ fn run_program_with(
         let (proc_state, wayland) = (Arc::clone(&spawn.proc_state), spawn.wayland.clone());
         // The old image's memory goes before the new one runs: every holder
         // of it is dropped here, or it stays resident for the new program's
-        // whole life.
+        // whole life. The process goes on in the exec's run.
+        process.spawn = None;
+        process.kernel = None;
         drop(store);
         drop(linker);
         drop(spawn);
@@ -3792,8 +3842,24 @@ fn exec_program(
     proc_state: Arc<ProcCell>,
     wayland: Option<wayland::Wayland>,
 ) -> Result<(Exit, Stats)> {
-    if let Some(exit) = host_exec(&req, &kernel)? {
-        return Ok((exit, Stats::default()));
+    // A Darwin process that ends here (its host program's end, or the
+    // host's failure to run one) ends its task as proc_exit does.
+    let ended = |kernel: &mut Kernel| {
+        if kernel.darwin {
+            kernel.darwin_task_terminate();
+            kernel.close_all_fds();
+        }
+    };
+    match host_exec(&req, &kernel) {
+        Ok(Some(exit)) => {
+            ended(&mut kernel);
+            return Ok((exit, Stats::default()));
+        }
+        Ok(None) => {}
+        Err(e) => {
+            ended(&mut kernel);
+            return Err(e);
+        }
     }
     if let Some(img) = kernel.darwin_exec.take() {
         return exec_darwin(img, req, opts, xlate, kernel, proc_state, wayland);

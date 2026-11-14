@@ -665,16 +665,10 @@ pub struct TaskLink {
     pub ipc_active: std::sync::atomic::AtomicBool,
     /// Its name port (`itk_task_ports[TASK_FLAVOR_NAME]`), once made.
     pub name_port: Mutex<Option<ObjId>>,
-    /// Its code signature, for its entitlements.
+    /// Its code signature, for the entitlements its requests to other
+    /// tasks' kernel objects are judged by (what another process is, by
+    /// its pid, is its record in the process table: `proc_find`).
     pub codesign: Option<super::codesign::CodeSign>,
-    /// Its credential's Sandbox label.
-    pub sandbox: super::sandboxes::Label,
-    /// Its process's `p_csflags`, `p_idversion` and `p_textoff`.
-    pub csflags: Arc<std::sync::atomic::AtomicU32>,
-    pub pidversion: i32,
-    pub textoff: i64,
-    /// Its process's `p_uniqueid`.
-    pub uniqueid: u64,
     /// Its task policy, with its importance marks.
     pub policy: Option<super::importance::Policy>,
 }
@@ -754,7 +748,10 @@ fn request_table_grow(ocount: usize) -> usize {
 impl Ipc {
     /// Take the system's table from `cell` for this task: its space comes
     /// out of the shared spaces (a task taking it the first time gets its
-    /// key and keeps the space it has).
+    /// key and keeps the space it has). A task that has ended has neither:
+    /// its kernel reaches the ports and the other tasks' spaces, its own
+    /// space is the inactive one its end left it (`is_active` false: no
+    /// name is in it and none is given out), and it takes no key.
     pub fn check_out(&mut self, cell: &Arc<IpcCell>) {
         debug_assert!(!self.held);
         let mut s = cell.take();
@@ -762,7 +759,9 @@ impl Ipc {
         self.objects = std::mem::take(&mut s.objects);
         self.next_id = s.next_id;
         self.timestamp = s.timestamp;
-        if self.task == 0 {
+        if self.ended {
+            debug_assert!(self.task == 0 && !self.space.active);
+        } else if self.task == 0 {
             s.next_task += 1;
             self.task = s.next_task;
         } else if let Some(sp) = s.spaces.remove(&self.task) {
@@ -790,19 +789,23 @@ impl Ipc {
         }
         let cell = Arc::clone(self.cell.as_ref().expect("a held table has its cell"));
         let mut spaces = std::mem::take(&mut self.others);
-        spaces.insert(self.task, std::mem::take(&mut self.space));
+        // (an ended task's space stays its own, out of the table)
+        if !self.ended {
+            spaces.insert(self.task, std::mem::take(&mut self.space));
+        }
         let s = IpcShared { objects: std::mem::take(&mut self.objects), next_id: self.next_id, timestamp: self.timestamp, spaces, next_task: self.next_task_hint, queues: std::mem::take(&mut self.queues), links: std::mem::take(&mut self.links), globals: std::mem::take(&mut self.globals), host_special: std::mem::take(&mut self.host_special), host_exc: std::mem::take(&mut self.host_exc), vouchers: std::mem::take(&mut self.vouchers) };
         self.held = false;
         cell.put(s);
     }
 
     /// The task has ended: its (terminated) space leaves the table, and the
-    /// task gives up its key.
+    /// task gives up its key. What its kernel does with IPC from here on
+    /// finds its space inactive ([`Ipc::check_out`]).
     pub fn space_leave(&mut self) {
         debug_assert!(self.held);
         self.links.remove(&self.task);
         self.link = None;
-        self.space = Space::new();
+        self.space = Space::terminated();
         self.task = 0;
         self.ended = true;
         let cell = self.cell.take();
@@ -1016,10 +1019,11 @@ impl Ipc {
     }
 
     /// `ipc_port_alloc`: a port with its receive right (and a send right,
-    /// with `make_send`) under a new name. `Err` is `KERN_NO_SPACE`.
+    /// with `make_send`) under a new name. `Err` is `ipc_entry_alloc`'s:
+    /// KERN_NO_SPACE, or KERN_INVALID_TASK in an ended task's space.
     pub fn port_alloc(&mut self, make_send: bool) -> Result<(u32, ObjId), u64> {
         let id = self.new_id();
-        let name = self.space.alloc(Some(id)).ok_or(kr::NO_SPACE)?;
+        let name = self.space.alloc(Some(id))?;
         let mut p = Port::new(Receiver::Space(name));
         p.owner = self.task;
         let mut t = ty::RECEIVE;
@@ -1037,7 +1041,7 @@ impl Ipc {
     /// `ipc_pset_alloc`: a port set under a new name.
     pub fn pset_alloc(&mut self) -> Result<(u32, ObjId), u64> {
         let id = self.new_id();
-        let name = self.space.alloc(Some(id)).ok_or(kr::NO_SPACE)?;
+        let name = self.space.alloc(Some(id))?;
         self.objects.insert(id, Object::Pset(Pset { active: true, owner: self.task, name, members: Vec::new(), refs: 1, knotes: 0 }));
         self.space.lookup_mut_any(name).bits |= ty::PORT_SET;
         Ok((name, id))

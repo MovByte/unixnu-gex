@@ -511,10 +511,10 @@ impl Ipc {
         let name = match (t != msgt::PORT_SEND_ONCE).then(|| self.right_reverse(port)).flatten() {
             Some(n) => n,
             None => match self.space.alloc(Some(port)) {
-                Some(n) => n,
-                None => {
+                Ok(n) => n,
+                Err(e) => {
                     self.object_destroy(c, t);
-                    return Err(kr::NO_SPACE);
+                    return Err(e);
                 }
             },
         };
