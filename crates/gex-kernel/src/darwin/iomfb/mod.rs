@@ -157,7 +157,8 @@ pub const NOTIFY_TYPES: usize = 6;
 /// it (`+0xe8`), its type (`+0xf0`, 2 once it swaps), the block client
 /// profile its entitlement gives (`+0x104`, `+0x108`), whether it started
 /// and is not stopped (`+0xe0`), its power assertions (`+0xfc`), whether
-/// it turned statistics on (`+0xf4`), and its notification slots.
+/// it turned statistics on (`+0xf4`), the frame information size selector
+/// 74 last gave it (`+0x3c8`), and its notification slots.
 pub struct Client {
     pub pid: i32,
     pub ty: u32,
@@ -167,6 +168,7 @@ pub struct Client {
     pub started: bool,
     pub power_assertions: i32,
     pub statistics: bool,
+    pub frame_info_size: u32,
     pub slots: [Slot; NOTIFY_TYPES],
 }
 
@@ -201,7 +203,7 @@ pub fn new_user_client(k: &mut Kernel, ty: u32) -> Result<Client, i32> {
             return Err(ret::UNSUPPORTED);
         }
     };
-    let c = Client { pid: k.pid, ty, block_profile, block_profile_index, started: true, power_assertions: 0, statistics: false, slots: Default::default() };
+    let c = Client { pid: k.pid, ty, block_profile, block_profile_index, started: true, power_assertions: 0, statistics: false, frame_info_size: 0, slots: Default::default() };
     if ty == 2 {
         swap::add_swap_client();
     }
@@ -271,7 +273,7 @@ pub fn register_notification_port(k: &mut Kernel, c: &mut Client, port: Option<O
     }
     slot.port = port;
     slot.refcon = reference as u32;
-    if ty == 3 && swap::frame_info_size(c) != 0 {
+    if ty == 3 && c.frame_info_size != 0 {
         k.darwin_unimplemented("IOMobileFramebufferUserClient frame information through its shared data queue (IOSharedDataQueue of 0x1040 bytes)".to_string());
     }
     ret::SUCCESS

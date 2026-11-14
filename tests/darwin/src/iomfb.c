@@ -16,6 +16,7 @@
 //   a source rectangle outside its surface, the debug flags a production
 //   device refuses, the parameters SetParameter does not take (a power
 //   assertion among them) and the gain map's without its entitlement, the
+//   frame information the pipe names and the options only it takes, the
 //   notification types, and memory of no type.
 // - The glass, on that connection (selector 83, with backboardd's graphics
 //   priority entitlement): layer 0 holds the swapped surface and layer 1
@@ -231,6 +232,26 @@ int main(void) {
     if ((kr = IOConnectCallMethod(c, 68, in, 1, sp, 8, NULL, NULL, NULL, NULL)) != kIOReturnBadArgument) return bad("SetParameter 4 of 101", kr, kIOReturnBadArgument);
     in[0] = 16;
     if ((kr = IOConnectCallMethod(c, 68, in, 1, sp, 8, NULL, NULL, NULL, NULL)) != kIOReturnNotPrivileged) return bad("SetParameter 16", kr, kIOReturnNotPrivileged);
+    // Frame information: the pipe names 14 items of one word each; there is
+    // no item 14; options go only to frame information's record.
+    char item[64];
+    size_t itemsz = sizeof item;
+    in[0] = 0;
+    outn = 2;
+    if ((kr = IOConnectCallMethod(c, 74, in, 1, NULL, 0, out, &outn, item, &itemsz)) != KERN_SUCCESS || out[0] != 14 || out[1] != 1 || strcmp(item, "Layer_0_CRC") != 0) return bad("SupportedFrameInfo 0", kr ? kr : (long)out[0], 14);
+    in[0] = 13;
+    outn = 2;
+    itemsz = sizeof item;
+    if ((kr = IOConnectCallMethod(c, 74, in, 1, NULL, 0, out, &outn, item, &itemsz)) != KERN_SUCCESS || strcmp(item, "CA_mode") != 0) return bad("SupportedFrameInfo 13", kr, 0);
+    in[0] = 14;
+    outn = 2;
+    itemsz = sizeof item;
+    if ((kr = IOConnectCallMethod(c, 74, in, 1, NULL, 0, out, &outn, item, &itemsz)) != kIOReturnBadArgument) return bad("SupportedFrameInfo 14", kr, kIOReturnBadArgument);
+    in[0] = 0;
+    in[1] = 1;
+    if ((kr = IOConnectCallScalarMethod(c, 73, in, 2, NULL, NULL)) != kIOReturnBadArgument) return bad("ChangeFrameInfo of hot plug", kr, kIOReturnBadArgument);
+    in[0] = 6;
+    if ((kr = IOConnectCallScalarMethod(c, 73, in, 2, NULL, NULL)) != kIOReturnBadArgument) return bad("ChangeFrameInfo of type 6", kr, kIOReturnBadArgument);
     outn = 1;
     if ((kr = IOConnectCallScalarMethod(c, 18, NULL, 0, out, &outn)) != KERN_SUCCESS || out[0] != 1) return bad("IsMainDisplay", out[0], 1);
     outn = 1;

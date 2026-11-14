@@ -444,12 +444,6 @@ pub fn client_gone(_k: &mut Kernel, client: u32) {
     });
 }
 
-/// The frame information size selector 74 gave the client (`+0x3c8`),
-/// which decides whether type 3 has a queue.
-pub fn frame_info_size(_c: &super::Client) -> u32 {
-    0
-}
-
 /// The surfaces a request holds let go.
 fn release_request(k: &mut Kernel, r: Request) {
     for l in r.layers {

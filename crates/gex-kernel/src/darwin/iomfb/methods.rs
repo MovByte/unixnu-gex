@@ -383,6 +383,40 @@ pub fn external_method(k: &mut Kernel, id: u32, c: &mut Client, a: &mut MethodAr
             }
             set_parameter(k, param, &words, count)
         }
+        // s_change_frame_info (0xfffffff00677a6c0, member
+        // 0xfffffff0067785f8): a type below 6, its record and the options
+        // to the framebuffer's slot 210, as selector 72's option.
+        73 => {
+            let ty = sc(0) as u32;
+            if ty as usize >= super::NOTIFY_TYPES {
+                return ret::BAD_ARGUMENT;
+            }
+            notification_options(k, ty, sc(1) as u32)
+        }
+        // s_supported_frame_info (0xfffffff00677a718, member
+        // 0xfffffff006778688): the framebuffer's slot 211
+        // (0xfffffff006bfa8e8) to the pipe's 0xfffffff006bb66b4, which
+        // names frame information item `index` (of 14) and gives its size
+        // (1): the count and the size out, the name in the 64-byte
+        // structure (`strncpy`); an index past 13 is kIOReturnBadArgument.
+        // Either way the size given (0 on a refusal) is the client's
+        // `+0x3c8`.
+        74 => {
+            const NAMES: [&str; 14] = ["Layer_0_CRC", "Layer_1_CRC", "Layer_2_CRC", "Blend_CRC", "ColorManager_CRC", "Dither_CRC", "Presentation_time", "Presentation_delta", "Requested_presentation", "Issued_time", "Performance_headroom", "Thermal_throttle", "PRC_duration", "CA_mode"];
+            let index = sc(0) as u32;
+            let Some(name) = NAMES.get(index as usize) else {
+                a.scalar_out[0] = 0;
+                a.scalar_out[1] = 0;
+                c.frame_info_size = 0;
+                return ret::BAD_ARGUMENT;
+            };
+            a.scalar_out[0] = NAMES.len() as u64;
+            a.scalar_out[1] = 1;
+            c.frame_info_size = 1;
+            a.struct_out.iter_mut().for_each(|b| *b = 0);
+            a.struct_out[..name.len()].copy_from_slice(name.as_bytes());
+            ret::SUCCESS
+        }
         // s_swap_cancel (0xfffffff006779574): slot 217's gated cancel.
         52 => swap::cancel(k, sc(0) as u32),
         // s_notifications (0xfffffff00677a658, member 0xfffffff006778460):
@@ -496,11 +530,7 @@ fn notifications(k: &mut Kernel, id: u32, c: &mut Client, callout: u64, refcon: 
         Ok(r) if r == ret::SUCCESS => {
             c.slots[ty].enabled = true;
             if extra != 0 {
-                if ty != 3 {
-                    return ret::BAD_ARGUMENT;
-                }
-                k.darwin_unimplemented(format!("IOMobileFramebuffer frame information notifications with option {extra:#x} (the pipe's update_notify_clients, 0xfffffff006bb6774)"));
-                return ret::UNSUPPORTED;
+                return notification_options(k, ty as u32, extra);
             }
             ret::SUCCESS
         }
@@ -510,6 +540,19 @@ fn notifications(k: &mut Kernel, id: u32, c: &mut Client, callout: u64, refcon: 
             ret::UNSUPPORTED
         }
     }
+}
+
+/// The framebuffer's slot 210 (0xfffffff006794058, gated to AppleCLCD's
+/// slot 211 and the pipe's 0xfffffff006bb672c): options for a type's
+/// record, which only frame information (3) takes (the pipe's
+/// `update_notify_clients`, 0xfffffff006bb6774, which is not modelled);
+/// any other type is kIOReturnBadArgument.
+fn notification_options(k: &mut Kernel, ty: u32, options: u32) -> i32 {
+    if ty != 3 {
+        return ret::BAD_ARGUMENT;
+    }
+    k.darwin_unimplemented(format!("IOMobileFramebuffer frame information options {options:#x} (the pipe's update_notify_clients, 0xfffffff006bb6774)"));
+    ret::UNSUPPORTED
 }
 
 /// A power assertion the client holds let go at its stop: the
