@@ -1,0 +1,47 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>gex GPU Worker</title>
+<canvas id="display" width="64" height="16"></canvas>
+<pre id="out"></pre>
+<script type="module">
+// The page of tests/check_page.py: the ring, the GPU Worker (hosts/browser/js/metal-worker.mjs) with the display's
+// canvas and a process memory, and a task Worker that stands where that process's kernel stands
+// (examples/check_task.rs). Each result goes to the server as it arrives, then `/__done`.
+import { createRing } from '/js/metal-ring.mjs';
+
+const out = document.getElementById('out');
+const post = (path, v) => fetch(path, { method: 'POST', body: JSON.stringify(v) });
+const say = (s) => { out.textContent += s + '\n'; };
+
+try {
+  await post('/__environment', { userAgent: navigator.userAgent, crossOriginIsolated, waitAsync: typeof Atomics.waitAsync });
+  const ring = createRing({ endpoints: 64, requestSize: 1 << 16, endpointSize: 1 << 12 });
+  const gpu = new Worker('/js/metal-worker.mjs', { type: 'module' });
+  const started = new Promise((resolve) => { gpu.onmessage = (e) => resolve(e.data); });
+  gpu.postMessage({ start: { glue: '/pkg/gex_metal_page.js', ring } });
+  const s = await started;
+  await post('/__result', { name: 'start', ok: s.started === true, detail: s.dead || s.failed || 'the device is set up' });
+  if (s.started !== true) throw new Error(s.dead || s.failed);
+  gpu.onmessage = (e) => post('/__result', { name: 'gpu-worker', ok: false, detail: JSON.stringify(e.data) });
+  const canvas = document.getElementById('display').transferControlToOffscreen();
+  gpu.postMessage({ canvas }, [canvas]);
+  const memory = new SharedArrayBuffer(64 << 20);
+  const table = new SharedArrayBuffer(4 * (4 + 8 * 16));
+  gpu.postMessage({ attach: 1, memory, table });
+  const task = new Worker('./task-worker.js', { type: 'module' });
+  const done = new Promise((resolve) => {
+    task.onmessage = (e) => resolve(e.data);
+    task.onerror = (e) => resolve({ error: String(e.message || e) });
+  });
+  task.postMessage({ ring, memory, table, glue: '/pkg-task/check_task.js' });
+  const r = await done;
+  for (const x of r.results || []) {
+    say(`${x.name}: ${x.ok ? 'pass' : 'FAIL'} ${x.detail}`);
+    await post('/__result', x);
+  }
+  if (r.error) await post('/__result', { name: 'task', ok: false, detail: r.error });
+  await post('/__done', { log: r.log || [] });
+} catch (e) {
+  await post('/__done', { failure: String(e && e.stack ? e.stack : e) });
+}
+</script>

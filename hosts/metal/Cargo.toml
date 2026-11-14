@@ -1,0 +1,32 @@
+# A workspace of its own: see the root manifest's `exclude`.
+[workspace]
+
+[package]
+name = "gex-metal-page"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.96"
+license = "AGPL-3.0-only"
+description = "The page's GPU Worker: WebMetal's executor on the browser's WebGPU, the ring the guest's Workers reach it by, and the display's canvas"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+webmetal-wire = { path = "../../third_party/WebMetal/wire" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+webmetal-host = { path = "../../third_party/WebMetal/host", features = ["web"] }
+# The versions WebMetal's host pins; the wasm-bindgen CLI that post-processes the module must match.
+wasm-bindgen = "=0.2.105"
+js-sys = "=0.3.82"
+wasm-bindgen-futures = "=0.4.55"
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+# The compiler WebMetal's host pins: the checks read the reference shader library with it.
+airwgsl = { git = "https://github.com/MovByte/AirWgsl", rev = "8dc0da5acb091beda089f2b0f46ed4d436d077c9" }
+
+# The GPU Worker checked from where a process's kernel stands (tests/check_page.py).
+[[example]]
+name = "check_task"
+crate-type = ["cdylib"]

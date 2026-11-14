@@ -35,7 +35,10 @@ members = [
 ]
 # WebMetal and AirWgsl are pinned submodules with workspaces (and manifests)
 # of their own; gexc builds them as dependencies (its `webmetal` feature).
-exclude = ["third_party/WebMetal", "third_party/AirWgsl"]
+# The page's GPU Worker (hosts/metal) builds WebMetal's browser binding, which
+# pins its wasm-bindgen exactly: it is a workspace of its own, so that the pin
+# does not hold this workspace's other wasm crates.
+exclude = ["third_party/WebMetal", "third_party/AirWgsl", "hosts/metal"]
 
 [workspace.package]
 version = "0.0.1"
