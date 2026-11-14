@@ -36,6 +36,53 @@ if [ -n "$WEBMETAL" ] && [ -f "$WEBMETAL" ]; then
     progs="$progs $WEBMETAL"
     cats="$cats --category 2:$WEBMETAL"
 fi
+
+# opaque DIR: overlayfs's mark (in its user.overlay. form) of an overlay
+# directory that hides the root's of its name entirely.
+opaque() {
+    if command -v xattr >/dev/null 2>&1; then
+        xattr -w user.overlay.opaque y "$1"
+    else
+        setfattr -n user.overlay.opaque -v y "$1"
+    fi
+}
+
+# machos DIR: the Mach-O files under DIR, thin or fat, by their magic.
+machos() {
+    find "$1" -type f | while read -r f; do
+        case $(od -An -N4 -tx1 "$f" | tr -d ' \n') in
+        cffaedfe | cefaedfe | cafebabe) echo "$f" ;;
+        esac
+    done
+}
+
+# The overlays (gexc run --overlay), host trees laid over the root as part
+# of its system volume. overlay's check overlay (src/overlay.c) holds a
+# bundle that shadows the root's AGXMetalA10.bundle, with the root's own
+# Info.plist and a program as its executable, and a bundle the root has no
+# bundle of that name beside.
+CHECK=$HERE/bin/overlay-check
+rm -rf "$CHECK"
+EXT=${GEX_DARWIN_ROOT:-}/System/Library/Extensions
+if [ -n "${GEX_DARWIN_ROOT:-}" ] && [ -f "$EXT/AGXMetalA10.bundle/Info.plist" ] && [ -f "$EXT/AGXGPURawCounterBundle.bundle/Info.plist" ]; then
+    mkdir -p "$CHECK/System/Library/Extensions/AGXMetalA10.bundle" "$CHECK/System/Library/Extensions/GexOverlay.bundle"
+    chmod 755 "$CHECK/System/Library/Extensions/AGXMetalA10.bundle" "$CHECK/System/Library/Extensions/GexOverlay.bundle"
+    cp -p "$EXT/AGXMetalA10.bundle/Info.plist" "$CHECK/System/Library/Extensions/AGXMetalA10.bundle/"
+    cp -p "$HERE/bin/overlayexe" "$CHECK/System/Library/Extensions/AGXMetalA10.bundle/AGXMetalA10"
+    opaque "$CHECK/System/Library/Extensions/AGXMetalA10.bundle"
+    cp -p "$EXT/AGXGPURawCounterBundle.bundle/Info.plist" "$CHECK/System/Library/Extensions/GexOverlay.bundle/"
+fi
+# The overlays' code is the system's, in the static trust cache with the
+# rest of it, with the entry the device's trust cache gives its own plugin
+# bundles on the system volume (SHA-256, flags 0, launch constraint
+# category 2, as AppleUVDMLib.plugin's and IOUSBLib.bundle's).
+for o in "$CHECK"; do
+    [ -d "$o" ] || continue
+    for f in $(machos "$o"); do
+        progs="$progs $f"
+        cats="$cats --category 2:$f"
+    done
+done
 if [ -n "${GEX_DARWIN_BOOT:-}" ]; then
     # shellcheck disable=SC2086
     python3 -I "$ROOT/tools/darwin-trust-cache.py" -o "$BOOT/TrustCache" --bundle "$GEX_DARWIN_BOOT/TrustCache" $cats $progs || exit 1
@@ -55,6 +102,7 @@ export GEX_DARWIN_BOOT="$BOOT"
 
 fail=0
 as=
+overlay=
 named=$#
 
 report() {
@@ -90,7 +138,7 @@ check_root() {
     mkdir -p "$GEX_DARWIN_ROOT/var/tmp"
     cp "$HERE/bin/$name" "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$name"
     # shellcheck disable=SC2086
-    out=$("$GEXC" run --sysroot "$GEX_DARWIN_ROOT" ${as:+--uid "$as"} "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$name" "$@" 2>/dev/null)
+    out=$("$GEXC" run --sysroot "$GEX_DARWIN_ROOT" ${overlay:+--overlay "$overlay"} ${as:+--uid "$as"} "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$name" "$@" 2>/dev/null)
     report "$name" "$out" $? "$want_out" "$want_status"
 }
 
@@ -366,6 +414,13 @@ hello from /var/tmp/gex-exec-fat with 1 argument" 0
     cfrunloop) check_root cfrunloop "cfrunloop 3 1" 0 ;;
     xpc-anon) check_root xpc-anon "xpc-anon 42" 0 ;;
     layout) check_root layout "layout ok" 0 ;;
+    overlay)
+        # Without the root's bundles to shadow and stand beside, there is
+        # no check overlay: the program then finds nothing laid over it.
+        [ -d "$CHECK" ] && overlay=$CHECK
+        check_root overlay "overlay ok" 0
+        overlay=
+        ;;
     stackfb) check_root stackfb "stackfb ok" 0 ;;
     *)
         echo "FAIL $1: no such program"
@@ -379,7 +434,7 @@ if [ "$named" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname taskreg excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl iokit ioreg accel accelr metalwire metal iosurface iosurfacex iosurfacesplash iosurfacexpreboard iogpudev iomfb xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit sbxinit sbxexec sbxkill hostspecial sbxmask sbxnet sbxiokit sbxpriv sbxfile sbxscrub cfrunloop xpc-anon layout stackfb launchcon; do
+    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname taskreg excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl iokit ioreg accel accelr metalwire metal iosurface iosurfacex iosurfacesplash iosurfacexpreboard iogpudev iomfb xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit sbxinit sbxexec sbxkill hostspecial sbxmask sbxnet sbxiokit sbxpriv sbxfile sbxscrub cfrunloop xpc-anon layout overlay stackfb launchcon; do
         run "$p"
     done
 fi
