@@ -1,7 +1,9 @@
 //! The extended attribute calls (`bsd/vfs/vfs_syscalls.c`, `vfs_xattr.c`).
 //! An attribute keeps its Darwin name behind the filesystems' `user.`
-//! prefix; a resource fork's offset and the DAC check on the file are not
-//! here, and the first is reported.
+//! prefix, but for the record of a file's owner, group, mode and flags
+//! (`vattr::RECORD`), which no listing shows and a call naming it is
+//! refused and reported; a resource fork's offset and the DAC check on the
+//! file are not here, and the first is reported.
 
 use super::errno::errno_of;
 use crate::errno::Errno;
@@ -59,6 +61,12 @@ impl Kernel {
         let name = String::from_utf8(raw).map_err(|_| Errno::EINVAL)?;
         if name.is_empty() {
             return Err(Errno::EINVAL);
+        }
+        // The record of a file's owner, group, mode and flags is kept under
+        // this name, which a guest's attribute cannot have here.
+        if name == super::vattr::RECORD_DARWIN_NAME {
+            super::note_unimplemented(format!("the extended attribute {name}, under which gex keeps a file's owner, group, mode and flags"));
+            return Err(Errno::EPERM);
         }
         Ok(name)
     }
@@ -214,7 +222,7 @@ impl Kernel {
         let mut raw = vec![0u8; size];
         let n = self.darwin_xattr_op(&target, XattrOp::List { buf: &mut raw }).map_err(xattr_errno)?;
         let mut names = Vec::new();
-        for full in raw[..n].split(|&c| c == 0).filter(|s| !s.is_empty()) {
+        for full in raw[..n].split(|&c| c == 0).filter(|s| !s.is_empty() && *s != super::vattr::RECORD.as_bytes()) {
             if let Some(name) = full.strip_prefix(PREFIX.as_bytes()) {
                 names.extend_from_slice(name);
                 names.push(0);

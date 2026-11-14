@@ -41,6 +41,8 @@ pub enum Then {
     /// `proc_prepareexit`'s EXC_CRASH: the process goes on to die of
     /// `signal`.
     Exit { signal: u32, core: bool },
+    /// The same for an `exit()` with status `code`.
+    Exited(i32),
 }
 
 /// An exception on its way through the levels.
@@ -150,6 +152,13 @@ impl Kernel {
                 // The rest of proc_prepareexit: P_REF_DEAD.
                 self.procs.set_exited(self.pid);
                 SyscallOutcome::Killed { signal, core }
+            }
+            Then::Exited(code) => {
+                if kr != kr::SUCCESS && self.darwin_task_exc_handled(exc::EXC_CORPSE_NOTIFY) {
+                    self.darwin_unimplemented("a corpse of a crashed task for its EXC_CORPSE_NOTIFY handler (corpses)".into());
+                }
+                self.procs.set_exited(self.pid);
+                SyscallOutcome::Exit(code)
             }
         }
     }

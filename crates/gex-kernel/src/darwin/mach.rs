@@ -1703,7 +1703,7 @@ mod tests {
         let key = c.dtask.ipc_raw.task;
         let old = name_port(&mut k, key).unwrap();
         let version = c.dtask.pidversion;
-        c.darwin_exec_switch(None, 0);
+        c.darwin_exec_switch(None, 0, Default::default());
         assert_ne!(c.dtask.pidversion, version);
         assert_eq!(pid_for(&mut k, &mut buf, old), (kr::FAILURE, -1));
         assert_eq!(task_of(&mut k, pid), Some((key, false)));
@@ -1731,7 +1731,7 @@ mod tests {
         let key = c.dtask.ipc_raw.task;
         let n = name_port(&mut k, key).unwrap();
         let version = c.dtask.pidversion;
-        c.darwin_exec_switch(Some(&crate::darwin::spawn::After::default()), 0);
+        c.darwin_exec_switch(Some(&crate::darwin::spawn::After::default()), 0, Default::default());
         assert_ne!(c.dtask.pidversion, version);
         assert_eq!(task_of(&mut k, pid), Some((key, true)));
         assert_eq!(pid_for(&mut k, &mut buf, n), (kr::SUCCESS, pid));

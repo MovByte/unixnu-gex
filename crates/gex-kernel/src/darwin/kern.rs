@@ -129,13 +129,15 @@ const MAC_MAX_POLICY_NAME: usize = 32;
 /// `ENOPOLICY`, `ENOSYS` and `ENOTSUP` as Darwin numbers them.
 const ENOPOLICY: i32 = 103;
 
-/// A mount, as `getfsstat64` reports it.
+/// A mount, as `getfsstat64` reports it, and the sealed volume whose
+/// image gives its files' owners, modes and flags, if one does.
 pub struct Mount {
     pub on: &'static str,
     pub from: &'static str,
     pub fsid: u64,
     pub flags: u32,
     pub fs: Fs,
+    pub vol: Option<super::volattrs::Vol>,
 }
 
 /// The filesystem a mount is of.
@@ -167,9 +169,9 @@ pub const DEVFS_FSID: u32 = 0x9a3c_51e7;
 /// from its MACF `vfc_flags`), and the SystemOS cryptex the shared cache
 /// is in, by the filesystem id its dynamic data names.
 pub const MOUNTS: &[Mount] = &[
-    Mount { on: "/", from: "/dev/disk0s1s1", fsid: 0x0100_0002, flags: MNT_RDONLY | MNT_ROOTFS, fs: Fs::Apfs },
-    Mount { on: "/dev", from: "devfs", fsid: DEVFS_FSID as u64, flags: MNT_LOCAL | MNT_DONTBROWSE | MNT_MULTILABEL, fs: Fs::Devfs },
-    Mount { on: "/System/Cryptexes/OS", from: "/dev/disk3s1", fsid: super::CACHE_FS_ID, flags: MNT_RDONLY | MNT_DONTBROWSE, fs: Fs::Apfs },
+    Mount { on: "/", from: "/dev/disk0s1s1", fsid: 0x0100_0002, flags: MNT_RDONLY | MNT_ROOTFS, fs: Fs::Apfs, vol: Some(super::volattrs::Vol::System) },
+    Mount { on: "/dev", from: "devfs", fsid: DEVFS_FSID as u64, flags: MNT_LOCAL | MNT_DONTBROWSE | MNT_MULTILABEL, fs: Fs::Devfs, vol: None },
+    Mount { on: "/System/Cryptexes/OS", from: "/dev/disk3s1", fsid: super::CACHE_FS_ID, flags: MNT_RDONLY | MNT_DONTBROWSE, fs: Fs::Apfs, vol: Some(super::volattrs::Vol::OsCryptex) },
 ];
 
 /// The volume the preboot cryptexes are on: what `vnode_lookup` of
@@ -347,7 +349,7 @@ fn darwin_gettimeofday(m: &mut GuestMem<'_>, tp: u64, tzp: u64, abs: u64) -> Res
 const MAXPATHLEN: usize = 1024;
 
 /// `securelevel`: the system never raises it.
-const DARWIN_SECURELEVEL: i32 = 0;
+pub(crate) const DARWIN_SECURELEVEL: i32 = 0;
 
 /// A sysctl's numbers, as `int`s.
 fn oid_bytes(oid: &[i32]) -> Vec<u8> {
@@ -462,6 +464,15 @@ impl Kernel {
             }
         }
         Some(match raw {
+            // A unix socket's bind, which makes its name's socket file: its
+            // record once made.
+            sys::BIND if self.darwin_creation.is_some() => {
+                let r = self.canonical(m, nr::BIND, *a);
+                if let (Ok(_), Some(c)) = (&r, self.darwin_creation.take()) {
+                    self.darwin_created(&c, None);
+                }
+                res(r)
+            }
             sys::SHARED_REGION_CHECK_NP => res(self.darwin_shared_region_check_np(m, a[0])),
             sys::SHARED_REGION_MAP_AND_SLIDE_2_NP => res(self.darwin_shared_region_map_and_slide_2_np(m, a)),
             sys::MAP_WITH_LINKING_NP => res(self.darwin_map_with_linking(m, a)),
@@ -969,6 +980,8 @@ impl Kernel {
 
     /// `faccessat(fd, path, amode, flag)`: its flags checked; with
     /// AT_SYMLINK_NOFOLLOW_ANY no link on the way, the last not followed.
+    /// What the mode asks was authorized with Sandbox's check
+    /// (`darwin_sb_access_call`): the lookup is what is left to fail.
     fn darwin_faccessat(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
         const AT_EACCESS: u64 = 0x10;
         const AT_SYMLINK_NOFOLLOW: u64 = 0x20;
@@ -984,7 +997,7 @@ impl Kernel {
         if flag & AT_SYMLINK_NOFOLLOW_ANY != 0 {
             f |= AT_SYMLINK_NOFOLLOW;
         }
-        self.canonical(m, nr::FACCESSAT, [super::bsd::dirfd(a[0]), a[1], a[2], super::bsd::at_flags(f), 0, 0])
+        self.canonical(m, nr::FACCESSAT, [super::bsd::dirfd(a[0]), a[1], 0, super::bsd::at_flags(f), 0, 0])
     }
 
     /// `kill(pid, signum, posix)`: one process (a zombie succeeds unsignalled),

@@ -121,8 +121,10 @@ pub fn translate(raw: u64, a: &mut [u64; 6]) -> u64 {
             *a = [dirfd(a[0]), a[1], open_flags(a[2]), a[3], 0, 0];
             nr::OPENAT
         }
+        // What the mode asks was authorized with Sandbox's check
+        // (`access1`'s); the lookup is what is left to fail.
         sys::ACCESS => {
-            *a = [LINUX_AT_FDCWD, a[0], a[1], 0, 0, 0];
+            *a = [LINUX_AT_FDCWD, a[0], 0, 0, 0, 0];
             nr::FACCESSAT
         }
         sys::FACCESSAT => {
