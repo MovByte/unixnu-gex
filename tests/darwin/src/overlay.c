@@ -163,7 +163,8 @@ static const char *name_of(const struct cmn *c) {
     return (const char *)&c->name + c->name.attr_dataoffset;
 }
 
-static void attrs_as(const char *what, const char *path, const char *real, const char *parent) {
+// (`flags`: the file's own flags, or -1 for the real file's)
+static void attrs_as(const char *what, const char *path, const char *real, const char *parent, long long flags) {
     struct cmn a = attrs(path), b = attrs(real);
     struct stat s = st(path), p = st(parent);
     char w[160];
@@ -183,7 +184,7 @@ static void attrs_as(const char *what, const char *path, const char *real, const
     snprintf(w, sizeof w, "%s: ATTR_CMN_ACCESSMASK", what);
     EXPECT(w, a.mask, b.mask);
     snprintf(w, sizeof w, "%s: ATTR_CMN_FLAGS", what);
-    EXPECT(w, a.flags, b.flags);
+    EXPECT(w, a.flags, flags < 0 ? (long long)b.flags : flags);
     snprintf(w, sizeof w, "%s: ATTR_CMN_USERACCESS", what);
     EXPECT(w, a.useraccess, b.useraccess);
     snprintf(w, sizeof w, "%s: ATTR_CMN_FILEID against st_ino", what);
@@ -384,10 +385,13 @@ int main(void) {
     }
 
     // getattrlist: the root's answers.
-    attrs_as("an overlay file in the shadowing directory", plist, REAL "/Info.plist", SHADOW);
-    attrs_as("an overlay file in the new directory", NEW "/Info.plist", REAL "/Info.plist", NEW);
-    attrs_as("the shadowing directory", SHADOW, REALDIR, EXT);
-    attrs_as("the new directory", NEW, REALDIR, EXT);
+    // A file the root's volume has at its path has that file's flags; one
+    // where it has none is stored as the overlay holds it, uncompressed,
+    // with none.
+    attrs_as("an overlay file in the shadowing directory", plist, REAL "/Info.plist", SHADOW, -1);
+    attrs_as("an overlay file in the new directory", NEW "/Info.plist", REAL "/Info.plist", NEW, 0);
+    attrs_as("the shadowing directory", SHADOW, REALDIR, EXT, -1);
+    attrs_as("the new directory", NEW, REALDIR, EXT, -1);
 
     // The merged listing, counted and sized as the root's directories are;
     // the shadowing directory's, the overlay's alone.

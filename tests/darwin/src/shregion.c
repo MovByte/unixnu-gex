@@ -9,7 +9,9 @@
 //   (KERN_FAILURE, 5, read as EIO);
 // - shared_region_map_and_slide_setup refuses a dyld-memory file (fd -1)
 //   with more than one mapping or an unaligned one, a descriptor not open
-//   (EBADF), one not readable (EPERM), and what is not a regular file.
+//   (EBADF), one not readable (EPERM), what is not a regular file, and a
+//   file root does not own (EPERM): one the caller made, run as another
+//   user.
 
 #include <errno.h>
 #include <fcntl.h>
@@ -93,6 +95,14 @@ int main(void) {
     fail |= expect("a descriptor not open for reading", map2(1, f, 1, m), EPERM);
     close(wr);
     unlink("/private/var/tmp/gex-darwin-shregion-w");
+    if (geteuid() != 0) {
+        int own = open("/private/var/tmp/gex-darwin-shregion-own", O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (own < 0 || ftruncate(own, 0x4000) != 0) return bad("a file of one's own", errno, 0);
+        f[0].sf_fd = own;
+        fail |= expect("a file not root's", map2(1, f, 1, m), EPERM);
+        close(own);
+        unlink("/private/var/tmp/gex-darwin-shregion-own");
+    }
 
     // Still mapped where it was.
     uint64_t again = 0;

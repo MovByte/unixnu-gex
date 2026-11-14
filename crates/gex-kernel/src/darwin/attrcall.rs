@@ -69,18 +69,6 @@ pub(crate) fn darwin_dev(linux: u64) -> u32 {
     ((major as u32) << 24) | (minor as u32 & 0x00ff_ffff)
 }
 
-/// `W_OK | R_OK | X_OK` for a caller who owns the file (every file here is
-/// the process's own, as `stat` says), who is `root` or not, on a mount
-/// that is read-only or not.
-fn user_access(mode: u32, is_dir: bool, root: bool, rdonly: bool) -> u32 {
-    let owner = (mode >> 6) & 7;
-    let (r, mut w, x) = if root { (true, true, is_dir || mode & 0o111 != 0) } else { (owner & 4 != 0, owner & 2 != 0, owner & 1 != 0) };
-    if rdonly {
-        w = false;
-    }
-    u32::from(w) * 2 | u32::from(r) * 4 | u32::from(x)
-}
-
 fn vtype_of(t: FileType) -> u32 {
     use al::vtype::*;
     match t {
@@ -102,9 +90,14 @@ fn last(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or("")
 }
 
+/// The attributes that read a vnode's owner, group, mode or flags.
+const OWNER_ATTRS: u32 = al::cmn::OWNERID | al::cmn::GRPID | al::cmn::ACCESSMASK | al::cmn::FLAGS | al::cmn::USERACCESS;
+
 /// The vnode at `path` (absolute, with every link on it followed) as the
-/// attribute code sees it.
-fn vnode(pio: &PathIo<'_>, path: &str, md: &Metadata, name: Option<&str>, want_children: bool) -> Result<Vn, Errno> {
+/// attribute code sees it; its owner, group, mode and flags read when
+/// `want_owner` (`vnode_getattr` fetches only what is asked for), its
+/// `user_access` left for the caller.
+fn vnode(pio: &PathIo<'_>, path: &str, md: &Metadata, name: Option<&str>, want_children: bool, want_owner: bool) -> Result<Vn, Errno> {
     let mnt: &Mount = mount_of(path);
     if mnt.fs == super::kern::Fs::Devfs {
         // A listing of the directory devfs is mounted on finds the
@@ -113,7 +106,7 @@ fn vnode(pio: &PathIo<'_>, path: &str, md: &Metadata, name: Option<&str>, want_c
             super::note_unimplemented(format!("getattrlistbulk's entry {path}: the directory devfs covers on the root volume"));
             return Err(Errno::EOPNOTSUPP);
         }
-        return Ok(devfs_vnode(pio, mnt, path, md, name));
+        return Ok(devfs_vnode(mnt, path, md, name));
     }
     let st = Kernel::stat_from(md);
     let is_dir = md.file_type == FileType::Directory;
@@ -148,7 +141,7 @@ fn vnode(pio: &PathIo<'_>, path: &str, md: &Metadata, name: Option<&str>, want_c
     };
     let t = |s: i64, ns: u32| (s, i64::from(ns));
     let birth = t(st.mtime, st.mtime_ns);
-    let rdonly = mnt.flags & 0x1 != 0;
+    let owned = if want_owner { super::vattr::get(pio.ns, path, md, None)? } else { super::vattr::Owned { uid: 0, gid: 0, mode: md.mode & 0o7777, flags: 0 } };
     let (data_alloc, rdev) = match md.file_type {
         FileType::Regular => (roundup(md.size, u64::from(vfsstat::BSIZE)), 0),
         FileType::CharDevice => (0, darwin_dev(st.rdev)),
@@ -164,10 +157,10 @@ fn vnode(pio: &PathIo<'_>, path: &str, md: &Metadata, name: Option<&str>, want_c
         is_mount_point: MOUNTS.iter().any(|m| m.on == path),
         fileid: md.ino,
         parentid,
-        mode: md.mode & 0o7777,
-        uid: pio.creds.uid(),
-        gid: pio.creds.gid(),
-        flags: 0,
+        mode: owned.mode,
+        uid: owned.uid,
+        gid: owned.gid,
+        flags: owned.flags,
         nlink: md.nlink.max(1),
         nchildren,
         // Nothing here keeps a creation or added time: both are the
@@ -182,7 +175,7 @@ fn vnode(pio: &PathIo<'_>, path: &str, md: &Metadata, name: Option<&str>, want_c
         data_alloc,
         rdev,
         iosize: VNODE_IOSIZE,
-        user_access: user_access(md.mode, is_dir, pio.creds.uid() == 0, rdonly),
+        user_access: 0,
         finderinfo: None,
         encoding: ENCODING,
         gen_count: GEN_COUNT,
@@ -205,7 +198,7 @@ const VT_DEVFS: u32 = 18;
 /// root vnode has none). devfs keeps no creation, backup or added time, no
 /// encoding, generation, document id, protection class, child count,
 /// clone or extended flags, and no extended security.
-fn devfs_vnode(pio: &PathIo<'_>, mnt: &Mount, path: &str, md: &Metadata, name: Option<&str>) -> Vn {
+fn devfs_vnode(mnt: &Mount, path: &str, md: &Metadata, name: Option<&str>) -> Vn {
     use al::cmn;
     let is_root = path == mnt.on;
     let (uid, gid) = if is_root {
@@ -256,8 +249,8 @@ fn devfs_vnode(pio: &PathIo<'_>, mnt: &Mount, path: &str, md: &Metadata, name: O
         // The node's device, makedev(0, 0) (the console's) included.
         rdev: if is_chr { darwin_dev(md.rdev) } else { 0 },
         iosize: if is_chr { super::devfs::MAXPHYSIO as u32 } else { 512 },
-        // `perms` as vnode_authorize grants them: the attribute call's.
-        user_access: user_access(md.mode, md.file_type == FileType::Directory, pio.creds.uid() == 0, false),
+        // `perms`, the attribute call's.
+        user_access: 0,
         encoding: ENCODING,
         unsupported,
         obj32: true,
@@ -285,13 +278,14 @@ fn volume_uuid(mnt: &Mount) -> [u8; 16] {
     u
 }
 
-/// The volume `mnt` as `getvolattrlist` has it.
-fn volume(pio: &PathIo<'_>, mnt: &Mount) -> Result<VolInfo, Errno> {
+/// The volume `mnt` as `getvolattrlist` has it, its root's owner read
+/// when `want_owner`.
+fn volume(pio: &PathIo<'_>, mnt: &Mount, want_owner: bool) -> Result<VolInfo, Errno> {
     if mnt.fs == super::kern::Fs::Devfs {
         return devfs_volume(pio, mnt);
     }
     let md = pio.ns.metadata(mnt.on)?;
-    let root = vnode(pio, mnt.on, &md, None, false)?;
+    let root = vnode(pio, mnt.on, &md, None, false, want_owner)?;
     Ok(VolInfo {
         typenum: vfsstat::APFS_TYPENUM,
         typename: "apfs".into(),
@@ -333,7 +327,7 @@ fn volume(pio: &PathIo<'_>, mnt: &Mount) -> Result<VolInfo, Errno> {
 fn devfs_volume(pio: &PathIo<'_>, mnt: &Mount) -> Result<VolInfo, Errno> {
     use al::cmn;
     let md = pio.ns.metadata(mnt.on)?;
-    let root = devfs_vnode(pio, mnt, mnt.on, &md, None);
+    let root = devfs_vnode(mnt, mnt.on, &md, None);
     let nodes = super::devfs::stats().0 as u32;
     // VOL_CAP_FMT_SYMBOLICLINKS, _HARDLINKS, _NO_ROOT_TIMES,
     // _CASE_SENSITIVE, _CASE_PRESERVING, _FAST_STATFS, _2TB_FILESIZE,
@@ -480,6 +474,9 @@ struct SetAttrs {
     modtime: Option<(i64, u32)>,
     acctime: Option<(i64, u32)>,
     mode: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    flags: Option<u32>,
     finderinfo: Option<[u8; 32]>,
     /// The attributes the filesystems here cannot keep, by name.
     missing: Vec<&'static str>,
@@ -544,19 +541,16 @@ fn unpack_setattrs(alist: &AttrList, buf: &[u8]) -> Result<SetAttrs, Errno> {
         out.finderinfo = Some(c.take(32)?.try_into().unwrap());
     }
     if set.common & cmn::OWNERID != 0 {
-        c.u32()?;
-        out.missing.push("ATTR_CMN_OWNERID");
+        out.uid = Some(c.u32()?);
     }
     if set.common & cmn::GRPID != 0 {
-        c.u32()?;
-        out.missing.push("ATTR_CMN_GRPID");
+        out.gid = Some(c.u32()?);
     }
     if set.common & cmn::ACCESSMASK != 0 {
         out.mode = Some(c.u32()?);
     }
     if set.common & cmn::FLAGS != 0 {
-        c.u32()?;
-        out.missing.push("ATTR_CMN_FLAGS");
+        out.flags = Some(c.u32()?);
     }
     if set.common & cmn::EXTENDED_SECURITY != 0 {
         c.take(8)?;
@@ -589,25 +583,30 @@ fn unpack_setattrs(alist: &AttrList, buf: &[u8]) -> Result<SetAttrs, Errno> {
 }
 
 impl Kernel {
-    /// `ATTR_CMN_USERACCESS`'s `perms`: what `vnode_authorize` grants the
-    /// caller of read, write and execute (search, for a directory) by the
-    /// owner, group and other bits; the superuser all but executing a file
-    /// with no execute bit.
-    fn darwin_dac_perms(&self, uid: u32, gid: u32, mode: u32, is_dir: bool) -> u32 {
-        let c = &self.dtask.cred;
-        if c.uid == 0 {
-            let x = is_dir || mode & 0o111 != 0;
-            return 4 | 2 | u32::from(x);
-        }
-        let bits = if c.uid == uid {
-            mode >> 6
-        } else if c.gid() == gid || c.groups.contains(&gid) {
-            mode >> 3
+    /// `ATTR_CMN_USERACCESS`'s `perms` (`getattrlist_internal`): `W_OK`,
+    /// `R_OK` and `X_OK` for what `vnode_authorize` grants the caller of
+    /// writing (adding to and deleting from a directory), reading (listing)
+    /// and executing (searching) vnode `vn` at `path`.
+    fn darwin_user_access(&self, path: &str, vn: &Vn) -> u32 {
+        use super::vauth::kauth;
+        let is_dir = vn.vtype == al::vtype::VDIR;
+        let vtype = match vn.vtype {
+            al::vtype::VDIR => FileType::Directory,
+            al::vtype::VLNK => FileType::Symlink,
+            al::vtype::VCHR => FileType::CharDevice,
+            al::vtype::VSOCK => FileType::Socket,
+            al::vtype::VFIFO => FileType::Fifo,
+            _ => FileType::Regular,
+        };
+        let node = super::vauth::Node { vtype, attrs: Ok(super::vattr::Owned { uid: vn.uid, gid: vn.gid, mode: vn.mode, flags: vn.flags }), mnt_flags: super::vattr::device_mnt_flags(path) };
+        let ok = |action: u32| self.darwin_authorize_check(&self.dtask.cred, &node, None, kauth::ACCESS | action).is_ok();
+        let (w, r, x) = if is_dir {
+            (kauth::ADD_FILE | kauth::ADD_SUBDIRECTORY | kauth::DELETE_CHILD, kauth::LIST_DIRECTORY, kauth::SEARCH)
         } else {
-            mode
-        } & 7;
-        // R_OK 4, W_OK 2, X_OK 1, the bits' own order.
-        bits
+            (kauth::WRITE_DATA, kauth::READ_DATA, kauth::EXECUTE)
+        };
+        // W_OK 2, R_OK 4, X_OK 1.
+        u32::from(ok(w)) * 2 | u32::from(ok(r)) * 4 | u32::from(ok(x))
     }
 
     /// `setattrlist(path, alist, attributeBuffer, bufferSize, options)`.
@@ -675,8 +674,27 @@ impl Kernel {
             self.darwin_unimplemented(format!("setattrlist of {what} (the filesystems here do not keep it)"));
             return Err(Errno::EINVAL);
         }
-        // FSOPT_UTIMES_NULL only widens who may set the times, and every
-        // file here is the caller's.
+        // The flags' check, as they are unpacked.
+        if let (Some(f), Some(flags)) = (&found, attrs.flags) {
+            let e = self.darwin_mac_check_vnode_setflags(super::macvfs::sb_vnode(&f.path, &f.md), flags);
+            if e != 0 {
+                return Err(super::errno::errno_of(e as i32));
+            }
+        }
+        // vnode_authattr of what is set, Finder Info's right with it, and
+        // vnode_authorize of what they need.
+        let mut va = super::vattr::SetAttr {
+            uid: attrs.uid,
+            gid: attrs.gid,
+            mode: attrs.mode.map(|mode| mode & ALLPERMS as u32),
+            flags: attrs.flags,
+            times: attrs.modtime.is_some() || attrs.acctime.is_some(),
+            utimes_null: options & fsopt::UTIMES_NULL != 0,
+        };
+        let any = va.uid.is_some() || va.gid.is_some() || va.mode.is_some() || va.flags.is_some() || va.times;
+        let extra = if attrs.finderinfo.is_some() { super::vauth::kauth::WRITE_EXTATTRIBUTES } else { 0 };
+        let what = if path == 0 { super::fsops::SetTarget::Fd(dir) } else { super::fsops::SetTarget::Path { dirfd: dir, path, follow } };
+        let (canon, old, file) = self.darwin_setattr_auth(m, &what, &mut va, super::fsops::Call::Setattrlist, extra)?;
         // Finder Info goes first when the owner is losing write access, so
         // that the mode change does not stop it.
         let finder_first = attrs.mode.is_some_and(|mode| mode & S_IWUSR == 0);
@@ -685,16 +703,11 @@ impl Kernel {
                 self.darwin_set_finderinfo(dir, target.as_ref().map(|(p, _)| p.as_str()), follow, info)?;
             }
         }
+        if any {
+            self.darwin_setattr_apply(&canon, old, file.as_ref().map(|f| f.handle.as_ref()), va, super::fsops::Call::Setattrlist)?;
+        }
         if attrs.modtime.is_some() || attrs.acctime.is_some() {
             self.path_io().set_times_at(m, dir, path, attrs.acctime, attrs.modtime, follow)?;
-        }
-        if let Some(mode) = attrs.mode {
-            let mode = u64::from(mode & ALLPERMS);
-            if path == 0 {
-                self.canonical(m, crate::syscalls::nr::FCHMOD, [dir as u64, mode, 0, 0, 0, 0])?;
-            } else {
-                self.canonical(m, crate::syscalls::nr::FCHMODAT, [dir as i64 as u64, path, mode, if follow { 0 } else { 0x100 }, 0, 0])?;
-            }
         }
         if !finder_first {
             if let Some(info) = &attrs.finderinfo {
@@ -837,15 +850,19 @@ impl Kernel {
     fn attrlist_vnode(&self, pio: &PathIo<'_>, path: &str, md: &Metadata, name: Option<&str>, alist: &AttrList, size: usize, options: u64, scrub: bool) -> (Result<Reply, Errno>, Vec<String>) {
         let use_fork = options & fsopt::ATTR_CMN_EXTENDED != 0;
         let mut missing = Vec::new();
+        let want_owner = alist.set.common & OWNER_ATTRS != 0;
+        let want_access = alist.set.common & al::cmn::USERACCESS != 0;
         if alist.bitmapcount == al::BIT_MAP_COUNT && size >= 4 && alist.set.vol != 0 {
             // Volume attributes are for the volume alone.
             if alist.set.file != 0 || alist.set.dir != 0 || (alist.set.fork != 0 && !use_fork) {
                 return (Err(Errno::EINVAL), missing);
             }
-            let r = volume(pio, mount_of(path)).and_then(|mut vi| {
-                if vi.root.tag == VT_DEVFS {
-                    vi.root.user_access = self.darwin_dac_perms(vi.root.uid, vi.root.gid, vi.root.mode, true);
-                } else {
+            let mnt = mount_of(path);
+            let r = volume(pio, mnt, want_owner).and_then(|mut vi| {
+                if want_access {
+                    vi.root.user_access = self.darwin_user_access(mnt.on, &vi.root);
+                }
+                if vi.root.tag != VT_DEVFS {
                     missing = volume_missing(alist);
                 }
                 al::getvolattrlist(alist, size, options, &vi)
@@ -853,13 +870,14 @@ impl Kernel {
             return (r, missing);
         }
         let want_children = alist.set.dir & dir::ENTRYCOUNT != 0;
-        let r = vnode(pio, path, md, name, want_children).and_then(|mut vn| {
+        let r = vnode(pio, path, md, name, want_children, want_owner).and_then(|mut vn| {
             if scrub {
                 (vn.crtime, vn.acctime, vn.modtime, vn.chgtime, vn.bkuptime, vn.addedtime) = ((0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0));
             }
-            if vn.tag == VT_DEVFS {
-                vn.user_access = self.darwin_dac_perms(vn.uid, vn.gid, vn.mode, vn.vtype == al::vtype::VDIR);
-            } else {
+            if want_access {
+                vn.user_access = self.darwin_user_access(path, &vn);
+            }
+            if vn.tag != VT_DEVFS {
                 missing = vnode_missing(alist, options);
             }
             al::getattrlist(alist, size, options, &vn)
@@ -990,16 +1008,6 @@ mod tests {
         assert_eq!(darwin_dev(0x103), 0x0100_0003);
         // major 136 minor 300: the minor's high bits sit above bit 8
         assert_eq!(darwin_dev((136 << 8) | (300 & 0xff) | ((300 >> 8) << 20)), (136 << 24) | 300);
-    }
-
-    #[test]
-    fn access_follows_the_owner_and_the_mount() {
-        assert_eq!(user_access(0o755, false, false, false), 7);
-        assert_eq!(user_access(0o555, false, false, false), 5);
-        assert_eq!(user_access(0o755, false, false, true), 5);
-        assert_eq!(user_access(0o644, false, true, false), 6);
-        assert_eq!(user_access(0o644, true, true, false), 7);
-        assert_eq!(user_access(0o000, false, false, false), 0);
     }
 
     #[test]

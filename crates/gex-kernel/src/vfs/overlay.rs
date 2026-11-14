@@ -25,7 +25,13 @@
 //! does not is refused. What the root has nothing at is the overlay's own,
 //! and is reported when the overlay is read: its modes are the overlay's.
 //! Owners and flags are not the overlay's to say: they are the root
-//! volume's, answered for every file alike above this layer.
+//! volume's, answered for every file alike above this layer. There
+//! (`darwin::vattr`), an overlay file has the owner, group, mode and flags
+//! of the system volume's file at its path, and one at a path where the
+//! system volume has none is the system's: owned by root, group wheel (as
+//! every file of the device's `/System/Library/Extensions` is), with the
+//! overlay's mode and no flags (its data is stored as the overlay holds
+//! it, not compressed).
 
 use super::{walk_links, within_any, DirEntry, FileHandle, FileSystem, FileType, Metadata, Moved, Walked, XattrOp};
 use crate::errno::{Errno, SysResult};
@@ -568,9 +574,15 @@ thread_local! {
     static BOTH: std::cell::RefCell<(String, String, String)> = const { std::cell::RefCell::new((String::new(), String::new(), String::new())) };
 }
 
+/// Whether inode number `ino` is one the overlay gives its own files
+/// ([`OWN_INO_FIRST`]): a file of the overlay's, and not of the root's.
+pub fn is_own_ino(ino: u64) -> bool {
+    (OWN_INO_FIRST..OWN_INO_FIRST + OWN_INO_SLOTS).contains(&ino)
+}
+
 /// [`OWN_INO_FIRST`]'s check of an inode number of the root's.
 fn own_range_check(ino: u64) -> Result<(), Errno> {
-    if (OWN_INO_FIRST..OWN_INO_FIRST + OWN_INO_SLOTS).contains(&ino) {
+    if is_own_ino(ino) {
         eprintln!("gex: overlay: the root has a file numbered {ino:#x}, among the numbers of the overlay's own files");
         return Err(Errno::EIO);
     }

@@ -131,6 +131,32 @@ impl Cred {
         displaced
     }
 
+    /// `kauth_cred_copy_real`: the credential with the real user and group
+    /// as its effective ones (a supplementary group the real group
+    /// displaces opts it out of memberd), as `access` checks.
+    pub fn copy_real(&self) -> Cred {
+        let mut c = self.clone();
+        if c.ruid == c.uid && c.rgid == c.gid() {
+            return c;
+        }
+        c.uid = c.ruid;
+        if c.change_egid(c.rgid) {
+            c.flags |= CRF_NOMEMBERD;
+            c.gmuid = UID_NONE;
+        }
+        if c.gmuid != UID_NONE {
+            c.gmuid = c.ruid;
+        }
+        c
+    }
+
+    /// `kauth_cred_ismember_gid`: the credential's own group list, which
+    /// is the whole answer on a kernel without an external resolver
+    /// (iOS's has none: no `CONFIG_EXT_RESOLVER`).
+    pub fn is_member(&self, gid: u32) -> bool {
+        self.groups.contains(&gid)
+    }
+
     /// `kauth_cred_model_setgroups`.
     pub fn setgroups(&mut self, groups: &[u32], gmuid: u32) -> bool {
         let groups = &groups[..groups.len().min(NGROUPS)];
@@ -358,9 +384,10 @@ impl Kernel {
         Ok(0)
     }
 
-    /// `kern_settid`: for root, a thread identity of its own, or back to
-    /// the process's.
+    /// `kern_settid`: `mac_proc_check_settid` first, then for root a
+    /// thread identity of its own, or back to the process's.
     fn darwin_settid(&mut self, uid: u32) -> Result<u64, Errno> {
+        self.darwin_mac_proc_check_settid()?;
         self.darwin_suser()?;
         if uid == UID_NONE {
             // The thread has no identity of its own to drop.
@@ -368,6 +395,16 @@ impl Kernel {
         }
         self.darwin_unimplemented("settid: a thread's own identity (the per-thread credential the file system checks)".into());
         Err(Errno::EPERM)
+    }
+
+    /// `mac_proc_check_settid`: the policies' `mpo_proc_check_settid`.
+    /// None of this kernel's policies has one: AMFI's operations
+    /// (filled in by its start, `0xfffffff005ab4b2c` on), Sandbox's
+    /// (`0xfffffff006f8b9b8`) and AppleImage4's (`0xfffffff006cf33a8`, its
+    /// sysctl check alone) leave slot 197 of `struct mac_policy_ops` NULL,
+    /// so the check allows.
+    fn darwin_mac_proc_check_settid(&mut self) -> Result<(), Errno> {
+        Ok(())
     }
 
     /// `getlogin(namebuf, namelen)`: the session's login name, `namelen`

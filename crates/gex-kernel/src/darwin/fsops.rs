@@ -1,9 +1,10 @@
 //! The filesystem calls that change names, modes and times, by the rules
 //! of XNU's `bsd/vfs/vfs_syscalls.c`, and `getdirentries64`.
 //!
-//! The filesystems here keep no file owners and check no permissions
-//! (`vnode_authorize` has nothing to go by), so the `chown` family is
-//! refused and reported rather than answered.
+//! A file's owner, group, mode and flags are [`super::vattr`]'s; the
+//! `chmod`, `chown` and `chflags` families change them as `vnode_authattr`,
+//! `vnode_authorize` and `vnode_setattr` let them, and record what they
+//! set. The host's file keeps the mode it was made with.
 
 use super::bsd::dirfd;
 use super::sysno as sys;
@@ -28,6 +29,41 @@ const RENAME_NOFOLLOW_ANY: u64 = 0x10;
 /// `ACCESSPERMS`, `ALLPERMS`.
 pub(super) const ACCESSPERMS: u64 = 0o777;
 const ALLPERMS: u64 = 0o7777;
+
+/// What a call that sets attributes names: a path from a directory
+/// (Linux's numbering), its last link followed or not, or a descriptor.
+pub(crate) enum SetTarget {
+    Path { dirfd: i32, path: u64, follow: bool },
+    Fd(i32),
+}
+
+/// The call that sets them, whose errors differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Call {
+    Chmod,
+    Chown,
+    Chflags,
+    Setattrlist,
+    /// `setutimes`, setting the times to now or not.
+    Utimes(bool),
+}
+
+impl Call {
+    fn name(self) -> &'static str {
+        match self {
+            Call::Chmod => "chmod",
+            Call::Chown => "chown",
+            Call::Chflags => "chflags",
+            Call::Setattrlist => "setattrlist",
+            Call::Utimes(_) => "utimes",
+        }
+    }
+}
+
+/// A mode to set: its ALLPERMS.
+fn mode_set(mode: u64) -> super::vattr::SetAttr {
+    super::vattr::SetAttr { mode: Some((mode & ALLPERMS) as u32), ..Default::default() }
+}
 
 /// `GETDIRENTRIES64_EXTENDED_BUFSIZE`, `GETDIRENTRIES_MAXBUFSIZE`,
 /// `GETDIRENTRIES64_EOF`.
@@ -326,26 +362,39 @@ impl Kernel {
     /// The filesystem calls this file serves; `None` for any other.
     pub(crate) fn darwin_fs_call(&mut self, m: &mut GuestMem<'_>, raw: u64, a: &[u64; 6]) -> Option<Result<u64, Errno>> {
         let cwd = dirfd(super::bsd::AT_FDCWD as u64);
-        Some(match raw {
+        let r = match raw {
             // mkdir: the mode's ACCESSPERMS under the umask.
             sys::MKDIR => self.canonical(m, nr::MKDIRAT, [cwd, a[0], a[1] & ACCESSPERMS, 0, 0, 0]),
             sys::MKDIRAT => self.canonical(m, nr::MKDIRAT, [dirfd(a[0]), a[1], a[2] & ACCESSPERMS, 0, 0, 0]),
+            sys::SYMLINK => self.darwin_creating_ok(m, cwd, a[1]).and_then(|()| self.canonical(m, nr::SYMLINKAT, [a[0], cwd, a[1], 0, 0, 0])),
+            sys::SYMLINKAT => self.darwin_creating_ok(m, a[1], a[2]).and_then(|()| self.canonical(m, nr::SYMLINKAT, [a[0], dirfd(a[1]), a[2], 0, 0, 0])),
+            _ => return self.darwin_fs_call_more(m, raw, a),
+        };
+        // What the call made, its checks passed: its record.
+        if let (Ok(_), Some(c)) = (&r, self.darwin_creation.take()) {
+            self.darwin_created(&c, None);
+        }
+        Some(r)
+    }
+
+    /// The rest of [`Kernel::darwin_fs_call`]'s calls, which make nothing.
+    fn darwin_fs_call_more(&mut self, m: &mut GuestMem<'_>, raw: u64, a: &[u64; 6]) -> Option<Result<u64, Errno>> {
+        let cwd = dirfd(super::bsd::AT_FDCWD as u64);
+        Some(match raw {
             sys::RMDIR => self.canonical(m, nr::UNLINKAT, [cwd, a[0], L_AT_REMOVEDIR, 0, 0, 0]),
             sys::CHDIR => self.canonical(m, nr::CHDIR, [a[0], 0, 0, 0, 0, 0]),
             sys::FCHDIR => self.canonical(m, nr::FCHDIR, [a[0], 0, 0, 0, 0, 0]),
             // umask1: ALLPERMS of it kept; the old one back.
             sys::UMASK => self.canonical(m, nr::UMASK, [a[0] & ALLPERMS, 0, 0, 0, 0, 0]),
-            sys::SYMLINK => self.darwin_creating(m, cwd, a[1]).and_then(|()| self.canonical(m, nr::SYMLINKAT, [a[0], cwd, a[1], 0, 0, 0])),
-            sys::SYMLINKAT => self.darwin_creating(m, a[1], a[2]).and_then(|()| self.canonical(m, nr::SYMLINKAT, [a[0], dirfd(a[1]), a[2], 0, 0, 0])),
             // link follows a symlink it names, as linkat with
             // AT_SYMLINK_FOLLOW does; linkat takes that flag alone.
-            sys::LINK => self.darwin_creating(m, cwd, a[1]).and_then(|()| self.canonical(m, nr::LINKAT, [cwd, a[0], cwd, a[1], L_AT_SYMLINK_FOLLOW, 0])),
+            sys::LINK => self.darwin_creating_ok(m, cwd, a[1]).and_then(|()| self.canonical(m, nr::LINKAT, [cwd, a[0], cwd, a[1], L_AT_SYMLINK_FOLLOW, 0])),
             sys::LINKAT => {
                 if a[4] & !AT_SYMLINK_FOLLOW != 0 {
                     Err(Errno::EINVAL)
                 } else {
                     let f = if a[4] & AT_SYMLINK_FOLLOW != 0 { L_AT_SYMLINK_FOLLOW } else { 0 };
-                    self.darwin_creating(m, a[2], a[3]).and_then(|()| self.canonical(m, nr::LINKAT, [dirfd(a[0]), a[1], dirfd(a[2]), a[3], f, 0]))
+                    self.darwin_creating_ok(m, a[2], a[3]).and_then(|()| self.canonical(m, nr::LINKAT, [dirfd(a[0]), a[1], dirfd(a[2]), a[3], f, 0]))
                 }
             }
             sys::RENAME => self.darwin_renaming(m, cwd, a[0], cwd, a[1]).and_then(|()| self.canonical(m, nr::RENAMEAT2, [cwd, a[0], cwd, a[1], 0, 0])),
@@ -368,9 +417,9 @@ impl Kernel {
                     r.and_then(|()| self.darwin_renaming(m, a[0], a[1], a[2], a[3])).and_then(|()| self.canonical(m, nr::RENAMEAT2, [dirfd(a[0]), a[1], dirfd(a[2]), a[3], l, 0]))
                 }
             }
-            // The mode's ALLPERMS.
-            sys::CHMOD => self.canonical(m, nr::FCHMODAT, [cwd, a[0], a[1] & ALLPERMS, 0, 0, 0]),
-            sys::FCHMOD => self.canonical(m, nr::FCHMOD, [a[0], a[1] & ALLPERMS, 0, 0, 0, 0]),
+            // chmod_vnode of the mode's ALLPERMS.
+            sys::CHMOD => self.darwin_setattr(m, SetTarget::Path { dirfd: cwd as i32, path: a[0], follow: true }, mode_set(a[1]), Call::Chmod),
+            sys::FCHMOD => self.darwin_setattr(m, SetTarget::Fd(a[0] as i32), mode_set(a[1]), Call::Chmod),
             sys::FCHMODAT => {
                 let flag = a[3] as u32 as u64;
                 if flag & !(AT_SYMLINK_NOFOLLOW | AT_SYMLINK_NOFOLLOW_ANY) != 0 {
@@ -378,12 +427,15 @@ impl Kernel {
                 } else {
                     // chmodat: AT_SYMLINK_NOFOLLOW_ANY looks up without
                     // following the last component and with no link on the
-                    // way. A symlink's own mode (lchmod) is refused as the
-                    // filesystems here keep none.
+                    // way; a link's own mode is the link's (lchmod).
                     let r = if flag & AT_SYMLINK_NOFOLLOW_ANY != 0 { self.darwin_no_link_on_the_way(m, a[0], a[1]) } else { Ok(()) };
-                    r.and_then(|()| self.canonical(m, nr::FCHMODAT, [dirfd(a[0]), a[1], a[2] & ALLPERMS, if flag & (AT_SYMLINK_NOFOLLOW | AT_SYMLINK_NOFOLLOW_ANY) != 0 { 0x100 } else { 0 }, 0, 0]))
+                    let follow = flag & (AT_SYMLINK_NOFOLLOW | AT_SYMLINK_NOFOLLOW_ANY) == 0;
+                    r.and_then(|()| self.darwin_setattr(m, SetTarget::Path { dirfd: dirfd(a[0]) as i32, path: a[1], follow }, mode_set(a[2]), Call::Chmod))
                 }
             }
+            // chflags1.
+            sys::CHFLAGS => self.darwin_setattr(m, SetTarget::Path { dirfd: cwd as i32, path: a[0], follow: true }, super::vattr::SetAttr { flags: Some(a[1] as u32), ..Default::default() }, Call::Chflags),
+            sys::FCHFLAGS => self.darwin_setattr(m, SetTarget::Fd(a[0] as i32), super::vattr::SetAttr { flags: Some(a[1] as u32), ..Default::default() }, Call::Chflags),
             sys::CHOWN | sys::LCHOWN | sys::FCHOWN | sys::FCHOWNAT => self.darwin_chown(m, raw, a),
             sys::TRUNCATE => self.darwin_truncate(m, a[0], a[1] as i64),
             sys::MKFIFO | sys::MKFIFOAT | sys::MKNOD | sys::MKNODAT => {
@@ -427,7 +479,7 @@ impl Kernel {
     /// `fd` (Darwin's numbering), its last component not followed.
     /// `lookup_validate_creation_path` for a name being made that is not to
     /// be a directory: with a trailing slash, where nothing is, ENOENT.
-    fn darwin_creating(&mut self, m: &GuestMem<'_>, fd: u64, path: u64) -> Result<(), Errno> {
+    fn darwin_creating_ok(&mut self, m: &GuestMem<'_>, fd: u64, path: u64) -> Result<(), Errno> {
         if self.darwin_slash_creation(m, fd, path) {
             return Err(Errno::ENOENT);
         }
@@ -495,11 +547,135 @@ impl Kernel {
                 return Err(super::errno::errno_of(e as i32));
             }
         }
-        if uid == VNOVAL && gid == VNOVAL {
-            return Ok(0);
+        let set = super::vattr::SetAttr { uid: (uid != VNOVAL).then_some(uid), gid: (gid != VNOVAL).then_some(gid), ..Default::default() };
+        let target = match raw {
+            sys::FCHOWN => SetTarget::Fd(a[0] as i32),
+            sys::CHOWN => SetTarget::Path { dirfd: dirfd(cwd) as i32, path: a[0], follow: true },
+            sys::LCHOWN => SetTarget::Path { dirfd: dirfd(cwd) as i32, path: a[0], follow: false },
+            _ => SetTarget::Path { dirfd: dirfd(a[0]) as i32, path: a[1], follow: a[4] as u32 as u64 & (AT_SYMLINK_NOFOLLOW | AT_SYMLINK_NOFOLLOW_ANY) == 0 },
+        };
+        self.darwin_setattr(m, target, set, Call::Chown)
+    }
+
+    /// The file a call that changes attributes names, found: its canonical
+    /// path (its last link not followed where the call does not follow
+    /// it), its attributes and its open description.
+    fn darwin_setattr_target(&mut self, m: &GuestMem<'_>, t: &SetTarget) -> Result<(String, crate::vfs::Metadata, Option<std::sync::Arc<crate::file::OpenFile>>), Errno> {
+        match *t {
+            SetTarget::Fd(fd) => {
+                let file = self.fds.get(fd)?;
+                if self.darwin_vnode_of(&file).is_none() {
+                    return Err(Errno::EINVAL);
+                }
+                let md = file.handle.metadata()?;
+                Ok((super::vattr::vnode_path(&self.vfs, &file.path, &md), md, Some(file)))
+            }
+            SetTarget::Path { dirfd, path, follow } => {
+                let abs = self.path_io().at_path(m, dirfd, path)?;
+                let md = if follow { self.vfs.metadata(&abs)? } else { self.vfs.metadata_nofollow(&abs)? };
+                let canon = if !follow && md.file_type == crate::vfs::FileType::Symlink {
+                    let dir = self.vfs.canonical(&crate::vfs::parent_of(&abs));
+                    let name = crate::vfs::basename(&abs);
+                    if dir == "/" { format!("/{name}") } else { format!("{dir}/{name}") }
+                } else {
+                    self.vfs.canonical(&abs)
+                };
+                Ok((canon, md, None))
+            }
         }
-        self.darwin_unimplemented("the chown family setting an owner or group (the filesystems here keep none)".into());
-        Err(Errno::EOPNOTSUPP)
+    }
+
+    /// A file's owner, group, mode or flags set as `call` sets them, its
+    /// MAC check passed: `vnode_authattr` (its EACCES chmod's EPERM), then
+    /// `vnode_authorize` of what the change needs (chmod's always, the
+    /// others' when it needs anything; chflags' disregarding the flags it
+    /// may change; chmod's and chown's EACCES their EPERM), then
+    /// `vnode_setattr`: EROFS on a read-only volume, the flags but the
+    /// superuser's unsupported ones, and APFS's UF_COMPRESSED, which goes
+    /// with a file's compressed data: one that has none does not take it
+    /// (measured on a Mac's APFS: the call succeeds, the flag is not set),
+    /// and taking it from one that has is not modelled. What is set is
+    /// recorded.
+    pub(crate) fn darwin_setattr(&mut self, m: &GuestMem<'_>, target: SetTarget, mut set: super::vattr::SetAttr, call: Call) -> Result<u64, Errno> {
+        let (canon, old, file) = self.darwin_setattr_auth(m, &target, &mut set, call, 0)?;
+        self.darwin_setattr_apply(&canon, old, file.as_ref().map(|f| f.handle.as_ref()), set, call)
+    }
+
+    /// [`Kernel::darwin_setattr`]'s checks, `extra` rights (setattrlist's
+    /// Finder Info) added to what `vnode_authattr` asks: the file's
+    /// canonical path, its attributes, and its open description.
+    pub(crate) fn darwin_setattr_auth(&mut self, m: &GuestMem<'_>, target: &SetTarget, set: &mut super::vattr::SetAttr, call: Call, extra: u32) -> Result<(String, super::vattr::Owned, Option<std::sync::Arc<crate::file::OpenFile>>), Errno> {
+        use super::vauth::kauth;
+        let (canon, md, file) = self.darwin_setattr_target(m, target)?;
+        if file.as_ref().is_some_and(|f| f.handle.is_host_stdio()) {
+            self.darwin_unimplemented(format!("{} of the host's standard stream {canon}", call.name()));
+            return Err(Errno::EOPNOTSUPP);
+        }
+        let handle = file.as_ref().map(|f| f.handle.as_ref());
+        let old = match super::vattr::of(&self.vfs, &canon, &md, handle) {
+            Ok(o) => o,
+            Err(why) => {
+                self.darwin_unimplemented(why);
+                return Err(Errno::EIO);
+            }
+        };
+        let cred = self.dtask.cred.clone();
+        let eperm = |e: Errno| if e == Errno::EACCES { Errno::EPERM } else { e };
+        let action = match super::vattr::authattr(&cred, &old, set) {
+            Ok(a) => a | extra,
+            Err(e) if matches!(call, Call::Chmod | Call::Utimes(false)) => return Err(eperm(e)),
+            Err(e) => return Err(e),
+        };
+        if call == Call::Chmod || action != 0 {
+            let node = super::vauth::Node { vtype: md.file_type, attrs: Ok(old), mnt_flags: super::vattr::device_mnt_flags(&canon) };
+            let action = if call == Call::Chflags { action | kauth::NOIMMUTABLE } else { action };
+            match self.darwin_authorize(&cred, &node, None, action) {
+                Ok(()) => {}
+                Err(e) if matches!(call, Call::Chmod | Call::Chown | Call::Utimes(false)) => return Err(eperm(e)),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok((canon, old, file))
+    }
+
+    /// `vnode_setattr` of what `set` asks of the file at canonical `canon`
+    /// with attributes `old` (open as `handle`), its checks passed.
+    pub(crate) fn darwin_setattr_apply(&mut self, canon: &str, old: super::vattr::Owned, handle: Option<&dyn crate::vfs::FileHandle>, set: super::vattr::SetAttr, call: Call) -> Result<u64, Errno> {
+        use super::vattr::flags as vf;
+        let canon = canon.to_string();
+        if super::vattr::device_mnt_flags(&canon) & super::vauth::mnt::RDONLY != 0 {
+            return Err(Errno::EROFS);
+        }
+        let attrs = set.uid.is_some() || set.gid.is_some() || set.mode.is_some() || set.flags.is_some();
+        if attrs && super::kern::mount_of(&canon).fs == super::kern::Fs::Devfs {
+            self.darwin_unimplemented(format!("{} of devfs node {canon} (devfs_setattr)", call.name()));
+            return Err(Errno::EOPNOTSUPP);
+        }
+        let mut new = old;
+        if let Some(f) = set.flags {
+            let f = f & (vf::SF_SUPPORTED | vf::UF_SETTABLE);
+            if old.flags & vf::UF_COMPRESSED != 0 && f & vf::UF_COMPRESSED == 0 {
+                self.darwin_unimplemented(format!("clearing UF_COMPRESSED of {canon} (APFS's decompression of its data)"));
+                return Err(Errno::EOPNOTSUPP);
+            }
+            new.flags = (f & !vf::UF_COMPRESSED) | (old.flags & vf::UF_COMPRESSED);
+        }
+        if let Some(mode) = set.mode {
+            new.mode = mode & super::vattr::ALLPERMS;
+        }
+        if let Some(uid) = set.uid {
+            new.uid = uid;
+        }
+        if let Some(gid) = set.gid {
+            new.gid = gid;
+        }
+        if new != old {
+            if let Err(why) = super::vattr::record(&self.vfs, &canon, handle, &new) {
+                self.darwin_unimplemented(why);
+                return Err(Errno::EIO);
+            }
+        }
+        Ok(0)
     }
 
     pub(crate) fn darwin_no_link_on_the_way(&mut self, m: &GuestMem<'_>, fd: u64, path: u64) -> Result<(), Errno> {
@@ -538,6 +714,12 @@ impl Kernel {
             };
             (Some(tv(tptr)?), Some(tv(tptr + 16)?))
         };
+        // setutimes: the owner or root may set any times, anyone allowed to
+        // write the file the time now.
+        let target = if path == 0 { SetTarget::Fd(dirfd) } else { SetTarget::Path { dirfd, path, follow: true } };
+        let mut set = super::vattr::SetAttr { times: true, utimes_null: tptr == 0, ..Default::default() };
+        let (canon, old, file) = self.darwin_setattr_auth(m, &target, &mut set, Call::Utimes(tptr == 0), 0)?;
+        self.darwin_setattr_apply(&canon, old, file.as_ref().map(|f| f.handle.as_ref()), set, Call::Utimes(tptr == 0))?;
         self.path_io().set_times_at(m, dirfd, path, atime, mtime, true)
     }
 

@@ -1064,7 +1064,7 @@ impl Kernel {
         // Setup's checks as launchd meets them: root, and no sandbox.
         for f in &files {
             if let Some(file) = &f.file {
-                self.darwin_sr_check_file(file, &f.mappings, None).map_err(|e| format!("{}: {e:?}", file.path))?;
+                self.darwin_sr_check_file(file, &f.mappings, false).map_err(|e| format!("{}: {e:?}", file.path))?;
             }
         }
         let mut space = BootSpace { data: (data_at, data) };
@@ -1136,25 +1136,31 @@ impl Kernel {
 
     /// `shared_region_map_and_slide_setup`'s checks of a vnode to map: a
     /// regular file, `mac_file_check_mmap` (Sandbox's, of everything),
-    /// owned by root (as `stat` reports owners here: the caller's ids), on
-    /// the process's root volume or the preboot cryptex volume, and every
-    /// mapping but a zero-filled one covered by a code signature on it.
-    /// `caller` is this process (`Some(uid)`), or none for launchd at boot,
-    /// root with no sandbox.
-    fn darwin_sr_check_file(&mut self, f: &File, mappings: &[MappingNp], caller: Option<u32>) -> Result<(), Errno> {
+    /// owned by root (its `va_uid`), on the process's root volume or the
+    /// preboot cryptex volume, and every mapping but a zero-filled one
+    /// covered by a code signature on it. `caller` is whether this process
+    /// calls (launchd at boot is root with no sandbox).
+    fn darwin_sr_check_file(&mut self, f: &File, mappings: &[MappingNp], caller: bool) -> Result<(), Errno> {
         let md = f.handle.metadata()?;
         if md.file_type != crate::vfs::FileType::Regular {
             return Err(Errno::EINVAL);
         }
-        if let Some(uid) = caller {
+        if caller {
             let v = super::macvfs::sb_vnode(&f.path, &md);
             let e = self.darwin_mac_check_file_mmap(v, u64::from(prot::ALL), shared_dyld(f.vnode));
             if e != 0 {
                 return Err(super::errno::errno_of(e as i32));
             }
-            if uid != 0 {
-                return Err(Errno::EPERM);
+        }
+        let owner = match super::vattr::of(&self.vfs, &f.path, &md, Some(f.handle.as_ref())) {
+            Ok(o) => o.uid,
+            Err(why) => {
+                self.darwin_unimplemented(why);
+                return Err(Errno::EIO);
             }
+        };
+        if owner != 0 {
+            return Err(Errno::EPERM);
         }
         let file_mount = super::kern::mount_of(&f.path).on;
         if file_mount != super::kern::mount_of("/").on && Some(file_mount) != super::kern::preboot_cryptex_volume() {
@@ -1284,8 +1290,7 @@ impl Kernel {
             let Some(vnode) = self.darwin_vnode_of(&file) else { return Err(Errno::EINVAL) };
             let path = self.vfs.canonical(&file.path);
             let f = Arc::new(File { handle: Arc::clone(&file.handle), path, vnode });
-            let uid = self.creds.uid();
-            self.darwin_sr_check_file(&f, &srf.mappings, Some(uid))?;
+            self.darwin_sr_check_file(&f, &srf.mappings, true)?;
             srf.file = Some(f);
         }
         let mut space = TaskSpace { k: self, m, unported: Vec::new() };

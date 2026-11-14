@@ -67,6 +67,8 @@ pub struct Image {
     /// What AMFI's launch constraints hook is to see of a spawn: its launch
     /// type and AMFI's MAC extension (none for an execve).
     pub launch: Option<super::launchcon::Spawn>,
+    /// The image's owner, group and set-id bits, for `exec_handle_sugid`.
+    pub setid: SetId,
     /// An exec in place's new thread (`cloneproc`'s): its thread id. Zero
     /// for a spawn's child, whose thread the spawn made.
     pub thread_id: u64,
@@ -96,6 +98,19 @@ struct Imgp {
     binprefs: Option<[(u32, u32); 4]>,
     /// Sandbox's process-exec check of the last lookup marked the exec.
     sandbox_mark: bool,
+    /// `ip_origvattr`'s owner, group and set-id bits, as
+    /// `exec_check_permissions` leaves them.
+    setid: SetId,
+}
+
+/// What `exec_handle_sugid` reads of the image (`ip_origvattr`): its
+/// owner, its group, and its VSUID and VSGID bits (none on a nosuid
+/// volume).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SetId {
+    pub uid: u32,
+    pub gid: u32,
+    pub bits: u32,
 }
 
 fn be32(b: &[u8], o: usize) -> u32 {
@@ -260,7 +275,7 @@ impl Kernel {
     pub(crate) fn darwin_exec_activate_with(&mut self, m: &GuestMem<'_>, fname: u64, argv: u64, envv: u64, binprefs: Option<[(u32, u32); 4]>) -> Result<Image, Errno> {
         let mut strings = Strings::new();
         strings.save_user_path(m, fname)?;
-        let mut img = Imgp { strings, vdata: Vec::new(), interpret: false, interp_buffer: Vec::new(), origcputype: 0, origcpusubtype: 0, arch_offset: 0, arch_size: 0, path: String::new(), size: 0, binprefs, sandbox_mark: false };
+        let mut img = Imgp { strings, vdata: Vec::new(), interpret: false, interp_buffer: Vec::new(), origcputype: 0, origcpusubtype: 0, arch_offset: 0, arch_size: 0, path: String::new(), size: 0, binprefs, sandbox_mark: false, setid: SetId::default() };
         let mut itercount = 0;
         // ip_scriptvp: the script an interpreter runs.
         let mut script = None;
@@ -296,7 +311,7 @@ impl Kernel {
         let slice = bytes.get(img.arch_offset as usize..(img.arch_offset + size) as usize).ok_or(ebadmacho())?;
         let load = self.darwin_load_signatures(&img.path, img.arch_offset, slice)?;
         let sandbox = super::sandboxes::Pending { script, spawnattrs: None, marked: img.sandbox_mark };
-        Ok(Image { path: img.path, arch_offset: img.arch_offset, arch_size: img.arch_size, cputype: img.origcputype, cpusubtype: img.origcpusubtype, strings: img.strings, spawn: None, load, thread_id: 0, sandbox, launch: None })
+        Ok(Image { path: img.path, arch_offset: img.arch_offset, arch_size: img.arch_size, cputype: img.origcputype, cpusubtype: img.origcpusubtype, strings: img.strings, spawn: None, load, thread_id: 0, sandbox, launch: None, setid: img.setid })
     }
 
     /// `namei` of the saved path, links followed, then
@@ -316,22 +331,32 @@ impl Kernel {
         if md.file_type != crate::vfs::FileType::Regular {
             return Err(Errno::EACCES);
         }
-        if md.mode & 0o111 == 0 {
+        // The image's owner, group and mode (vnode_getattr).
+        let canonical = self.vfs.canonical(&abs);
+        let node = self.darwin_vnode_node(&canonical, &md, None);
+        let owned = match &node.attrs {
+            Ok(o) => *o,
+            Err(why) => {
+                self.darwin_unimplemented(why.clone());
+                return Err(Errno::EIO);
+            }
+        };
+        if owned.mode & 0o111 == 0 {
             return Err(Errno::EACCES);
         }
         if md.size == 0 {
             return Err(Errno::ENOEXEC);
         }
-        // mac_vnode_check_exec, of the interpreter's for a script's.
-        let canonical = self.vfs.canonical(&abs);
-        img.sandbox_mark = self.darwin_mac_check_vnode_exec(&canonical, md.mode, img.interpret).map_err(|e| super::errno::errno_of(e as i32))?;
-        // vnode_authorize(KAUTH_VNODE_EXECUTE): no mount here is noexec; the
-        // superuser needs only an execute bit, which there is. Anyone else
-        // by the owner's bit, the file being owned by whom its stat says,
-        // the caller (gex's files have no owner of their own).
-        if self.creds.uid() != 0 && md.mode & 0o100 == 0 {
-            return Err(Errno::EACCES);
-        }
+        // No process is traced here; a nosuid volume's set-id bits do not
+        // count.
+        let bits = if super::vattr::device_nosuid(&canonical) { 0 } else { owned.mode & (super::vattr::S_ISUID | super::vattr::S_ISGID) };
+        img.setid = SetId { uid: owned.uid, gid: owned.gid, bits };
+        // mac_vnode_check_exec, of the interpreter's for a script's (its
+        // policies read the vnode's own mode).
+        img.sandbox_mark = self.darwin_mac_check_vnode_exec(&canonical, owned.mode, img.interpret).map_err(|e| super::errno::errno_of(e as i32))?;
+        // vnode_authorize(KAUTH_VNODE_EXECUTE).
+        let cred = self.dtask.cred.clone();
+        self.darwin_authorize(&cred, &node, None, super::vauth::kauth::EXECUTE)?;
         img.arch_offset = 0;
         img.arch_size = md.size;
         img.size = md.size;
@@ -441,8 +466,9 @@ impl Kernel {
 }
 
 impl Kernel {
-    /// The task an exec leaves ([`Self::darwin_exec_switch_body`]).
-    pub fn darwin_exec_switch(&mut self, spawn: Option<&super::spawn::After>, thread_id: u64) {
+    /// The task an exec leaves ([`Self::darwin_exec_switch_body`]), of an
+    /// image whose owner, group and set-id bits are `setid`.
+    pub fn darwin_exec_switch(&mut self, spawn: Option<&super::spawn::After>, thread_id: u64, setid: SetId) {
         // An exec in place goes on in its new thread: its id, and no TSD
         // base until the image sets one.
         if thread_id != 0 {
@@ -452,6 +478,7 @@ impl Kernel {
             t.set_name(None);
         }
         self.darwin_exec_switch_body(spawn);
+        self.darwin_exec_setid(setid);
         self.darwin_ipc_leave();
         // posix_spawn's exec_failure_reason past the point of no return:
         // SIGKILL, carrying OS_REASON_EXEC's EXEC_EXIT_REASON_BAD_PSATTR.
@@ -460,6 +487,45 @@ impl Kernel {
             const EXEC_EXIT_REASON_BAD_PSATTR: u64 = 19;
             let r = super::reason::OsReason::new(OS_REASON_EXEC, EXEC_EXIT_REASON_BAD_PSATTR);
             self.darwin_psignal_try_thread(super::signal::dsig::SIGKILL, Some(std::sync::Arc::new(r)));
+        }
+    }
+
+    /// `exec_handle_sugid` of a set-id image: one whose set-user-id owner
+    /// is not the caller's effective user, or whose set-group-id group is
+    /// not its effective group (a member's leaves P_SUGID clear). A
+    /// release kernel (no CONFIG_SETUID) changes no id; the process is
+    /// marked P_SUGID, and its descriptors 0, 1 and 2, any not open, are
+    /// opened on /dev/null. The task's and thread's ports are reset
+    /// (`ipc_task_reset`, `ipc_thread_reset`), which is reported.
+    fn darwin_exec_setid(&mut self, setid: SetId) {
+        let c = &self.dtask.cred;
+        let suid = setid.bits & super::vattr::S_ISUID != 0 && c.uid != setid.uid;
+        let mut leave_sugid_clear = false;
+        let sgid = !suid && setid.bits & super::vattr::S_ISGID != 0 && {
+            leave_sugid_clear = c.is_member(setid.gid);
+            !leave_sugid_clear || c.gid() != setid.gid
+        };
+        if !(suid || sgid) || leave_sugid_clear {
+            return;
+        }
+        self.darwin_unimplemented("ipc_task_reset and ipc_thread_reset of a set-id image's exec".into());
+        self.dtask.sugid = true;
+        const O_RDONLY: u64 = 0;
+        const O_WRONLY: u64 = 1;
+        for fd in 0..3 {
+            if self.fds.get(fd).is_ok() {
+                continue;
+            }
+            let flags = if fd == 0 { O_RDONLY } else { O_WRONLY };
+            match self.vfs.open("/dev/null", flags, 0) {
+                Ok(h) => {
+                    let file = crate::file::OpenFile::new(h, "/dev/null".to_string(), flags, fd == 0, fd != 0);
+                    if self.fds.install(fd, file, false).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
         }
     }
 
@@ -772,7 +838,7 @@ mod tests {
     fn script(line: &[u8]) -> Imgp {
         let mut vdata = vec![0u8; PAGE_SIZE as usize];
         vdata[..line.len()].copy_from_slice(line);
-        Imgp { strings: Strings::new(), vdata, interpret: false, interp_buffer: Vec::new(), origcputype: 0, origcpusubtype: 0, arch_offset: 0, arch_size: 0, path: String::new(), size: 0, binprefs: None, sandbox_mark: false }
+        Imgp { strings: Strings::new(), vdata, interpret: false, interp_buffer: Vec::new(), origcputype: 0, origcpusubtype: 0, arch_offset: 0, arch_size: 0, path: String::new(), size: 0, binprefs: None, sandbox_mark: false, setid: SetId::default() }
     }
 
     #[test]

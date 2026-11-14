@@ -293,8 +293,13 @@ impl Kernel {
         let dflags = a[at];
         self.darwin_open_mode(dflags)?;
         let (dirfd, path) = if at == 1 { (super::bsd::AT_FDCWD as u64, a[0]) } else { (a[0], a[1]) };
-        // vn_open_auth's lookup and Sandbox's checks of it.
-        self.darwin_sb_open_check(m, dirfd, path, dflags)?;
+        // openat_internal's creation mode: the access permissions the umask
+        // leaves (`((mode & ~fd_cmask) & ALLPERMS) & ~S_ISTXT`, then
+        // ACCESSPERMS of it).
+        let cmode = (a[at + 1] as u32 & !self.darwin_umask()) & super::fsops::ACCESSPERMS as u32;
+        // vn_open_auth's lookup, Sandbox's checks of it and the
+        // authorization; what an O_CREAT makes.
+        let creating = self.darwin_sb_open_check(m, dirfd, path, dflags, cmode)?;
         // A creation whose last component ends in a slash: namei's ENOENT.
         if dflags & super::kern::DARWIN_O_CREAT != 0 && self.darwin_slash_creation(m, dirfd, path) {
             return Err(Errno::ENOENT);
@@ -313,6 +318,10 @@ impl Kernel {
             la[2] = (la[2] & !3) | crate::fs::oflags::O_PATH | 0x8000;
         }
         let fd = self.canonical(m, n, la)? as i32;
+        if let Some(c) = creating {
+            let file = self.fds.get(fd)?;
+            self.darwin_created(&c, Some(file.handle.as_ref()));
+        }
         if dflags & O_CLOFORK != 0 {
             let _ = self.fds.set_clofork(fd, true);
         }
