@@ -560,15 +560,46 @@ mod task {
         (0..h).flat_map(|y| bytes[y * bpr..y * bpr + w * texel].to_vec()).collect()
     }
 
-    fn present_cases() -> String {
-        let (w, h) = (64u32, 16u32);
+    const PANEL: (u32, u32) = (64, 16);
+
+    fn bgra_layer() -> Layer {
+        let (w, h) = PANEL;
         let n = (w * h) as usize;
-        // BGRA: the canvas holds the bytes.
-        let bgra: Vec<u8> = (0..n * 4).map(|i| ((i * 2654435761usize) >> 7) as u8).collect();
-        let l = Layer { index: 0, surface: 1, pixel_format: fourcc(b"BGRA"), width: w.into(), height: h.into(), planes: vec![plane(0, w.into(), h.into(), (w * 4).into(), 4)], bytes: bgra.clone(), src: full(w, h), dst: full(w, h), transform: 0 };
-        let got = present(&frame(1, (w, h), vec![l.clone()])).expect("a BGRA frame");
-        assert_eq!(rows(&got, w as usize, h as usize, 4), bgra, "the canvas holds the BGRA frame's bytes");
-        // b3a8: every 10-bit code in each channel, the halves of their values.
+        let bytes: Vec<u8> = (0..n * 4).map(|i| ((i * 2654435761usize) >> 7) as u8).collect();
+        Layer { index: 0, surface: 1, pixel_format: fourcc(b"BGRA"), width: w.into(), height: h.into(), planes: vec![plane(0, w.into(), h.into(), (w * 4).into(), 4)], bytes, src: full(w, h), dst: full(w, h), transform: 0 }
+    }
+
+    /// BGRA: the canvas holds the bytes. Frames the page cannot show are
+    /// refused with their reason. The panel goes dark and lights.
+    fn present_bgra() -> String {
+        let (w, h) = PANEL;
+        let l = bgra_layer();
+        let got = present(&frame(1, PANEL, vec![l.clone()])).expect("a BGRA frame");
+        assert_eq!(rows(&got, w as usize, h as usize, 4), l.bytes, "the canvas holds the BGRA frame's bytes");
+        let mut argb = l.clone();
+        argb.pixel_format = fourcc(b"ARGB");
+        let e = present(&frame(3, PANEL, vec![argb])).unwrap_err();
+        assert!(e.contains("no description"), "{e}");
+        let e = present(&frame(4, PANEL, vec![l.clone(), l.clone()])).unwrap_err();
+        assert!(e.contains("blending"), "{e}");
+        let mut scaled = l.clone();
+        scaled.dst = full(w / 2, h);
+        let e = present(&frame(5, PANEL, vec![scaled])).unwrap_err();
+        assert!(e.contains("covers the panel"), "{e}");
+        for on in [0u32, 1] {
+            let mut wr = Writer::default();
+            wr.u32(on);
+            ep_send(protocol::PANEL, 0, &wr.0);
+            let p = ep_receive(protocol::PANEL_DONE, WAIT_MS).expect("PANEL_DONE");
+            assert_eq!(u32::from_le_bytes(p[0..4].try_into().unwrap()), 0, "{}", String::from_utf8_lossy(&p[8..]));
+        }
+        format!("BGRA {w}x{h} byte for byte; ARGB, two layers and a scaled layer refused; the panel dark and lit")
+    }
+
+    /// b3a8: every 10-bit code in each channel; the canvas holds their halves.
+    fn present_b3a8() -> String {
+        let (w, h) = PANEL;
+        let n = (w * h) as usize;
         let xr = display::xr_halves();
         let alpha = display::unorm8_halves();
         let mut bytes = vec![0u8; n * 4 + n];
@@ -582,7 +613,7 @@ mod task {
                 want.extend_from_slice(&x.to_le_bytes());
             }
         }
-        let l3 = Layer {
+        let l = Layer {
             index: 0,
             surface: 2,
             pixel_format: fourcc(b"b3a8"),
@@ -594,28 +625,9 @@ mod task {
             dst: full(w, h),
             transform: 0,
         };
-        let got = present(&frame(2, (w, h), vec![l3])).expect("a b3a8 frame");
+        let got = present(&frame(2, PANEL, vec![l])).unwrap_or_else(|e| panic!("a b3a8 frame: {e}"));
         assert_eq!(rows(&got, w as usize, h as usize, 8), want, "the canvas holds each code's half");
-        // Refused frames.
-        let mut argb = l.clone();
-        argb.pixel_format = fourcc(b"ARGB");
-        let e = present(&frame(3, (w, h), vec![argb])).unwrap_err();
-        assert!(e.contains("no description"), "{e}");
-        let e = present(&frame(4, (w, h), vec![l.clone(), l.clone()])).unwrap_err();
-        assert!(e.contains("blending"), "{e}");
-        let mut scaled = l.clone();
-        scaled.dst = full(w / 2, h);
-        let e = present(&frame(5, (w, h), vec![scaled])).unwrap_err();
-        assert!(e.contains("covers the panel"), "{e}");
-        // The panel's power.
-        for on in [0u32, 1] {
-            let mut wr = Writer::default();
-            wr.u32(on);
-            ep_send(protocol::PANEL, 0, &wr.0);
-            let p = ep_receive(protocol::PANEL_DONE, WAIT_MS).expect("PANEL_DONE");
-            assert_eq!(u32::from_le_bytes(p[0..4].try_into().unwrap()), 0, "{}", String::from_utf8_lossy(&p[8..]));
-        }
-        format!("BGRA {w}x{h} byte for byte; b3a8 {w}x{h} ({n} codes per channel) as the exact halves; ARGB, two layers and a scaled layer refused")
+        format!("b3a8 {w}x{h} ({n} codes per channel) as the exact halves of their values")
     }
 
     /// Run the checks; each result goes to the page.
@@ -638,7 +650,7 @@ mod task {
         check("blit", || blit_cases(&mut c));
         check("faults", || fault_cases(&mut c));
         check("iosurface", || surface_cases(&mut c));
-        check("present", present_cases);
+        check("present-bgra", present_bgra);
         let reports = ep_pending(protocol::REPORT);
         let mut texts = Vec::new();
         for _ in 0..reports {
@@ -646,6 +658,9 @@ mod task {
             texts.push(String::from_utf8_lossy(&p[8..]).into_owned());
         }
         result("reports", true, &texts.join(" | "));
+        // Last: a browser without rgba16float canvases fails it, and a failed
+        // check ends the module.
+        check("present-b3a8", present_b3a8);
         let mut w = Writer::default();
         w.u64(CONN);
         ep_send(protocol::CLOSE, 0, &w.0);

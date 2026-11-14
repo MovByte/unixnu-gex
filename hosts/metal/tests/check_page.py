@@ -127,6 +127,24 @@ def launch(browser, url, profile):
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def close_safari_tabs(prefix):
+    """Close the Safari tabs the run opened (`open -a` leaves them open)."""
+    script = [
+        'tell application "Safari"',
+        "repeat with w in windows",
+        'set ts to (every tab of w whose URL starts with "%s")' % prefix,
+        "repeat with i from (count of ts) to 1 by -1",
+        "close (item i of ts)",
+        "end repeat",
+        "end repeat",
+        "end tell",
+    ]
+    args = ["osascript"]
+    for line in script:
+        args += ["-e", line]
+    subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--browser", default="chrome")
@@ -152,7 +170,9 @@ def main():
     try:
         finished = state["event"].wait(args.timeout)
     finally:
-        if proc is not None:
+        if proc is None:
+            close_safari_tabs("http://127.0.0.1:%d/" % httpd.server_address[1])
+        else:
             proc.terminate()
             try:
                 proc.wait(15)
