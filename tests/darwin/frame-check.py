@@ -2,7 +2,9 @@
 # it (hosts/native/src/darwin_frames.rs): one frame, of swap 1, one layer
 # (layer 0) of a BGRA surface the panel's size, its source and destination
 # the whole panel, untransformed, one plane, and every pixel the pattern
-# the program wrote (iomfb.c's fill), the rows' padding zero.
+# the program wrote (iomfb.c's fill), the rows' padding zero. Then the
+# panel going dark and lighting again, after that frame and in that order
+# (the program's power change; the swap it made while off is never shown).
 import struct
 import sys
 from pathlib import Path
@@ -13,9 +15,9 @@ def fail(why):
     sys.exit(1)
 
 
-frames = sorted(Path(sys.argv[1]).glob("frame-*.bin"))
-if len(frames) != 1:
-    fail(f"{len(frames)} frames recorded, want 1")
+frames = sorted(Path(sys.argv[1]).glob("frame-*.bin"), key=lambda p: int(p.name[len("frame-"):-len(".bin")]))
+if len(frames) != 2:
+    fail(f"{len(frames)} frames recorded, want 2")
 b = frames[0].read_bytes()
 at = 0
 
@@ -55,3 +57,36 @@ for y in range(h):
     if row != want:
         x = next(i for i in range(bpr) if row[i] != want[i]) // 4
         fail(f"row {y} differs from pixel {x}")
+
+# The second frame: a later swap that set only layer 1 (a 64x64 BGRA surface
+# of 0x40 bytes on the panel's corner), layer 0 still the first swap's.
+b = frames[1].read_bytes()
+at = 0
+magic, version, swap2, vbl2, time2, pw2, ph2, layers2 = take("4sIIQQIII")
+if magic != b"GEXF" or swap2 <= swap_id or vbl2 <= vbl or layers2 != 2:
+    fail(f"second frame: swap {swap2}, blank {vbl2}, {layers2} layers")
+index0, surface0, fmt0, w0, h0 = take("IIIQQ")
+src0, dst0 = take("4i"), take("4i")
+transform0, planes0 = take("II")
+if (index0, surface0, w0, h0, src0, dst0) != (0, surface, w, h, src, dst):
+    fail(f"second frame's layer 0: {index0}, surface {surface0}, {w0}x{h0}, {src0} to {dst0}")
+at += planes0 * struct.calcsize("<QQQQIIIQ")
+(n0,) = take("Q")
+at += n0
+index1, surface1, fmt1, w1, h1 = take("IIIQQ")
+src1, dst1 = take("4i"), take("4i")
+transform1, planes1 = take("II")
+if (index1, fmt1, w1, h1, src1, dst1, transform1, planes1) != (1, fmt, 64, 64, (0, 0, 64, 64), (0, 0, 64, 64), 0, 1) or surface1 == surface:
+    fail(f"second frame's layer 1: {index1}, format {fmt1:#x}, {w1}x{h1}, {src1} to {dst1}")
+offset1, pw1, ph1, bpr1, bpe1, ew1, eh1, size1 = take("QQQQIIIQ")
+(n1,) = take("Q")
+if any(b[at + y * bpr1 + x] != 0x40 for y in range(64) for x in range(256)):
+    fail("second frame's layer 1 is not its surface's bytes")
+
+# The panel's power, numbered with the frames: dark, then lit, after the
+# frames.
+first = int(frames[-1].name[len("frame-"):-len(".bin")])
+panel = sorted(Path(sys.argv[1]).glob("panel-*.txt"), key=lambda p: int(p.name[len("panel-"):-len(".txt")]))
+states = [(int(p.name[len("panel-"):-len(".txt")]), p.read_text().strip()) for p in panel]
+if [s for _, s in states] != ["off", "on"] or any(n <= first for n, _ in states):
+    fail(f"the panel's power {states} after frame {first}, want off then on")

@@ -392,13 +392,8 @@ impl Kernel {
         if let Some((target, op)) = reply.defer {
             match req.reply {
                 Some(Carried::Port(rport)) => {
-                    let blank = matches!(op, Deferred::IomfbSwapWait { .. });
                     let pending = PendingReply { id: req.id, rport, rtype: bits::local(req.bits), target, op };
                     self.dtask.pending_replies.push(pending);
-                    // A swap wait is answered at a vertical blank.
-                    if blank {
-                        self.darwin_iomfb_arm();
-                    }
                 }
                 Some(r) => self.ipc().object_destroy(r, bits::local(req.bits)),
                 None => {}
@@ -510,10 +505,6 @@ pub enum Deferred {
     /// (`held`: a stop hold was put on it for this.)
     GetState { flavor: i32, count: u32, held: bool },
     SetState { flavor: i32, state: Vec<u32>, held: bool },
-    /// IOMobileFramebuffer's blocking swap wait (selector 6): io_connect_method's
-    /// reply once the swap is where the wait's options ask, or the client
-    /// that waits is stopped (kIOReturnAborted).
-    IomfbSwapWait { client: u32, swap: u32, options: u32 },
     /// A user client's method that answers later, by its token
     /// ([`super::mig::later_reply`]); answered by
     /// [`Kernel::darwin_answer_later`], not by a thread stopping.
@@ -569,7 +560,6 @@ impl Kernel {
         match p.op {
             Deferred::Later(_) => false,
             Deferred::TaskWait { .. } => self.thread_signals.tids_in_order().into_iter().filter(|&t| t != p.target).all(|t| self.darwin_offcpu(t)),
-            Deferred::IomfbSwapWait { client, swap, options } => super::iokit::iomfb_wait_outcome(client, swap, options).is_some(),
             _ => p.target == self.tid || !self.darwin_thread_alive(p.target) || self.darwin_offcpu(p.target),
         }
     }
@@ -590,13 +580,6 @@ impl Kernel {
                 Deferred::TaskWait { token: Some(port) } => Reply { ret: 0, defer: None, out: Vec::new(), ports: vec![PortOut::Right(Carried::Port(port), msgt::PORT_SEND_ONCE)], unimplemented: None },
                 Deferred::GetState { flavor, count, .. } => self.darwin_thread_state_now(m, tid, flavor, count, None),
                 Deferred::SetState { flavor, ref state, .. } => self.darwin_thread_state_now(m, tid, flavor, 0, Some(state.clone())),
-                // io_connect_method's reply with no output: the inband and
-                // scalar counts and the out-of-line size, all zero.
-                Deferred::IomfbSwapWait { client, swap, options } => match super::iokit::iomfb_wait_outcome(client, swap, options) {
-                    Some(0) => Reply::ok(vec![0; 16]),
-                    Some(r) => Reply::err(r),
-                    None => unreachable!("a swap wait answered before it is done"),
-                },
                 Deferred::Later(_) => unreachable!("a method's later reply is never ready by itself"),
             };
             if matches!(p.op, Deferred::GetState { held: true, .. } | Deferred::SetState { held: true, .. }) {

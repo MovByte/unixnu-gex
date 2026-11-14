@@ -550,7 +550,7 @@ dyld and libSystem from the device's shared cache.
 | kqueue, poll and pipes | `kq-pipe`, `vnode`, `vnextend`, `select`, `poll`, `pipe`, `timeouts` |
 | terminals and `/dev` | `pty`, `ptyjob`, `ptyclose`, `bsdpty`, `ttyinfo`, `ttydead`, `ttydrain`, `fcntltty`, `revoke`, `devfs`, `devattr` |
 | sockets | `sockerr`, `sockevent`, `sockname`, `sockopts`, `halfclose`, `nosigpipe`, `dgrambuf`, `streambuf` |
-| code signing and IOKit | `codesig`, `amfi`, `launchcon`, `policy`, `iokit`, `ioreg`, `iosurface`, `iosurfacex`, `iogpudev`, `accel`, `accelr`, `iomfb` |
+| code signing and IOKit | `codesig`, `amfi`, `launchcon`, `policy`, `iokit`, `ioreg`, `iosurface`, `iosurfacex`, `iogpudev`, `accel`, `accelr`, `iomfb`, `iomfbmain` |
 | the GPU (WebMetal) | `metalwire`, `metal` |
 
 The suite runs single programs and the processes they create. None of it
@@ -611,8 +611,12 @@ is the reference (search `crates/gex-kernel/src/` for
     selectors;
   - the framebuffer's user client selectors other than the swap's (begin,
     end, wait, cancel, cancel all), the display's size, id and main-display
-    query, the default surface, the debug flags, the absolute time and the
-    notification switch, and a displayed surface's send right;
+    query, the default surface, the debug flags, the absolute time, the
+    notification switch and the color remap mode, and a displayed surface's
+    send right;
+  - the pipe's runtime properties registered with starting values not yet
+    worked out (the framebuffer publishes each it registers; the names it
+    never registers are answered missing);
   - framebuffer frame information and CRC notifications, and its power
     assertions;
   - swaps whose layers the pipe would scale, rotate, or read from YCbCr,

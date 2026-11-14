@@ -11,13 +11,16 @@
 //! - Its user client, `IOMobileFramebufferUserClient`, which
 //!   IOMobileFramebuffer.framework opens with `IOServiceOpen` for any type
 //!   (`IOMobileFramebuffer::newUserClient` checks none): its methods
-//!   ([`methods`]), its notification ports, and the swaps a client makes
-//!   ([`swap`]).
+//!   ([`methods`]), its notification ports, the swaps a client makes and
+//!   the display's power ([`swap`]).
 //! - The panel. A completed swap's surfaces go to the embedder's
 //!   presentation sink ([`sink`]) at the panel's vertical blank, which the
-//!   framebuffer counts at the panel's rate ([`swap::Panel`]).
+//!   framebuffer counts at the panel's rate ([`swap::Panel`]) while the
+//!   display's controller is on; the sink is told as the panel goes dark
+//!   and lights.
 
 pub mod methods;
+pub mod rtprop;
 pub mod sink;
 pub mod swap;
 
@@ -69,7 +72,7 @@ pub fn is_service(i: u32) -> bool {
 /// - There is no `IOMatchCategory` in the personality.
 ///
 /// What the framebuffer's start sets besides is reported when read (see
-/// [`property_absent`] for the names no image can set).
+/// [`property_absent`] for the names no driver sets).
 pub fn add_service(t: &mut Vec<Node>, nub: u32) {
     let s = |v: &str| Prop::Str(v.to_string());
     let sym = |v: &str| Prop::Sym(v.to_string());
@@ -89,15 +92,45 @@ pub fn add_service(t: &mut Vec<Node>, nub: u32) {
     t.push(Node { name: CLASS.to_string(), props: Vec::new(), class: CLASS, service_props, parent: Some(nub), children: Vec::new(), kernel_only: false, nub: None });
 }
 
-/// Property names that no image of the 21H461 kernelcache has as a
-/// string, and that so no driver can set on the framebuffer or its nub:
-/// read on them, they are answered as missing.
-/// - `GainMapVersion`, which `IOMobileFramebufferOpen` reads from the
-///   service.
-/// - `canvas-width` and `canvas-height`, which it reads from the service's
-///   provider (`getEDTProperty`); disp0's device tree entry has neither.
-pub fn property_absent(name: &str) -> bool {
-    matches!(name, "GainMapVersion" | "canvas-width" | "canvas-height")
+/// Property names no driver sets on the framebuffer (entry `i`, the
+/// service) or on its nub (the service's provider), which read on them are
+/// answered as missing:
+/// - Names no image of the 21H461 kernelcache has as a string:
+///   `GainMapVersion`, which `IOMobileFramebufferOpen` reads from the
+///   service; `canvas-width` and `canvas-height`, which it reads from the
+///   service's provider (`getEDTProperty`; disp0's device tree entry has
+///   neither); and `dfr`, which the framework's `iomfb_match_callback`
+///   reads from each framebuffer it finds.
+/// - Names other kexts use only otherwise: `AppleTV`, which
+///   IOUSBDeviceFamily compares a model string with (0xfffffff00617c0c0),
+///   and `hdcp-hoover-protocol`, which AUC reads from the framebuffer
+///   (0xfffffff00655fb8c) and nothing sets.
+/// - Names QuartzCore reads from the framebuffer that its kexts never set
+///   here: `CursorPlane` and `VirtualDisplayMode`, which no image of the
+///   kernelcache has as a string; `SupportsRotation`, whose only setter
+///   (0xfffffff006bd15ec) runs when the pipe's slot +0xcb0 answers true,
+///   which it does not, and goes through 0xfffffff006bf3e3c, which sets
+///   no name but `NormalModeActive`; and `GPBandwidth`, set only on a hot
+///   plug (0xfffffff006c01334) when the pipe's slot +0x8b8 (a dual pipe)
+///   answers true, which it does not.
+/// - The names of the pipe's runtime properties that it never registers,
+///   which only IOMobileGraphicsFamily's name tables form
+///   ([`rtprop::absent`]; `IOMFBIntDcpUsedForExtWhenLidClose`, runtime
+///   property 0x7f, is one): the pipe publishes the runtime properties it
+///   registers, on the service, and nothing sets the others.
+/// - On the service, `external`: AppleCLCD sets it (0xfffffff006bf55ec,
+///   0xfffffff006bf5a54) only when its provider's device tree entry has
+///   `external`.
+pub fn property_absent(t: &[Node], i: u32, name: &str) -> bool {
+    if matches!(name, "GainMapVersion" | "canvas-width" | "canvas-height" | "dfr" | "AppleTV" | "hdcp-hoover-protocol" | "CursorPlane" | "VirtualDisplayMode" | "SupportsRotation" | "GPBandwidth") || rtprop::absent(name) {
+        return true;
+    }
+    let Some(n) = t.get(i as usize) else { return false };
+    if n.class != CLASS || name != "external" {
+        return false;
+    }
+    let provider = n.parent.and_then(|p| t.get(p as usize));
+    provider.is_some_and(|p| !p.props.iter().any(|(k, _)| k == "external"))
 }
 
 // ---------------------------------------------------------------------------
@@ -124,7 +157,8 @@ pub const NOTIFY_TYPES: usize = 6;
 /// it (`+0xe8`), its type (`+0xf0`, 2 once it swaps), the block client
 /// profile its entitlement gives (`+0x104`, `+0x108`), whether it started
 /// and is not stopped (`+0xe0`), its power assertions (`+0xfc`), whether
-/// it turned statistics on (`+0xf4`), and its notification slots.
+/// it turned statistics on (`+0xf4`), the frame information size selector
+/// 74 last gave it (`+0x3c8`), and its notification slots.
 pub struct Client {
     pub pid: i32,
     pub ty: u32,
@@ -134,6 +168,7 @@ pub struct Client {
     pub started: bool,
     pub power_assertions: i32,
     pub statistics: bool,
+    pub frame_info_size: u32,
     pub slots: [Slot; NOTIFY_TYPES],
 }
 
@@ -168,7 +203,7 @@ pub fn new_user_client(k: &mut Kernel, ty: u32) -> Result<Client, i32> {
             return Err(ret::UNSUPPORTED);
         }
     };
-    let c = Client { pid: k.pid, ty, block_profile, block_profile_index, started: true, power_assertions: 0, statistics: false, slots: Default::default() };
+    let c = Client { pid: k.pid, ty, block_profile, block_profile_index, started: true, power_assertions: 0, statistics: false, frame_info_size: 0, slots: Default::default() };
     if ty == 2 {
         swap::add_swap_client();
     }
@@ -238,7 +273,7 @@ pub fn register_notification_port(k: &mut Kernel, c: &mut Client, port: Option<O
     }
     slot.port = port;
     slot.refcon = reference as u32;
-    if ty == 3 && swap::frame_info_size(c) != 0 {
+    if ty == 3 && c.frame_info_size != 0 {
         k.darwin_unimplemented("IOMobileFramebufferUserClient frame information through its shared data queue (IOSharedDataQueue of 0x1040 bytes)".to_string());
     }
     ret::SUCCESS

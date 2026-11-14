@@ -51,6 +51,7 @@ cc -O2 -framework IOKit -framework IOSurface -framework CoreFoundation -o "$OUT/
 cc -O2 -framework IOSurface -framework CoreFoundation -o "$OUT/iosurfacex" "$HERE/src/iosurfacex.c"
 cc -O2 -framework IOKit -framework IOSurface -framework CoreFoundation -o "$OUT/iogpudev" "$HERE/src/iogpudev.c"
 cc -O2 -framework IOKit -framework IOSurface -framework CoreFoundation -o "$OUT/iomfb" "$HERE/src/iomfb.c"
+cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/iomfbmain" "$HERE/src/iomfbmain.c"
 # metalwire: WebMetal's wire records, from its generated header (the pinned
 # submodule's).
 xcrun -sdk iphoneos clang++ -target "$TARGET" -std=c++17 -O2 -I "$HERE/../../third_party/WebMetal/wire/generated" \
@@ -127,9 +128,13 @@ codesign -s - -f --entitlements "$HERE/src/workinterval.entitlements" "$OUT/work
 # no-sandbox.
 codesign -s - -f -i com.apple.splashboardd --entitlements "$HERE/src/splashboardd.entitlements" "$OUT/iosurfacesplash" 2>/dev/null
 codesign -s - -f -i com.apple.PreBoard --entitlements "$HERE/src/preboard.entitlements" "$OUT/iosurfacexpreboard" 2>/dev/null
-# iomfb opens the framebuffer as splashboardd, whose iokit-user-client-class
-# entitlement names IOMobileFramebufferUserClient too.
-codesign -s - -f -i com.apple.splashboardd --entitlements "$HERE/src/splashboardd.entitlements" "$OUT/iomfb" 2>/dev/null
+# iomfb and iomfbmain open the framebuffer as splashboardd, whose
+# iokit-user-client-class entitlement names IOMobileFramebufferUserClient
+# too; iomfb also holds backboardd's
+# com.apple.private.allow-explicit-graphics-priority, which the
+# framebuffer's selector 83 asks for.
+codesign -s - -f -i com.apple.splashboardd --entitlements "$HERE/src/iomfb.entitlements" "$OUT/iomfb" 2>/dev/null
+codesign -s - -f -i com.apple.splashboardd --entitlements "$HERE/src/splashboardd.entitlements" "$OUT/iomfbmain" 2>/dev/null
 # accelr's IOGPU device client is restricted by its entitlement.
 codesign -s - -f --entitlements "$HERE/src/gpurestricted.entitlements" "$OUT/accelr" 2>/dev/null
 # atmflag sets the ATM diagnostic flag, which its entitlement allows.

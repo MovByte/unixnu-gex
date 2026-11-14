@@ -14,7 +14,21 @@
 // - On a connection of its own, the user client's refusals: the selector
 //   range, the dispatch counts, reserved and empty entries, unknown swaps,
 //   a source rectangle outside its surface, the debug flags a production
-//   device refuses, the notification types, and memory of no type.
+//   device refuses, the parameters SetParameter does not take (a power
+//   assertion among them) and the gain map's without its entitlement, the
+//   frame information the pipe names and the options only it takes, the
+//   notification types, and memory of no type.
+// - The glass, on that connection (selector 83, with backboardd's graphics
+//   priority entitlement): layer 0 holds the swapped surface and layer 1
+//   nothing; a second swap that sets only layer 1 leaves layer 0 as it
+//   was, and the test embedder records both layers (frame-check.py).
+// - Power, on that connection: power notifications asked for (an option
+//   for them refused), the display turned off (selector 12), its
+//   notification (the time, and state 0), the swap waits a display that is
+//   off answers, a swap made while it is off, the display turned on again
+//   (state 3: controller and panel), and that swap gone with the queue's
+//   flush, never shown. The test embedder records the panel going dark and
+//   lighting again (frame-check.py).
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
@@ -45,6 +59,34 @@ static void fill(uint8_t *base, size_t bpr, uint32_t w, uint32_t h) {
             row[4 * x + 3] = 0xff;
         }
     }
+}
+
+// A power notification: IOUserClient's async result (kOSNotificationMessageID,
+// an OSNotificationHeader64 of kIOAsyncCompletionNotificationType with the
+// reference the enable set, the result, and the time and state).
+static int power_note(mach_port_t p, uint64_t callout, uint64_t refcon, uint64_t want_state) {
+    // The header, then at 24 the notification header's size and type, at
+    // 32 its eight-word reference, at 96 the result and at 100 the
+    // arguments (packed).
+    uint64_t buf[64];
+    memset(buf, 0, sizeof buf);
+    mach_msg_header_t *h = (mach_msg_header_t *)buf;
+    kern_return_t kr = mach_msg(h, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof buf, p, 5000, MACH_PORT_NULL);
+    if (kr != KERN_SUCCESS) return bad("receiving a power notification", kr, 0);
+    if (h->msgh_id != 53 || h->msgh_size != 120) return bad("the power notification's id and size", (long)h->msgh_id << 16 | h->msgh_size, 53 << 16 | 120);
+    const uint8_t *b = (const uint8_t *)buf;
+    uint32_t size, type;
+    uint64_t reference[8], args[2];
+    int32_t result;
+    memcpy(&size, b + 24, 4);
+    memcpy(&type, b + 28, 4);
+    memcpy(reference, b + 32, 64);
+    memcpy(&result, b + 96, 4);
+    memcpy(args, b + 100, 16);
+    if (size != 4 + 16 || type != 150) return bad("its header's size and type", (long)size << 16 | type, 20 << 16 | 150);
+    if (reference[0] != 0 || reference[1] != callout || reference[2] != refcon || reference[3] != 0) return bad("its reference", (long)reference[1], (long)callout);
+    if (result != 0 || args[0] == 0 || args[1] != want_state) return bad("its result, time and state", (long)args[1], (long)want_state);
+    return 0;
 }
 
 static CFNumberRef num(int v) {
@@ -175,6 +217,41 @@ int main(void) {
     outn = 1;
     if ((kr = IOConnectCallScalarMethod(c, 15, in, 2, out, &outn)) != kIOReturnError) return bad("SetDebugFlags", kr, kIOReturnError);
     if (out[0] != 5) return bad("SetDebugFlags' output", out[0], 5);
+    // SetParameter: a power assertion (11), which the framebuffer does not
+    // take, an unknown parameter, values of the wrong count or range, and
+    // the gain map's (16) without its entitlement.
+    uint64_t sp[4] = {1, 0, 0, 0};
+    in[0] = 11;
+    if ((kr = IOConnectCallMethod(c, 68, in, 1, sp, 8, NULL, NULL, NULL, NULL)) != kIOReturnBadArgument) return bad("SetParameter 11", kr, kIOReturnBadArgument);
+    in[0] = 8;
+    if ((kr = IOConnectCallMethod(c, 68, in, 1, sp, 8, NULL, NULL, NULL, NULL)) != kIOReturnBadArgument) return bad("SetParameter 8", kr, kIOReturnBadArgument);
+    in[0] = 0;
+    if ((kr = IOConnectCallMethod(c, 68, in, 1, sp, 24, NULL, NULL, NULL, NULL)) != kIOReturnBadArgument) return bad("SetParameter 0 with three values", kr, kIOReturnBadArgument);
+    in[0] = 4;
+    sp[0] = 101;
+    if ((kr = IOConnectCallMethod(c, 68, in, 1, sp, 8, NULL, NULL, NULL, NULL)) != kIOReturnBadArgument) return bad("SetParameter 4 of 101", kr, kIOReturnBadArgument);
+    in[0] = 16;
+    if ((kr = IOConnectCallMethod(c, 68, in, 1, sp, 8, NULL, NULL, NULL, NULL)) != kIOReturnNotPrivileged) return bad("SetParameter 16", kr, kIOReturnNotPrivileged);
+    // Frame information: the pipe names 14 items of one word each; there is
+    // no item 14; options go only to frame information's record.
+    char item[64];
+    size_t itemsz = sizeof item;
+    in[0] = 0;
+    outn = 2;
+    if ((kr = IOConnectCallMethod(c, 74, in, 1, NULL, 0, out, &outn, item, &itemsz)) != KERN_SUCCESS || out[0] != 14 || out[1] != 1 || strcmp(item, "Layer_0_CRC") != 0) return bad("SupportedFrameInfo 0", kr ? kr : (long)out[0], 14);
+    in[0] = 13;
+    outn = 2;
+    itemsz = sizeof item;
+    if ((kr = IOConnectCallMethod(c, 74, in, 1, NULL, 0, out, &outn, item, &itemsz)) != KERN_SUCCESS || strcmp(item, "CA_mode") != 0) return bad("SupportedFrameInfo 13", kr, 0);
+    in[0] = 14;
+    outn = 2;
+    itemsz = sizeof item;
+    if ((kr = IOConnectCallMethod(c, 74, in, 1, NULL, 0, out, &outn, item, &itemsz)) != kIOReturnBadArgument) return bad("SupportedFrameInfo 14", kr, kIOReturnBadArgument);
+    in[0] = 0;
+    in[1] = 1;
+    if ((kr = IOConnectCallScalarMethod(c, 73, in, 2, NULL, NULL)) != kIOReturnBadArgument) return bad("ChangeFrameInfo of hot plug", kr, kIOReturnBadArgument);
+    in[0] = 6;
+    if ((kr = IOConnectCallScalarMethod(c, 73, in, 2, NULL, NULL)) != kIOReturnBadArgument) return bad("ChangeFrameInfo of type 6", kr, kIOReturnBadArgument);
     outn = 1;
     if ((kr = IOConnectCallScalarMethod(c, 18, NULL, 0, out, &outn)) != KERN_SUCCESS || out[0] != 1) return bad("IsMainDisplay", out[0], 1);
     outn = 1;
@@ -204,6 +281,89 @@ int main(void) {
     mach_vm_size_t len = 0;
     if ((kr = IOConnectMapMemory64(c, 0, mach_task_self(), &addr, &len, kIOMapAnywhere)) != kIOReturnBadArgument) return bad("memory of type 0", kr, kIOReturnBadArgument);
     if ((kr = IOConnectMapMemory64(c, 3, mach_task_self(), &addr, &len, kIOMapAnywhere)) != kIOReturnBadArgument) return bad("memory of type 3", kr, kIOReturnBadArgument);
+
+    // The glass: layer 0's surface is the swapped one, as a send right;
+    // layer 1 has none (kIOReturnError); there is no layer 4.
+    in[0] = 0;
+    outn = 1;
+    if ((kr = IOConnectCallScalarMethod(c, 83, in, 1, out, &outn)) != KERN_SUCCESS) return bad("CopyLayerDisplayedSurface of layer 0", kr, 0);
+    IOSurfaceRef shown = IOSurfaceLookupFromMachPort((mach_port_t)out[0]);
+    if (shown == NULL || IOSurfaceGetID(shown) != IOSurfaceGetID(s)) return bad("layer 0's surface", shown ? IOSurfaceGetID(shown) : 0, IOSurfaceGetID(s));
+    CFRelease(shown);
+    mach_port_deallocate(mach_task_self(), (mach_port_t)out[0]);
+    in[0] = 1;
+    outn = 1;
+    if ((kr = IOConnectCallScalarMethod(c, 83, in, 1, out, &outn)) != kIOReturnError) return bad("CopyLayerDisplayedSurface of an empty layer", kr, kIOReturnError);
+    in[0] = 4;
+    outn = 1;
+    if ((kr = IOConnectCallScalarMethod(c, 83, in, 1, out, &outn)) != kIOReturnBadArgument) return bad("CopyLayerDisplayedSurface of layer 4", kr, kIOReturnBadArgument);
+    // A swap that sets only layer 1, a small surface of its own: layer 0
+    // stays as the first swap left it.
+    const void *vals2[] = {num(64), num(64), num(bpe), num(fmt)};
+    CFDictionaryRef props2 = CFDictionaryCreate(NULL, keys, vals2, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    IOSurfaceRef s2 = IOSurfaceCreate(props2);
+    if (s2 == NULL) return bad("IOSurfaceCreate of the small surface", 0, 1);
+    if (IOSurfaceLock(s2, 0, NULL) != KERN_SUCCESS) return bad("locking the small surface", 0, 1);
+    memset(IOSurfaceGetBaseAddress(s2), 0x40, IOSurfaceGetAllocSize(s2));
+    if (IOSurfaceUnlock(s2, 0, NULL) != KERN_SUCCESS) return bad("unlocking the small surface", 0, 1);
+    int second = 0;
+    if ((kr = swap_begin(fb, &second)) != KERN_SUCCESS) return bad("SwapBegin of layer 1", kr, 0);
+    FbRect small = {0, 0, 64, 64};
+    if ((kr = swap_set_layer(fb, 1, s2, small, small, 0)) != KERN_SUCCESS) return bad("SwapSetLayer of layer 1", kr, 0);
+    if ((kr = swap_end(fb)) != KERN_SUCCESS) return bad("SwapEnd of layer 1", kr, 0);
+    if ((kr = swap_wait(fb, second, 1)) != KERN_SUCCESS) return bad("SwapWait until layer 1 is displayed", kr, 0);
+    for (int layer = 0; layer < 2; layer++) {
+        in[0] = layer;
+        outn = 1;
+        if ((kr = IOConnectCallScalarMethod(c, 83, in, 1, out, &outn)) != KERN_SUCCESS) return bad("CopyLayerDisplayedSurface after layer 1's swap", kr, 0);
+        IOSurfaceRef on = IOSurfaceLookupFromMachPort((mach_port_t)out[0]);
+        IOSurfaceRef want = layer == 0 ? s : s2;
+        if (on == NULL || IOSurfaceGetID(on) != IOSurfaceGetID(want)) return bad("a layer's surface after layer 1's swap", on ? IOSurfaceGetID(on) : 0, IOSurfaceGetID(want));
+        CFRelease(on);
+        mach_port_deallocate(mach_task_self(), (mach_port_t)out[0]);
+    }
+
+    // Power notifications (type 1) to a port of their own: an option for
+    // them is refused, the record staying listed.
+    mach_port_t pp;
+    mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &pp);
+    mach_port_insert_right(mach_task_self(), pp, pp, MACH_MSG_TYPE_MAKE_SEND);
+    if ((kr = IOConnectSetNotificationPort(c, 1, pp, 0)) != KERN_SUCCESS) return bad("a power port", kr, 0);
+    in[0] = 0x1234;
+    in[1] = 0x5678;
+    in[2] = 1;
+    in[3] = 1;
+    if ((kr = IOConnectCallScalarMethod(c, 72, in, 4, NULL, NULL)) != kIOReturnBadArgument) return bad("power notifications with an option", kr, kIOReturnBadArgument);
+    in[3] = 0;
+    if ((kr = IOConnectCallScalarMethod(c, 72, in, 4, NULL, NULL)) != kIOReturnError) return bad("power notifications listed already", kr, kIOReturnError);
+    // Off: the request succeeds, the scheduler sets the soft state (no swap
+    // is pending), the controller and panel go off, and the client is told.
+    in[0] = 0;
+    if ((kr = IOConnectCallScalarMethod(c, 12, in, 1, NULL, NULL)) != KERN_SUCCESS) return bad("RequestPowerChange off", kr, 0);
+    if (power_note(pp, 0x1234, 0x5678, 0)) return 1;
+    // Off: option 4 is so and option 3 is not, at once or not; a wait on a
+    // swap is kIOReturnOffline.
+    if ((kr = swap_wait(fb, token, 4)) != KERN_SUCCESS) return bad("SwapWait option 4 while off", kr, 0);
+    if ((kr = swap_wait(fb, token, 3)) != kIOReturnBadArgument) return bad("SwapWait option 3 while off", kr, kIOReturnBadArgument);
+    if ((kr = swap_wait(fb, token, 0x80000004)) != KERN_SUCCESS) return bad("SwapWait option 4 while off, not blocking", kr, 0);
+    if ((kr = swap_wait(fb, token, 0x80000003)) != kIOReturnBusy) return bad("SwapWait option 3 while off, not blocking", kr, kIOReturnBusy);
+    if ((kr = swap_wait(fb, token, 1)) != (kern_return_t)0xe00002e3) return bad("SwapWait while off", kr, 0xe00002e3);
+    // A swap while off is queued, not shown.
+    int off = 0;
+    if ((kr = swap_begin(fb, &off)) != KERN_SUCCESS) return bad("SwapBegin while off", kr, 0);
+    if ((kr = swap_set_layer(fb, 0, s, whole, whole, 0)) != KERN_SUCCESS) return bad("SwapSetLayer while off", kr, 0);
+    if ((kr = swap_end(fb)) != KERN_SUCCESS) return bad("SwapEnd while off", kr, 0);
+    if ((kr = swap_wait(fb, off, 1)) != (kern_return_t)0xe00002e3) return bad("SwapWait on a swap made while off", kr, 0xe00002e3);
+    // On again: the controller's change flushes the queue (the swap is gone
+    // and never shown), the panel lights, and the client is told.
+    in[0] = 1;
+    if ((kr = IOConnectCallScalarMethod(c, 12, in, 1, NULL, NULL)) != KERN_SUCCESS) return bad("RequestPowerChange on", kr, 0);
+    if (power_note(pp, 0x1234, 0x5678, 3)) return 1;
+    if ((kr = swap_wait(fb, off, 1)) != KERN_SUCCESS) return bad("SwapWait on the flushed swap", kr, 0);
+    if ((kr = swap_wait(fb, off, 2)) != KERN_SUCCESS) return bad("SwapWait for an idle queue after the flush", kr, 0);
+    if ((kr = swap_wait(fb, off, 3)) != KERN_SUCCESS) return bad("SwapWait option 3 when on again", kr, 0);
+    in[0] = 0;
+    if ((kr = IOConnectCallScalarMethod(c, 72, in, 4, NULL, NULL)) != KERN_SUCCESS) return bad("power notifications off", kr, 0);
     IOServiceClose(c);
 
     printf("iomfb ok\n");

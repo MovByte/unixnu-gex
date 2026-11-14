@@ -1,17 +1,29 @@
-//! The framebuffer's swaps, its vertical blanks and its notifications, as
-//! `IOMobileFramebufferLegacy` (IOMobileGraphicsFamily) runs them with
-//! AppleMobileDispH9G's pipe beneath:
+//! The framebuffer's swaps, its vertical blanks, its power and its
+//! notifications, as `IOMobileFramebufferLegacy` (IOMobileGraphicsFamily)
+//! runs them with AppleMobileDispH9G's `AppleCLCD` and pipe beneath:
 //!
 //! - A client begins a swap (selector 4: a request with the next swap id,
 //!   in the begun list) and ends it with its transaction (selector 5: the
 //!   1288-byte record the framework builds), which `swap_submit`
 //!   (0xfffffff00678f224) checks, the pipe verifies, and the request goes
 //!   to the queue.
-//! - The display controller takes the queue's head as its pending swap,
-//!   and the vertical blank after makes it the displayed swap: then its
-//!   layers reach the glass (the embedder's [`super::sink`]), and the swap
-//!   it replaces retires, its surfaces let go.
-//! - Swap waits (selector 6) wait on those steps.
+//! - The kick (AppleCLCD slot 290, 0xfffffff006bfb384) takes the queue's
+//!   head as the pending swap while the display is powered, and the
+//!   vertical blank after completes it (0xfffffff00678a96c): each layer it
+//!   enables goes on the glass in place of the one there, whose surface is
+//!   let go, and the layers it does not enable stay as earlier swaps left
+//!   them (0xfffffff00679534c); the glass then reaches the embedder's
+//!   [`super::sink`].
+//! - Swap waits (selector 6, `swap_wait_gated` 0xfffffff00678b960) sleep on
+//!   the queue's event, which a completed swap, a removed one and
+//!   `swap_cancel_all` wake, each for five seconds at most.
+//! - Power (selector 12, AppleCLCD 0xfffffff006bf792c): a request for a
+//!   power state is run by the power scheduler, which waits for the
+//!   pending swap to complete and then sets the soft power state; the
+//!   controller and the panel follow it (0xfffffff006bf7bc4), the swap
+//!   queue is flushed at each controller change, the vertical blanks stop
+//!   while the controller is off, and the clients that asked for power
+//!   notifications are told.
 //! - No vertical blank message is sent. The family's only sender of them
 //!   (0xfffffff006796720, the records of type 5 with each blank's count,
 //!   time and delta) is called only by
@@ -19,16 +31,22 @@
 //!   (0xfffffff00678a428), which AppleCLCD overrides (vtable slot 346,
 //!   0xfffffff006bf710c) with one that sends none; AppleMobileDispH9G
 //!   sends no async message at all. Turning type 5 on lists the record and
-//!   calls slot 316 (empty on AppleCLCD) and slot 290 (the pipe's kick).
+//!   calls slot 316 (empty on AppleCLCD) and slot 290, the kick.
 //!
 //! The panel is disp0's: its mode is the timing the device tree gives
 //! (`display-timing-info`), and its vertical blanks come one frame apart,
 //! a frame being two subframes of `subframe-duration-nclks` ([`Panel`]).
-//! They are counted from the system's boot.
+//! They are counted from the system's boot, while the controller is on.
+//!
+//! The display is one for every task: what a call changes is done by the
+//! kernel of the task that made it, and a method of another task that
+//! answers later is answered in its own task ([`Effect::Answer`]).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
-use super::super::iokit::ret;
+use super::super::iokit::{ret, ASYNC_REF64_COUNT};
+use super::super::ipc::{ObjId, TaskLink};
 use super::sink;
 use crate::syscalls::Kernel;
 use crate::GuestMem;
@@ -40,7 +58,15 @@ pub mod kr {
     pub const BUSY: i32 = 0xe00002d5_u32 as i32;
     pub const ABORTED: i32 = 0xe00002eb_u32 as i32;
     pub const OFFLINE: i32 = 0xe00002e3_u32 as i32;
+    pub const TIMEOUT: i32 = 0xe00002d6_u32 as i32;
     pub const VM_ERROR: i32 = 0xe00002c8_u32 as i32;
+}
+
+/// `clock_interval_to_deadline(ms, kMillisecondScale)`'s interval: `ms`
+/// milliseconds in absolute time.
+fn ms_to_abs(ms: u64) -> u64 {
+    let (numer, denom) = super::super::mach::TIMEBASE;
+    ms * 1_000_000 * u64::from(denom) / u64::from(numer)
 }
 
 /// The panel's mode and refresh.
@@ -76,8 +102,19 @@ impl Panel {
     }
 }
 
+/// Whether the panel is built in: AppleCLCD's `+0x1782`, which its
+/// 0xfffffff006bf5a30 sets at start to the inverse of `external`, read
+/// from disp0's device tree entry there. `Err` when disp0 is not in the
+/// tree.
+pub fn builtin() -> Result<bool, String> {
+    let t = super::super::iokit::tree();
+    let disp = t.iter().find(|n| n.props.iter().any(|(k, v)| k == "compatible" && v.split(|&c| c == 0).any(|c| c == b"disp0,t8011"))).ok_or("disp0 in the device tree")?;
+    Ok(!disp.props.iter().any(|(k, _)| k == "external"))
+}
+
 /// The subframes a frame takes at the start (`+0x294`).
 const SUBFRAMES: u64 = 2;
+
 
 /// A layer of a request (the request's `+0x11 + 16 * n` source rectangle,
 /// `+0x51 + 16 * n` destination, `+0x244 + 4 * n` transform), and the
@@ -92,10 +129,13 @@ pub struct LayerReq {
 }
 
 /// An `IOMFBSwapIORequest` (0xba0 bytes): its swap id (`+0x314`), the
-/// client that began it and that client's task, whether it was handed to
-/// swap_submit (`+0x54b`) or cancelled (`+0x54a`), its enabled layers
-/// (`+0x318`) and the record's completed mask (`+0x31c`), its kind
-/// (`+0x32c`), its presentation time (`+0x2d0`), and its layers.
+/// client that began it (`+0xad0`) and that client's task, whether it was
+/// handed to swap_submit (`+0x54b`) or cancelled (`+0x54a`), its enabled
+/// layers (`+0x318`) and the record's completed mask (`+0x31c`), its kind
+/// (`+0x32c`), its status (`+0x34c`, the family's swap history codes: 2
+/// programmed, 3 flushed, 4 displayed, 5 timed out, 7 dropped), its
+/// presentation time (`+0x2d0`), the deadline a swap wait with a timeout
+/// gave it (`+0x2c8`), and its layers.
 #[derive(Clone, Debug, Default)]
 pub struct Request {
     pub id: u32,
@@ -106,33 +146,138 @@ pub struct Request {
     pub enabled: u32,
     pub completed: u32,
     pub kind: u32,
+    pub status: u32,
     pub presentation: u64,
+    pub deadline: u64,
     pub layers: [LayerReq; 4],
 }
 
 /// A notification record a client listed for a type (`+0x118 + type *
-/// 0xb0` of the client, listed at the framebuffer's `+0x1588 + type * 16`),
-/// by its client.
+/// 0xb0` of the client, listed at the framebuffer's `+0x1588 + type * 16`):
+/// its client, and the async reference the enable set
+/// (`setAsyncReference64` at the record's `+0x18`: the slot's port, the
+/// callout and its reference).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Record {
     pub client: u32,
+    pub port: Option<ObjId>,
+    pub reference: [u64; ASYNC_REF64_COUNT],
 }
 
-/// The framebuffer's swap and display state.
+/// The display's power, AppleCLCD's: the hard power state (`+0x16cc`),
+/// the soft one selector 12 sets (`+0x16d0`), the controller's and the
+/// panel's (`+0x16d4`, `+0x16d8`), the state requested (`+0x16dc`) and
+/// whether a request is with the power scheduler (`+0x16e0`). All are on
+/// at start (0xfffffff006bf55ec). The power scheduler
+/// (`iomfb_api_pstate_sched`, `+0x1dc8`) runs its actions in turn, and the
+/// state changes take the PState ticket (`+0x1ed0`, `+0x1ed4`) in order,
+/// each waiting for the pending swap to complete before it is made.
+#[derive(Debug)]
+struct Power {
+    hard: u32,
+    soft: u32,
+    controller: bool,
+    panel: bool,
+    requested: u32,
+    transition: bool,
+    /// The scheduler's actions not yet run, and whether one is running (its
+    /// change waiting for its turn).
+    jobs: u32,
+    scheduling: bool,
+    /// The changes holding or waiting for the ticket, in its order, and the
+    /// task each was asked by.
+    changes: VecDeque<(Change, i32)>,
+}
+
+/// A power state change (`AppleCLCD` slot 354, 0xfffffff006bf79a8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Change {
+    /// The soft state set (0xfffffff00678b858 with no hard state): the
+    /// power scheduler's action, which wakes the requests waiting on
+    /// `+0x16e0` once made (`sched`), or the last swap client's going.
+    Soft { state: u32, sched: bool },
+    /// The states evaluated again (0xfffffff006795b18).
+    Evaluate,
+}
+
+/// What a sleeping swap wait or power request waits on: the power
+/// scheduler (`+0x16e0`, 0xfffffff00678db9c), or the swap queue
+/// (`+0x1568`, with a five-second deadline).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sleep {
+    Power,
+    Queue { deadline: u64 },
+}
+
+/// A swap wait asleep (selector 6): the token it answers by and the task
+/// that waits, its client, swap id, mode (the options' low 31 bits) and
+/// whether it may block (bit 31 clear), its timeout and the deadline that
+/// gave the swap (`local_58`), the times it went to sleep on the queue
+/// (`local_64`), and what it sleeps on.
+#[derive(Debug)]
+struct Waiter {
+    token: u64,
+    link: Arc<TaskLink>,
+    pid: i32,
+    client: u32,
+    id: u32,
+    mode: u32,
+    no_block: bool,
+    timeout: u32,
+    swap_deadline: u64,
+    sleeps: u32,
+    on: Sleep,
+}
+
+/// A power request asleep (selector 12 while a request is with the
+/// scheduler): the token it answers by, its task and the state it asks.
+#[derive(Debug)]
+struct PowerCaller {
+    token: u64,
+    link: Arc<TaskLink>,
+    state: u32,
+}
+
+/// What a change of the display does in the kernel that made it, once the
+/// display's lock is let go.
+#[derive(Debug)]
+pub enum Effect {
+    /// A request's surfaces let go.
+    Release(Request),
+    /// A surface the glass held let go.
+    ReleaseSurface(u32),
+    /// The glass after swap `.0` at the blank (its count and time): the
+    /// layers on it, by index.
+    Present(u32, u64, u64, Vec<(u32, LayerReq)>),
+    /// A method that answered later answered, in its task.
+    Answer { link: Arc<TaskLink>, token: u64, ret: i32 },
+    /// An async result to a notification record's port
+    /// (`sendAsyncResult64WithOptions` with `kIOUserNotifyOptionCanDrop`).
+    Notify { port: ObjId, reference: [u64; ASYNC_REF64_COUNT], args: [u64; 2] },
+    /// The panel lit or dark.
+    Panel(bool),
+    /// What is not modelled, reported.
+    Unimplemented(String),
+}
+
+/// The framebuffer's swap, display and power state.
 struct Display {
     panel: Option<Panel>,
     /// `+0x16b8`: the last swap id given.
     next_id: u32,
     /// `+0x1578`: begun requests; `+0x1568`: the queue; `+0x1560`: the
-    /// pending swap; the displayed swap and its id (`+0x16bc`).
+    /// pending swap; the display's swap id (`+0x16bc`).
     begun: Vec<Request>,
     queue: VecDeque<Request>,
     pending: Option<Request>,
-    displayed: Option<Request>,
     display_swap_id: u32,
-    /// The last vertical blank processed (its index since boot), the
-    /// count (`+0x100`), its time (`+0x108`) and the time since the one
-    /// before (`+0x110`).
+    /// The layers on the glass (`+0x1358 + 8 * n` their surfaces, with the
+    /// rectangles and transform their swaps gave), each holding a reference
+    /// on its surface.
+    glass: [Option<LayerReq>; 4],
+    /// The last vertical blank reached (its index since boot), the count
+    /// (`+0x100`), its time (`+0x108`) and the time since the one before
+    /// (`+0x110`).
     vbl_index: u64,
     vbl_count: u64,
     vbl_time: u64,
@@ -142,6 +287,19 @@ struct Display {
     records: [Vec<Record>; super::NOTIFY_TYPES],
     /// The clients started and not stopped.
     started: Vec<u32>,
+    power: Power,
+    waiters: Vec<Waiter>,
+    power_callers: Vec<PowerCaller>,
+    /// Each client's `+0xf8` and `+0x100`: the swap its swap wait waits for,
+    /// and whether that swap was removed while it waited.
+    client_wait: HashMap<u32, (u32, bool)>,
+    /// `+0x118`: the swap timer's deadline, the earliest a swap wait gave a
+    /// queued request; 0 when not armed.
+    swap_timer: u64,
+    /// `+0x16e4`: the requests the swap timer removed since a swap last
+    /// completed.
+    timed_out: u32,
+    effects: Vec<Effect>,
 }
 
 static DISPLAY: std::sync::Mutex<Option<Display>> = std::sync::Mutex::new(None);
@@ -154,7 +312,7 @@ fn display<R>(f: impl FnOnce(&mut Display) -> R) -> R {
         begun: Vec::new(),
         queue: VecDeque::new(),
         pending: None,
-        displayed: None,
+        glass: [None; 4],
         display_swap_id: 0,
         vbl_index: 0,
         vbl_count: 0,
@@ -163,13 +321,55 @@ fn display<R>(f: impl FnOnce(&mut Display) -> R) -> R {
         swap_clients: 0,
         records: Default::default(),
         started: Vec::new(),
+        power: Power { hard: 1, soft: 1, controller: true, panel: true, requested: 0, transition: false, jobs: 0, scheduling: false, changes: VecDeque::new() },
+        waiters: Vec::new(),
+        power_callers: Vec::new(),
+        client_wait: HashMap::new(),
+        swap_timer: 0,
+        timed_out: 0,
+        effects: Vec::new(),
     });
     f(d)
+}
+
+/// Run `f` on the display, then do what it left to do.
+fn with_display<R>(k: &mut Kernel, f: impl FnOnce(&mut Display) -> R) -> R {
+    let (r, effects) = display(|d| {
+        let r = f(d);
+        (r, std::mem::take(&mut d.effects))
+    });
+    perform(k, effects);
+    r
 }
 
 /// The panel, or what the device tree lacks to describe it.
 pub fn panel() -> Result<Panel, String> {
     display(|d| d.panel).ok_or_else(|| Panel::from_tree().err().unwrap_or_default())
+}
+
+/// The effects of a change done, in order.
+fn perform(k: &mut Kernel, effects: Vec<Effect>) {
+    for e in effects {
+        match e {
+            Effect::Release(r) => release_request(k, r),
+            Effect::ReleaseSurface(id) => super::super::iosurface::kernel_release(k, id),
+            Effect::Present(swap, vbl, time, layers) => present(k, swap, vbl, time, &layers),
+            Effect::Answer { link, token, ret } => {
+                link.mailbox.lock().unwrap_or_else(|e| e.into_inner()).push(super::super::ipc::Remote::Later { token, ret, scalars: Vec::new() });
+                link.bell.ring();
+            }
+            Effect::Notify { port, reference, args } => k.darwin_io_async_result(port, &reference, ret::SUCCESS, &args, true),
+            Effect::Panel(on) => match sink::sink() {
+                Some(s) => {
+                    if let Err(why) = s.panel(on) {
+                        k.darwin_unimplemented(format!("turning the embedder's panel {}: {why}", if on { "on" } else { "off" }));
+                    }
+                }
+                None => k.darwin_unimplemented(format!("turning the panel {}: no presentation sink is installed", if on { "on" } else { "off" })),
+            },
+            Effect::Unimplemented(what) => k.darwin_unimplemented(what),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -182,41 +382,66 @@ pub fn add_swap_client() {
     display(|d| d.swap_clients += 1);
 }
 
-/// Slot 170 (0xfffffff00678c998): the client's swaps cleared
-/// (0xfffffff00678a214: its begun requests released, its queued ones
-/// cancelled), and the last swap client's going powers down the display's
-/// swap path (0xfffffff00678b544).
+/// Slot 170 (0xfffffff00678c998): the client's swaps cleared (gated
+/// 0xfffffff00678a214), and the last swap client's going handled
+/// (0xfffffff00678b544).
+///
+/// The clearing: each begun request of the client not yet handed to
+/// swap_submit removed (status 7) and one handed to it marked cancelled;
+/// each queued request of the client removed (status 7); the kick; and
+/// the swap queue's waiters woken when the client was waiting for a swap
+/// (`+0xf8`).
+///
+/// The last swap client: with the display hard on, the main display (slot
+/// 184) is powered on (0xfffffff00678b858 with state 1: its soft state set
+/// once the pending swap completes). What 0xfffffff00678b544 does after
+/// that, when no swap left the console mode on (0xfffffff00678b834) and
+/// the panel's contents are not preserved (`IOMFBPreserveContents`), is
+/// not modelled: the kernel's own swaps of kinds 7 and 6 when the timing
+/// is enabled (`+0x1e49`), and the console mode on the displayed surface
+/// (0xfffffff00678c44c, `SystemConsoleMode`).
 pub fn remove_swap_client(k: &mut Kernel, client: u32) {
-    let released = display(|d| {
-        let mut out = Vec::new();
+    let pid = k.pid;
+    with_display(k, |d| {
+        let now = super::super::mach::absolute_time();
         let mut i = 0;
         while i < d.begun.len() {
-            if d.begun[i].client == client {
-                out.push(d.begun.remove(i));
+            if d.begun[i].client != client {
+                i += 1;
+            } else if !d.begun[i].submitted {
+                let r = d.begun.remove(i);
+                d.remove_request(r, 7);
+            } else {
+                d.begun[i].cancelled = true;
+                i += 1;
+            }
+        }
+        let mut i = 0;
+        while i < d.queue.len() {
+            if d.queue[i].client == client {
+                let r = d.queue.remove(i).expect("a queued request");
+                d.remove_request(r, 7);
             } else {
                 i += 1;
             }
         }
-        for r in d.queue.iter_mut().filter(|r| r.client == client) {
-            r.cancelled = true;
+        d.kick();
+        if d.client_wait.get(&client).is_some_and(|w| w.0 != 0) {
+            d.wake_queue(now);
         }
         d.swap_clients = d.swap_clients.saturating_sub(1);
-        out
+        if d.swap_clients == 0 && d.power.hard != 0 {
+            d.change(Change::Soft { state: 1, sched: false }, pid, now);
+        }
     });
-    for r in released {
-        release_request(k, r);
-    }
 }
 
 /// A client gone: its notification records dropped.
 pub fn client_gone(_k: &mut Kernel, client: u32) {
-    display(|d| d.records.iter_mut().for_each(|l| l.retain(|r| r.client != client)));
-}
-
-/// The frame information size selector 74 gave the client (`+0x3c8`),
-/// which decides whether type 3 has a queue.
-pub fn frame_info_size(_c: &super::Client) -> u32 {
-    0
+    display(|d| {
+        d.records.iter_mut().for_each(|l| l.retain(|r| r.client != client));
+        d.client_wait.remove(&client);
+    });
 }
 
 /// The surfaces a request holds let go.
@@ -396,15 +621,22 @@ pub fn submit(k: &mut Kernel, record: &[u8]) -> i32 {
     };
     match r {
         Ok(()) => {
-            display(|d| {
+            // Queued (0xfffffff0067916f8); a controller that is off while
+            // the display is hard on evaluated again (0xfffffff006791644:
+            // the soft state is not kept on by +0x178a, never set here);
+            // and the kick.
+            let pid = k.pid;
+            with_display(k, |d| {
                 if let Some(i) = d.begun.iter().position(|r| r.id == id) {
                     d.begun.remove(i);
                 }
-                if d.pending.is_none() {
-                    d.pending = Some(req);
-                } else {
-                    d.queue.push_back(req);
+                req.submitted = true;
+                d.queue.push_back(req);
+                let now = super::super::mach::absolute_time();
+                if !d.power.controller && d.power.hard != 0 {
+                    d.change(Change::Evaluate, pid, now);
                 }
+                d.kick();
             });
             k.darwin_iomfb_arm();
             ret::SUCCESS
@@ -622,120 +854,567 @@ fn enqueue(req: &Request) -> Result<(), i32> {
 // Cancelling.
 
 /// Slot 217's gated `swap_cancel` (0xfffffff006789460): a begun request
-/// not yet handed to swap_submit goes (released); one being submitted, or
-/// queued, is marked cancelled; none by that id is kIOReturnBadArgument.
-/// The pending swap is not looked at.
+/// not yet handed to swap_submit is removed (status 7); one handed to it,
+/// or a queued one, is marked cancelled; none by that id is
+/// kIOReturnBadArgument. The pending swap is not looked at, and no waiter
+/// is woken.
 pub fn cancel(k: &mut Kernel, id: u32) -> i32 {
-    let (r, released) = display(|d| {
+    with_display(k, |d| {
         if let Some(i) = d.begun.iter().position(|r| r.id == id) {
             if !d.begun[i].submitted {
-                return (ret::SUCCESS, Some(d.begun.remove(i)));
+                let r = d.begun.remove(i);
+                d.remove_request(r, 7);
+            } else {
+                d.begun[i].cancelled = true;
             }
-            d.begun[i].cancelled = true;
-            return (ret::SUCCESS, None);
+            return ret::SUCCESS;
         }
         match d.queue.iter_mut().find(|r| r.id == id) {
             Some(r) => {
                 r.cancelled = true;
-                (ret::SUCCESS, None)
+                ret::SUCCESS
             }
-            None => (ret::BAD_ARGUMENT, None),
+            None => ret::BAD_ARGUMENT,
         }
-    });
-    if let Some(req) = released {
-        release_request(k, req);
-    }
-    r
+    })
 }
 
-/// Slot 218's `swap_cancel_all(time)` (0xfffffff0067a0488): every begun
-/// request removed, and the queued ones from the first whose presentation
-/// time is at `time` or later; the waiters woken.
+/// Slot 218's `swap_cancel_all(time)` (0xfffffff0067a0488): each begun
+/// request of kind 0 removed (status 7) if not yet handed to swap_submit,
+/// else marked cancelled; the queued ones of kind 0 from the first whose
+/// presentation time is at `time` or later marked cancelled; then slot 309
+/// and the swap queue's waiters woken.
 pub fn cancel_all(k: &mut Kernel, time: u64) -> i32 {
-    let gone = display(|d| {
-        let mut gone: Vec<Request> = d.begun.drain(..).collect();
-        if let Some(first) = d.queue.iter().position(|r| time <= r.presentation) {
-            gone.extend(d.queue.drain(first..));
+    with_display(k, |d| {
+        d.cancel_all(time, super::super::mach::absolute_time());
+        ret::SUCCESS
+    })
+}
+
+// ---------------------------------------------------------------------------
+// The display's state machine.
+
+impl Display {
+    /// 0xfffffff0067a0488 (see [`cancel_all`]).
+    fn cancel_all(&mut self, time: u64, now: u64) {
+        let mut i = 0;
+        while i < self.begun.len() {
+            if self.begun[i].kind != 0 {
+                i += 1;
+            } else if !self.begun[i].submitted {
+                let r = self.begun.remove(i);
+                self.remove_request(r, 7);
+            } else {
+                self.begun[i].cancelled = true;
+                i += 1;
+            }
         }
-        gone
-    });
-    for r in gone {
-        release_request(k, r);
+        if let Some(first) = self.queue.iter().position(|r| time <= r.presentation) {
+            for r in self.queue.iter_mut().skip(first) {
+                if r.kind == 0 {
+                    r.cancelled = true;
+                }
+            }
+        }
+        self.wake_queue(now);
     }
-    ret::SUCCESS
+
+    /// `IOMobileFramebufferLegacy`'s request removal (AppleCLCD slot 340,
+    /// 0xfffffff006bf6798, to 0xfffffff006789698): the request marked
+    /// cancelled with its status, its surfaces let go, and the client that
+    /// began it told, when it is waiting for this swap, that it went
+    /// (`+0x100`). The caller has taken it out of its list.
+    fn remove_request(&mut self, mut r: Request, status: u32) {
+        r.cancelled = true;
+        r.status = status;
+        if let Some(w) = self.client_wait.get_mut(&r.client) {
+            if w.0 == r.id {
+                w.1 = true;
+            }
+        }
+        self.effects.push(Effect::Release(r));
+    }
+
+    /// The kick (AppleCLCD slot 290, 0xfffffff006bfb384): the queue's head
+    /// becomes the pending swap when there is none and the display is
+    /// powered (the soft state and the controller on). A cancelled head is
+    /// dropped as it is reached.
+    fn kick(&mut self) {
+        if self.pending.is_some() || self.power.soft == 0 || !self.power.controller {
+            return;
+        }
+        while let Some(mut r) = self.queue.pop_front() {
+            if r.cancelled {
+                self.effects.push(Effect::Release(r));
+                continue;
+            }
+            r.status = 2;
+            self.pending = Some(r);
+            break;
+        }
+    }
+
+    /// The pending swap completed (0xfffffff00678a96c): `shown` at a
+    /// vertical blank (0xfffffff00679534c: each layer it enables on the
+    /// glass, the surface there let go (0xfffffff00679437c), and the glass
+    /// to the sink), or not (a flush: each enabled layer dropped, status
+    /// 7).
+    /// Either way a swap of kind 0 or 15 is the display's swap id, the swap
+    /// queue's waiters are woken, the swap timer's count of removals starts
+    /// again, and with the soft state off and the controller on the power
+    /// states are evaluated again once the pending swap is gone
+    /// (0xfffffff006795b18).
+    fn complete_pending(&mut self, shown: Option<(u64, u64)>, pid: i32, now: u64) {
+        let Some(mut req) = self.pending.take() else { return };
+        match shown {
+            Some((count, time)) => {
+                req.status = 4;
+                for n in 0..4 {
+                    if req.enabled & (1 << n) == 0 {
+                        continue;
+                    }
+                    if let Some(old) = self.glass[n].take().and_then(|l| l.surface) {
+                        self.effects.push(Effect::ReleaseSurface(old));
+                    }
+                    // The request's reference goes to the glass.
+                    let l = std::mem::take(&mut req.layers[n]);
+                    self.glass[n] = l.surface.is_some().then_some(l);
+                }
+                let layers = (0..4u32).filter_map(|n| self.glass[n as usize].map(|l| (n, l))).collect();
+                self.effects.push(Effect::Present(req.id, count, time, layers));
+                if req.kind == 0 || req.kind == 0xf {
+                    self.display_swap_id = req.id;
+                }
+                self.effects.push(Effect::Release(req));
+            }
+            None => {
+                if req.enabled & 0xf != 0 {
+                    req.cancelled = true;
+                }
+                req.status = 7;
+                if req.kind == 0 || req.kind == 0xf {
+                    self.display_swap_id = req.id;
+                }
+                self.effects.push(Effect::Release(req));
+            }
+        }
+        self.wake_queue(now);
+        self.timed_out = 0;
+        if self.power.soft == 0 && self.power.controller {
+            self.change(Change::Evaluate, pid, now);
+        }
+    }
+
+    /// `clear_up_swap_queue_gated` (AppleCLCD slot 346, 0xfffffff006bf710c):
+    /// a pending swap that is not being flushed goes back to the queue's
+    /// head, and (with no always-on display state in hand, `+0x1e4c`) each
+    /// queued request in turn is made pending and completed without being
+    /// shown.
+    fn flush(&mut self, pid: i32, now: u64) {
+        if let Some(p) = self.pending.take() {
+            if p.status == 3 {
+                self.pending = Some(p);
+            } else {
+                self.queue.push_front(p);
+            }
+        }
+        while let Some(mut r) = self.queue.pop_front() {
+            r.status = 3;
+            self.pending = Some(r);
+            self.complete_pending(None, pid, now);
+        }
+    }
+
+    /// The swap queue's event woken (`commandWakeup(&+0x1568)`): each swap
+    /// wait asleep on it resumes, in turn.
+    fn wake_queue(&mut self, now: u64) {
+        let (woken, rest): (Vec<Waiter>, Vec<Waiter>) = std::mem::take(&mut self.waiters).into_iter().partition(|w| matches!(w.on, Sleep::Queue { .. }));
+        self.waiters = rest;
+        for w in woken {
+            self.wait_resume(w, false, now);
+        }
+    }
+
+    /// The power scheduler's event woken (`commandWakeup(&+0x16e0)`): the
+    /// swap waits and power requests asleep on it look again.
+    fn wake_power(&mut self, pid: i32, now: u64) {
+        let (woken, rest): (Vec<Waiter>, Vec<Waiter>) = std::mem::take(&mut self.waiters).into_iter().partition(|w| w.on == Sleep::Power);
+        self.waiters = rest;
+        for w in woken {
+            self.wait_power_done(w, now);
+        }
+        for c in std::mem::take(&mut self.power_callers) {
+            if let Some(r) = self.request_power(c.state, pid, now) {
+                self.effects.push(Effect::Answer { link: c.link, token: c.token, ret: r });
+            } else {
+                self.power_callers.push(c);
+            }
+        }
+    }
+
+    /// `swap_cancel_all` with the time now after `clear_up_swap_queue`: what
+    /// a swap wait that gives up does (slots 346 and 218).
+    fn clear_swaps(&mut self, pid: i32, now: u64) {
+        self.flush(pid, now);
+        self.cancel_all(now, now);
+    }
+
+    /// The swap timer (0xfffffff0067881b8): each queued request whose
+    /// deadline has passed removed (status 5), the waiters woken if one was,
+    /// the kick, and the timer armed again for the earliest deadline left.
+    /// More than four removals before a swap completes panic only with
+    /// `+0x189a`, which nothing sets here.
+    fn swap_timer_fire(&mut self, now: u64) {
+        self.swap_timer = 0;
+        let mut removed = false;
+        let mut next = 0u64;
+        let mut i = 0;
+        while i < self.queue.len() {
+            let deadline = self.queue[i].deadline;
+            if deadline == 0 {
+                i += 1;
+                continue;
+            }
+            if deadline < now {
+                self.timed_out += 1;
+                let r = self.queue.remove(i).expect("a queued request");
+                self.remove_request(r, 5);
+                removed = true;
+                continue;
+            }
+            if next == 0 || deadline < next {
+                next = deadline;
+            }
+            i += 1;
+        }
+        if removed {
+            self.wake_queue(now);
+        }
+        self.kick();
+        if next != 0 {
+            self.swap_timer = next;
+        }
+    }
+
+    /// A vertical blank at `time`, index `index`: counted, the pending swap
+    /// completed and shown, the kick, and a power change waiting for the
+    /// pending swap made if none is pending now.
+    fn blank(&mut self, index: u64, time: u64, pid: i32, now: u64) {
+        let frame = self.panel.map_or(0, |p| p.frame);
+        self.vbl_index = index;
+        self.vbl_count += 1;
+        self.vbl_delta = if self.vbl_time == 0 { frame } else { time - self.vbl_time };
+        self.vbl_time = time;
+        if self.pending.is_some() {
+            self.complete_pending(Some((self.vbl_count, time)), pid, now);
+        }
+        self.kick();
+        self.power_turn(now);
+    }
+
+    /// The display's timed events up to `now`, in order: its vertical
+    /// blanks while the controller is on, the swap timer, and the swap
+    /// waits' five-second deadlines.
+    fn advance(&mut self, pid: i32, now: u64) {
+        let Some(panel) = self.panel else { return };
+        loop {
+            let blank = (self.power.controller).then(|| (self.vbl_index + 1) * panel.frame);
+            let timer = (self.swap_timer != 0).then_some(self.swap_timer);
+            let wait = self.waiters.iter().filter_map(|w| match w.on {
+                Sleep::Queue { deadline } => Some(deadline),
+                Sleep::Power => None,
+            }).min();
+            let next = [blank, timer, wait].into_iter().flatten().min();
+            let Some(at) = next.filter(|&t| t <= now) else { break };
+            if blank == Some(at) {
+                // With nothing to complete, program or wait for, the blanks
+                // before the next other event change nothing but the count.
+                let idle = self.pending.is_none() && (self.queue.is_empty() || self.power.soft == 0) && self.power.changes.is_empty();
+                let until = [timer, wait].into_iter().flatten().min().unwrap_or(u64::MAX).min(now);
+                let last = until / panel.frame;
+                if idle && last > self.vbl_index + 1 {
+                    self.vbl_count += last - 1 - self.vbl_index;
+                    self.vbl_index = last - 1;
+                    self.vbl_time = self.vbl_index * panel.frame;
+                }
+                let index = self.vbl_index + 1;
+                let time = index * panel.frame;
+                self.blank(index, time, pid, time);
+            } else if timer == Some(at) {
+                self.swap_timer_fire(at);
+            } else {
+                self.wait_deadline(at, pid, at);
+            }
+        }
+        // While the controller is off no blank comes: the next is the first
+        // after it is on again.
+        if !self.power.controller {
+            self.vbl_index = self.vbl_index.max(now / panel.frame);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Swap waits.
+
+    /// A pass of `swap_wait_gated`'s loop for `w` (0xfffffff00678b960):
+    /// for modes 0 to 2, done when the swap is gone from the display (0),
+    /// is no longer pending or queued (1), or nothing is pending or queued
+    /// (2), the swap found given the wait's deadline (0xfffffff00678dc30);
+    /// then a wait that does not block is kIOReturnBusy, a cancelled swap
+    /// kIOReturnAborted, and otherwise it sleeps on the queue for five
+    /// seconds. `Some` is its result.
+    fn wait_pass(&mut self, w: &mut Waiter, no_block: bool, now: u64) -> Option<i32> {
+        let mut found_cancelled = None;
+        if w.mode <= 2 {
+            let displayed = w.id == self.display_swap_id;
+            let (pending, queued) = (self.pending.is_some(), !self.queue.is_empty());
+            let found = match self.pending.as_mut().filter(|r| r.id == w.id) {
+                Some(r) => Some(r),
+                None => self.queue.iter_mut().find(|r| r.id == w.id),
+            };
+            match w.mode {
+                0 if !displayed && found.is_none() => return Some(ret::SUCCESS),
+                1 if found.is_none() => return Some(ret::SUCCESS),
+                2 if !pending && !queued => return Some(ret::SUCCESS),
+                _ => {}
+            }
+            if let Some(r) = found {
+                if w.timeout != 0 && (r.deadline == 0 || w.swap_deadline < r.deadline) {
+                    r.deadline = w.swap_deadline;
+                    if self.swap_timer == 0 || w.swap_deadline < self.swap_timer {
+                        self.swap_timer = w.swap_deadline;
+                    }
+                }
+                found_cancelled = Some(r.cancelled);
+            }
+        }
+        if no_block {
+            return Some(kr::BUSY);
+        }
+        if found_cancelled == Some(true) {
+            return Some(kr::ABORTED);
+        }
+        // `+0x178a` is never set here: the sleep has its deadline.
+        w.sleeps += 1;
+        w.on = Sleep::Queue { deadline: now + ms_to_abs(5000) };
+        None
+    }
+
+    /// A swap wait asleep on the queue woken (`timed_out`: its deadline
+    /// passed instead): woken more than twice in mode 2, or timed out, it
+    /// clears the swaps and is kIOReturnAborted; then its loop goes on
+    /// while its client is started.
+    fn wait_resume(&mut self, mut w: Waiter, timed_out: bool, now: u64) {
+        let pid = w.pid;
+        if timed_out || (w.sleeps > 2 && w.mode == 2) {
+            self.clear_swaps(pid, now);
+            return self.wait_answer(w, kr::ABORTED);
+        }
+        if !self.started.contains(&w.client) {
+            return self.wait_answer(w, kr::ABORTED);
+        }
+        match self.wait_pass(&mut w, false, now) {
+            Some(r) => self.wait_answer(w, r),
+            None => self.waiters.push(w),
+        }
+    }
+
+    /// The swap wait whose deadline is `at` gave up.
+    fn wait_deadline(&mut self, at: u64, _pid: i32, now: u64) {
+        let Some(i) = self.waiters.iter().position(|w| w.on == Sleep::Queue { deadline: at }) else { return };
+        let w = self.waiters.remove(i);
+        self.wait_resume(w, true, now);
+    }
+
+    /// A swap wait asleep on the power scheduler woken: asleep again while
+    /// a request is with it, else on into the wait proper.
+    fn wait_power_done(&mut self, mut w: Waiter, now: u64) {
+        if self.power.transition {
+            self.waiters.push(w);
+            return;
+        }
+        let no_block = w.no_block;
+        match self.wait_body(&mut w, no_block, now) {
+            Some(r) => self.wait_answer(w, r),
+            None => self.waiters.push(w),
+        }
+    }
+
+    /// `swap_wait_gated` past the power scheduler: the swap's deadline from
+    /// the timeout; modes 3 and 4, which ask whether the soft state is on
+    /// (kIOReturnBadArgument where it is not as asked); the wait proper when
+    /// the controller is on (the display's power change support, `+0x8c`,
+    /// being on), else kIOReturnOffline.
+    fn wait_body(&mut self, w: &mut Waiter, no_block: bool, now: u64) -> Option<i32> {
+        if w.timeout != 0 {
+            w.swap_deadline = now + ms_to_abs(u64::from(w.timeout));
+        }
+        match w.mode {
+            3 => return Some(if self.power.soft == 0 { ret::BAD_ARGUMENT } else { ret::SUCCESS }),
+            4 => return Some(if self.power.soft == 0 { ret::SUCCESS } else { ret::BAD_ARGUMENT }),
+            _ => {}
+        }
+        if !self.power.controller {
+            return Some(kr::OFFLINE);
+        }
+        self.wait_pass(w, no_block, now)
+    }
+
+    /// The client's `swap_wait` after the framebuffer's (0xfffffff006777390):
+    /// kIOReturnTimeout when the swap it waited for was removed meanwhile
+    /// (`+0x100`, the swap id kept), else the swap id cleared.
+    fn wait_result(&mut self, client: u32, r: i32) -> i32 {
+        match self.client_wait.get_mut(&client) {
+            Some(w) if w.1 => kr::TIMEOUT,
+            Some(w) => {
+                w.0 = 0;
+                r
+            }
+            None => r,
+        }
+    }
+
+    /// A swap wait that slept answered.
+    fn wait_answer(&mut self, w: Waiter, r: i32) {
+        let r = self.wait_result(w.client, r);
+        self.effects.push(Effect::Answer { link: w.link, token: w.token, ret: r });
+    }
+
+    // -----------------------------------------------------------------------
+    // Power.
+
+    /// Selector 12's gated action past the power scheduler's wait
+    /// (0xfffffff006bf792c): the state requested and given to the
+    /// scheduler, success. `None` while a request is with the scheduler.
+    fn request_power(&mut self, state: u32, pid: i32, now: u64) -> Option<i32> {
+        if self.power.transition {
+            return None;
+        }
+        self.power.requested = state;
+        self.power.transition = true;
+        self.power.jobs += 1;
+        self.run_scheduler(pid, now);
+        Some(ret::SUCCESS)
+    }
+
+    /// The power scheduler's actions in turn (0xfffffff006c07b70, gated
+    /// 0xfffffff006c07bd0): the request taken (`+0x16e0` cleared) and its
+    /// state set (0xfffffff00678b858), one at a time.
+    fn run_scheduler(&mut self, pid: i32, now: u64) {
+        while !self.power.scheduling && self.power.jobs > 0 {
+            self.power.jobs -= 1;
+            if std::mem::replace(&mut self.power.transition, false) {
+                self.power.scheduling = true;
+                let state = self.power.requested;
+                self.change(Change::Soft { state, sched: true }, pid, now);
+            }
+        }
+    }
+
+    /// A power state change asked for (slot 354, 0xfffffff006bf79a8): it
+    /// takes the ticket after those before it and waits for the pending
+    /// swap to complete. The `iomfb_handle_power=0` boot-arg (`+0x212d`)
+    /// and the pipe's slot 0xb08, which would skip it, are neither here.
+    fn change(&mut self, c: Change, pid: i32, now: u64) {
+        self.power.changes.push_back((c, pid));
+        self.power_turn(now);
+    }
+
+    /// The changes whose turn it is made while no swap is pending.
+    fn power_turn(&mut self, now: u64) {
+        while self.pending.is_none() {
+            let Some((c, pid)) = self.power.changes.pop_front() else { break };
+            match c {
+                // The soft state set (0xfffffff00678b858's request leaves the
+                // hard state and evaluates only on a change).
+                Change::Soft { state, sched } => {
+                    if state != self.power.soft {
+                        self.power.soft = state;
+                        self.evaluate(pid, now);
+                    }
+                    if sched {
+                        self.power.scheduling = false;
+                        self.wake_power(pid, now);
+                        self.run_scheduler(pid, now);
+                    }
+                }
+                Change::Evaluate => self.evaluate(pid, now),
+            }
+        }
+    }
+
+    /// The power states evaluated (0xfffffff006bf7bc4) for this panel:
+    /// built in, the pipe without always-on display (slots 0x8d0, 0x250 and
+    /// 0x850 false) and its runtime property `AOTEnable` (0xad) as started.
+    /// The controller is on while the display is hard on and a swap is
+    /// pending or the soft state is on; the panel while the soft state and
+    /// the controller are. The panel going dark turns the backlight off
+    /// (0xfffffff006bf8434); the controller going off stops the pipe and its
+    /// vertical blanks, flushes the swap queue and lets the device go
+    /// (`setActive`, `set_device_enabled_gated`); coming on, the reverse; and
+    /// a change of either is told to the power notification records
+    /// (slot 215, 0xfffffff006796d0c).
+    fn evaluate(&mut self, pid: i32, now: u64) {
+        let aot = super::rtprop::value(0xad);
+        if aot != Some(0) {
+            self.effects.push(Effect::Unimplemented(format!("the display's power states with the pipe's AOTEnable runtime property {aot:?} (the always-on display path of 0xfffffff006bf7bc4)")));
+        }
+        let soft = self.power.soft != 0;
+        let controller = self.power.hard != 0 && (self.pending.is_some() || soft);
+        let panel = soft && controller;
+        let (was_controller, was_panel) = (self.power.controller, self.power.panel);
+        self.power.panel = panel;
+        if was_panel && !panel {
+            self.effects.push(Effect::Panel(false));
+        }
+        if was_controller != controller {
+            self.power.controller = controller;
+            if !controller {
+                // The vertical blanks up to now counted; none comes while off.
+                if let Some(p) = self.panel {
+                    self.vbl_index = self.vbl_index.max(now / p.frame);
+                }
+            }
+            self.flush(pid, now);
+        }
+        if !was_panel && panel {
+            self.effects.push(Effect::Panel(true));
+        }
+        if was_controller != controller || was_panel != panel {
+            self.power_notify(now);
+        }
+    }
+
+    /// `powerstate_notify` (slot 215): each listed power record (type 1)
+    /// sent the time and the state, 2 for the controller on and 1 for the
+    /// panel.
+    fn power_notify(&mut self, now: u64) {
+        let state = (if self.power.controller { 2 } else { 0 }) | u64::from(self.power.panel);
+        for r in self.records[1].clone() {
+            if let Some(port) = r.port {
+                self.effects.push(Effect::Notify { port, reference: r.reference, args: [now, state] });
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Vertical blanks.
 
-/// The vertical blanks up to now processed: at each, the pending swap
-/// becomes the displayed one (its layers to the glass, the one it
-/// replaces retired) and the queue's next uncancelled request becomes
-/// pending; and the count, time and delta kept (0xfffffff00679662c).
-fn advance(k: &mut Kernel, now: u64) {
-    let Ok(panel) = panel() else { return };
-    let index = now / panel.frame;
-    loop {
-        let step = display(|d| {
-            if d.vbl_index >= index {
-                return None;
-            }
-            // With nothing pending the blanks up to now change nothing but
-            // the count.
-            if d.pending.is_none() && d.queue.is_empty() && d.vbl_index + 1 < index {
-                d.vbl_count += index - 1 - d.vbl_index;
-                d.vbl_index = index - 1;
-                d.vbl_time = d.vbl_index * panel.frame;
-            }
-            d.vbl_index += 1;
-            let time = d.vbl_index * panel.frame;
-            d.vbl_count += 1;
-            d.vbl_delta = if d.vbl_time == 0 { panel.frame } else { time - d.vbl_time };
-            d.vbl_time = time;
-            let shown = d.pending.take();
-            let retired = if shown.is_some() { d.displayed.take() } else { None };
-            let mut dropped = Vec::new();
-            while let Some(r) = d.queue.pop_front() {
-                if r.cancelled {
-                    dropped.push(r);
-                    continue;
-                }
-                d.pending = Some(r);
-                break;
-            }
-            if let Some(s) = &shown {
-                if s.kind == 0 || s.kind == 0xf {
-                    d.display_swap_id = s.id;
-                }
-            }
-            Some((d.vbl_count, time, d.vbl_delta, shown, retired, dropped))
-        });
-        let Some((count, time, delta, shown, retired, dropped)) = step else { break };
-        if let Some(s) = shown {
-            present(k, &s, count, time, panel);
-            display(|d| d.displayed = Some(s));
-        }
-        for r in retired.into_iter().chain(dropped) {
-            release_request(k, r);
-        }
-        let _ = delta;
-    }
-}
-
-/// The vertical blanks up to now processed, whoever calls: the display
-/// runs whether or not the task that swapped is still there to watch it.
+/// The display's timed events up to now processed, whoever calls: the
+/// display runs whether or not the task that swapped is still there to
+/// watch it.
 pub fn catch_up(k: &mut Kernel) {
-    advance(k, super::super::mach::absolute_time());
+    let pid = k.pid;
+    with_display(k, |d| d.advance(pid, super::super::mach::absolute_time()));
 }
 
-/// Swap `s`'s layers to the glass.
-fn present(k: &mut Kernel, s: &Request, vbl: u64, time: u64, panel: Panel) {
-    let mut frame = sink::Frame { swap_id: s.id, vbl, time, panel: (panel.width, panel.height), layers: Vec::new() };
-    for (n, l) in s.layers.iter().enumerate() {
+/// The glass after swap `swap`, its `layers`, to the sink.
+fn present(k: &mut Kernel, swap: u32, vbl: u64, time: u64, layers: &[(u32, LayerReq)]) {
+    let Ok(panel) = panel() else { return };
+    let mut frame = sink::Frame { swap_id: swap, vbl, time, panel: (panel.width, panel.height), layers: Vec::new() };
+    for &(n, l) in layers {
         let Some(id) = l.surface else { continue };
-        if s.enabled & (1 << n) == 0 {
-            continue;
-        }
         let Some(g) = super::super::iosurface::geometry(id) else { continue };
         let count = if g.plane_count == 0 { 1 } else { g.plane_count };
         let planes = (0..count)
@@ -745,7 +1424,7 @@ fn present(k: &mut Kernel, s: &Request, vbl: u64, time: u64, panel: Panel) {
         let size = g.alloc_size as usize;
         let bytes = super::super::iosurface::with_bytes(k, id, |b| b[..size.min(b.len())].to_vec()).unwrap_or_default();
         let rect = |r: [i32; 4]| sink::Rect { x: r[0], y: r[1], w: r[2], h: r[3] };
-        frame.layers.push(sink::Layer { index: n as u32, surface: id, pixel_format: g.pixel_format, width: g.width, height: g.height, planes, bytes, src: rect(l.src), dst: rect(l.dst), transform: l.transform });
+        frame.layers.push(sink::Layer { index: n, surface: id, pixel_format: g.pixel_format, width: g.width, height: g.height, planes, bytes, src: rect(l.src), dst: rect(l.dst), transform: l.transform });
     }
     match sink::sink() {
         Some(s) => {
@@ -757,89 +1436,74 @@ fn present(k: &mut Kernel, s: &Request, vbl: u64, time: u64, panel: Panel) {
     }
 }
 
-/// Whether a swap was ever displayed.
-pub fn any_displayed() -> bool {
-    display(|d| d.displayed.is_some())
+/// The surface on the glass in layer `layer` (`+0x1358 + 8 * layer`), if
+/// any.
+pub fn glass_surface(layer: u32) -> Option<u32> {
+    display(|d| d.glass.get(layer as usize).copied().flatten().and_then(|l| l.surface))
 }
 
-/// Whether the calling task has a reason for the framebuffer's thread
-/// call: swaps it made still on their way to the glass, or swap waits of
-/// its threads.
-pub fn wants_blanks(pid: i32, waits: bool) -> bool {
-    waits || display(|d| d.pending.as_ref().is_some_and(|r| r.pid == pid) || d.queue.iter().any(|r| r.pid == pid))
-}
-
-/// When the next vertical blank after now comes, in absolute time.
-pub fn next_blank() -> Option<u64> {
-    let panel = panel().ok()?;
-    let now = super::super::mach::absolute_time();
-    Some((now / panel.frame + 1) * panel.frame)
+/// When task `pid` wants the display's thread call: the next vertical
+/// blank while it has swaps on their way to the glass, swap waits, or a
+/// power change waiting for the pending swap; the swap timer while one of
+/// its queued swaps has a deadline; its swap waits' deadlines.
+fn next_event(pid: i32) -> Option<u64> {
+    display(|d| {
+        let panel = d.panel?;
+        let now = super::super::mach::absolute_time();
+        let swaps = d.pending.as_ref().is_some_and(|r| r.pid == pid) || d.queue.iter().any(|r| r.pid == pid);
+        let waits = d.waiters.iter().any(|w| w.pid == pid && matches!(w.on, Sleep::Queue { .. }));
+        let changes = d.power.changes.iter().any(|&(_, p)| p == pid);
+        let blank = (d.power.controller && (swaps || waits || changes)).then(|| (now / panel.frame + 1) * panel.frame);
+        let timer = (d.swap_timer != 0 && d.queue.iter().any(|r| r.pid == pid && r.deadline != 0)).then_some(d.swap_timer);
+        let deadline = d.waiters.iter().filter(|w| w.pid == pid).filter_map(|w| match w.on {
+            Sleep::Queue { deadline } => Some(deadline),
+            Sleep::Power => None,
+        }).min();
+        [blank, timer, deadline].into_iter().flatten().min()
+    })
 }
 
 // ---------------------------------------------------------------------------
 // Swap waits.
 
-/// What a swap wait waits for, by its options' low bits: 0 until the swap
-/// is gone from the display (neither pending, queued nor displayed); 1
-/// until it is no longer pending or queued; 2 until nothing is pending or
-/// queued.
-fn wait_satisfied(d: &Display, id: u32, mode: u32) -> Option<i32> {
-    let displayed = d.display_swap_id == id;
-    let found = d.pending.as_ref().filter(|r| r.id == id).or_else(|| d.queue.iter().find(|r| r.id == id));
-    if let Some(r) = found {
-        if r.cancelled {
-            return Some(kr::ABORTED);
+/// Selector 6: the client's `swap_wait` (0xfffffff006777390: its `+0xf8`
+/// the swap, `+0x100` cleared) and the framebuffer's (slot 176,
+/// 0xfffffff00678d998). With bit 31 of the options, modes 3 and 4 answer
+/// at once from the soft state and the power scheduler (kIOReturnBusy where
+/// not as asked). Otherwise `swap_wait_gated` (0xfffffff00678b960) waits
+/// for no request to be with the power scheduler, then goes on
+/// ([`Display::wait_body`]). `Ok` is its result now; `Err(token)` that it
+/// sleeps, answered later by that token.
+pub fn wait(k: &mut Kernel, client: u32, id: u32, options: u32, timeout: u32) -> Result<i32, u64> {
+    let (pid, link) = (k.pid, k.dtask.ipc_raw.link.clone());
+    let r = with_display(k, |d| {
+        let now = super::super::mach::absolute_time();
+        d.advance(pid, now);
+        let no_block = options & 0x8000_0000 != 0;
+        let mode = options & 0x7fff_ffff;
+        d.client_wait.insert(client, (id, false));
+        if no_block && (mode == 3 || mode == 4) {
+            let on = d.power.soft != 0;
+            let asked = if mode == 3 { on } else { !on };
+            let r = if !d.power.transition && asked { ret::SUCCESS } else { kr::BUSY };
+            return Ok(d.wait_result(client, r));
         }
-    }
-    let done = match mode {
-        0 => !displayed && found.is_none(),
-        1 => found.is_none(),
-        _ => d.pending.is_none() && d.queue.is_empty(),
-    };
-    done.then_some(ret::SUCCESS)
-}
-
-/// The outcome of selector 6 now (`swap_wait`, 0xfffffff00678d998, gated
-/// 0xfffffff00678b960): `Some` its result, `None` to wait. Options 3 and
-/// 4 ask whether the display is enabled (`+0x16d0`, set at start);
-/// bit 31 does not wait (kIOReturnBusy where it would). A timeout arms the
-/// swap's own timer, which is not modelled (`Err`).
-pub fn wait(k: &mut Kernel, id: u32, options: u32, timeout: u32) -> Result<Option<i32>, String> {
-    let now = super::super::mach::absolute_time();
-    advance(k, now);
-    let no_block = options & 0x8000_0000 != 0;
-    let mode = options & 0x7fff_ffff;
-    // `+0x16e0`, a power transition in progress, is never set here; the
-    // display is enabled (`+0x16d0`).
-    if no_block && mode == 3 {
-        return Ok(Some(ret::SUCCESS));
-    }
-    if no_block && mode == 4 {
-        return Ok(Some(kr::BUSY));
-    }
-    match mode {
-        3 => return Ok(Some(ret::SUCCESS)),
-        4 => return Ok(Some(ret::BAD_ARGUMENT)),
-        _ => {}
-    }
-    if timeout != 0 {
-        return Err(format!("an IOMobileFramebuffer swap wait with a timeout ({timeout} ms): the swap's timer"));
-    }
-    let r = display(|d| wait_satisfied(d, id, mode.min(2)));
-    if r.is_some() {
-        return Ok(r);
-    }
-    if no_block {
-        return Ok(Some(kr::BUSY));
-    }
-    Ok(None)
-}
-
-/// A waiting swap wait's outcome now, if it has one: its client stopped
-/// ends the wait's loop with kIOReturnAborted (0xfffffff00678b960's loop
-/// runs while the client has started).
-pub fn wait_done(client: u32, id: u32, options: u32) -> Option<i32> {
-    display(|d| if d.started.contains(&client) { wait_satisfied(d, id, (options & 0x7fff_ffff).min(2)) } else { Some(kr::ABORTED) })
+        let Some(link) = link else { unreachable!("a task serving a call has its link") };
+        let mut w = Waiter { token: 0, link, pid, client, id, mode, no_block, timeout, swap_deadline: 0, sleeps: 0, on: Sleep::Power };
+        let r = if d.power.transition { None } else { d.wait_body(&mut w, no_block, now) };
+        match r {
+            Some(r) => Ok(d.wait_result(client, r)),
+            None => {
+                w.token = super::super::mig::later_token();
+                let token = w.token;
+                d.waiters.push(w);
+                Err(token)
+            }
+        }
+    });
+    // A wait asleep on the queue has its deadline and the blanks to watch.
+    k.darwin_iomfb_arm();
+    r
 }
 
 /// A framebuffer client started.
@@ -853,18 +1517,45 @@ pub fn client_stopped(client: u32) {
 }
 
 // ---------------------------------------------------------------------------
+// Power.
+
+/// Selector 12's power change for the framebuffer (AppleCLCD slot 229,
+/// 0xfffffff006bf7900, the command gate's action 0xfffffff006bf792c): it
+/// waits while a request is with the power scheduler
+/// (0xfffffff00678db9c), then gives the scheduler the state and succeeds;
+/// the scheduler sets it once the pending swap completes. `Ok` is its
+/// result now; `Err(token)` that it sleeps, answered later by that token.
+pub fn request_power_change(k: &mut Kernel, state: u32) -> Result<i32, u64> {
+    let (pid, link) = (k.pid, k.dtask.ipc_raw.link.clone());
+    let r = with_display(k, |d| {
+        let now = super::super::mach::absolute_time();
+        d.advance(pid, now);
+        match d.request_power(state, pid, now) {
+            Some(r) => Ok(r),
+            None => {
+                let Some(link) = link else { unreachable!("a task serving a call has its link") };
+                let token = super::super::mig::later_token();
+                d.power_callers.push(PowerCaller { token, link, state });
+                Err(token)
+            }
+        }
+    });
+    k.darwin_iomfb_arm();
+    r
+}
+
+// ---------------------------------------------------------------------------
 // Notifications.
 
 /// Selector 72 with a callout, the framebuffer's gated enable
 /// (0xfffffff006795ec0): a record already listed, or a type past the
 /// slots, is kIOReturnError; else its async reference is set
-/// (`setAsyncReference64`, but for frame information through a queue: the
-/// slot's port and the callout, which no message here carries) and it is
-/// listed. Vertical blank (5) calls AppleCLCD's slots 316 (empty)
-/// and 290 (the pipe's kick, which programs a pending swap, none waiting
-/// here); frame information (3) and CRC (4) turn the hardware's on, which
-/// is not modelled (`Err`).
-pub fn enable_notifications(client: u32, ty: usize, listed: bool) -> Result<i32, String> {
+/// (`setAsyncReference64` with the slot's port, the callout and its
+/// reference, in a 64-bit task; frame information through a queue sets
+/// none) and it is listed. Vertical blank (5) calls AppleCLCD's slots 316
+/// (empty) and 290 (the kick); frame information (3) and CRC (4) turn the
+/// hardware's on, which is not modelled (`Err`).
+pub fn enable_notifications(k: &mut Kernel, client: u32, ty: usize, listed: bool, port: Option<ObjId>, callout: u64, refcon: u64) -> Result<i32, String> {
     if listed || ty >= super::NOTIFY_TYPES {
         return Ok(ret::ERROR);
     }
@@ -873,7 +1564,17 @@ pub fn enable_notifications(client: u32, ty: usize, listed: bool) -> Result<i32,
         4 => return Err("IOMobileFramebuffer CRC notifications (the pipe's CRC hardware)".to_string()),
         _ => {}
     }
-    display(|d| d.records[ty].push(Record { client }));
+    // kIOUCAsync64Flag in the reserved word, beside the port.
+    let mut reference = [0u64; ASYNC_REF64_COUNT];
+    reference[0] = 1;
+    reference[1] = callout;
+    reference[2] = refcon;
+    with_display(k, |d| {
+        d.records[ty].push(Record { client, port, reference });
+        if ty == 5 {
+            d.kick();
+        }
+    });
     Ok(ret::SUCCESS)
 }
 
@@ -888,24 +1589,27 @@ pub fn disable_notifications(client: u32, ty: usize) {
 }
 
 impl Kernel {
-    /// The framebuffer's thread call armed for the next vertical blank,
-    /// when the task has a reason for it.
+    /// The framebuffer's thread call armed for the display's next event
+    /// this task wants ([`next_event`]), or again sooner when that is
+    /// earlier than the one armed.
     pub(crate) fn darwin_iomfb_arm(&mut self) {
-        let waits = self.dtask.pending_replies.iter().any(|p| matches!(p.op, super::super::kobject::Deferred::IomfbSwapWait { .. }));
-        if !wants_blanks(self.pid, waits) || self.dtask.iomfb_call.is_some() {
-            return;
+        let Some(at) = next_event(self.pid) else { return };
+        let when = super::super::mach::abs_to_instant(at);
+        if let Some(key) = self.dtask.iomfb_call {
+            if key.0 <= when {
+                return;
+            }
+            self.dtask.timers.cancel(key);
         }
-        let Some(at) = next_blank() else { return };
-        let key = self.dtask.timers.arm(super::super::mach::abs_to_instant(at), super::super::timer::Action::Iomfb);
+        let key = self.dtask.timers.arm(when, super::super::timer::Action::Iomfb);
         self.dtask.iomfb_call = Some(key);
     }
 
-    /// The framebuffer's thread call: the vertical blanks up to now, the
-    /// task's swap waits answered, and the call armed again while needed.
+    /// The framebuffer's thread call: the display's events up to now, and
+    /// the call armed again while needed.
     pub(crate) fn darwin_iomfb_blank(&mut self, m: &mut GuestMem<'_>) {
         self.dtask.iomfb_call = None;
-        advance(self, super::super::mach::absolute_time());
-        self.darwin_pending_ready(m);
+        catch_up(self);
         self.darwin_ipc_settle(m);
         self.darwin_iomfb_arm();
     }

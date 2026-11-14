@@ -488,16 +488,30 @@ fn lookup_port(k: &mut Kernel, uc: u32, a: &mut MethodArgs) -> i32 {
     }
 }
 
-/// Selector 35 (0xfffffff005bae7a8, 0xfffffff005bafcc8): a send right to
-/// the surface, as a port name in the caller's space
-/// (`copyPortNameForObjectInTask`); option bit 0 wires it, bit 1 keeps it
-/// from holding a use count.
+/// Selector 35 (0xfffffff005bae7a8, 0xfffffff005bafcc8): the client's
+/// surface by its handle (kIOReturnBadArgument without one), and a send
+/// right to it in the caller's space ([`send_right_in_task`]).
 fn create_port(k: &mut Kernel, uc: u32, id: u32, options: u32, a: &mut MethodArgs) -> i32 {
     a.scalar_out[0] = 0;
-    let made = root(|r| {
-        if handle(r, uc, id).is_none() {
-            return Err(ret::BAD_ARGUMENT);
+    if root(|r| handle(r, uc, id).is_none()) {
+        return ret::BAD_ARGUMENT;
+    }
+    match send_right_in_task(k, id, options) {
+        Ok(name) => {
+            a.scalar_out[0] = u64::from(name);
+            ret::SUCCESS
         }
+        Err(e) => e,
+    }
+}
+
+/// 0xfffffff005baa918, which selector 35 and the kernel's own callers
+/// (0xfffffff005baa90c, with no options) reach: a send right to surface
+/// `id` as a port name in the calling task (`copyPortNameForObjectInTask`);
+/// option bit 0 wires it, bit 1 keeps it from holding a use count. A
+/// surface that is gone is kIOReturnBadArgument.
+pub fn send_right_in_task(k: &mut Kernel, id: u32, options: u32) -> Result<u32, i32> {
+    let made: Result<u32, i32> = root(|r| {
         let s = r.surfaces.get_mut(&id).ok_or(ret::BAD_ARGUMENT)?;
         let wired = options & 1 != 0;
         // The wired kind forces bit 1 (0xfffffff005bb7d84).
@@ -516,16 +530,12 @@ fn create_port(k: &mut Kernel, uc: u32, id: u32, options: u32, a: &mut MethodArg
         r.send_rights.insert(n, SendRight { surface: id, uses, wired });
         Ok(n)
     });
-    let n = match made {
-        Ok(n) => n,
-        Err(e) => return e,
-    };
+    let n = made?;
     let port = k.ipc().kobject_port(super::super::ipc::Kobject::IoIdent(n));
     k.ipc().port_mut(port).owner = 0;
     k.ipc().make_send(port);
     k.ipc().port_mut(port).nsrequest_kobject = true;
-    a.scalar_out[0] = u64::from(k.darwin_copyout_send(port));
-    ret::SUCCESS
+    Ok(k.darwin_copyout_send(port))
 }
 
 /// Trap 4 and selector 53 (0xfffffff005baf794): the handle detached into

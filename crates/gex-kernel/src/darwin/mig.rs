@@ -321,7 +321,8 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             let name = String::from_utf8_lossy(name);
             // An OSString's bytes and its NUL, an OSBoolean's "Yes" or "No",
             // an OSNumber's or OSData's bytes; a collection is not bytes.
-            let typed = node.service_props.iter().find(|(k, _)| *k == name).map(|(_, p)| super::iokit::prop_bytes(p));
+            let live = super::iokit::live_prop(super::iokit::tree(), *i, &name);
+            let typed = live.as_ref().or_else(|| node.service_props.iter().find(|(k, _)| *k == name).map(|(_, p)| p)).map(super::iokit::prop_bytes);
             let value = match (typed, node.props.iter().find(|(k, _)| *k == name)) {
                 (Some(Some(v)), _) => v,
                 (Some(None), _) => return Reply::err(K_IO_RETURN_BAD_ARGUMENT),
@@ -364,7 +365,9 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
                 r.unimplemented = Some(format!("io_registry_entry_get_property_bin_buf of {name} (recursion or the property keys)"));
                 return r;
             }
-            let bin = if let Some((_, p)) = node.service_props.iter().find(|(k, _)| *k == name) {
+            let bin = if let Some(p) = super::iokit::live_prop(super::iokit::tree(), *i, &name) {
+                super::iokit::serialize_prop(&p)
+            } else if let Some((_, p)) = node.service_props.iter().find(|(k, _)| *k == name) {
                 super::iokit::serialize_prop(p)
             } else if let Some((_, value)) = node.props.iter().find(|(k, _)| *k == name) {
                 super::iokit::serialize_data(if node.kernel_only { &[] } else { value })
@@ -2291,15 +2294,6 @@ fn connect_method(k: &mut Kernel, c: &mut super::iokit::UserClient, mut a: super
             return reply;
         }
     }
-    // A method that answers later (IOMobileFramebuffer's swap wait): the
-    // reply waits with it.
-    if r == ret::SUCCESS {
-        if let Some(d) = a.deferred.take() {
-            let mut reply = Reply::ok(Vec::new());
-            reply.defer = Some((k.tid, d));
-            return reply;
-        }
-    }
     connect_method_reply(r, &a, ool_out_field)
 }
 
@@ -2316,6 +2310,15 @@ fn connect_method_reply(r: i32, a: &super::iokit::MethodArgs, ool_out_field: boo
         return Reply::err(ret::UNDERRUN);
     }
     method_reply(a, Some(a.ool_out.map_or(0, |(_, n)| n)))
+}
+
+/// The tokens of the methods that answer later, never reused.
+static NEXT_LATER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A new token for a method that answers later (set in its
+/// [`super::iokit::MethodArgs::later`]).
+pub(crate) fn later_token() -> u64 {
+    NEXT_LATER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The methods that answer later, by token: their arguments, and whether

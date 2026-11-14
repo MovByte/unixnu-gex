@@ -1607,6 +1607,13 @@ impl Kernel {
                     self.dtask.kcaller = kcaller;
                 }
                 super::ipc::Remote::Accel(note) => self.darwin_accel_note(m, note),
+                // A method another task's kernel finished for one of this
+                // task's routines that answer later.
+                super::ipc::Remote::Later { token, ret, scalars } => {
+                    if let Some(reply) = super::mig::later_reply(token, ret, &scalars) {
+                        self.darwin_answer_later(m, token, reply);
+                    }
+                }
             }
         }
         self.darwin_pending_ready(m);
@@ -1688,6 +1695,18 @@ impl Kernel {
     pub(crate) fn darwin_kernel_send(&mut self, k: Box<Kmsg>) {
         if let Err(SendWait::Failed(_, Some(k))) = self.kmsg_send(k, opt::SEND_MSG | opt::SEND_ALWAYS | opt::SEND_NOIMPORTANCE, false) {
             self.ipc().kmsg_destroy(k, false);
+        }
+    }
+
+    /// `mach_msg_send_from_kernel_with_options(MACH64_SEND_TIMEOUT,
+    /// MACH_MSG_TIMEOUT_NONE)`: the send without `MACH_SEND_ALWAYS` and with a
+    /// zero timeout, so a message to a full queue is destroyed
+    /// (MACH_SEND_TIMED_OUT) rather than queued past the limit.
+    pub(crate) fn darwin_kernel_send_droppable(&mut self, k: Box<Kmsg>) {
+        match self.kmsg_send(k, opt::SEND_MSG | opt::SEND_TIMEOUT | opt::SEND_NOIMPORTANCE, true) {
+            Err(SendWait::Failed(_, Some(k))) => self.ipc().kmsg_destroy(k, false),
+            Err(SendWait::Room(_)) => unreachable!("a send with a zero timeout waits for no room"),
+            _ => {}
         }
     }
 }

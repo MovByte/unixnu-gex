@@ -313,8 +313,7 @@ fn add_volumes(t: &mut Vec<Node>) {
 ///   kernelcache, only IOSkywalkFamily sets it, on its own objects
 ///   (0xfffffff00593be08); the kernel only reads it (`skipKey`,
 ///   0xfffffff007816644). On the display's framebuffer and its nub, so are
-///   the names no image of the kernelcache has
-///   ([`super::iomfb::property_absent`]).
+///   the names no driver sets there ([`super::iomfb::property_absent`]).
 pub fn property_unknown(t: &[Node], i: u32, name: &str) -> bool {
     let Some(n) = t.get(i as usize) else { return false };
     if i as usize + 1 == t.len() {
@@ -327,11 +326,21 @@ pub fn property_unknown(t: &[Node], i: u32, name: &str) -> bool {
         return false;
     }
     let display = n.class == super::iomfb::CLASS || t.iter().any(|m| m.class == super::iomfb::CLASS && m.parent == Some(i));
-    if display && super::iomfb::property_absent(name) {
+    if display && super::iomfb::property_absent(t, i, name) {
         return false;
     }
     let on_gpu_path = i == 0 || n.nub.is_some() || super::platform::is_driver(n.class) || n.class == super::accel::CLASS || n.class == super::iomfb::CLASS;
     !(on_gpu_path && name == "IOClassNameOverride")
+}
+
+/// A property entry `i`'s driver keeps and may change while it runs,
+/// ahead of its fixed ones: the framebuffer's published runtime properties
+/// ([`super::iomfb::rtprop`]).
+pub fn live_prop(t: &[Node], i: u32, name: &str) -> Option<Prop> {
+    if t.get(i as usize)?.class != super::iomfb::CLASS {
+        return None;
+    }
+    super::iomfb::rtprop::published(name)
 }
 
 /// The services a matching dictionary asks for: `IOProviderClass` by class
@@ -791,6 +800,13 @@ pub mod ret {
     pub const UNDERRUN: i32 = 0xe00002e7_u32 as i32;
 }
 
+/// `kOSNotificationMessageID`, `kIOAsyncCompletionNotificationType`,
+/// `kMaxAsyncArgs` and `kOSAsyncRef64Count` (`OSMessageNotification.h`).
+pub const NOTIFICATION_MESSAGE_ID: i32 = 53;
+pub const ASYNC_COMPLETION_TYPE: u32 = 150;
+pub const MAX_ASYNC_ARGS: usize = 16;
+pub const ASYNC_REF64_COUNT: usize = 8;
+
 /// `kIOUCVariableStructureSize`: a dispatch count that is not checked.
 pub const VARIABLE: u32 = 0xffff_ffff;
 
@@ -822,8 +838,8 @@ pub struct MethodArgs {
     pub wake: Option<super::ipc::ObjId>,
     pub reference: Vec<u64>,
     /// Set by a method that answers later (a WebMetal call the host
-    /// executor runs): the token its reply is sent by
-    /// ([`super::mig::later_reply`]).
+    /// executor runs, a framebuffer swap or power wait): the token its reply
+    /// is sent by ([`super::mig::later_token`], [`super::mig::later_reply`]).
     pub later: Option<u64>,
     pub scalar_in: Vec<u64>,
     pub struct_in: Vec<u8>,
@@ -831,8 +847,6 @@ pub struct MethodArgs {
     pub scalar_out: Vec<u64>,
     pub struct_out: Vec<u8>,
     pub ool_out: Option<(u64, u64)>,
-    /// A method that answers later: the reply deferred until then.
-    pub deferred: Option<super::kobject::Deferred>,
 }
 
 impl MethodArgs {
@@ -1139,20 +1153,8 @@ pub fn external_method(k: &mut crate::syscalls::Kernel, c: &mut UserClient, a: &
         Kind::Apfs => apfs_method(k, c.service, a),
         Kind::Accel(x) => super::accel::external_method(k, x, a),
         Kind::Surface(id) => super::iosurface::external_method(k, *id, a),
-        Kind::Framebuffer(f) => match super::iomfb::methods::external_method(k, key, f, a) {
-            super::iomfb::methods::Outcome::Done(r) => r,
-            super::iomfb::methods::Outcome::Wait { swap, options } => {
-                a.deferred = Some(super::kobject::Deferred::IomfbSwapWait { client: key, swap, options });
-                ret::SUCCESS
-            }
-        },
+        Kind::Framebuffer(f) => super::iomfb::methods::external_method(k, key, f, a),
     }
-}
-
-/// A framebuffer swap wait's outcome now: done (its result), the client
-/// that waits stopped (kIOReturnAborted), or `None` while it waits.
-pub fn iomfb_wait_outcome(client: u32, swap: u32, options: u32) -> Option<i32> {
-    super::iomfb::swap::wait_done(client, swap, options)
 }
 
 /// AppleAPFSUserClient's methods: of them, selector 9, a volume's
@@ -1285,8 +1287,61 @@ impl crate::syscalls::Kernel {
     }
 }
 
+impl crate::syscalls::Kernel {
+    /// `IOUserClient::_sendAsyncResult64` to the wake port of a 64-bit
+    /// task's async reference: a message from the kernel with a copy of the
+    /// kernel's send right, `kOSNotificationMessageID`, an
+    /// `OSNotificationHeader64` of type `kIOAsyncCompletionNotificationType`
+    /// whose reference is the async reference with its first word zero, the
+    /// result and the arguments. Its size is the reply structure's less the
+    /// arguments not sent (the 64-bit arm of the structure is 8-aligned, so
+    /// it ends with 4 bytes of zeros after the arguments). `can_drop`:
+    /// `kIOUserNotifyOptionCanDrop`, the send made with a zero timeout and
+    /// without `MACH_SEND_ALWAYS`, so a full queue drops the message; else
+    /// `mach_msg_send_from_kernel`'s.
+    pub(crate) fn darwin_io_async_result(&mut self, wake: super::ipc::ObjId, reference: &[u64; ASYNC_REF64_COUNT], result: i32, args: &[u64], can_drop: bool) {
+        use super::ipc::msg::{bits, Kmsg, Sender};
+        use super::ipc::right::msgt;
+        debug_assert!(args.len() <= MAX_ASYNC_ARGS);
+        let ipc = self.ipc();
+        if !ipc.port(wake).active {
+            return;
+        }
+        ipc.copy_send(wake);
+        // struct { OSNotificationHeader64 notifyHdr; IOAsyncCompletionContent
+        // asyncContent; io_user_reference_t args[kMaxAsyncArgs] packed; }:
+        // 72 + 4 + 128 bytes, 208 with its alignment.
+        const MSG64: usize = 208;
+        let len = MSG64 - (MAX_ASYNC_ARGS - args.len()) * 8;
+        let mut body = vec![0u8; len];
+        let size = 4 + 8 * args.len() as u32;
+        body[0..4].copy_from_slice(&size.to_le_bytes());
+        body[4..8].copy_from_slice(&ASYNC_COMPLETION_TYPE.to_le_bytes());
+        for (i, r) in reference.iter().enumerate().skip(1) {
+            body[8 + 8 * i..16 + 8 * i].copy_from_slice(&r.to_le_bytes());
+        }
+        body[72..76].copy_from_slice(&result.to_le_bytes());
+        for (i, v) in args.iter().enumerate() {
+            body[76 + 8 * i..84 + 8 * i].copy_from_slice(&v.to_le_bytes());
+        }
+        let k = Kmsg { bits: bits::set(msgt::PORT_SEND, 0, 0, 0), size: 24 + body.len() as u32, dest: wake, reply: None, voucher: None, voucher_raw: 0, id: NOTIFICATION_MESSAGE_ID, body, descs: Vec::new(), sender: Sender::KERNEL, aux: Vec::new(), keep_alive: false, ppriority: 0, qos_override: 0, imp: None };
+        if can_drop {
+            self.darwin_kernel_send_droppable(Box::new(k));
+        } else {
+            self.darwin_kernel_send(Box::new(k));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn async_result_sizes_follow_the_kernel_structure() {
+        // One argument: 24 + 208 - 15 * 8 = 112 bytes, as
+        // _sendAsyncResult64 computes msgh_size.
+        assert_eq!(24 + 208 - (super::MAX_ASYNC_ARGS - 1) * 8, 112);
+    }
+
     use super::*;
 
     fn prop(out: &mut Vec<u8>, name: &str, value: &[u8]) {
@@ -1443,10 +1498,16 @@ mod tests {
         let classes: Vec<&str> = up.iter().map(|&i| class(&t, i).unwrap()).collect();
         assert_eq!(classes, ["AppleCLCD", "AppleARMIODevice", "AppleT8011IO", "IOPlatformDevice", "AppleARMPE", "IOPlatformExpertDevice", "IORegistryEntry"]);
         assert_eq!(conforms(&t, clcd, "IOMobileFramebuffer"), Ok(true));
-        // What no image can set is missing, on the service and its nub;
+        // What no driver sets is missing, on the service and its nub;
         // the rest of what the drivers set is not known.
         assert!(!property_unknown(&t, clcd, "GainMapVersion") && !property_unknown(&t, disp, "canvas-width"));
+        assert!(!property_unknown(&t, clcd, "dfr") && !property_unknown(&t, clcd, "IOMFBIntDcpUsedForExtWhenLidClose"));
         assert!(property_unknown(&t, clcd, "IOMFBSupportsHeadOfLineSwaps") && property_unknown(&t, disp, "IODeviceMemory"));
+        // AppleCLCD sets external only from its provider's device tree
+        // entry, which has none here.
+        assert!(!property_unknown(&t, clcd, "external"));
+        t[disp as usize].props.push(("external".to_string(), 1u32.to_le_bytes().to_vec()));
+        assert!(property_unknown(&t, clcd, "external"));
         // The personality's dictionary, serialized as OSSerializeBinary.
         let backlight = &t[clcd as usize].service_props.iter().find(|(k, _)| k == "BacklightMatching").unwrap().1;
         let bin = serialize_prop(backlight);
