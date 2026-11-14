@@ -67,19 +67,25 @@ machos() {
 # The overlays (gexc run --overlay), host trees laid over the root as part
 # of its system volume. Metal.framework loads the bundle the accelerator's
 # MetalPluginName names (PLUGIN) from /System/Library/Extensions: WebMetal's
-# is installed there, opaque, so that a bundle of the root's of that name
-# is hidden entirely. overlay's check overlay (src/overlay.c) holds a
-# bundle that shadows the root's AGXMetalA10.bundle, with the root's own
-# Info.plist and a program as its executable, and a bundle the root has no
-# bundle of that name beside.
-PLUGIN=WebMetal
+# is installed there over the root's AGXMetalA10.bundle, merged with it, as
+# an update of the driver would be: the driver's resource files stay as
+# they are; WebMetal's Info.plist and _CodeSignature/CodeResources take the
+# place of the root's (the overlay holds them to their files' modes and
+# extended attributes) and its executable, WebMetal, is added. The driver's
+# own executable path, AGXMetalA10.bundle/AGXMetalA10, is the shared
+# cache's, which dyld loads from the cache whatever is on disk; the bundle's
+# Info.plist names WebMetal instead. overlay's check overlay
+# (src/overlay.c) holds a bundle that shadows the root's
+# AGXMetalA10.bundle, opaque, with the root's own Info.plist and a program
+# as its executable, and a bundle the root has no bundle of that name
+# beside.
+PLUGIN=AGXMetalA10
 METAL=$HERE/bin/overlay-metal
 CHECK=$HERE/bin/overlay-check
 rm -rf "$METAL" "$CHECK"
 if [ -n "${GEX_DARWIN_WEBMETAL:-}" ] && [ -d "$GEX_DARWIN_WEBMETAL" ]; then
-    mkdir -p "$METAL/System/Library/Extensions"
-    cp -Rp "$GEX_DARWIN_WEBMETAL" "$METAL/System/Library/Extensions/$PLUGIN.bundle"
-    opaque "$METAL/System/Library/Extensions/$PLUGIN.bundle"
+    mkdir -p "$METAL/System/Library/Extensions/$PLUGIN.bundle"
+    cp -Rp "$GEX_DARWIN_WEBMETAL/." "$METAL/System/Library/Extensions/$PLUGIN.bundle/"
 fi
 EXT=${GEX_DARWIN_ROOT:-}/System/Library/Extensions
 if [ -n "${GEX_DARWIN_ROOT:-}" ] && [ -f "$EXT/AGXMetalA10.bundle/Info.plist" ] && [ -f "$EXT/AGXGPURawCounterBundle.bundle/Info.plist" ]; then
@@ -370,7 +376,7 @@ hello from /var/tmp/gex-exec-fat with 1 argument" 0
     metalwire) check_webmetal metalwire "metalwire ok" 0 ;;
     # The digest WebMetal's macOS test shim prints for the same program
     # (and the Mac's own Metal device: every output is exact).
-    metal) check_metal metal "metal WebMetalDevice 8dd26b24238872f1" 0 ;;
+    metal) check_metal metal "metal AGXA10XDevice 8dd26b24238872f1" 0 ;;
     iosurface) check_root iosurface "iosurface ok" 0 container ;;
     iosurfacex) check_root iosurfacex "iosurfacex ok" 0 container ;;
     # splashboardd and PreBoard run as mobile.

@@ -496,7 +496,7 @@ int main(int argc, char **argv) {
 
     // The registry as the device's kexts make it, which an app's sandbox
     // lets it read little of: the personality's and matching's properties,
-    // what IOGPU::start sets, and the providers.
+    // what IOGPU::start and AGXG9G's start set, and the providers.
     if (string_prop(accel, "IOMatchCategory", "IOAcceleratorES") || string_prop(accel, "IOClass", "AGXAcceleratorG9G_A0")) return 1;
     if (string_prop(accel, "IOProviderClass", "AppleARMIODevice") || string_prop(accel, "CFBundleIdentifier", "com.apple.AGXG9G") || string_prop(accel, "IONameMatched", "gpu,t8011") || string_prop(accel, "IOGLESBundleName", "AppleMetalGLRenderer")) return 1;
     CFTypeRef names = IORegistryEntryCreateCFProperty(accel, CFSTR("IONameMatch"), kCFAllocatorDefault, 0);
@@ -506,13 +506,18 @@ int main(int argc, char **argv) {
     long long v = 0;
     if (kdebug == NULL || CFGetTypeID(kdebug) != CFNumberGetTypeID() || !CFNumberGetValue(kdebug, kCFNumberLongLongType, &v) || v != 0x100000000ll) return bad("KDebugVersion", v, 0x100000000ll);
     CFRelease(kdebug);
+    // The C strings AGXG9G's start sets besides MetalPluginClassName and
+    // MetalStatisticsName (which an app reads, below).
+    if (string_prop(accel, "AGXTraceCodeVersion", "3.33.11") || string_prop(accel, "GPURawCounterBundleName", "AGXGPURawCounterBundle") || string_prop(accel, "GPURawCounterPluginClassName", "AGXGPURawCounterSourceGroup")) return 1;
+    if (string_prop(accel, "SCMVersionNumber", "") || string_prop(accel, "SCMBuildTime", "")) return 1;
     if (ancestors(accel) || clients(argv[0], accel_id)) return 1;
 
     // From here on, as an app does: in the container profile's sandbox.
     char *err = NULL;
     if (sandbox_init("container", SANDBOX_NAMED_BUILTIN, &err) != 0) return bad("the container sandbox", 0, 1);
-    // What Metal.framework reads: WebMetal's bundle and its device class.
-    if (string_prop(accel, "MetalPluginName", "WebMetal") || string_prop(accel, "MetalPluginClassName", "WebMetalDevice")) return 1;
+    // What Metal.framework reads: AGXMetalA10's bundle, its device class
+    // and its statistics.
+    if (string_prop(accel, "MetalPluginName", "AGXMetalA10") || string_prop(accel, "MetalPluginClassName", "AGXA10XDevice") || string_prop(accel, "MetalStatisticsName", "AGXMetalStatisticsExternalA10X")) return 1;
 
     // The types it does not make: IOGPU refuses them, and the service has
     // no IOUserClientClass.

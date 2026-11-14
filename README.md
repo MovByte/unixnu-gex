@@ -172,9 +172,10 @@ subsystem, most naming in their header the XNU source they port:
     its `webmetal` build): one host thread owning one WebGPU device for
     the whole system, reaching each connection's task's memory, and the
     kernel's IOSurfaces through the executor's surface table.
-  - Its properties are its personality's and matching's, but
-    `MetalPluginName` and `MetalPluginClassName` name the WebMetal
-    bundle.
+  - Its properties are its personality's and matching's, what
+    `IOGPU::start` sets and the strings AGXG9G's start sets: as on the
+    device, `MetalPluginName` is `AGXMetalA10` and `MetalPluginClassName`
+    `AGXA10XDevice`, the names the WebMetal plugin is installed under.
   - It sits on its providers in the `IOService` plane, as the device's
     kernelcache matches and publishes them over its device tree
     (`platform.rs`): the platform expert `AppleARMPE` on the
@@ -377,10 +378,15 @@ of the root must be of the same type and mode and carry the same extended
 attributes, or gexc refuses the overlay; what the root has nothing at is
 the overlay's own, which gexc says on stderr when it lays it.
 
+WebMetal's plugin is installed over the root's `AGXMetalA10.bundle`,
+merged with it: the driver's resource files stay visible, the plugin's
+`Info.plist` and `_CodeSignature/CodeResources` shadow the root's, and its
+executable, `WebMetal`, is added (the driver's own executable path is the
+shared cache's, which dyld loads from the cache).
+
 ```sh
-mkdir -p <overlay>/System/Library/Extensions
-cp -Rp WebMetal.bundle <overlay>/System/Library/Extensions/
-xattr -w user.overlay.opaque y <overlay>/System/Library/Extensions/WebMetal.bundle
+mkdir -p <overlay>/System/Library/Extensions/AGXMetalA10.bundle
+cp -Rp AGXMetalA10.bundle/. <overlay>/System/Library/Extensions/AGXMetalA10.bundle/
 ```
 
 Its code, like the root's, runs only from the static trust cache (below).
@@ -502,7 +508,7 @@ exits 1 when any fails. It builds the programs first when
 | `GEXC` | the gexc to run (default `target/release/gexc`) |
 | `GEX_DARWIN_ROOT` | the root for the dynamic programs, which run from its `/var/tmp`. Without it they are skipped, or fail when named |
 | `GEX_DARWIN_BOOT` | the device's boot payload. Its trust cache, with the test programs' cdhashes added, goes to `tests/darwin/bin/boot/TrustCache`, with its `DeviceTree` and Sandbox blobs beside it, and gexc boots from there. Without it, the trust cache holds the test programs only |
-| `GEX_DARWIN_WEBMETAL` | WebMetal's plugin bundle, as UniXNU's `scripts/build-web-metal-plugin.py` builds it (`<out>/ios/WebMetal.bundle`), which `metal` loads. Without it `metal` is skipped, or fails when named |
+| `GEX_DARWIN_WEBMETAL` | WebMetal's plugin bundle, as UniXNU's `scripts/build-web-metal-plugin.py` builds it (`<out>/ios/AGXMetalA10.bundle`), which `metal` loads. Without it `metal` is skipped, or fails when named |
 
 `GEX_DARWIN_STRICT=1` reaches gexc from the environment as well. The
 runner discards each program's stderr, so run a failing program directly
@@ -513,8 +519,11 @@ under gexc to see its reports.
 through the root's own Metal.framework, which loads the bundle the
 accelerator's `MetalPluginName` names from `/System/Library/Extensions`:
 the runner installs `GEX_DARWIN_WEBMETAL`'s bundle there, under the name
-`MetalPluginName` gives (`WebMetal.bundle`), through an overlay
-(`tests/darwin/bin/overlay-metal`), its directory opaque. `overlay` checks
+`MetalPluginName` gives (`AGXMetalA10.bundle`), through an overlay
+(`tests/darwin/bin/overlay-metal`), merged with the root's bundle of that
+name: its `Info.plist` and `_CodeSignature/CodeResources` shadow the
+root's, and its executable, `WebMetal`, which its `Info.plist` names, is
+added beside the driver's resources. `overlay` checks
 that an overlay's files cannot be told from the root's, with an overlay of
 its own (`tests/darwin/bin/overlay-check`) made from the root's files. Each
 overlay's Mach-O files go into the run's static trust cache with the

@@ -7,8 +7,10 @@
 //! Metal.framework's `_MTLRegisterDevices` finds it by class
 //! (`IOServiceMatching("IOAcceleratorES")`), loads the bundle its
 //! `MetalPluginName` names from /System/Library/Extensions and makes the
-//! class `MetalPluginClassName` names: WebMetal's, in place of AGXMetalA10's
-//! (`AGXA10XDevice`, which AGXG9G sets at 0xfffffff005c28830).
+//! class `MetalPluginClassName` names: AGXMetalA10's `AGXA10XDevice`. The
+//! web device's WebMetal plugin is installed as AGXMetalA10.bundle, with the
+//! driver's class names; its executable is `WebMetal`, since the shared
+//! cache holds the driver's own.
 //! IOGPU.framework's clients (RunningBoard's `IOServiceMatching("IOGPU")`,
 //! then `IOGPUDeviceCreate`) open its device user client, type 1. The
 //! WebMetal plugin's own connection is type 0, which carries the WebMetal
@@ -76,14 +78,35 @@ const KDEBUG_VERSION: u64 = 0x1_0000_0000;
 
 /// The accelerator on the GPU's nub `gpu`, its provider in the `IOService`
 /// plane, with the properties the device's has from its personality
-/// (AGXG9G's "AGXG9G_A0") and matching (see [`super::platform`]), and what
-/// `IOGPU::start` sets. `MetalPluginName` and `MetalPluginClassName` name
-/// the WebMetal bundle and its device class. What AGXG9G's start and probe
-/// set besides is not modelled, and is reported when read:
+/// (AGXG9G's "AGXG9G_A0", `MetalPluginName` among them) and matching (see
+/// [`super::platform`]), what `IOGPU::start` sets, and the C strings AGXG9G's
+/// start sets (`AGXAcceleratorG9G_A0::start`, vtable slot 0x2b0 at
+/// 0xfffffff005c280dc, through 0xfffffff005be1eec) with
+/// `setProperty(const char *, const char *)` (vtable slot 0xd0,
+/// 0xfffffff0077ad860: an `OSSymbol` each):
+/// - `SCMVersionNumber` and `SCMBuildTime`, both empty (0xfffffff005be455c,
+///   0xfffffff005be4580);
+/// - `AGXTraceCodeVersion`, `GPURawCounterBundleName` and
+///   `GPURawCounterPluginClassName` (0xfffffff005be4a10 to
+///   0xfffffff005be4a70);
+/// - by its vtable's slot 0xa68 (0xfffffff005c28808, AGXAcceleratorG9G_A0's
+///   vtable at 0xfffffff006d4d2a0), `MetalPluginClassName` and
+///   `MetalStatisticsName`.
+///
+/// What AGXG9G's start and probe set besides is not modelled, and is
+/// reported when read:
 /// - `IOProbeScore` is the probe's (0xfffffff005c02e48), from the GPU's
 ///   probed configuration.
 /// - `PerformanceStatistics` is IOGPUStatistics'.
-/// - There are the power, performance and firmware properties.
+/// - `GPUConfigurationVariable` (0xfffffff005be98a0) is the GPU's core
+///   configuration.
+/// - `AGXParameterBufferMaxSize`, `AGXParameterBufferMaxSizeEverMemless`
+///   and `AGXParameterBufferMaxSizeNeverMemless` (0xfffffff005c325d4 to
+///   0xfffffff005c3261c) are from the firmware's configuration.
+/// - `CommandSubmissionEnabled` (0xfffffff005bec0e4) follows the GPU's
+///   power.
+/// - `IOReportLegend` and `IOReportLegendPublic` are its IOReporting
+///   channels'.
 pub fn add_service(t: &mut Vec<Node>, gpu: u32) {
     let s = |v: &str| Prop::Str(v.to_string());
     let sym = |v: &str| Prop::Sym(v.to_string());
@@ -98,9 +121,15 @@ pub fn add_service(t: &mut Vec<Node>, gpu: u32) {
         ("IOMatchedAtBoot".to_string(), Prop::Bool(true)),
         ("IOGLESBundleName".to_string(), s("AppleMetalGLRenderer")),
         ("IOSourceVersion".to_string(), s("282.14")),
-        ("MetalPluginName".to_string(), s("WebMetal")),
-        ("MetalPluginClassName".to_string(), sym("WebMetalDevice")),
+        ("MetalPluginName".to_string(), s("AGXMetalA10")),
         ("KDebugVersion".to_string(), Prop::Num(KDEBUG_VERSION, 64)),
+        ("SCMVersionNumber".to_string(), sym("")),
+        ("SCMBuildTime".to_string(), sym("")),
+        ("AGXTraceCodeVersion".to_string(), sym("3.33.11")),
+        ("GPURawCounterBundleName".to_string(), sym("AGXGPURawCounterBundle")),
+        ("GPURawCounterPluginClassName".to_string(), sym("AGXGPURawCounterSourceGroup")),
+        ("MetalPluginClassName".to_string(), sym("AGXA10XDevice")),
+        ("MetalStatisticsName".to_string(), sym("AGXMetalStatisticsExternalA10X")),
     ];
     t.push(Node { name: CLASS.to_string(), props: Vec::new(), class: CLASS, service_props, parent: Some(gpu), children: Vec::new(), kernel_only: false, nub: None });
 }
