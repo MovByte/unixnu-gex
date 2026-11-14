@@ -394,20 +394,36 @@ const ELSEWHERE: [u8; 4] = [0x05, 0x4d, 0x78, 0x90];
 ///   0xe5 false; 0x5b and 0x5c 0 and 0x5d 1 (no boot-arg); 0x70 to 0x75 and
 ///   0x6e false; 0xb0 0xffffffff and 0xb1 0.
 ///
+/// - The number properties 0xfffffff006bd19d8 registers there (a 32-bit
+///   value, type 2): 0x13 `IOMFBBrightnessLevel`, 0x14
+///   `IOMFBIndicatorBrightnessNits`, 0x15 `IOMFBSecureContentFactor`, 0x16
+///   `IOMFBSecureIndicatorFactor` and 0x2e `AmbientBrightness` at 1 shifted
+///   by the halfword at 0xfffffff0058a26e2 (16), 0x10000; 0x23
+///   `defaultTemperatureCorrectionValue` and 0x27 `set0DTempSensorValue` at
+///   0xffffffff.
+///
 /// At start nothing else sets these: a boolean or 32-bit runtime property
 /// changes through the framebuffer's slot at +0x9e8 (0xfffffff006bf4568,
 /// the only caller of the setter 0xfffffff006bea2dc), which only the
 /// `iomfb_RuntimeProperty_*` boot-args (none on this boot) and
-/// `AppleCLCD::setProperties` reach. The 64-bit ones have other setters
-/// (0xfffffff006bea1f8's callers), and are left out until those are worked
-/// out.
-const START: [(u8, u32); 38] = [
+/// `AppleCLCD::setProperties` reach; the type 2 setter 0xfffffff006bea1f8
+/// is reached by setProperties, by SetParameter 1 (0x13, AppleCLCD's slot
+/// 0x8a8) and for 0x12 and 0x19 (0xfffffff006c03dd4, 0xfffffff006c07b50),
+/// none of them at start.
+const START: [(u8, u32); 45] = [
     (0x00, 0),
+    (0x13, 0x1_0000),
+    (0x14, 0x1_0000),
+    (0x15, 0x1_0000),
+    (0x16, 0x1_0000),
     (0x21, 0),
     (0x22, 0),
+    (0x23, 0xffff_ffff),
     (0x24, 0),
     (0x25, 1),
+    (0x27, 0xffff_ffff),
     (0x28, 0),
+    (0x2e, 0x1_0000),
     (0x5b, 0),
     (0x5c, 0),
     (0x5d, 1),
@@ -449,6 +465,11 @@ const START: [(u8, u32); 38] = [
 /// `hgodCutoff` (with `+0xf0`), all in 0xfffffff006bd0b2c. They are never
 /// published, and read are answered missing.
 const NOT_MADE: [u8; 4] = [0x2c, 0x2d, 0x2f, 0xac];
+
+/// The runtime properties' names in id order.
+pub fn names() -> impl Iterator<Item = &'static str> {
+    NAMES.iter().map(|&(_, n)| n)
+}
 
 /// The id of the runtime property `name`.
 pub fn id_of(name: &str) -> Option<u8> {
@@ -502,6 +523,8 @@ mod tests {
         assert_eq!(published("ProxScanPlan"), Some(Prop::Num(0xffff_ffff, 32)));
         assert_eq!(published("APTDefaultGrayValue"), Some(Prop::Num(0xff, 32)));
         assert_eq!(published("QoSDebug"), None);
+        assert_eq!(published("IOMFBBrightnessLevel"), Some(Prop::Num(0x1_0000, 32)));
+        assert_eq!(published("set0DTempSensorValue"), Some(Prop::Num(0xffff_ffff, 32)));
         // Registered only with a component the pipe never makes: missing.
         assert!(absent("enableGamutMapper") && absent("hgodCutoff") && absent("enableLatLeakComp") && absent("enableHighGrayOD"));
         assert_eq!(published("enableGamutMapper"), None);

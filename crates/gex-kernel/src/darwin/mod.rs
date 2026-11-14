@@ -109,6 +109,7 @@ pub mod thread;
 pub mod timer;
 pub mod triage;
 pub mod trustcache;
+pub mod vconsole;
 pub mod vm;
 pub mod coalition;
 pub mod importance;

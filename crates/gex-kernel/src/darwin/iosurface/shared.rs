@@ -100,6 +100,25 @@ impl Shared {
         self.rw_write(k, id, 0, &[0; rw::SIZE as usize]);
     }
 
+    /// [`Shared::alloc`] before any task maps a chunk (at boot): the
+    /// records written into the backing store, which every view takes when
+    /// it is made.
+    pub fn alloc_unmapped(&mut self, id: u32) {
+        Self::ensure(&mut self.ro, RO_PER_CHUNK, id);
+        Self::ensure(&mut self.rw, RW_PER_CHUNK, id);
+        let (c, i) = ((id / RO_PER_CHUNK) as usize, u64::from(id % RO_PER_CHUNK));
+        let o = (i * ro::SIZE) as usize;
+        let rec = &mut self.ro[c].backing[o..o + ro::SIZE as usize];
+        rec.fill(0);
+        rec[ro::VALUE_SEED as usize..][..4].copy_from_slice(&1u32.to_le_bytes());
+        rec[ro::VALUE_SIZE_HINT as usize..][..4].copy_from_slice(&0x1000u32.to_le_bytes());
+        rec[ro::PIXEL_SIZE_CASTING as usize] = 1;
+        rec[ro::SYS_MEM_ONLY as usize] = 1;
+        let (c, i) = ((id / RW_PER_CHUNK) as usize, u64::from(id % RW_PER_CHUNK));
+        let o = (i * rw::SIZE) as usize;
+        self.rw[c].backing[o..o + rw::SIZE as usize].fill(0);
+    }
+
     /// Bytes of surface `id`'s read-only record (which no task can write).
     pub fn ro_read(&self, id: u32, at: u64, len: usize) -> Vec<u8> {
         let (c, i) = ((id / RO_PER_CHUNK) as usize, u64::from(id % RO_PER_CHUNK));

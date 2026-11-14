@@ -335,10 +335,13 @@ pub fn property_unknown(t: &[Node], i: u32, name: &str) -> bool {
 
 /// A property entry `i`'s driver keeps and may change while it runs,
 /// ahead of its fixed ones: the framebuffer's published runtime properties
-/// ([`super::iomfb::rtprop`]).
+/// ([`super::iomfb::rtprop`]) and its console mode (`SystemConsoleMode`).
 pub fn live_prop(t: &[Node], i: u32, name: &str) -> Option<Prop> {
     if t.get(i as usize)?.class != super::iomfb::CLASS {
         return None;
+    }
+    if name == "SystemConsoleMode" {
+        return super::iomfb::swap::console_property().map(Prop::Bool);
     }
     super::iomfb::rtprop::published(name)
 }
@@ -1005,7 +1008,7 @@ pub fn open_user_client(k: &mut crate::syscalls::Kernel, service: u32, ty: u32) 
         if let Some(cell) = client_remove(id) {
             let mut c = cell.lock().unwrap_or_else(|e| e.into_inner());
             c.closed = true;
-            client_close(k, &mut c);
+            client_close(k, &mut c, None);
             let key = c.id as u32;
             match &mut c.kind {
                 Kind::Accel(a) => super::accel::client_free(k, a),
@@ -1078,16 +1081,27 @@ pub fn is_nvram(i: u32) -> bool {
     from_path(tree(), "IODeviceTree:/options").ok().flatten() == Some(i)
 }
 
-/// The client's `clientClose`.
-pub fn client_close(k: &mut crate::syscalls::Kernel, c: &mut UserClient) {
+/// The client's `clientClose`. A framebuffer client's may sleep in the
+/// closing thread (its last swap client's going): `closer` is the
+/// io_service_close that would wait, answered later by that token, and the
+/// result is whether it waits. The open that a MAC check refuses closes its
+/// client without its reply waiting, and a client that dies has no caller
+/// to hold up: the display goes on with the work by itself.
+pub fn client_close(k: &mut crate::syscalls::Kernel, c: &mut UserClient, closer: Option<u64>) -> bool {
     match &mut c.kind {
         // AppleAPFSUserClient's (0xfffffff00666facc) closes what the client
         // opened on its container and terminates it; neither has a state
         // here, the container's opens not being modelled.
-        Kind::Apfs => {}
-        Kind::Accel(a) => super::accel::client_close(k, a),
-        Kind::Surface(id) => super::iosurface::client_close(k, *id),
-        Kind::Framebuffer(f) => super::iomfb::client_close(k, c.id as u32, f),
+        Kind::Apfs => false,
+        Kind::Accel(a) => {
+            super::accel::client_close(k, a);
+            false
+        }
+        Kind::Surface(id) => {
+            super::iosurface::client_close(k, *id);
+            false
+        }
+        Kind::Framebuffer(f) => super::iomfb::client_close(k, c.id as u32, f, closer),
     }
 }
 
@@ -1099,7 +1113,7 @@ pub fn client_died(k: &mut crate::syscalls::Kernel, id: u32) {
     let mut c = cell.lock().unwrap_or_else(|e| e.into_inner());
     if !c.closed {
         c.closed = true;
-        client_close(k, &mut c);
+        client_close(k, &mut c, None);
     }
     if let Kind::Accel(a) = &mut c.kind {
         super::accel::client_free(k, a);
@@ -1122,18 +1136,41 @@ pub fn client_service(c: &UserClient) -> Option<u32> {
     }
 }
 
-/// `clientMemoryForType`: no client here gives memory. `Ok`: the
-/// client answers success with none (the framebuffer's for most types);
+/// `clientMemoryForType`: the memory a client gives for a type. `Ok(None)`:
+/// the client answers success with none (the framebuffer's for most types);
 /// `Err`: its error (IOUserClient's default, kIOReturnUnsupported).
-pub fn client_memory_for_type(_k: &mut crate::syscalls::Kernel, c: &mut UserClient, ty: u32) -> Result<(), i32> {
+pub fn client_memory_for_type(c: &mut UserClient, ty: u32) -> Result<Option<super::iomfb::Memory>, i32> {
     match &c.kind {
-        Kind::Framebuffer(f) => super::iomfb::client_memory_for_type(f, ty),
+        Kind::Framebuffer(_) => super::iomfb::client_memory_for_type(c.id as u32, ty),
         _ => Err(ret::UNSUPPORTED),
+    }
+}
+
+/// `IOUserClient::mapClientMemory64` into the calling task with the
+/// caller's `flags`: the type's memory mapped with the user options
+/// (`kIOMapUserOptionsMask`) of the flags and none of the client's. Its
+/// address and size; `Ok(None)` when no mapping is made (no memory, or an
+/// error from the client); `Err` is what is not modelled.
+pub fn map_client_memory(k: &mut crate::syscalls::Kernel, c: &mut UserClient, ty: u32, flags: u32) -> Result<Option<(u64, u64)>, String> {
+    const K_IO_MAP_ANYWHERE: u32 = 0x1;
+    const K_IO_MAP_USER_OPTIONS_MASK: u32 = 0xfff;
+    let Ok(Some(memory)) = client_memory_for_type(c, ty) else { return Ok(None) };
+    let options = flags & K_IO_MAP_USER_OPTIONS_MASK;
+    if options != K_IO_MAP_ANYWHERE {
+        return Err(format!("mapping {}'s memory of type {ty} with the options {options:#x} (only kIOMapAnywhere with the default cache mode is modelled)", c.class));
+    }
+    match memory {
+        super::iomfb::Memory::FrameInfo(id) => match super::iomfb::finfo::map(k, id) {
+            Some(Ok(m)) => Ok(Some(m)),
+            Some(Err(e)) => Err(format!("mapping {}'s frame information queue (Mach error {e:#x})", c.class)),
+            None => Ok(None),
+        },
     }
 }
 
 /// `registerNotificationPort(port, type, refCon)`.
 pub fn register_notification_port(k: &mut crate::syscalls::Kernel, c: &mut UserClient, port: Option<super::ipc::ObjId>, ty: u32, reference: u64) -> i32 {
+    let key = c.id as u32;
     match &mut c.kind {
         Kind::Apfs => {
             k.darwin_unimplemented("AppleAPFSUserClient::registerNotificationPort".to_string());
@@ -1142,7 +1179,7 @@ pub fn register_notification_port(k: &mut crate::syscalls::Kernel, c: &mut UserC
         Kind::Accel(a) => super::accel::register_notification_port(k, a, port, ty, reference),
         // IOUserClient's (IOSurfaceRootUserClient has none of its own).
         Kind::Surface(_) => ret::UNSUPPORTED,
-        Kind::Framebuffer(f) => super::iomfb::register_notification_port(k, f, port, ty, reference),
+        Kind::Framebuffer(f) => super::iomfb::register_notification_port(k, key, f, port, ty, reference),
     }
 }
 
