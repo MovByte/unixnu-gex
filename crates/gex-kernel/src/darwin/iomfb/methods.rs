@@ -473,29 +473,76 @@ pub fn external_method(k: &mut Kernel, id: u32, c: &mut Client, a: &mut MethodAr
     r
 }
 
-/// The block types the pipe's block manager (`+0x1b70`, made by
-/// 0xfffffff006bd0b2c) can have a handler for: every type a registration
-/// site of AppleMobileDispH9G gives one (0xfffffff006bd1ce0,
-/// 0xfffffff006ba8304, 0xfffffff006bdf1c4, 0xfffffff006be254c,
-/// 0xfffffff006be896c, 0xfffffff006c09198), each site's own condition
-/// aside. IOMobileGraphicsFamily registers none of its own.
-const BLOCK_TYPES: [u32; 29] = [1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 20, 28, 36, 37, 38, 39, 40, 41, 42, 75, 76, 77, 78, 85, 91, 98, 106, 120];
+/// A block handler the pipe's block manager (`+0x1b70`, made by
+/// 0xfffffff006bd0b2c) has on this panel: its type (`+0x1c`), the extra
+/// scalars it takes (`+0x30` to `+0x34`), its size (`+0x38`), and whether
+/// it has a get (`+0x40`) and a set (`+0x48`).
+struct Handler {
+    ty: u32,
+    extra: (u32, u32),
+    size: u32,
+    get: bool,
+    set: bool,
+}
+
+/// The handlers 0xfffffff006bd1ce0 registers at the pipe's first block
+/// setup, for the components this pipe makes (`+0xc0`, the 2D temperature
+/// correction `+0xe8`, the temperature compensation `+0x100` and the
+/// brightness compensation `+0x108`; not `+0xd0`, `+0xd8`, `+0xe0`, `+0xf0`
+/// or `+0xf8`, whose types 0x4d, 0x4e, 0x14, 0x24, 0x25 and 0x26 it
+/// registers only with them; nor 0x6a, which needs the pipe's slot +0x358
+/// to answer 2, and it answers 1).
+const HANDLERS: [Handler; 11] = [
+    Handler { ty: 7, extra: (0, 0), size: 0x15c, get: true, set: false },
+    Handler { ty: 2, extra: (0, 0), size: 0x70c, get: true, set: true },
+    Handler { ty: 1, extra: (0, 1), size: 0x180, get: true, set: true },
+    Handler { ty: 0x27, extra: (0, 0), size: 0xd4, get: true, set: false },
+    Handler { ty: 0x28, extra: (0, 0), size: 0x14, get: true, set: false },
+    Handler { ty: 0x29, extra: (0, 0), size: 0x118, get: true, set: false },
+    Handler { ty: 0x5b, extra: (0, 0), size: 0x28, get: true, set: false },
+    Handler { ty: 0x2a, extra: (0, 0), size: 0x20, get: true, set: false },
+    Handler { ty: 0x62, extra: (0, 0), size: 0x28, get: false, set: true },
+    Handler { ty: 0x55, extra: (0, 0), size: 0x48, get: false, set: true },
+    Handler { ty: 0x78, extra: (0, 0), size: 0x40, get: true, set: false },
+];
+
+/// The types the other registration sites give a handler, each as a block
+/// of the pipe starts (0xfffffff006ba8304: 9 to 12; 0xfffffff006bdf1c4: 6;
+/// 0xfffffff006be254c: 3 to 5; 0xfffffff006be896c: 0x4b, 0x4c;
+/// 0xfffffff006c09198: 0x1c): whether those blocks are made here is not
+/// worked out.
+const OTHER_TYPES: [u32; 11] = [3, 4, 5, 6, 9, 10, 11, 12, 0x1c, 0x4b, 0x4c];
+
+/// The block manager's call for `ty` (0xfffffff006775618 after the pipe's
+/// checks): a type with no handler is kIOReturnUnsupported. A handler's get
+/// or set (its vtable's +0x38 or +0x40, the same template for each: a
+/// missing function is kIOReturnUnsupported, an extra scalar count outside
+/// its range or a size not its own kIOReturnBadArgument) then runs the
+/// component's function, through the command gate, which is not modelled.
+fn block_call(k: &mut Kernel, name: &str, ty: u32, set: bool, size: usize, extra: u32) -> i32 {
+    let Some(h) = HANDLERS.iter().find(|h| h.ty == ty) else {
+        if OTHER_TYPES.contains(&ty) {
+            k.darwin_unimplemented(format!("IOMobileFramebufferUserClient {name} of block type {ty} ({size} bytes, {extra} extra scalars): whether the pipe's block that registers it is made"));
+        }
+        return ret::UNSUPPORTED;
+    };
+    if !(if set { h.set } else { h.get }) {
+        return ret::UNSUPPORTED;
+    }
+    if extra < h.extra.0 || extra > h.extra.1 || size != h.size as usize {
+        return ret::BAD_ARGUMENT;
+    }
+    k.darwin_unimplemented(format!("IOMobileFramebufferUserClient {name} of block type {ty} ({size} bytes, {extra} extra scalars): its component's function"));
+    ret::UNSUPPORTED
+}
 
 /// Selector 79, GetBlock (0xfffffff0067799b4): at least two scalars, the
 /// block type and a word that must be zero, then any extra scalars; the
 /// structure output is the block (the inband output is never null, so its
 /// check passes). The framebuffer's slot 0x700 (0xfffffff006bfeae0) goes to
 /// the pipe (0xfffffff006bd6984: the second scalar's low word nonzero is
-/// kIOReturnBadArgument) and its block manager (0xfffffff006775ca4,
-/// 0xfffffff006775618): a type with no handler is kIOReturnUnsupported.
-///
-/// Types 77 and 78 (the 0x62c- and 0xc04-byte blocks of the pipe's
-/// component at `+0xd0`, 0xfffffff006c0b878) are registered only with that
-/// component, which nothing in this kernelcache makes (its only stores are
-/// zeros); 72 and 74, which QuartzCore also asks for, have no registration
-/// site. A type that is registered here is not modelled: whether its
-/// site's condition holds, and its handler (`vt+0x38`, 0xfffffff006bdae94
-/// for the pipe's: the extra scalar count and size checked, then its get).
+/// kIOReturnBadArgument) and its block manager ([`block_call`]).
+/// QuartzCore's 0x4d, 72 and 74 have no handler here.
 fn get_block(k: &mut Kernel, a: &MethodArgs) -> i32 {
     if a.scalar_in.len() < 2 {
         return ret::BAD_ARGUMENT;
@@ -504,11 +551,7 @@ fn get_block(k: &mut Kernel, a: &MethodArgs) -> i32 {
     if a.scalar_in[1] as u32 != 0 {
         return ret::BAD_ARGUMENT;
     }
-    if !BLOCK_TYPES.contains(&ty) || ty == 77 || ty == 78 {
-        return ret::UNSUPPORTED;
-    }
-    k.darwin_unimplemented(format!("IOMobileFramebufferUserClient selector 79 (GetBlock) of block type {ty} ({} bytes, {} extra scalars): its registration and handler", a.struct_out.len(), a.scalar_in.len() - 2));
-    ret::UNSUPPORTED
+    block_call(k, "selector 79 (GetBlock)", ty, false, a.struct_out.len(), (a.scalar_in.len() - 2) as u32)
 }
 
 /// The block types each block client profile 1 index may set
@@ -533,9 +576,7 @@ const SET_BLOCK_TYPES: [&[u32]; 5] = [
 /// framebuffer's slot 0x6f8 (0xfffffff006bfea00) to the pipe's
 /// 0xfffffff006bd691c: the second scalar's low word nonzero is
 /// kIOReturnBadArgument, and the block manager's set (0xfffffff006775dc8,
-/// the lookup of 0xfffffff006775618) is kIOReturnUnsupported for a type
-/// with no handler, as for GetBlock ([`get_block`]); a type that has one is
-/// not modelled.
+/// the lookup of 0xfffffff006775618, [`block_call`]).
 fn set_block(k: &mut Kernel, c: &Client, a: &MethodArgs) -> i32 {
     if a.scalar_in.len() < 2 {
         return ret::BAD_ARGUMENT;
@@ -552,11 +593,7 @@ fn set_block(k: &mut Kernel, c: &Client, a: &MethodArgs) -> i32 {
     if a.scalar_in[1] as u32 != 0 {
         return ret::BAD_ARGUMENT;
     }
-    if !BLOCK_TYPES.contains(&ty) || ty == 77 || ty == 78 {
-        return ret::UNSUPPORTED;
-    }
-    k.darwin_unimplemented(format!("IOMobileFramebufferUserClient selector 78 (SetBlock) of block type {ty} ({} bytes, {} extra scalars): its registration and handler", a.struct_in.len(), a.scalar_in.len() - 2));
-    ret::UNSUPPORTED
+    block_call(k, "selector 78 (SetBlock)", ty, true, a.struct_in.len(), (a.scalar_in.len() - 2) as u32)
 }
 
 /// Selector 72's member (0xfffffff006778460): a type past the slots is
