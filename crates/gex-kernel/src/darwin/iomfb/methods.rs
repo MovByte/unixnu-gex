@@ -362,6 +362,8 @@ pub fn external_method(k: &mut Kernel, id: u32, c: &mut Client, a: &mut MethodAr
             a.scalar_out[0] = super::super::mach::absolute_time();
             ret::SUCCESS
         }
+        // s_get_block (0xfffffff0067799b4).
+        79 => get_block(k, a),
         // s_swap_cancel_all (0xfffffff0067795b0): slot 218 with the time
         // `scalar[0] << 32 | scalar[1]`.
         81 => swap::cancel_all(k, (sc(0) << 32) | (sc(1) & 0xffff_ffff)),
@@ -392,6 +394,44 @@ pub fn external_method(k: &mut Kernel, id: u32, c: &mut Client, a: &mut MethodAr
         }
     };
     r
+}
+
+/// The block types the pipe's block manager (`+0x1b70`, made by
+/// 0xfffffff006bd0b2c) can have a handler for: every type a registration
+/// site of AppleMobileDispH9G gives one (0xfffffff006bd1ce0,
+/// 0xfffffff006ba8304, 0xfffffff006bdf1c4, 0xfffffff006be254c,
+/// 0xfffffff006be896c, 0xfffffff006c09198), each site's own condition
+/// aside. IOMobileGraphicsFamily registers none of its own.
+const BLOCK_TYPES: [u32; 29] = [1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 20, 28, 36, 37, 38, 39, 40, 41, 42, 75, 76, 77, 78, 85, 91, 98, 106, 120];
+
+/// Selector 79, GetBlock (0xfffffff0067799b4): at least two scalars, the
+/// block type and a word that must be zero, then any extra scalars; the
+/// structure output is the block (the inband output is never null, so its
+/// check passes). The framebuffer's slot 0x700 (0xfffffff006bfeae0) goes to
+/// the pipe (0xfffffff006bd6984: the second scalar's low word nonzero is
+/// kIOReturnBadArgument) and its block manager (0xfffffff006775ca4,
+/// 0xfffffff006775618): a type with no handler is kIOReturnUnsupported.
+///
+/// Types 77 and 78 (the 0x62c- and 0xc04-byte blocks of the pipe's
+/// component at `+0xd0`, 0xfffffff006c0b878) are registered only with that
+/// component, which nothing in this kernelcache makes (its only stores are
+/// zeros); 72 and 74, which QuartzCore also asks for, have no registration
+/// site. A type that is registered here is not modelled: whether its
+/// site's condition holds, and its handler (`vt+0x38`, 0xfffffff006bdae94
+/// for the pipe's: the extra scalar count and size checked, then its get).
+fn get_block(k: &mut Kernel, a: &MethodArgs) -> i32 {
+    if a.scalar_in.len() < 2 {
+        return ret::BAD_ARGUMENT;
+    }
+    let ty = a.scalar_in[0] as u32;
+    if a.scalar_in[1] as u32 != 0 {
+        return ret::BAD_ARGUMENT;
+    }
+    if !BLOCK_TYPES.contains(&ty) || ty == 77 || ty == 78 {
+        return ret::UNSUPPORTED;
+    }
+    k.darwin_unimplemented(format!("IOMobileFramebufferUserClient selector 79 (GetBlock) of block type {ty} ({} bytes, {} extra scalars): its registration and handler", a.struct_out.len(), a.scalar_in.len() - 2));
+    ret::UNSUPPORTED
 }
 
 /// Selector 72's member (0xfffffff006778460): a type past the slots is

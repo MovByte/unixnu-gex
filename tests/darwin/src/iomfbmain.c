@@ -15,7 +15,9 @@
 // - The main display opens like any framebuffer, and its service and size
 //   are the panel's.
 // - It answers what QuartzCore's display reads first: the color remap mode
-//   and the pipe's runtime properties, published or never registered.
+//   and the pipe's runtime properties, published or never registered; and
+//   the blocks it asks for (types 77, 74 and 72), which the pipe has no
+//   handler for (kIOReturnUnsupported), with the selector's own refusals.
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
@@ -78,6 +80,29 @@ int main(void) {
     if (csc == NULL || CFGetTypeID(csc) != CFNumberGetTypeID() || !CFNumberGetValue(csc, kCFNumberIntType, &csc_value) || csc_value != 0) return bad("BlendOutputCSCMethod", csc_value, 0);
     if (copy_property(fb, CFSTR("IOMFBSupportsGPLite")) != NULL) return bad("IOMFBSupportsGPLite", 1, 0);
     if (IORegistryEntryCreateCFProperty(s, CFSTR("VRRIdleEnabled"), NULL, 0) != NULL) return bad("VRRIdleEnabled", 1, 0);
+
+    // QuartzCore's blocks: 77 (0x62c bytes), 74 (0x808) and 72 (0xc5c), none
+    // of which the pipe registers a handler for.
+    kern_return_t (*get_block)(Framebuffer, uint32_t, void *, uint32_t, const uint32_t *, uint32_t) = dlsym(h, "IOMobileFramebufferGetBlock");
+    if (!get_block) return bad("IOMobileFramebufferGetBlock", 0, 1);
+    static uint8_t block[0xc5c];
+    if ((kr = get_block(fb, 0x4d, block, 0x62c, NULL, 0)) != kIOReturnUnsupported) return bad("GetBlock 77", kr, kIOReturnUnsupported);
+    if ((kr = get_block(fb, 0x4a, block, 0x808, NULL, 0)) != kIOReturnUnsupported) return bad("GetBlock 74", kr, kIOReturnUnsupported);
+    if ((kr = get_block(fb, 0x48, block, 0xc5c, NULL, 0)) != kIOReturnUnsupported) return bad("GetBlock 72", kr, kIOReturnUnsupported);
+    // The selector itself: fewer than two scalars, or a second one whose low
+    // word is not zero, is kIOReturnBadArgument.
+    io_connect_t c = IO_OBJECT_NULL;
+    if ((kr = IOServiceOpen(clcd, mach_task_self(), 0, &c)) != KERN_SUCCESS) return bad("IOServiceOpen", kr, 0);
+    uint64_t sc[2] = {0x4d, 0};
+    size_t outsz = 0x62c;
+    if ((kr = IOConnectCallMethod(c, 79, sc, 1, NULL, 0, NULL, NULL, block, &outsz)) != kIOReturnBadArgument) return bad("GetBlock with one scalar", kr, kIOReturnBadArgument);
+    sc[1] = 1;
+    outsz = 0x62c;
+    if ((kr = IOConnectCallMethod(c, 79, sc, 2, NULL, 0, NULL, NULL, block, &outsz)) != kIOReturnBadArgument) return bad("GetBlock with a second scalar", kr, kIOReturnBadArgument);
+    sc[1] = 1ull << 32;
+    outsz = 0x62c;
+    if ((kr = IOConnectCallMethod(c, 79, sc, 2, NULL, 0, NULL, NULL, block, &outsz)) != kIOReturnUnsupported) return bad("GetBlock with a second scalar's high word", kr, kIOReturnUnsupported);
+    IOServiceClose(c);
 
     // No other display: kIOReturnNoDevice.
     Framebuffer other = NULL;
