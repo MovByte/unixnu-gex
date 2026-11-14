@@ -28,6 +28,15 @@
 //   was, and the test embedder records both layers (frame-check.py).
 // - An idle buffer (IOMobileFramebufferSetIdleBuffer, a swap of kind 8),
 //   which the kick drops unshown, the glass as it was.
+// - Frame information, on that connection: a port of type 3 after the
+//   items' size makes the client's shared data queue (an IODataQueue of
+//   0x1040 bytes, mapped; a mapping of it does not unmap), and turned on
+//   with the times' items each shown swap of kind 0 puts the items asked
+//   for, the swap id and their values on it, telling its port: the layer 1
+//   swap's (presented at a blank, after it was issued) and the no-op
+//   swap's (completed at once, the last blank's time); neither the idle
+//   buffer nor a swap made before it was turned on puts any. Turned off,
+//   its record is unlisted; a record not listed cannot be.
 // - A swap that changes nothing on the glass completes at once, with no
 //   new frame; swap signals (selector 20) for a begun swap, a queued one,
 //   a layer it does not enable, and none.
@@ -50,6 +59,7 @@
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
+#include <IOKit/IODataQueueClient.h>
 #include <IOSurface/IOSurfaceRef.h>
 #include <dlfcn.h>
 #include <mach/mach.h>
@@ -159,6 +169,28 @@ static kern_return_t submit_kind(io_connect_t c, uint32_t id, uint32_t surface, 
     memcpy(rec + 0x150, &one, 4);
     memcpy(rec + 0x17c, &kind, 4);
     return IOConnectCallStructMethod(c, 5, rec, sizeof rec, NULL, NULL);
+}
+
+// A frame information entry on the queue, after its data-available message:
+// the items asked for (Presentation_time, Presentation_delta,
+// Requested_presentation, Issued_time), swap `swap`, the presentation time
+// (a blank's: after the issue time for a swap that waited for one) and its
+// delta from `last`, no requested time, and the issue time.
+static int frame_info(mach_port_t port, IODataQueueMemory *q, uint32_t swap, uint64_t last, int waited, uint64_t *pt) {
+    struct {
+        mach_msg_header_t h;
+        mach_msg_trailer_t t;
+    } m;
+    kern_return_t kr = mach_msg(&m.h, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof m, port, 2000, MACH_PORT_NULL);
+    if (kr != KERN_SUCCESS || m.h.msgh_id != 0 || m.h.msgh_size != sizeof(mach_msg_header_t)) return bad("the queue's data-available message", kr, 0);
+    uint64_t w[8];
+    uint32_t n = sizeof w;
+    if ((kr = IODataQueueDequeue(q, w, &n)) != KERN_SUCCESS || n != 48) return bad("a frame information entry", kr ? kr : (long)n, 48);
+    if (w[0] != 0x3c0 || w[1] != swap) return bad("the entry's items and swap", (long)w[1], swap);
+    if (w[2] == 0 || w[2] < last || w[3] != w[2] - last || w[4] != 0 || w[5] == 0 || (waited && w[5] > w[2])) return bad("the entry's times", (long)w[3], (long)(w[2] - last));
+    if (IODataQueueDataAvailable(q)) return bad("another frame information entry", 1, 0);
+    *pt = w[2];
+    return 0;
 }
 
 static volatile sig_atomic_t alarmed;
@@ -382,6 +414,28 @@ int main(void) {
     mach_vm_size_t len = 0;
     if ((kr = IOConnectMapMemory64(c, 0, mach_task_self(), &addr, &len, kIOMapAnywhere)) != kIOReturnBadArgument) return bad("memory of type 0", kr, kIOReturnBadArgument);
     if ((kr = IOConnectMapMemory64(c, 3, mach_task_self(), &addr, &len, kIOMapAnywhere)) != kIOReturnBadArgument) return bad("memory of type 3", kr, kIOReturnBadArgument);
+    // Frame information: the items' size asked again (the refused item
+    // left none), then a port of type 3 makes the queue.
+    in[0] = 6;
+    outn = 2;
+    itemsz = sizeof item;
+    if ((kr = IOConnectCallMethod(c, 74, in, 1, NULL, 0, out, &outn, item, &itemsz)) != KERN_SUCCESS || strcmp(item, "Presentation_time") != 0) return bad("SupportedFrameInfo 6", kr, 0);
+    mach_port_t fq = IODataQueueAllocateNotificationPort();
+    if (fq == MACH_PORT_NULL) return bad("IODataQueueAllocateNotificationPort", 0, 1);
+    if ((kr = IOConnectSetNotificationPort(c, 3, fq, 0)) != KERN_SUCCESS) return bad("a frame information port", kr, 0);
+    mach_vm_address_t qaddr = 0;
+    mach_vm_size_t qlen = 0;
+    if ((kr = IOConnectMapMemory64(c, 3, mach_task_self(), &qaddr, &qlen, kIOMapAnywhere)) != KERN_SUCCESS || qlen != 0x1068) return bad("mapping the frame information queue", kr ? kr : (long)qlen, 0x1068);
+    IODataQueueMemory *fqm = (IODataQueueMemory *)qaddr;
+    if (fqm->queueSize != 0x1040 || fqm->head != 0 || fqm->tail != 0) return bad("the frame information queue's header", fqm->queueSize, 0x1040);
+    if ((kr = IOConnectUnmapMemory64(c, 3, mach_task_self(), qaddr)) != kIOReturnBadArgument) return bad("unmapping the frame information queue", kr, kIOReturnBadArgument);
+    // On, with Presentation_time, Presentation_delta, Requested_presentation
+    // and Issued_time as the record's options.
+    in[0] = 0x1111;
+    in[1] = 0x2222;
+    in[2] = 3;
+    in[3] = 0x3c0;
+    if ((kr = IOConnectCallScalarMethod(c, 72, in, 4, NULL, NULL)) != KERN_SUCCESS) return bad("frame information notifications", kr, 0);
 
     // The glass: layer 0's surface is the swapped one, as a send right;
     // layer 1 has none (kIOReturnError); there is no layer 4.
@@ -413,6 +467,8 @@ int main(void) {
     if ((kr = swap_set_layer(fb, 1, s2, small, small, 0)) != KERN_SUCCESS) return bad("SwapSetLayer of layer 1", kr, 0);
     if ((kr = swap_end(fb)) != KERN_SUCCESS) return bad("SwapEnd of layer 1", kr, 0);
     if ((kr = swap_wait(fb, second, 1)) != KERN_SUCCESS) return bad("SwapWait until layer 1 is displayed", kr, 0);
+    uint64_t pt1 = 0, pt2 = 0;
+    if (frame_info(fq, fqm, (uint32_t)second, 0, 1, &pt1)) return 1;
     for (int layer = 0; layer < 2; layer++) {
         in[0] = layer;
         outn = 1;
@@ -449,6 +505,13 @@ int main(void) {
     if ((kr = swap_set_layer(fb, 0, s, whole, whole, 0)) != KERN_SUCCESS) return bad("SwapSetLayer of a no-op swap", kr, 0);
     if ((kr = swap_end(fb)) != KERN_SUCCESS) return bad("SwapEnd of a no-op swap", kr, 0);
     if ((kr = swap_wait(fb, same, 0x80000001)) != KERN_SUCCESS) return bad("a no-op swap, done at once", kr, 0);
+    if (frame_info(fq, fqm, (uint32_t)same, pt1, 0, &pt2)) return 1;
+    // Off: unlisted, and then not listed (kIOReturnError).
+    in[0] = 0;
+    in[2] = 3;
+    in[3] = 0;
+    if ((kr = IOConnectCallScalarMethod(c, 72, in, 4, NULL, NULL)) != KERN_SUCCESS) return bad("frame information notifications off", kr, 0);
+    if ((kr = IOConnectCallScalarMethod(c, 72, in, 4, NULL, NULL)) != kIOReturnError) return bad("frame information notifications off again", kr, kIOReturnError);
     // Swap signals: a begun swap takes one for any layer; an unknown swap
     // is kIOReturnError, and a layer past 3 kIOReturnBadArgument.
     outn = 1;

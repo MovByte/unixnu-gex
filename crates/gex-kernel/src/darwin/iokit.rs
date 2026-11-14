@@ -1136,18 +1136,41 @@ pub fn client_service(c: &UserClient) -> Option<u32> {
     }
 }
 
-/// `clientMemoryForType`: no client here gives memory. `Ok`: the
-/// client answers success with none (the framebuffer's for most types);
+/// `clientMemoryForType`: the memory a client gives for a type. `Ok(None)`:
+/// the client answers success with none (the framebuffer's for most types);
 /// `Err`: its error (IOUserClient's default, kIOReturnUnsupported).
-pub fn client_memory_for_type(_k: &mut crate::syscalls::Kernel, c: &mut UserClient, ty: u32) -> Result<(), i32> {
+pub fn client_memory_for_type(c: &mut UserClient, ty: u32) -> Result<Option<super::iomfb::Memory>, i32> {
     match &c.kind {
-        Kind::Framebuffer(f) => super::iomfb::client_memory_for_type(f, ty),
+        Kind::Framebuffer(_) => super::iomfb::client_memory_for_type(c.id as u32, ty),
         _ => Err(ret::UNSUPPORTED),
+    }
+}
+
+/// `IOUserClient::mapClientMemory64` into the calling task with the
+/// caller's `flags`: the type's memory mapped with the user options
+/// (`kIOMapUserOptionsMask`) of the flags and none of the client's. Its
+/// address and size; `Ok(None)` when no mapping is made (no memory, or an
+/// error from the client); `Err` is what is not modelled.
+pub fn map_client_memory(k: &mut crate::syscalls::Kernel, c: &mut UserClient, ty: u32, flags: u32) -> Result<Option<(u64, u64)>, String> {
+    const K_IO_MAP_ANYWHERE: u32 = 0x1;
+    const K_IO_MAP_USER_OPTIONS_MASK: u32 = 0xfff;
+    let Ok(Some(memory)) = client_memory_for_type(c, ty) else { return Ok(None) };
+    let options = flags & K_IO_MAP_USER_OPTIONS_MASK;
+    if options != K_IO_MAP_ANYWHERE {
+        return Err(format!("mapping {}'s memory of type {ty} with the options {options:#x} (only kIOMapAnywhere with the default cache mode is modelled)", c.class));
+    }
+    match memory {
+        super::iomfb::Memory::FrameInfo(id) => match super::iomfb::finfo::map(k, id) {
+            Some(Ok(m)) => Ok(Some(m)),
+            Some(Err(e)) => Err(format!("mapping {}'s frame information queue (Mach error {e:#x})", c.class)),
+            None => Ok(None),
+        },
     }
 }
 
 /// `registerNotificationPort(port, type, refCon)`.
 pub fn register_notification_port(k: &mut crate::syscalls::Kernel, c: &mut UserClient, port: Option<super::ipc::ObjId>, ty: u32, reference: u64) -> i32 {
+    let key = c.id as u32;
     match &mut c.kind {
         Kind::Apfs => {
             k.darwin_unimplemented("AppleAPFSUserClient::registerNotificationPort".to_string());
@@ -1156,7 +1179,7 @@ pub fn register_notification_port(k: &mut crate::syscalls::Kernel, c: &mut UserC
         Kind::Accel(a) => super::accel::register_notification_port(k, a, port, ty, reference),
         // IOUserClient's (IOSurfaceRootUserClient has none of its own).
         Kind::Surface(_) => ret::UNSUPPORTED,
-        Kind::Framebuffer(f) => super::iomfb::register_notification_port(k, f, port, ty, reference),
+        Kind::Framebuffer(f) => super::iomfb::register_notification_port(k, key, f, port, ty, reference),
     }
 }
 

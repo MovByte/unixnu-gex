@@ -2171,24 +2171,56 @@ fn connect_routine(k: &mut Kernel, req: &Kmsg, id: u32, n: i32) -> Reply {
         // io_connect_map_memory_into_task(connection, memory_type, into_task,
         // address, size, flags) and io_connect_unmap_memory_from_task
         // (connection, memory_type, from_task, address): the client's
-        // clientMemoryForType for the type. A client with none maps nothing
-        // (kIOReturnBadArgument) and unmaps with clientMemoryForType's
-        // error. The task must be one (any task's control port).
+        // clientMemoryForType for the type. The task must be one (any
+        // task's control port).
+        // - Mapping (mapClientMemory64): the memory mapped into the task
+        //   with the flags' user options; its address and size. No memory,
+        //   or none mapped, is kIOReturnBadArgument. A mapping into the
+        //   calling task is kept with the client (`mappings`).
+        // - Unmapping: clientMemoryForType's error, or success with no
+        //   memory; with memory, the mapping looked up with kIOMapReference
+        //   at the address, which a descriptor the client makes anew for
+        //   the call (the framebuffer's queue's) has none of:
+        //   kIOReturnBadArgument.
         2863 | 2864 => {
             let Some((task, _)) = desc_port(req, 0) else { return bad() };
             let Some(ty) = i32_at(&req.body, 4 + 12 + NDR) else { return bad() };
-            let is_task = match task {
-                Some(Carried::Port(p)) => k.ipc().port(p).kobject == Some(Kobject::Task),
-                _ => false,
+            let (is_task, current) = match task {
+                Some(Carried::Port(p)) => {
+                    let ipc = k.ipc();
+                    let port = ipc.port(p);
+                    (port.kobject == Some(Kobject::Task), port.owner == ipc.task)
+                }
+                _ => (false, false),
             };
             if !is_task {
                 Reply::err(ret::BAD_ARGUMENT)
+            } else if n == 2864 {
+                match super::iokit::client_memory_for_type(&mut c, ty as u32) {
+                    Ok(None) => Reply::err(ret::SUCCESS),
+                    Ok(Some(_)) => Reply::err(ret::BAD_ARGUMENT),
+                    Err(e) => Reply::err(e),
+                }
             } else {
-                // No memory: mapping is kIOReturnBadArgument; unmapping
-                // answers clientMemoryForType's result.
-                match super::iokit::client_memory_for_type(k, &mut c, ty as u32) {
-                    Ok(()) => Reply::err(if n == 2863 { ret::BAD_ARGUMENT } else { ret::SUCCESS }),
-                    Err(e) => Reply::err(if n == 2863 { ret::BAD_ARGUMENT } else { e }),
+                // address (8, 4-aligned after the type) then size (8), flags.
+                let Some(flags) = i32_at(&req.body, 4 + 12 + NDR + 4 + 8 + 8) else { return bad() };
+                if !current {
+                    let mut r = Reply::err(ret::UNSUPPORTED);
+                    r.unimplemented = Some(format!("io_connect_map_memory_into_task of {}'s memory of type {ty} into another task", c.class));
+                    return r;
+                }
+                match super::iokit::map_client_memory(k, &mut c, ty as u32, flags as u32) {
+                    Ok(Some((addr, size))) => {
+                        let mut out = addr.to_le_bytes().to_vec();
+                        out.extend_from_slice(&size.to_le_bytes());
+                        Reply::ok(out)
+                    }
+                    Ok(None) => Reply::err(ret::BAD_ARGUMENT),
+                    Err(what) => {
+                        let mut r = Reply::err(ret::BAD_ARGUMENT);
+                        r.unimplemented = Some(what);
+                        r
+                    }
                 }
             }
         }

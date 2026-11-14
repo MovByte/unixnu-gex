@@ -13,12 +13,15 @@
 //!   (`IOMobileFramebuffer::newUserClient` checks none): its methods
 //!   ([`methods`]), its notification ports, the swaps a client makes and
 //!   the display's power ([`swap`]).
+//! - What the pipe reports of each frame it shows: frame information on a
+//!   client's shared data queue and CRC notifications ([`finfo`]).
 //! - The panel. A completed swap's surfaces go to the embedder's
 //!   presentation sink ([`sink`]) at the panel's vertical blank, which the
 //!   framebuffer counts at the panel's rate ([`swap::Panel`]) while the
 //!   display's controller is on; the sink is told as the panel goes dark
 //!   and lights.
 
+pub mod finfo;
 pub mod methods;
 pub mod rtprop;
 pub mod sink;
@@ -261,15 +264,17 @@ pub fn client_close(k: &mut Kernel, id: u32, c: &mut Client, closer: Option<u64>
 pub fn client_free(k: &mut Kernel, id: u32, c: &mut Client) {
     client_close(k, id, c, None);
     swap::client_gone(k, id);
+    finfo::free(k, id);
 }
 
 /// `registerNotificationPort(port, type, refCon)` (0xfffffff006777610):
 /// a type past the slots is kIOReturnBadArgument and a slot that has a
-/// port already kIOReturnPortExists; the port and reference are kept.
-/// Type 3, frame information, also makes the client's shared data queue
-/// when the framebuffer gives frame information through one, which is not
-/// modelled.
-pub fn register_notification_port(k: &mut Kernel, c: &mut Client, port: Option<ObjId>, ty: u32, reference: u64) -> i32 {
+/// port already kIOReturnPortExists; the port and reference are kept. Type
+/// 3, frame information, with the item size selector 74 gave
+/// (`+0x3c8`), also makes the client's shared data queue if it has none
+/// (0xfffffff0067765a8; failing, kIOReturnError, the port kept) and has
+/// its data-available message go to the port ([`finfo::register`]).
+pub fn register_notification_port(k: &mut Kernel, id: u32, c: &mut Client, port: Option<ObjId>, ty: u32, reference: u64) -> i32 {
     const K_IO_RETURN_PORT_EXISTS: i32 = 0xe00002dd_u32 as i32;
     if ty as usize >= NOTIFY_TYPES {
         return ret::BAD_ARGUMENT;
@@ -281,19 +286,32 @@ pub fn register_notification_port(k: &mut Kernel, c: &mut Client, port: Option<O
     slot.port = port;
     slot.refcon = reference as u32;
     if ty == 3 && c.frame_info_size != 0 {
-        k.darwin_unimplemented("IOMobileFramebufferUserClient frame information through its shared data queue (IOSharedDataQueue of 0x1040 bytes)".to_string());
+        if let Err(what) = finfo::register(k, id, c.pid, port) {
+            k.darwin_unimplemented(what);
+            return ret::ERROR;
+        }
     }
     ret::SUCCESS
 }
 
+/// The memory `clientMemoryForType` gives.
+pub enum Memory {
+    /// Client `.0`'s frame information queue.
+    FrameInfo(u32),
+}
+
 /// `clientMemoryForType(type, options, memory)` (0xfffffff0067777d8):
-/// type 3 is the frame information queue (kIOReturnNotReady without one);
-/// any other is success with no memory, which maps nothing.
-pub fn client_memory_for_type(_c: &Client, ty: u32) -> Result<(), i32> {
-    if ty == 3 {
+/// type 3 is the frame information queue's memory (kIOReturnNotReady
+/// without one), with no options; any other is success with no memory,
+/// which maps nothing.
+pub fn client_memory_for_type(id: u32, ty: u32) -> Result<Option<Memory>, i32> {
+    if ty != 3 {
+        return Ok(None);
+    }
+    if !finfo::has_queue(id) {
         return Err(ret::NOT_READY);
     }
-    Ok(())
+    Ok(Some(Memory::FrameInfo(id)))
 }
 
 /// The client's properties: none of its own.

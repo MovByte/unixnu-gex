@@ -394,7 +394,7 @@ pub fn external_method(k: &mut Kernel, id: u32, c: &mut Client, a: &mut MethodAr
             if ty as usize >= super::NOTIFY_TYPES {
                 return ret::BAD_ARGUMENT;
             }
-            notification_options(k, ty, sc(1) as u32)
+            swap::notification_options(id, ty, sc(1) as u32)
         }
         // s_supported_frame_info (0xfffffff00677a718, member
         // 0xfffffff006778688): the framebuffer's slot 211
@@ -405,7 +405,7 @@ pub fn external_method(k: &mut Kernel, id: u32, c: &mut Client, a: &mut MethodAr
         // Either way the size given (0 on a refusal) is the client's
         // `+0x3c8`.
         74 => {
-            const NAMES: [&str; 14] = ["Layer_0_CRC", "Layer_1_CRC", "Layer_2_CRC", "Blend_CRC", "ColorManager_CRC", "Dither_CRC", "Presentation_time", "Presentation_delta", "Requested_presentation", "Issued_time", "Performance_headroom", "Thermal_throttle", "PRC_duration", "CA_mode"];
+            const NAMES: [&str; 14] = super::finfo::ITEMS;
             let index = sc(0) as u32;
             let Some(name) = NAMES.get(index as usize) else {
                 a.scalar_out[0] = 0;
@@ -562,50 +562,32 @@ fn set_block(k: &mut Kernel, c: &Client, a: &MethodArgs) -> i32 {
 /// Selector 72's member (0xfffffff006778460): a type past the slots is
 /// kIOReturnBadArgument; with a callout the record is set up with the
 /// slot's port, the callout and its reference and listed (slot 208, gated
-/// 0xfffffff006795ec0) and, with `extra`, slot 210 run (gated, AppleCLCD
-/// slot 211 to the pipe's 0xfffffff006bb672c), which takes options for
-/// frame information only and answers kIOReturnBadArgument for any other
-/// type, the record staying listed; without a callout it is unlisted
-/// (slot 209).
+/// 0xfffffff006795ec0) and, with `extra`, slot 210 run with it as the
+/// record's options ([`swap::notification_options`]), which only frame
+/// information takes (kIOReturnBadArgument for any other type, the record
+/// staying listed); without a callout it is unlisted (slot 209, gated
+/// 0xfffffff006796198: kIOReturnError for a record not listed).
 fn notifications(k: &mut Kernel, id: u32, c: &mut Client, callout: u64, refcon: u64, ty: u32, extra: u32) -> i32 {
     let ty = ty as usize;
     if ty >= super::NOTIFY_TYPES {
         return ret::BAD_ARGUMENT;
     }
     if callout == 0 {
-        // The gated disable (0xfffffff006796198): an unlisted record is
-        // left as it is.
-        swap::disable_notifications(id, ty);
-        c.slots[ty].enabled = false;
-        return ret::SUCCESS;
-    }
-    match swap::enable_notifications(k, id, ty, c.slots[ty].enabled, c.slots[ty].port, callout, refcon) {
-        Ok(r) if r == ret::SUCCESS => {
-            c.slots[ty].enabled = true;
-            if extra != 0 {
-                return notification_options(k, ty as u32, extra);
-            }
-            ret::SUCCESS
+        let r = swap::disable_notifications(id, ty);
+        if r == ret::SUCCESS {
+            c.slots[ty].enabled = false;
         }
-        Ok(r) => r,
-        Err(what) => {
-            k.darwin_unimplemented(what);
-            ret::UNSUPPORTED
-        }
+        return r;
     }
-}
-
-/// The framebuffer's slot 210 (0xfffffff006794058, gated to AppleCLCD's
-/// slot 211 and the pipe's 0xfffffff006bb672c): options for a type's
-/// record, which only frame information (3) takes (the pipe's
-/// `update_notify_clients`, 0xfffffff006bb6774, which is not modelled);
-/// any other type is kIOReturnBadArgument.
-fn notification_options(k: &mut Kernel, ty: u32, options: u32) -> i32 {
-    if ty != 3 {
-        return ret::BAD_ARGUMENT;
+    let r = swap::enable_notifications(k, id, ty, c.slots[ty].enabled, c.slots[ty].port, callout, refcon);
+    if r != ret::SUCCESS {
+        return r;
     }
-    k.darwin_unimplemented(format!("IOMobileFramebuffer frame information options {options:#x} (the pipe's update_notify_clients, 0xfffffff006bb6774)"));
-    ret::UNSUPPORTED
+    c.slots[ty].enabled = true;
+    if extra != 0 {
+        return swap::notification_options(id, ty as u32, extra);
+    }
+    ret::SUCCESS
 }
 
 /// SetParameter 3's value as the pipe's component at `+0xc8` keeps it

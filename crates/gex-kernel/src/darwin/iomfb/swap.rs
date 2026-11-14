@@ -33,6 +33,9 @@
 //!   is off, and the clients that asked for power notifications are told.
 //!   A signal ends a swap wait's or a power request's sleep, as
 //!   `thread_abort_safely` does on the device ([`interrupt`]).
+//! - Each swap's completion reports the frame to the clients that asked
+//!   for frame information or CRCs (AppleCLCD's slot 337,
+//!   [`super::finfo`]).
 //! - No vertical blank message is sent. The family's only sender of them
 //!   (0xfffffff006796720, the records of type 5 with each blank's count,
 //!   time and delta) is called only by
@@ -179,6 +182,8 @@ pub struct Request {
     /// `+0x310` bit 0: the swap was dropped (0xfffffff00679cf6c) rather
     /// than programmed.
     pub dropped: bool,
+    /// `+0x2d8`: when swap_submit took it (the pipe's time, slot 241).
+    pub issued: u64,
 }
 
 /// A notification record a client listed for a type (`+0x118 + type *
@@ -343,7 +348,10 @@ pub enum Effect {
     Answer { link: Arc<TaskLink>, token: u64, ret: i32 },
     /// An async result to a notification record's port
     /// (`sendAsyncResult64WithOptions` with `kIOUserNotifyOptionCanDrop`).
-    Notify { port: ObjId, reference: [u64; ASYNC_REF64_COUNT], args: [u64; 2] },
+    Notify { port: ObjId, reference: [u64; ASYNC_REF64_COUNT], args: Vec<u64> },
+    /// A frame information message (its words) on a client's queue
+    /// (0xfffffff00677ae18).
+    FrameInfo { client: u32, words: Vec<u64> },
     /// The panel lit or dark.
     Panel(bool),
     /// The IOSurface root told what a layer shows now (0xfffffff005bacfe0).
@@ -398,6 +406,8 @@ struct Display {
     /// `+0x16e4`: the requests the swap timer removed since a swap last
     /// completed.
     timed_out: u32,
+    /// The pipe's frame information and AppleCLCD's frame ring.
+    finfo: super::finfo::Pipe,
     effects: Vec<Effect>,
 }
 
@@ -430,6 +440,7 @@ fn display<R>(f: impl FnOnce(&mut Display) -> R) -> R {
         client_wait: HashMap::new(),
         swap_timer: 0,
         timed_out: 0,
+        finfo: Default::default(),
         effects: Vec::new(),
     });
     f(d)
@@ -462,6 +473,15 @@ fn perform(k: &mut Kernel, effects: Vec<Effect>) {
                 link.bell.ring();
             }
             Effect::Notify { port, reference, args } => k.darwin_io_async_result(port, &reference, ret::SUCCESS, &args, true),
+            // A message the queue refuses is dropped ("dropped frame info
+            // message"; the `iomfb_finfo_enqueue_panic_enable` boot-arg that
+            // would panic instead is not passed).
+            Effect::FrameInfo { client, words } => {
+                let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                if let Err(what) = super::finfo::enqueue(k, client, &bytes) {
+                    k.darwin_unimplemented(what);
+                }
+            }
             Effect::Panel(on) => match sink::sink() {
                 Some(s) => {
                     if let Err(why) = s.panel(on) {
@@ -563,6 +583,7 @@ pub fn client_gone(_k: &mut Kernel, client: u32) {
     display(|d| {
         d.records.iter_mut().for_each(|l| l.retain(|r| r.client != client));
         d.client_wait.remove(&client);
+        d.finfo.records.remove(&client);
     });
 }
 
@@ -671,8 +692,9 @@ pub fn submit(k: &mut Kernel, record: &[u8]) -> i32 {
     req.ahead = record[rec::AHEAD] & 1 != 0;
     req.words_16c = [u64_at(record, rec::WORDS_16C), u64_at(record, rec::WORDS_16C + 8)];
     req.presentation = u64_at(record, rec::TIMESTAMPS);
+    req.issued = super::super::mach::absolute_time();
     if record[rec::RELATIVE_TIME] & 1 != 0 {
-        req.presentation = req.presentation.wrapping_add(super::super::mach::absolute_time());
+        req.presentation = req.presentation.wrapping_add(req.issued);
     }
     if record[rec::USER_DATA_FLAG] & 1 != 0 && u64_at(record, 0x38) != 0 {
         k.darwin_unimplemented("an IOMobileFramebuffer swap's 0x20c bytes of user data (the transaction's +0x38, read from the task)".to_string());
@@ -1176,8 +1198,16 @@ impl Display {
             self.drop_request(r, false, pid, now);
             return;
         }
+        // Programmed (0xfffffff006bf8cc0): the ring's next entry is its.
         r.status = 2;
+        self.ring_push(&r);
         self.pending = Some(r);
+    }
+
+    /// The frame ring's next entry for `r` (0xfffffff006bd5900).
+    fn ring_push(&mut self, r: &Request) {
+        let items = self.finfo.items();
+        self.finfo.ring.push(super::finfo::Entry { issued: r.issued, requested: r.presentation, id: r.id, items, kind: r.kind });
     }
 
     /// 0xfffffff00679cf6c: `r` dropped (status 8, `+0x310` bit 0) and
@@ -1277,7 +1307,9 @@ impl Display {
     /// interrupt (0xfffffff006bfbf8c) keeps of shown swaps of kind 0x13
     /// (`+0x1f38`, and its IOReporting reporter's, `+0x2080`).
     fn complete_pending(&mut self, shown: Shown, pid: i32, now: u64) {
-        let Some(mut req) = self.pending.take() else { return };
+        let Some(id) = self.pending.as_ref().map(|r| r.id) else { return };
+        self.frame_notify(id);
+        let mut req = self.pending.take().expect("the pending swap");
         match shown {
             Shown::Blank(..) | Shown::NoOp => {
                 req.status = 4;
@@ -1363,6 +1395,7 @@ impl Display {
         }
         while let Some(mut r) = self.queue.pop_front() {
             r.status = 3;
+            self.ring_push(&r);
             self.pending = Some(r);
             self.complete_pending(Shown::Flush, pid, now);
         }
@@ -1736,7 +1769,9 @@ impl Display {
                 if self.next_id == 0 {
                     self.next_id = 1;
                 }
-                self.pending = Some(Request { id: self.next_id, client: KERNEL, pid, submitted: true, enabled: u32::MAX, completed: u32::MAX, kind: 0xf, status: 3, ..Default::default() });
+                let r = Request { id: self.next_id, client: KERNEL, pid, submitted: true, enabled: u32::MAX, completed: u32::MAX, kind: 0xf, status: 3, ..Default::default() };
+                self.ring_push(&r);
+                self.pending = Some(r);
             }
             self.power.timing = controller;
             if !controller {
@@ -1746,6 +1781,11 @@ impl Display {
                 }
             }
             self.flush(pid, now);
+            // On, after the flush: the pipe's power-on (its slot 0x28,
+            // 0xfffffff006bb9384) empties the frame ring (0xfffffff006bf89d0).
+            if controller {
+                self.finfo.ring.reset();
+            }
             if !controller && self.pending.as_ref().is_some_and(|r| r.kind == 0xf && r.client == KERNEL && r.status == 3) {
                 self.vbl_count += 1;
                 self.complete_pending(Shown::Blank(self.vbl_count, now), pid, now);
@@ -1766,7 +1806,7 @@ impl Display {
         let state = (if self.power.controller { 2 } else { 0 }) | u64::from(self.power.panel);
         for r in self.records[1].clone() {
             if let Some(port) = r.port {
-                self.effects.push(Effect::Notify { port, reference: r.reference, args: [now, state] });
+                self.effects.push(Effect::Notify { port, reference: r.reference, args: vec![now, state] });
             }
         }
     }
@@ -1916,6 +1956,7 @@ impl Display {
         r.id = self.next_id;
         r.client = KERNEL;
         r.pid = pid;
+        r.issued = now;
         self.begun.push(Request { id: r.id, client: KERNEL, pid, ..Default::default() });
         r.submitted = true;
         if let Err((e, back)) = self.enqueue(r.clone(), pid, now) {
@@ -2207,42 +2248,168 @@ pub fn request_power_change(k: &mut Kernel, state: u32) -> Result<i32, u64> {
 /// (0xfffffff006795ec0): a record already listed, or a type past the
 /// slots, is kIOReturnError; else its async reference is set
 /// (`setAsyncReference64` with the slot's port, the callout and its
-/// reference, in a 64-bit task; frame information through a queue sets
-/// none) and it is listed. Vertical blank (5) calls AppleCLCD's slots 316
-/// (empty) and 290 (the kick); frame information (3) and CRC (4) turn the
-/// hardware's on, which is not modelled (`Err`).
-pub fn enable_notifications(k: &mut Kernel, client: u32, ty: usize, listed: bool, port: Option<ObjId>, callout: u64, refcon: u64) -> Result<i32, String> {
+/// reference, in a 64-bit task) unless it is frame information, which
+/// AppleCLCD gives through the client's queue (slot 336 answers true), and
+/// it is listed. Then frame information (3) turns the pipe's on (AppleCLCD's
+/// slot 306 to the pipe's 0xfffffff006bb6708, which does nothing more:
+/// the record's options ask for the items); CRC (4) turns CRC notifications
+/// on (slot 305, the pipe's 0xfffffff006bb6888); vertical blank (5) calls
+/// slots 316 (empty on AppleCLCD) and 290 (the kick).
+pub fn enable_notifications(k: &mut Kernel, client: u32, ty: usize, listed: bool, port: Option<ObjId>, callout: u64, refcon: u64) -> i32 {
     if listed || ty >= super::NOTIFY_TYPES {
-        return Ok(ret::ERROR);
-    }
-    match ty {
-        3 => return Err("IOMobileFramebuffer frame information notifications (the pipe's frame statistics)".to_string()),
-        4 => return Err("IOMobileFramebuffer CRC notifications (the pipe's CRC hardware)".to_string()),
-        _ => {}
+        return ret::ERROR;
     }
     // kIOUCAsync64Flag in the reserved word, beside the port.
     let mut reference = [0u64; ASYNC_REF64_COUNT];
-    reference[0] = 1;
-    reference[1] = callout;
-    reference[2] = refcon;
+    if ty != 3 {
+        reference[0] = 1;
+        reference[1] = callout;
+        reference[2] = refcon;
+    }
     let pid = k.pid;
     with_display(k, |d| {
         d.records[ty].push(Record { client, port, reference });
-        if ty == 5 {
-            d.kick(pid, super::super::mach::absolute_time());
+        match ty {
+            4 => d.finfo.set_crc(true),
+            5 => d.kick(pid, super::super::mach::absolute_time()),
+            _ => {}
         }
     });
-    Ok(ret::SUCCESS)
+    ret::SUCCESS
 }
 
-/// A client's record for `ty` unlisted (the gated disable,
-/// 0xfffffff006796198).
-pub fn disable_notifications(client: u32, ty: usize) {
+/// Selector 72 with no callout, the framebuffer's gated disable
+/// (0xfffffff006796198): an unlisted record, or a type past the slots, is
+/// kIOReturnError; else it is unlisted, and frame information's record has
+/// its options cleared (slot 306 off: the pipe's 0xfffffff006bb6708 sets
+/// them to 0 through 0xfffffff006bb672c), CRC's turns CRC notifications off
+/// (slot 305), and vertical blank's last calls slot 316 (empty).
+pub fn disable_notifications(client: u32, ty: usize) -> i32 {
     display(|d| {
-        if let Some(l) = d.records.get_mut(ty) {
-            l.retain(|r| r.client != client);
+        let Some(l) = d.records.get_mut(ty) else { return ret::ERROR };
+        let Some(i) = l.iter().position(|r| r.client == client) else { return ret::ERROR };
+        l.remove(i);
+        match ty {
+            3 => {
+                let rec = d.finfo.records.entry(client).or_default();
+                let old = std::mem::take(&mut rec.items);
+                d.finfo.update(old, 0);
+            }
+            4 => d.finfo.set_crc(false),
+            _ => {}
         }
+        ret::SUCCESS
+    })
+}
+
+/// The framebuffer's slot 210 (0xfffffff006794058, gated to AppleCLCD's
+/// slot 211 and the pipe's 0xfffffff006bb672c) for client `client`'s record
+/// of type `ty`, listed or not: only frame information takes options, the
+/// items its record asks for (`+0x78`), each item counted for the pipe
+/// (0xfffffff006bb6774); any other type is kIOReturnBadArgument.
+pub fn notification_options(client: u32, ty: u32, options: u32) -> i32 {
+    if ty != 3 {
+        return ret::BAD_ARGUMENT;
+    }
+    display(|d| {
+        let rec = d.finfo.records.entry(client).or_default();
+        let old = std::mem::replace(&mut rec.items, options);
+        d.finfo.update(old, options);
     });
+    ret::SUCCESS
+}
+
+impl Display {
+    /// AppleCLCD's slot 337 (0xfffffff006bfa478) for swap `id`, as the
+    /// completion (0xfffffff00678a96c) calls it first. The pending swap
+    /// dropped (`+0x310` bit 0) is reported as it is now if the pipe has
+    /// items asked for and it is of kind 0 (the pipe's 0xfffffff006bd5900
+    /// filling the report); otherwise the frame ring's entries up to the
+    /// swap's are taken and those asking for items of kinds 0 and 0x18
+    /// reported ([`super::finfo::Ring::take_through`]).
+    fn frame_notify(&mut self, id: u32) {
+        let dropped = self.pending.as_ref().filter(|p| p.id == id && p.dropped).map(|p| super::finfo::Entry { issued: p.issued, requested: p.presentation, id, items: 0, kind: p.kind });
+        let reports = match dropped {
+            Some(mut e) => {
+                e.items = self.finfo.items();
+                if e.items == 0 || e.kind != 0 {
+                    return;
+                }
+                vec![(e, true)]
+            }
+            None => self.finfo.ring.take_through(id),
+        };
+        for (e, matched) in reports {
+            self.frame_report(e, matched);
+        }
+    }
+
+    /// A frame's report (slot 337's, by 0xfffffff0067968b4, gated
+    /// 0xfffffff006796934):
+    /// - The CRCs: for the swap's own entry, the pipe's blend and dither
+    ///   CRCs (its slots 0x428 and 0x430, the hardware's: the panel is built
+    ///   in and its mode valid, so they are read), else none ("frame notify
+    ///   missed").
+    /// - Each listed frame information record whose options ask for items
+    ///   (AppleCLCD's slot 307 to the pipe's 0xfffffff006bb68f4; one that
+    ///   asks for none is "dropped"): a message of the items asked for, the
+    ///   swap id, and each item's value in order, on its client's queue;
+    ///   the presentation time kept as the record's last.
+    /// - Slot 308: CRC notify (0xfffffff006796b7c), each listed CRC record
+    ///   sent the swap id and the two CRCs (`sendAsyncResult64WithOptions`,
+    ///   can drop); then slot 338, empty.
+    ///
+    /// Values: the presentation time is the pipe's `+0x1d18`, the last
+    /// vertical blank's time; the delta is from the record's last; the
+    /// requested and issue times are the entry's; the performance headroom
+    /// (`+0x4604`) and the thermal throttle (`+0x1d4`) are the pipe's; the
+    /// presentation's PRC duration is the pipe's `+0x1d20` only in run mode
+    /// 4, else 0; and the CA mode is the entry's `+0x3c`, which nothing
+    /// writes (0). The layers', blend's, color manager's and dither's CRCs
+    /// are the hardware's (the CRC blocks' registers), which have no model.
+    fn frame_report(&mut self, e: super::finfo::Entry, matched: bool) {
+        let presented = self.vbl_time;
+        for r in self.records[3].clone() {
+            let rec = self.finfo.records.entry(r.client).or_default();
+            if rec.items == 0 {
+                continue;
+            }
+            let mut words = vec![u64::from(rec.items), u64::from(e.id)];
+            let mut crcs = Vec::new();
+            for i in 0..14 {
+                if rec.items & (1 << i) == 0 {
+                    continue;
+                }
+                words.push(match i {
+                    0..=5 => {
+                        crcs.push(super::finfo::ITEMS[i]);
+                        0
+                    }
+                    6 => presented,
+                    7 => presented.wrapping_sub(rec.last),
+                    8 => e.requested,
+                    9 => e.issued,
+                    10 => u64::from(self.finfo.headroom),
+                    11 => u64::from(self.finfo.throttled),
+                    _ => 0,
+                });
+            }
+            rec.last = presented;
+            if crcs.is_empty() {
+                self.effects.push(Effect::FrameInfo { client: r.client, words });
+            } else {
+                self.effects.push(Effect::Unimplemented(format!("IOMobileFramebuffer frame information for swap {} with the display hardware's {crcs:?} (its CRC blocks' registers)", e.id)));
+            }
+        }
+        for r in self.records[4].clone() {
+            let Some(port) = r.port else { continue };
+            if matched {
+                self.effects.push(Effect::Unimplemented(format!("IOMobileFramebuffer CRC notification for swap {}: the display hardware's blend and dither CRCs (the pipe's slots 0x428 and 0x430)", e.id)));
+            } else {
+                self.effects.push(Effect::Notify { port, reference: r.reference, args: vec![u64::from(e.id), 0, 0] });
+            }
+        }
+    }
 }
 
 impl Kernel {

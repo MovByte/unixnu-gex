@@ -781,6 +781,9 @@ pub fn note_store(k: &mut Kernel, m: &mut GuestMem<'_>, page: u64) -> bool {
             None => false,
         }
     };
+    // The framebuffer's frame information queues are IOKit memory mapped
+    // the same way.
+    let claimed = claimed || super::iomfb::finfo::note_write(k, m, pid, page);
     if !claimed {
         let addr = page << gex_abi::PERM_PAGE_SHIFT;
         k.mem.lock().restore(addr, addr + gex_abi::PERM_PAGE, gex_abi::perm::WRITE);
