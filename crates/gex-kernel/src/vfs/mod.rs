@@ -16,6 +16,8 @@ pub mod hostcall;
 #[cfg(unix)]
 pub mod hostfs;
 pub mod oss;
+/// A directory tree laid over the root as part of it (`--overlay`).
+pub mod overlay;
 pub mod peimage;
 pub mod procfs;
 /// The filesystem when it is not in this process's memory.
@@ -27,6 +29,7 @@ pub mod tmpfs;
 pub use devfs::DevFs;
 #[cfg(unix)]
 pub use hostfs::HostFs;
+pub use overlay::OverlayFs;
 pub use procfs::{ProcFs, ProcSource, SysCpuFs};
 pub use remote::RemoteFs;
 pub use tmpfs::TmpFs;
@@ -1118,6 +1121,14 @@ pub trait FileSystem: Send + Sync {
         let _ = (path, op);
         Err(Errno::EOPNOTSUPP)
     }
+
+    /// The path, relative to this filesystem's root, of its file numbered
+    /// `ino`, for a filesystem that finds files by number (`VFS_VGET`);
+    /// `None` from one that looks them up by name only.
+    fn path_of_ino(&self, ino: u64) -> Option<String> {
+        let _ = ino;
+        None
+    }
 }
 
 /// Whether open `flags` ask to write, which a directory refuses (`EISDIR`).
@@ -1492,6 +1503,14 @@ impl Namespace {
     /// the way into another mount is not followed (the root's, then).
     pub fn mount_id_of(&self, path: &str) -> u64 {
         self.mount_at(&normalize(path, &self.cwd)).map_or(1, |(at, _)| mount_id(at))
+    }
+
+    /// The absolute path of the root filesystem's file numbered `ino`,
+    /// where that filesystem finds files by number
+    /// ([`FileSystem::path_of_ino`]).
+    pub fn root_path_of_ino(&self, ino: u64) -> Option<String> {
+        let rel = self.mounts.get("/")?.path_of_ino(ino)?;
+        Some(format!("/{rel}"))
     }
 
     /// Whether something is mounted at exactly this path.
