@@ -118,10 +118,15 @@ pub fn add_service(t: &mut Vec<Node>, nub: u32) {
 ///   ([`rtprop::absent`]; `IOMFBIntDcpUsedForExtWhenLidClose`, runtime
 ///   property 0x7f, is one): the pipe publishes the runtime properties it
 ///   registers, on the service, and nothing sets the others.
+/// - On the service, `SystemConsoleMode` until the console mode is first
+///   set ([`swap::console_property`]).
 /// - On the service, `external`: AppleCLCD sets it (0xfffffff006bf55ec,
 ///   0xfffffff006bf5a54) only when its provider's device tree entry has
 ///   `external`.
 pub fn property_absent(t: &[Node], i: u32, name: &str) -> bool {
+    if name == "SystemConsoleMode" && t.get(i as usize).is_some_and(|n| n.class == CLASS) {
+        return swap::console_property().is_none();
+    }
     if matches!(name, "GainMapVersion" | "canvas-width" | "canvas-height" | "dfr" | "AppleTV" | "hdcp-hoover-protocol" | "CursorPlane" | "VirtualDisplayMode" | "SupportsRotation" | "GPBandwidth") || rtprop::absent(name) {
         return true;
     }
@@ -205,7 +210,7 @@ pub fn new_user_client(k: &mut Kernel, ty: u32) -> Result<Client, i32> {
     };
     let c = Client { pid: k.pid, ty, block_profile, block_profile_index, started: true, power_assertions: 0, statistics: false, frame_info_size: 0, slots: Default::default() };
     if ty == 2 {
-        swap::add_swap_client();
+        swap::add_swap_client(k);
     }
     Ok(c)
 }
@@ -215,9 +220,13 @@ pub fn new_user_client(k: &mut Kernel, ty: u32) -> Result<Client, i32> {
 /// released (`SetParameter(11, 0)` each), its statistics turned off, the
 /// HDCP client stopped, each slot's notifications turned off and its port
 /// released, and a swap client unregistered. kIOReturnSuccess.
-pub fn client_close(k: &mut Kernel, id: u32, c: &mut Client) {
+///
+/// The last swap client's going sleeps in the closing thread; `closer` is
+/// the io_service_close that would wait for it (answered later by that
+/// token), and the result whether it waits.
+pub fn client_close(k: &mut Kernel, id: u32, c: &mut Client, closer: Option<u64>) -> bool {
     if !c.started {
-        return;
+        return false;
     }
     // OSDecrementAtomic gives the old count: one release for each the
     // client holds, the count ending one below zero.
@@ -245,14 +254,12 @@ pub fn client_close(k: &mut Kernel, id: u32, c: &mut Client) {
     }
     c.started = false;
     swap::client_stopped(id);
-    if c.ty == 2 {
-        swap::remove_swap_client(k, id);
-    }
+    c.ty == 2 && swap::remove_swap_client(k, id, closer)
 }
 
 /// The client freed: what it still holds let go.
 pub fn client_free(k: &mut Kernel, id: u32, c: &mut Client) {
-    client_close(k, id, c);
+    client_close(k, id, c, None);
     swap::client_gone(k, id);
 }
 

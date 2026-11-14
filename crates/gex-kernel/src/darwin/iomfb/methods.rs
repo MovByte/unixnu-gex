@@ -243,7 +243,7 @@ pub fn external_method(k: &mut Kernel, id: u32, c: &mut Client, a: &mut MethodAr
         4 => {
             if c.ty != 2 {
                 c.ty = 2;
-                swap::add_swap_client();
+                swap::add_swap_client(k);
             }
             a.scalar_out[0] = u64::from(swap::begin(id, k.pid));
             ret::SUCCESS
@@ -261,6 +261,9 @@ pub fn external_method(k: &mut Kernel, id: u32, c: &mut Client, a: &mut MethodAr
             }
             swap::submit(k, &record)
         }
+        // s_swap_signal (0xfffffff00677a298, member 0xfffffff006777350):
+        // the framebuffer's swap_signal with the swap id and the layer.
+        20 => swap::signal(k, sc(0) as u32, sc(1) as u32),
         // s_swap_wait (0xfffffff006779518): the client's swap_wait
         // (0xfffffff006777390) and the framebuffer's (slot 176), with the
         // swap id, the options and the timeout in milliseconds.
@@ -302,7 +305,7 @@ pub fn external_method(k: &mut Kernel, id: u32, c: &mut Client, a: &mut MethodAr
         12 => {
             if c.ty != 2 {
                 c.ty = 2;
-                swap::add_swap_client();
+                swap::add_swap_client(k);
             }
             match swap::request_power_change(k, sc(0) as u32) {
                 Ok(r) => r,

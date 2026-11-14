@@ -1094,6 +1094,19 @@ impl Kernel {
                     (Some(r), _) => r,
                     (None, res) => {
                         self.ipc().mqueue_cancel_receive(me);
+                        // A thread interrupted while it waits for a routine
+                        // that answers later: on the device the routine runs
+                        // in the thread, whose abort-safe sleep the signal
+                        // ends (thread_abort_safely); its reply follows.
+                        if res == WaitResult::Interrupted {
+                            let later = self.dtask.pending_replies.iter().find_map(|p| match p.op {
+                                super::kobject::Deferred::Later(t) if p.target == self.tid => Some(t),
+                                _ => None,
+                            });
+                            if let Some(token) = later {
+                                super::iomfb::swap::interrupt(self, token);
+                            }
+                        }
                         let state = match res {
                             WaitResult::TimedOut => mr::RCV_TIMED_OUT,
                             WaitResult::Interrupted => mr::RCV_INTERRUPTED,

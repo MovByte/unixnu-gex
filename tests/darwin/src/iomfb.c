@@ -22,13 +22,25 @@
 //   priority entitlement): layer 0 holds the swapped surface and layer 1
 //   nothing; a second swap that sets only layer 1 leaves layer 0 as it
 //   was, and the test embedder records both layers (frame-check.py).
+// - A swap that changes nothing on the glass completes at once, with no
+//   new frame; swap signals (selector 20) for a begun swap, a queued one,
+//   a layer it does not enable, and none.
+// - The console mode: SystemConsoleMode is not on the service until the
+//   first swap client comes, which turns it off.
 // - Power, on that connection: power notifications asked for (an option
 //   for them refused), the display turned off (selector 12), its
 //   notification (the time, and state 0), the swap waits a display that is
 //   off answers, a swap made while it is off, the display turned on again
 //   (state 3: controller and panel), and that swap gone with the queue's
-//   flush, never shown. The test embedder records the panel going dark and
-//   lighting again (frame-check.py).
+//   flush, never shown. The controller going off blanked the glass with the
+//   kernel's request for its last frame. The test embedder records the
+//   panel going dark, that blank frame, and the panel lighting again
+//   (frame-check.py).
+// - A swap whose completed layers are not all of those it enables waits at
+//   the queue's head until it is cancelled; a swap wait for another such
+//   one, interrupted by a signal, is kIOReturnAborted and clears the swaps.
+// - The last swap client's close waits for the kernel's swap that blanks
+//   the glass, a frame with no layers.
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
@@ -37,6 +49,8 @@
 #include <mach/mach.h>
 #include <stdio.h>
 #include <string.h>
+#include <signal.h>
+#include <unistd.h>
 
 typedef struct { double x, y, w, h; } FbRect;
 typedef struct { double w, h; } FbSize;
@@ -109,6 +123,35 @@ static kern_return_t submit(io_connect_t c, uint32_t id, uint32_t surface, int s
     return IOConnectCallStructMethod(c, 5, rec, sizeof rec, NULL, NULL);
 }
 
+// A raw transaction of `enabled` layers and the `completed` mask, layer 0
+// showing the whole of `surface`.
+static kern_return_t submit_masks(io_connect_t c, uint32_t id, uint32_t surface, int w, int h, uint32_t enabled, uint32_t completed) {
+    uint8_t rec[1288];
+    memset(rec, 0, sizeof rec);
+    int32_t src[4] = {0, 0, w, h};
+    memcpy(rec + 0x98, &id, 4);
+    memcpy(rec + 0x9c, &surface, 4);
+    memcpy(rec + 0xac, src, 16);
+    memcpy(rec + 0x10c, src, 16);
+    memcpy(rec + 0x14c, &enabled, 4);
+    memcpy(rec + 0x150, &completed, 4);
+    return IOConnectCallStructMethod(c, 5, rec, sizeof rec, NULL, NULL);
+}
+
+static volatile sig_atomic_t alarmed;
+
+static void on_alarm(int sig) {
+    (void)sig;
+    alarmed = 1;
+}
+
+static int console_mode(io_service_t clcd, int want) {
+    CFTypeRef v = IORegistryEntryCreateCFProperty(clcd, CFSTR("SystemConsoleMode"), NULL, 0);
+    int got = v == NULL ? -1 : v == kCFBooleanTrue ? 1 : v == kCFBooleanFalse ? 0 : 2;
+    if (v) CFRelease(v);
+    return got == want ? 0 : bad("SystemConsoleMode", got, want);
+}
+
 int main(void) {
     io_service_t clcd = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleCLCD"));
     if (clcd == IO_OBJECT_NULL) return bad("the AppleCLCD", 0, 1);
@@ -140,6 +183,8 @@ int main(void) {
     Framebuffer fb = NULL;
     kern_return_t kr = fb_open(clcd, mach_task_self(), 0, &fb);
     if (kr != KERN_SUCCESS || fb == NULL) return bad("IOMobileFramebufferOpen", kr, 0);
+    // No swap client yet: no console mode set.
+    if (console_mode(clcd, -1)) return 1;
     FbSize size = {0, 0};
     kr = display_size(fb, &size);
     if (kr != KERN_SUCCESS || size.w != pw || size.h != ph) return bad("the display size", (long)size.w << 16 | (long)size.h, (long)pw << 16 | ph);
@@ -160,6 +205,8 @@ int main(void) {
     int token = 0;
     kr = swap_begin(fb, &token);
     if (kr != KERN_SUCCESS || token != 1) return bad("SwapBegin's first swap id", token, 1);
+    // The first swap client turned the console mode off.
+    if (console_mode(clcd, 0)) return 1;
     FbRect whole = {0, 0, pw, ph};
     kr = swap_set_layer(fb, 0, s, whole, whole, 0);
     if (kr != KERN_SUCCESS) return bad("SwapSetLayer", kr, 0);
@@ -323,6 +370,30 @@ int main(void) {
         mach_port_deallocate(mach_task_self(), (mach_port_t)out[0]);
     }
 
+    // A swap of layer 0 with the surface and rectangles it has on the glass
+    // changes nothing: it completes at once, no blank waited for, and no
+    // frame is recorded for it.
+    int same = 0;
+    if ((kr = swap_begin(fb, &same)) != KERN_SUCCESS) return bad("SwapBegin of a no-op swap", kr, 0);
+    if ((kr = swap_set_layer(fb, 0, s, whole, whole, 0)) != KERN_SUCCESS) return bad("SwapSetLayer of a no-op swap", kr, 0);
+    if ((kr = swap_end(fb)) != KERN_SUCCESS) return bad("SwapEnd of a no-op swap", kr, 0);
+    if ((kr = swap_wait(fb, same, 0x80000001)) != KERN_SUCCESS) return bad("a no-op swap, done at once", kr, 0);
+    // Swap signals: a begun swap takes one for any layer; an unknown swap
+    // is kIOReturnError, and a layer past 3 kIOReturnBadArgument.
+    outn = 1;
+    if ((kr = IOConnectCallScalarMethod(c, 4, NULL, 0, out, &outn)) != KERN_SUCCESS) return bad("SwapBegin to signal", kr, 0);
+    uint32_t signalled = (uint32_t)out[0];
+    in[0] = signalled;
+    in[1] = 2;
+    if ((kr = IOConnectCallScalarMethod(c, 20, in, 2, NULL, NULL)) != KERN_SUCCESS) return bad("SwapSignal of a begun swap", kr, 0);
+    in[1] = 4;
+    if ((kr = IOConnectCallScalarMethod(c, 20, in, 2, NULL, NULL)) != kIOReturnBadArgument) return bad("SwapSignal of layer 4", kr, kIOReturnBadArgument);
+    in[0] = 0x7777;
+    in[1] = 0;
+    if ((kr = IOConnectCallScalarMethod(c, 20, in, 2, NULL, NULL)) != kIOReturnError) return bad("SwapSignal of no swap", kr, kIOReturnError);
+    in[0] = signalled;
+    if ((kr = IOConnectCallScalarMethod(c, 52, in, 1, NULL, NULL)) != KERN_SUCCESS) return bad("cancelling the signalled swap", kr, 0);
+
     // Power notifications (type 1) to a port of their own: an option for
     // them is refused, the record staying listed.
     mach_port_t pp;
@@ -354,6 +425,13 @@ int main(void) {
     if ((kr = swap_set_layer(fb, 0, s, whole, whole, 0)) != KERN_SUCCESS) return bad("SwapSetLayer while off", kr, 0);
     if ((kr = swap_end(fb)) != KERN_SUCCESS) return bad("SwapEnd while off", kr, 0);
     if ((kr = swap_wait(fb, off, 1)) != (kern_return_t)0xe00002e3) return bad("SwapWait on a swap made while off", kr, 0xe00002e3);
+    // Queued while off: a signal for the layer it enables is taken, one
+    // for a layer it does not is kIOReturnBadArgument.
+    in[0] = off;
+    in[1] = 0;
+    if ((kr = IOConnectCallScalarMethod(c, 20, in, 2, NULL, NULL)) != KERN_SUCCESS) return bad("SwapSignal of a queued swap", kr, 0);
+    in[1] = 1;
+    if ((kr = IOConnectCallScalarMethod(c, 20, in, 2, NULL, NULL)) != kIOReturnBadArgument) return bad("SwapSignal of a layer not enabled", kr, kIOReturnBadArgument);
     // On again: the controller's change flushes the queue (the swap is gone
     // and never shown), the panel lights, and the client is told.
     in[0] = 1;
@@ -362,9 +440,42 @@ int main(void) {
     if ((kr = swap_wait(fb, off, 1)) != KERN_SUCCESS) return bad("SwapWait on the flushed swap", kr, 0);
     if ((kr = swap_wait(fb, off, 2)) != KERN_SUCCESS) return bad("SwapWait for an idle queue after the flush", kr, 0);
     if ((kr = swap_wait(fb, off, 3)) != KERN_SUCCESS) return bad("SwapWait option 3 when on again", kr, 0);
+    // The kernel's request for the controller's last frame as it went off
+    // was shown: the glass is empty.
+    in[0] = 0;
+    outn = 1;
+    if ((kr = IOConnectCallScalarMethod(c, 83, in, 1, out, &outn)) != kIOReturnError) return bad("CopyLayerDisplayedSurface after the power cycle", kr, kIOReturnError);
+    // A swap that enables a layer past 3, which no signal completes, waits
+    // at the queue's head; cancelled, the next kick drops it.
+    int stuck = 0;
+    if ((kr = swap_begin(fb, &stuck)) != KERN_SUCCESS) return bad("SwapBegin of an incomplete swap", kr, 0);
+    if ((kr = submit_masks(c, (uint32_t)stuck, sid, (int)pw, (int)ph, 0x11, 0)) != KERN_SUCCESS) return bad("submitting an incomplete swap", kr, 0);
+    if ((kr = swap_wait(fb, stuck, 0x80000001)) != kIOReturnBusy) return bad("an incomplete swap, still queued", kr, kIOReturnBusy);
+    usleep(50000);
+    if ((kr = swap_wait(fb, stuck, 0x80000001)) != kIOReturnBusy) return bad("an incomplete swap, still queued after blanks", kr, kIOReturnBusy);
+    in[0] = stuck;
+    if ((kr = IOConnectCallScalarMethod(c, 52, in, 1, NULL, NULL)) != KERN_SUCCESS) return bad("cancelling the incomplete swap", kr, 0);
+    usleep(50000);
+    if ((kr = swap_wait(fb, stuck, 0x80000001)) != KERN_SUCCESS) return bad("the cancelled swap, dropped", kr, 0);
+    // Another, waited for: a signal ends the wait's sleep (kIOReturnAborted)
+    // after its handler ran, and the swaps are cleared, the swap with them.
+    if ((kr = swap_begin(fb, &stuck)) != KERN_SUCCESS) return bad("SwapBegin of a second incomplete swap", kr, 0);
+    if ((kr = submit_masks(c, (uint32_t)stuck, sid, (int)pw, (int)ph, 0x11, 0)) != KERN_SUCCESS) return bad("submitting a second incomplete swap", kr, 0);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_alarm;
+    sigaction(SIGALRM, &sa, NULL);
+    ualarm(100000, 0);
+    if ((kr = swap_wait(fb, stuck, 1)) != kIOReturnAborted || !alarmed) return bad("a swap wait a signal interrupts", kr, kIOReturnAborted);
+    if ((kr = swap_wait(fb, stuck, 0x80000001)) != KERN_SUCCESS) return bad("the swap the interrupted wait cleared", kr, 0);
     in[0] = 0;
     if ((kr = IOConnectCallScalarMethod(c, 72, in, 4, NULL, NULL)) != KERN_SUCCESS) return bad("power notifications off", kr, 0);
     IOServiceClose(c);
+    // The last swap client's close: its io_service_close returns once the
+    // kernel's swap that blanks the glass is shown; the console mode stays
+    // as the first swap client left it, the glass having no surface for it.
+    CFRelease(fb);
+    if (console_mode(clcd, 0)) return 1;
 
     printf("iomfb ok\n");
     return 0;

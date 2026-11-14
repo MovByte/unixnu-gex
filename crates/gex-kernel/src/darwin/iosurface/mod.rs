@@ -190,6 +190,11 @@ pub struct Root {
     send_rights: std::collections::BTreeMap<u32, SendRight>,
     next_send_right: u32,
     params: surface::RootParams,
+    /// `+0x250`: the displays that told the root what their layers show
+    /// (eight at most, each its framebuffer and the allocation size of
+    /// each of its four layers' surfaces), and `+0x248` the sum.
+    displayed: [Option<(u64, [u64; 4])>; 8],
+    displayed_bytes: u64,
 }
 
 /// An `IOSurfaceSendRight` (or `IOSurfaceWiredSendRight`): its surface,
@@ -225,6 +230,8 @@ fn root<R>(f: impl FnOnce(&mut Root) -> R) -> R {
             next_client: 0,
             send_rights: Default::default(),
             next_send_right: 0,
+            displayed: [None; 8],
+            displayed_bytes: 0,
             params: surface::RootParams { row_mask: (line - 1) | 0xf, offset_mask: (line - 1) | 0x3fff, max_alloc: super::mig::machine::MEMORY >> 2, debug: DEBUG_DEFAULT, page_size: super::mach::PAGE_MASK + 1 },
         };
         r.grow();
@@ -910,6 +917,36 @@ pub fn kernel_lookup(k: &mut Kernel, id: u32) -> Option<u32> {
         s.refs += 1;
         Some(id)
     })
+}
+
+/// The root told that `display`'s layer `layer` shows `surface` now
+/// (0xfffffff005bacfe0): the display's entry found, or the first free one
+/// of eight taken (none free: nothing is kept), the layer's size the
+/// surface's allocation size (or none), and the sum of every display's
+/// kept. When the sum changes the callback registered for it
+/// (0xfffffff005bad200) is called: IOGPU's scheduler registers one
+/// (IOGPUScheduler::init, 0xfffffff005bca870), which the accelerator here
+/// does not make, so none is.
+pub fn displayed(display: u64, layer: u32, surface: Option<u32>) {
+    root(|r| {
+        let slot = match r.displayed.iter().position(|d| d.is_some_and(|(k, _)| k == display)) {
+            Some(i) => i,
+            None => match r.displayed.iter().position(Option::is_none) {
+                Some(i) => {
+                    r.displayed[i] = Some((display, [0; 4]));
+                    i
+                }
+                None => return,
+            },
+        };
+        if layer > 3 {
+            return;
+        }
+        let size = surface.and_then(|id| r.surfaces.get(&id)).map_or(0, |s| s.desc.alloc_size);
+        let (_, sizes) = r.displayed[slot].as_mut().expect("the display's entry");
+        r.displayed_bytes = r.displayed_bytes - sizes[layer as usize] + size;
+        sizes[layer as usize] = size;
+    });
 }
 
 /// A reference [`kernel_lookup`] took let go.

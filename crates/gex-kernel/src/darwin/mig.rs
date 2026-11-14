@@ -2113,11 +2113,18 @@ fn connect_routine(k: &mut Kernel, req: &Kmsg, id: u32, n: i32) -> Reply {
         // io_registry_entry_get_property_bin_buf.
         2889 => client_property_bin_buf(k, req, &c),
         // io_service_close: clientClose, once (a shared instance aside);
-        // a second close is ignored. Always kIOReturnSuccess.
+        // a second close is ignored. Always kIOReturnSuccess, once a close
+        // that sleeps is done.
         2816 => {
             if !c.closed {
                 c.closed = true;
-                super::iokit::client_close(k, &mut c);
+                let token = later_token();
+                if super::iokit::client_close(k, &mut c, Some(token)) {
+                    LATER.lock().unwrap_or_else(|e| e.into_inner()).insert(token, Later::Close);
+                    let mut reply = Reply::ok(Vec::new());
+                    reply.defer = Some((k.tid, super::kobject::Deferred::Later(token)));
+                    return reply;
+                }
             }
             Reply::ok(Vec::new())
         }
@@ -2288,7 +2295,7 @@ fn connect_method(k: &mut Kernel, c: &mut super::iokit::UserClient, mut a: super
     // it there, as it waits in the method on the device.
     if let Some(token) = a.later.take() {
         if r == ret::SUCCESS {
-            LATER.lock().unwrap_or_else(|e| e.into_inner()).insert(token, (a, ool_out_field));
+            LATER.lock().unwrap_or_else(|e| e.into_inner()).insert(token, Later::Method(a, ool_out_field));
             let mut reply = Reply::ok(Vec::new());
             reply.defer = Some((k.tid, super::kobject::Deferred::Later(token)));
             return reply;
@@ -2321,15 +2328,26 @@ pub(crate) fn later_token() -> u64 {
     NEXT_LATER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The methods that answer later, by token: their arguments, and whether
-/// the routine was io_connect_method (with an out-of-line output field).
-static LATER: std::sync::Mutex<std::collections::BTreeMap<u64, (super::iokit::MethodArgs, bool)>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+/// A routine that answers later: a method (its arguments, and whether the
+/// routine was io_connect_method, with an out-of-line output field), or an
+/// io_service_close whose clientClose sleeps.
+enum Later {
+    Method(super::iokit::MethodArgs, bool),
+    Close,
+}
+
+/// The routines that answer later, by token.
+static LATER: std::sync::Mutex<std::collections::BTreeMap<u64, Later>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// The reply of method `token`, which answered later: it returned `r`, and
 /// on success the scalar outputs `scalars` (as many as the caller has room
 /// for). None for a token no method left.
 pub(crate) fn later_reply(token: u64, r: i32, scalars: &[u64]) -> Option<Reply> {
-    let (mut a, ool_out_field) = LATER.lock().unwrap_or_else(|e| e.into_inner()).remove(&token)?;
+    let (mut a, ool_out_field) = match LATER.lock().unwrap_or_else(|e| e.into_inner()).remove(&token)? {
+        Later::Method(a, ool_out_field) => (a, ool_out_field),
+        // io_service_close is always kIOReturnSuccess.
+        Later::Close => return Some(Reply::ok(Vec::new())),
+    };
     for (out, v) in a.scalar_out.iter_mut().zip(scalars) {
         *out = *v;
     }
