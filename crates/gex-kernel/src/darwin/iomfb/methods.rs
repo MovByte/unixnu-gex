@@ -350,6 +350,39 @@ pub fn external_method(k: &mut Kernel, id: u32, c: &mut Client, a: &mut MethodAr
                 ret::UNSUPPORTED
             }
         },
+        // s_set_parameter (0xfffffff006779d3c): the parameter (the first
+        // scalar) and its values (the structure input's 64-bit words).
+        // Parameter 16 needs com.apple.private.gain-map-access
+        // (kIOReturnNotPrivileged); parameter 1 given two words takes the
+        // first; parameter 11 counts the client's power assertions
+        // (`+0xfc`: up with a nonzero first word, else down); then the
+        // framebuffer's slot 228.
+        68 => {
+            let Some(&param) = a.scalar_in.first() else {
+                k.darwin_unimplemented("IOMobileFramebufferUserClient selector 68 (SetParameter) with no scalar: the method reads its first scalar unchecked".to_string());
+                return ret::UNSUPPORTED;
+            };
+            let param = param as u32;
+            let words: Vec<u64> = a.struct_in.chunks_exact(8).map(|w| u64::from_le_bytes(w.try_into().unwrap())).collect();
+            let mut count = (a.struct_in.len() / 8) as u32;
+            if param == 0x10 && !k.darwin_entitled("com.apple.private.gain-map-access") {
+                return ret::NOT_PRIVILEGED;
+            }
+            if param == 1 && count == 2 {
+                count = 1;
+            } else if param == 0xb {
+                let Some(&first) = words.first() else {
+                    k.darwin_unimplemented(format!("IOMobileFramebufferUserClient selector 68 (SetParameter) 11 with {} bytes: the method reads its first word unchecked", a.struct_in.len()));
+                    return ret::UNSUPPORTED;
+                };
+                if first == 0 {
+                    c.power_assertions -= 1;
+                } else {
+                    c.power_assertions += 1;
+                }
+            }
+            set_parameter(k, param, &words, count)
+        }
         // s_swap_cancel (0xfffffff006779574): slot 217's gated cancel.
         52 => swap::cancel(k, sc(0) as u32),
         // s_notifications (0xfffffff00677a658, member 0xfffffff006778460):
@@ -480,7 +513,31 @@ fn notifications(k: &mut Kernel, id: u32, c: &mut Client, callout: u64, refcon: 
 }
 
 /// A power assertion the client holds let go at its stop: the
-/// framebuffer's `SetParameter(11, 0)` (slot 228), which is not modelled.
+/// framebuffer's `SetParameter(11, 0)` (slot 228), whose answer the stop
+/// does not look at.
 pub fn release_power_assertion(k: &mut Kernel) {
-    k.darwin_unimplemented("IOMobileFramebuffer SetParameter 11 (a client's power assertion released at its stop)".to_string());
+    set_parameter(k, 0xb, &[0], 1);
+}
+
+/// `IOMobileFramebufferLegacy::SetParameter` (slot 228,
+/// 0xfffffff00679efb0, which AppleCLCD keeps): each parameter it knows runs
+/// a gated action when given the count of values it takes (0: four; 1 to
+/// 3, 6, 7 and 23: one; 4: one below 101; 5 and 9: none; 10: one or two;
+/// 22: any), and any other parameter or count is kIOReturnBadArgument.
+/// Parameter 11, the power assertions, is not one of them.
+fn set_parameter(k: &mut Kernel, param: u32, values: &[u64], count: u32) -> i32 {
+    let known = match param {
+        0 => count == 4,
+        1 | 2 | 3 | 6 | 7 | 0x17 => count == 1,
+        4 => count == 1 && values.first().is_some_and(|&v| v < 0x65),
+        5 | 9 => count == 0,
+        10 => count == 1 || count == 2,
+        0x16 => true,
+        _ => false,
+    };
+    if !known {
+        return ret::BAD_ARGUMENT;
+    }
+    k.darwin_unimplemented(format!("IOMobileFramebuffer SetParameter {param} with {count} values {:x?} (the framebuffer's gated action)", &values[..values.len().min(count as usize)]));
+    ret::UNSUPPORTED
 }

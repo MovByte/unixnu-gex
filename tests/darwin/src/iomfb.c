@@ -14,7 +14,9 @@
 // - On a connection of its own, the user client's refusals: the selector
 //   range, the dispatch counts, reserved and empty entries, unknown swaps,
 //   a source rectangle outside its surface, the debug flags a production
-//   device refuses, the notification types, and memory of no type.
+//   device refuses, the parameters SetParameter does not take (a power
+//   assertion among them) and the gain map's without its entitlement, the
+//   notification types, and memory of no type.
 // - The glass, on that connection (selector 83, with backboardd's graphics
 //   priority entitlement): layer 0 holds the swapped surface and layer 1
 //   nothing; a second swap that sets only layer 1 leaves layer 0 as it
@@ -214,6 +216,21 @@ int main(void) {
     outn = 1;
     if ((kr = IOConnectCallScalarMethod(c, 15, in, 2, out, &outn)) != kIOReturnError) return bad("SetDebugFlags", kr, kIOReturnError);
     if (out[0] != 5) return bad("SetDebugFlags' output", out[0], 5);
+    // SetParameter: a power assertion (11), which the framebuffer does not
+    // take, an unknown parameter, values of the wrong count or range, and
+    // the gain map's (16) without its entitlement.
+    uint64_t sp[4] = {1, 0, 0, 0};
+    in[0] = 11;
+    if ((kr = IOConnectCallMethod(c, 68, in, 1, sp, 8, NULL, NULL, NULL, NULL)) != kIOReturnBadArgument) return bad("SetParameter 11", kr, kIOReturnBadArgument);
+    in[0] = 8;
+    if ((kr = IOConnectCallMethod(c, 68, in, 1, sp, 8, NULL, NULL, NULL, NULL)) != kIOReturnBadArgument) return bad("SetParameter 8", kr, kIOReturnBadArgument);
+    in[0] = 0;
+    if ((kr = IOConnectCallMethod(c, 68, in, 1, sp, 24, NULL, NULL, NULL, NULL)) != kIOReturnBadArgument) return bad("SetParameter 0 with three values", kr, kIOReturnBadArgument);
+    in[0] = 4;
+    sp[0] = 101;
+    if ((kr = IOConnectCallMethod(c, 68, in, 1, sp, 8, NULL, NULL, NULL, NULL)) != kIOReturnBadArgument) return bad("SetParameter 4 of 101", kr, kIOReturnBadArgument);
+    in[0] = 16;
+    if ((kr = IOConnectCallMethod(c, 68, in, 1, sp, 8, NULL, NULL, NULL, NULL)) != kIOReturnNotPrivileged) return bad("SetParameter 16", kr, kIOReturnNotPrivileged);
     outn = 1;
     if ((kr = IOConnectCallScalarMethod(c, 18, NULL, 0, out, &outn)) != KERN_SUCCESS || out[0] != 1) return bad("IsMainDisplay", out[0], 1);
     outn = 1;
