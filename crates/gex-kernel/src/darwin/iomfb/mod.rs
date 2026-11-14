@@ -13,12 +13,15 @@
 //!   (`IOMobileFramebuffer::newUserClient` checks none): its methods
 //!   ([`methods`]), its notification ports, the swaps a client makes and
 //!   the display's power ([`swap`]).
+//! - What the pipe reports of each frame it shows: frame information on a
+//!   client's shared data queue and CRC notifications ([`finfo`]).
 //! - The panel. A completed swap's surfaces go to the embedder's
 //!   presentation sink ([`sink`]) at the panel's vertical blank, which the
 //!   framebuffer counts at the panel's rate ([`swap::Panel`]) while the
 //!   display's controller is on; the sink is told as the panel goes dark
 //!   and lights.
 
+pub mod finfo;
 pub mod methods;
 pub mod rtprop;
 pub mod sink;
@@ -118,10 +121,15 @@ pub fn add_service(t: &mut Vec<Node>, nub: u32) {
 ///   ([`rtprop::absent`]; `IOMFBIntDcpUsedForExtWhenLidClose`, runtime
 ///   property 0x7f, is one): the pipe publishes the runtime properties it
 ///   registers, on the service, and nothing sets the others.
+/// - On the service, `SystemConsoleMode` until the console mode is first
+///   set ([`swap::console_property`]).
 /// - On the service, `external`: AppleCLCD sets it (0xfffffff006bf55ec,
 ///   0xfffffff006bf5a54) only when its provider's device tree entry has
 ///   `external`.
 pub fn property_absent(t: &[Node], i: u32, name: &str) -> bool {
+    if name == "SystemConsoleMode" && t.get(i as usize).is_some_and(|n| n.class == CLASS) {
+        return swap::console_property().is_none();
+    }
     if matches!(name, "GainMapVersion" | "canvas-width" | "canvas-height" | "dfr" | "AppleTV" | "hdcp-hoover-protocol" | "CursorPlane" | "VirtualDisplayMode" | "SupportsRotation" | "GPBandwidth") || rtprop::absent(name) {
         return true;
     }
@@ -205,7 +213,7 @@ pub fn new_user_client(k: &mut Kernel, ty: u32) -> Result<Client, i32> {
     };
     let c = Client { pid: k.pid, ty, block_profile, block_profile_index, started: true, power_assertions: 0, statistics: false, frame_info_size: 0, slots: Default::default() };
     if ty == 2 {
-        swap::add_swap_client();
+        swap::add_swap_client(k);
     }
     Ok(c)
 }
@@ -215,9 +223,13 @@ pub fn new_user_client(k: &mut Kernel, ty: u32) -> Result<Client, i32> {
 /// released (`SetParameter(11, 0)` each), its statistics turned off, the
 /// HDCP client stopped, each slot's notifications turned off and its port
 /// released, and a swap client unregistered. kIOReturnSuccess.
-pub fn client_close(k: &mut Kernel, id: u32, c: &mut Client) {
+///
+/// The last swap client's going sleeps in the closing thread; `closer` is
+/// the io_service_close that would wait for it (answered later by that
+/// token), and the result whether it waits.
+pub fn client_close(k: &mut Kernel, id: u32, c: &mut Client, closer: Option<u64>) -> bool {
     if !c.started {
-        return;
+        return false;
     }
     // OSDecrementAtomic gives the old count: one release for each the
     // client holds, the count ending one below zero.
@@ -245,24 +257,24 @@ pub fn client_close(k: &mut Kernel, id: u32, c: &mut Client) {
     }
     c.started = false;
     swap::client_stopped(id);
-    if c.ty == 2 {
-        swap::remove_swap_client(k, id);
-    }
+    c.ty == 2 && swap::remove_swap_client(k, id, closer)
 }
 
 /// The client freed: what it still holds let go.
 pub fn client_free(k: &mut Kernel, id: u32, c: &mut Client) {
-    client_close(k, id, c);
+    client_close(k, id, c, None);
     swap::client_gone(k, id);
+    finfo::free(k, id);
 }
 
 /// `registerNotificationPort(port, type, refCon)` (0xfffffff006777610):
 /// a type past the slots is kIOReturnBadArgument and a slot that has a
-/// port already kIOReturnPortExists; the port and reference are kept.
-/// Type 3, frame information, also makes the client's shared data queue
-/// when the framebuffer gives frame information through one, which is not
-/// modelled.
-pub fn register_notification_port(k: &mut Kernel, c: &mut Client, port: Option<ObjId>, ty: u32, reference: u64) -> i32 {
+/// port already kIOReturnPortExists; the port and reference are kept. Type
+/// 3, frame information, with the item size selector 74 gave
+/// (`+0x3c8`), also makes the client's shared data queue if it has none
+/// (0xfffffff0067765a8; failing, kIOReturnError, the port kept) and has
+/// its data-available message go to the port ([`finfo::register`]).
+pub fn register_notification_port(k: &mut Kernel, id: u32, c: &mut Client, port: Option<ObjId>, ty: u32, reference: u64) -> i32 {
     const K_IO_RETURN_PORT_EXISTS: i32 = 0xe00002dd_u32 as i32;
     if ty as usize >= NOTIFY_TYPES {
         return ret::BAD_ARGUMENT;
@@ -274,19 +286,71 @@ pub fn register_notification_port(k: &mut Kernel, c: &mut Client, port: Option<O
     slot.port = port;
     slot.refcon = reference as u32;
     if ty == 3 && c.frame_info_size != 0 {
-        k.darwin_unimplemented("IOMobileFramebufferUserClient frame information through its shared data queue (IOSharedDataQueue of 0x1040 bytes)".to_string());
+        if let Err(what) = finfo::register(k, id, c.pid, port) {
+            k.darwin_unimplemented(what);
+            return ret::ERROR;
+        }
     }
     ret::SUCCESS
 }
 
+/// The memory `clientMemoryForType` gives.
+pub enum Memory {
+    /// Client `.0`'s frame information queue.
+    FrameInfo(u32),
+}
+
 /// `clientMemoryForType(type, options, memory)` (0xfffffff0067777d8):
-/// type 3 is the frame information queue (kIOReturnNotReady without one);
-/// any other is success with no memory, which maps nothing.
-pub fn client_memory_for_type(_c: &Client, ty: u32) -> Result<(), i32> {
-    if ty == 3 {
+/// type 3 is the frame information queue's memory (kIOReturnNotReady
+/// without one), with no options; any other is success with no memory,
+/// which maps nothing.
+pub fn client_memory_for_type(id: u32, ty: u32) -> Result<Option<Memory>, i32> {
+    if ty != 3 {
+        return Ok(None);
+    }
+    if !finfo::has_queue(id) {
         return Err(ret::NOT_READY);
     }
-    Ok(())
+    Ok(Some(Memory::FrameInfo(id)))
+}
+
+/// `AppleCLCD::setProperties` (0xfffffff006bf46a4): a dictionary only
+/// (else kIOReturnBadArgument, "given OSObject is not an OSDictionary").
+/// The first of the pipe's runtime property names (by id, 0 to 0xf4,
+/// `IOMFB::getRuntimePropertyName`) the dictionary has is set, its value
+/// checked against the property's type (a number for types 1 and 2, a
+/// boolean for 0, type 3 refused) and handed to the tiling manager's
+/// override and the framebuffer's slot 317 (0xfffffff006bf4568), which is
+/// not modelled; with none, the family's setProperties (0xfffffff006792404):
+/// each of `CollectStatistics`, `IOMFBPreserveContents`,
+/// `IOMFBSetConsoleMode` and `IOMFBSkipSpinner` that is an OSBoolean taken
+/// ([`swap::set_console_keys`]; statistics turned on are not modelled, and
+/// turned off while off do nothing); success when one was, else
+/// kIOReturnBadArgument.
+pub fn set_properties(k: &mut Kernel, g: &super::osserialize::Graph, obj: super::osserialize::Id) -> i32 {
+    use super::osserialize::Obj;
+    let Obj::Dict(entries) = g.get(obj) else { return ret::BAD_ARGUMENT };
+    if let Some(name) = rtprop::names().find(|n| entries.iter().any(|(key, _)| key.as_slice() == n.as_bytes())) {
+        k.darwin_unimplemented(format!("AppleCLCD::setProperties of the runtime property {name} (its type check and the pipe's setter, 0xfffffff006bf4568)"));
+        return ret::UNSUPPORTED;
+    }
+    let boolean = |key: &[u8]| entries.iter().find(|(k, _)| k.as_slice() == key).and_then(|&(_, v)| match g.get(v) {
+        Obj::Bool(b) => Some(*b),
+        _ => None,
+    });
+    let stats = boolean(b"CollectStatistics");
+    let preserve = boolean(b"IOMFBPreserveContents");
+    let console = boolean(b"IOMFBSetConsoleMode");
+    let skip = boolean(b"IOMFBSkipSpinner");
+    if stats == Some(true) {
+        k.darwin_unimplemented("AppleCLCD::setProperties turning the framebuffer's statistics on (PerformanceStatistics, 0xfffffff006796fb0)".to_string());
+    }
+    swap::set_console_keys(k, preserve, console, skip);
+    if stats.is_some() || preserve.is_some() || console.is_some() || skip.is_some() {
+        ret::SUCCESS
+    } else {
+        ret::BAD_ARGUMENT
+    }
 }
 
 /// The client's properties: none of its own.

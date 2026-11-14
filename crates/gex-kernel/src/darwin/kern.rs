@@ -1388,6 +1388,7 @@ impl Kernel {
                 None => Err(Errno::ENOENT),
             },
             "kern.dyld_flags" => self.darwin_sysctl_dyld_flags(m, req),
+            "kern.progressoptions" | "kern.consoleoptions" => self.darwin_sysctl_progressoptions(m, node.path, req),
             "vm.loadavg" => self.darwin_sysctl_loadavg(m, req),
             _ => match sysctl::value(node.path) {
                 Some(_) if req.new != 0 => {
@@ -1462,6 +1463,21 @@ impl Kernel {
         if req.new != 0 {
             let b = req.input(m, 8)?;
             super::commpage::set_dyld_flags(u64::from_le_bytes(b[..8].try_into().unwrap()));
+        }
+        Ok(())
+    }
+
+    /// IOPMrootDomain's `sysctl_progressoptions` (`sysctl_io_opaque` of the
+    /// video console's `vc_user_options`, which anybody may write) and
+    /// `sysctl_consoleoptions` (`sysctl_io_number` of their options word).
+    fn darwin_sysctl_progressoptions(&mut self, m: &mut GuestMem<'_>, path: &str, req: &mut SysctlReq) -> Result<(), Errno> {
+        let mut v = super::vconsole::user_options();
+        let n = if path == "kern.consoleoptions" { 4 } else { v.len() };
+        req.out(m, &v[..n])?;
+        if req.new != 0 {
+            let b = req.input(m, n)?;
+            v[..n].copy_from_slice(&b[..n]);
+            super::vconsole::set_user_options(v);
         }
         Ok(())
     }

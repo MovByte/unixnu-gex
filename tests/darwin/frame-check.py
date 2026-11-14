@@ -1,10 +1,14 @@
-# Check the frame the iomfb program swapped, as the test embedder recorded
-# it (hosts/native/src/darwin_frames.rs): one frame, of swap 1, one layer
-# (layer 0) of a BGRA surface the panel's size, its source and destination
-# the whole panel, untransformed, one plane, and every pixel the pattern
-# the program wrote (iomfb.c's fill), the rows' padding zero. Then the
-# panel going dark and lighting again, after that frame and in that order
-# (the program's power change; the swap it made while off is never shown).
+# Check the frames the iomfb program swapped, as the test embedder recorded
+# them (hosts/native/src/darwin_frames.rs): the first, of swap 2 (swap 1, of
+# kind 0x13, is dropped unshown), one layer (layer 0) of a BGRA surface the
+# panel's size, its source and destination the whole panel, untransformed,
+# one plane, and every pixel the pattern the program wrote (iomfb.c's fill),
+# the rows' padding zero; the second, its layer 1 swap (its idle buffer and
+# no-op swap make none). Then the panel going dark, the glass blanked (no
+# layers) by the kernel's request the controller made for its last frame as
+# it went off, the panel lighting again (the swap made while off is never
+# shown), and the glass blanked by the kernel's swap of kind 7 as the last
+# swap client closed.
 import struct
 import sys
 from pathlib import Path
@@ -16,8 +20,8 @@ def fail(why):
 
 
 frames = sorted(Path(sys.argv[1]).glob("frame-*.bin"), key=lambda p: int(p.name[len("frame-"):-len(".bin")]))
-if len(frames) != 2:
-    fail(f"{len(frames)} frames recorded, want 2")
+if len(frames) != 4:
+    fail(f"{len(frames)} frames recorded, want 4")
 b = frames[0].read_bytes()
 at = 0
 
@@ -32,7 +36,7 @@ def take(fmt):
 magic, version, swap_id, vbl, time, pw, ph, layers = take("4sIIQQIII")
 if magic != b"GEXF" or version != 1:
     fail("not a recorded frame")
-if swap_id != 1 or layers != 1 or vbl == 0 or time == 0:
+if swap_id != 2 or layers != 1 or vbl == 0 or time == 0:
     fail(f"swap {swap_id}, {layers} layers, blank {vbl} at {time}")
 index, surface, fmt, w, h = take("IIIQQ")
 src = take("4i")
@@ -83,10 +87,22 @@ offset1, pw1, ph1, bpr1, bpe1, ew1, eh1, size1 = take("QQQQIIIQ")
 if any(b[at + y * bpr1 + x] != 0x40 for y in range(64) for x in range(256)):
     fail("second frame's layer 1 is not its surface's bytes")
 
-# The panel's power, numbered with the frames: dark, then lit, after the
-# frames.
-first = int(frames[-1].name[len("frame-"):-len(".bin")])
-panel = sorted(Path(sys.argv[1]).glob("panel-*.txt"), key=lambda p: int(p.name[len("panel-"):-len(".txt")]))
-states = [(int(p.name[len("panel-"):-len(".txt")]), p.read_text().strip()) for p in panel]
-if [s for _, s in states] != ["off", "on"] or any(n <= first for n, _ in states):
-    fail(f"the panel's power {states} after frame {first}, want off then on")
+# The panel's power, numbered with the frames: dark between the second
+# frame and the third, lit between the third and the fourth.
+num = lambda p, pre, suf: int(p.name[len(pre):-len(suf)])
+at_ = [num(f, "frame-", ".bin") for f in frames]
+panel = sorted(Path(sys.argv[1]).glob("panel-*.txt"), key=lambda p: num(p, "panel-", ".txt"))
+states = [(num(p, "panel-", ".txt"), p.read_text().strip()) for p in panel]
+if [s for _, s in states] != ["off", "on"] or not (at_[1] < states[0][0] < at_[2] < states[1][0] < at_[3]):
+    fail(f"the panel's power {states} with frames at {at_}, want off after the second and on after the third")
+
+# The blanked glass: no layers, later swaps (each a new swap id), later
+# blanks.
+last_swap, last_vbl = swap2, vbl2
+for f in frames[2:]:
+    b = f.read_bytes()
+    at = 0
+    magic, version, sid_, vbl_, time_, pw_, ph_, layers_ = take("4sIIQQIII")
+    if magic != b"GEXF" or layers_ != 0 or sid_ <= last_swap or vbl_ <= last_vbl:
+        fail(f"{f.name}: swap {sid_}, blank {vbl_}, {layers_} layers, want an empty glass after swap {last_swap}")
+    last_swap, last_vbl = sid_, vbl_

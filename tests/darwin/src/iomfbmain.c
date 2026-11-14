@@ -17,7 +17,10 @@
 // - It answers what QuartzCore's display reads first: the color remap mode
 //   and the pipe's runtime properties, published or never registered; and
 //   the blocks it asks for (types 77, 74 and 72), which the pipe has no
-//   handler for (kIOReturnUnsupported), with the selector's own refusals.
+//   handler for (kIOReturnUnsupported), with the selector's own refusals;
+//   and the pipe's handlers' own: a type registered only with a component
+//   this pipe does not make (0x14), a handler with no get (0x62), and one
+//   given a block not its size (7) or extra scalars past its range (1).
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
@@ -102,6 +105,18 @@ int main(void) {
     sc[1] = 1ull << 32;
     outsz = 0x62c;
     if ((kr = IOConnectCallMethod(c, 79, sc, 2, NULL, 0, NULL, NULL, block, &outsz)) != kIOReturnUnsupported) return bad("GetBlock with a second scalar's high word", kr, kIOReturnUnsupported);
+    uint64_t gb[4] = {0x14, 0, 0, 0};
+    outsz = 0x100;
+    if ((kr = IOConnectCallMethod(c, 79, gb, 2, NULL, 0, NULL, NULL, block, &outsz)) != kIOReturnUnsupported) return bad("GetBlock 0x14", kr, kIOReturnUnsupported);
+    gb[0] = 0x62;
+    outsz = 0x28;
+    if ((kr = IOConnectCallMethod(c, 79, gb, 2, NULL, 0, NULL, NULL, block, &outsz)) != kIOReturnUnsupported) return bad("GetBlock 0x62", kr, kIOReturnUnsupported);
+    gb[0] = 7;
+    outsz = 0x15b;
+    if ((kr = IOConnectCallMethod(c, 79, gb, 2, NULL, 0, NULL, NULL, block, &outsz)) != kIOReturnBadArgument) return bad("GetBlock 7 of the wrong size", kr, kIOReturnBadArgument);
+    gb[0] = 1;
+    outsz = 0x180;
+    if ((kr = IOConnectCallMethod(c, 79, gb, 4, NULL, 0, NULL, NULL, block, &outsz)) != kIOReturnBadArgument) return bad("GetBlock 1 with two extra scalars", kr, kIOReturnBadArgument);
     IOServiceClose(c);
 
     // No other display: kIOReturnNoDevice.

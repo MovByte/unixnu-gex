@@ -344,6 +344,16 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             o.resize((o.len() + 3) & !3, 0);
             Reply::ok(o)
         }
+        // io_registry_entry_set_properties(entry, properties) -> result
+        // (is_io_registry_entry_set_properties): the properties, physically
+        // copied out of line, no larger than 1024 inband structures
+        // (kIOReturnMessageTooLarge, as the routine's own return);
+        // unserialized (OSUnserializeXML), none being kIOReturnBadArgument;
+        // the MAC check (kIOReturnNotPermitted); the entry's
+        // IORegistryEntryAllowableSetProperties, which no entry here has, nor
+        // IORegistryEntryDefaultLockingSetProperties; then its class's
+        // setProperties, as `result`.
+        (Kobject::IoEntry(i), 2828) => entry_set_properties(k, req, *i),
         // io_registry_entry_get_property_bin_buf(entry, plane, name, options,
         // buf, bufsize) -> properties, bufsize: the property serialized in
         // OSSerializeBinary, into `buf` when it fits, else out of line.
@@ -1960,6 +1970,47 @@ fn is_own_task(k: &mut Kernel, right: Option<Carried>) -> bool {
     p == task || p == me
 }
 
+/// [`Kobject::IoEntry`]'s io_registry_entry_set_properties: see the
+/// routine's arm. The result goes in the reply's `result`.
+fn entry_set_properties(k: &mut Kernel, req: &Kmsg, i: u32) -> Reply {
+    use super::iokit::ret;
+    const K_IO_RETURN_MESSAGE_TOO_LARGE: i32 = 0xe00002e1_u32 as i32;
+    const IO_STRUCT_INBAND_MAX: usize = 4096;
+    let Some(Desc::Ool { data, .. }) = req.descs.first() else { return Reply::err(MIG_BAD_ARGUMENTS) };
+    if data.len() > IO_STRUCT_INBAND_MAX * 1024 {
+        return Reply::err(K_IO_RETURN_MESSAGE_TOO_LARGE);
+    }
+    let result = |r: i32| Reply::ok(r.to_le_bytes().to_vec());
+    let (g, obj) = match super::osserialize::unserialize(data) {
+        super::osserialize::Parsed::Binary(Some(p)) => p,
+        super::osserialize::Parsed::Binary(None) | super::osserialize::Parsed::Invalid => return result(ret::BAD_ARGUMENT),
+        super::osserialize::Parsed::Xml => {
+            let mut r = result(ret::UNSUPPORTED);
+            r.unimplemented = Some(format!("io_registry_entry_set_properties on {}: OSUnserializeXML of XML text", super::iokit::name(super::iokit::tree(), i)));
+            return r;
+        }
+    };
+    if super::iokit::is_nvram(i) {
+        let mut r = result(ret::UNSUPPORTED);
+        r.unimplemented = Some("io_registry_entry_set_properties on the NVRAM entry (Sandbox's nvram-set of each key, and IODTNVRAM::setProperties)".to_string());
+        return r;
+    }
+    let keys: Vec<Vec<u8>> = match g.get(obj) {
+        super::osserialize::Obj::Dict(e) => e.iter().map(|(key, _)| key.clone()).collect(),
+        _ => Vec::new(),
+    };
+    if k.darwin_mac_check_iokit_set_properties(super::iokit::sb_entry(i), &keys) != 0 {
+        return result(ret::NOT_PERMITTED);
+    }
+    let class = super::iokit::tree().get(i as usize).map(|n| n.class).unwrap_or("");
+    if class == super::iomfb::CLASS {
+        return result(super::iomfb::set_properties(k, &g, obj));
+    }
+    let mut r = result(ret::UNSUPPORTED);
+    r.unimplemented = Some(format!("setProperties of {} (class {class:?})", super::iokit::name(super::iokit::tree(), i)));
+    r
+}
+
 /// `is_io_service_open_extended`: the caller's own task must own the
 /// client, and properties are not taken (kIOReturnUnsupported). A user
 /// client is made by the service's newUserClient; its failure is the
@@ -2113,11 +2164,18 @@ fn connect_routine(k: &mut Kernel, req: &Kmsg, id: u32, n: i32) -> Reply {
         // io_registry_entry_get_property_bin_buf.
         2889 => client_property_bin_buf(k, req, &c),
         // io_service_close: clientClose, once (a shared instance aside);
-        // a second close is ignored. Always kIOReturnSuccess.
+        // a second close is ignored. Always kIOReturnSuccess, once a close
+        // that sleeps is done.
         2816 => {
             if !c.closed {
                 c.closed = true;
-                super::iokit::client_close(k, &mut c);
+                let token = later_token();
+                if super::iokit::client_close(k, &mut c, Some(token)) {
+                    LATER.lock().unwrap_or_else(|e| e.into_inner()).insert(token, Later::Close);
+                    let mut reply = Reply::ok(Vec::new());
+                    reply.defer = Some((k.tid, super::kobject::Deferred::Later(token)));
+                    return reply;
+                }
             }
             Reply::ok(Vec::new())
         }
@@ -2164,24 +2222,56 @@ fn connect_routine(k: &mut Kernel, req: &Kmsg, id: u32, n: i32) -> Reply {
         // io_connect_map_memory_into_task(connection, memory_type, into_task,
         // address, size, flags) and io_connect_unmap_memory_from_task
         // (connection, memory_type, from_task, address): the client's
-        // clientMemoryForType for the type. A client with none maps nothing
-        // (kIOReturnBadArgument) and unmaps with clientMemoryForType's
-        // error. The task must be one (any task's control port).
+        // clientMemoryForType for the type. The task must be one (any
+        // task's control port).
+        // - Mapping (mapClientMemory64): the memory mapped into the task
+        //   with the flags' user options; its address and size. No memory,
+        //   or none mapped, is kIOReturnBadArgument. A mapping into the
+        //   calling task is kept with the client (`mappings`).
+        // - Unmapping: clientMemoryForType's error, or success with no
+        //   memory; with memory, the mapping looked up with kIOMapReference
+        //   at the address, which a descriptor the client makes anew for
+        //   the call (the framebuffer's queue's) has none of:
+        //   kIOReturnBadArgument.
         2863 | 2864 => {
             let Some((task, _)) = desc_port(req, 0) else { return bad() };
             let Some(ty) = i32_at(&req.body, 4 + 12 + NDR) else { return bad() };
-            let is_task = match task {
-                Some(Carried::Port(p)) => k.ipc().port(p).kobject == Some(Kobject::Task),
-                _ => false,
+            let (is_task, current) = match task {
+                Some(Carried::Port(p)) => {
+                    let ipc = k.ipc();
+                    let port = ipc.port(p);
+                    (port.kobject == Some(Kobject::Task), port.owner == ipc.task)
+                }
+                _ => (false, false),
             };
             if !is_task {
                 Reply::err(ret::BAD_ARGUMENT)
+            } else if n == 2864 {
+                match super::iokit::client_memory_for_type(&mut c, ty as u32) {
+                    Ok(None) => Reply::err(ret::SUCCESS),
+                    Ok(Some(_)) => Reply::err(ret::BAD_ARGUMENT),
+                    Err(e) => Reply::err(e),
+                }
             } else {
-                // No memory: mapping is kIOReturnBadArgument; unmapping
-                // answers clientMemoryForType's result.
-                match super::iokit::client_memory_for_type(k, &mut c, ty as u32) {
-                    Ok(()) => Reply::err(if n == 2863 { ret::BAD_ARGUMENT } else { ret::SUCCESS }),
-                    Err(e) => Reply::err(if n == 2863 { ret::BAD_ARGUMENT } else { e }),
+                // address (8, 4-aligned after the type) then size (8), flags.
+                let Some(flags) = i32_at(&req.body, 4 + 12 + NDR + 4 + 8 + 8) else { return bad() };
+                if !current {
+                    let mut r = Reply::err(ret::UNSUPPORTED);
+                    r.unimplemented = Some(format!("io_connect_map_memory_into_task of {}'s memory of type {ty} into another task", c.class));
+                    return r;
+                }
+                match super::iokit::map_client_memory(k, &mut c, ty as u32, flags as u32) {
+                    Ok(Some((addr, size))) => {
+                        let mut out = addr.to_le_bytes().to_vec();
+                        out.extend_from_slice(&size.to_le_bytes());
+                        Reply::ok(out)
+                    }
+                    Ok(None) => Reply::err(ret::BAD_ARGUMENT),
+                    Err(what) => {
+                        let mut r = Reply::err(ret::BAD_ARGUMENT);
+                        r.unimplemented = Some(what);
+                        r
+                    }
                 }
             }
         }
@@ -2288,7 +2378,7 @@ fn connect_method(k: &mut Kernel, c: &mut super::iokit::UserClient, mut a: super
     // it there, as it waits in the method on the device.
     if let Some(token) = a.later.take() {
         if r == ret::SUCCESS {
-            LATER.lock().unwrap_or_else(|e| e.into_inner()).insert(token, (a, ool_out_field));
+            LATER.lock().unwrap_or_else(|e| e.into_inner()).insert(token, Later::Method(a, ool_out_field));
             let mut reply = Reply::ok(Vec::new());
             reply.defer = Some((k.tid, super::kobject::Deferred::Later(token)));
             return reply;
@@ -2321,15 +2411,26 @@ pub(crate) fn later_token() -> u64 {
     NEXT_LATER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The methods that answer later, by token: their arguments, and whether
-/// the routine was io_connect_method (with an out-of-line output field).
-static LATER: std::sync::Mutex<std::collections::BTreeMap<u64, (super::iokit::MethodArgs, bool)>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+/// A routine that answers later: a method (its arguments, and whether the
+/// routine was io_connect_method, with an out-of-line output field), or an
+/// io_service_close whose clientClose sleeps.
+enum Later {
+    Method(super::iokit::MethodArgs, bool),
+    Close,
+}
+
+/// The routines that answer later, by token.
+static LATER: std::sync::Mutex<std::collections::BTreeMap<u64, Later>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// The reply of method `token`, which answered later: it returned `r`, and
 /// on success the scalar outputs `scalars` (as many as the caller has room
 /// for). None for a token no method left.
 pub(crate) fn later_reply(token: u64, r: i32, scalars: &[u64]) -> Option<Reply> {
-    let (mut a, ool_out_field) = LATER.lock().unwrap_or_else(|e| e.into_inner()).remove(&token)?;
+    let (mut a, ool_out_field) = match LATER.lock().unwrap_or_else(|e| e.into_inner()).remove(&token)? {
+        Later::Method(a, ool_out_field) => (a, ool_out_field),
+        // io_service_close is always kIOReturnSuccess.
+        Later::Close => return Some(Reply::ok(Vec::new())),
+    };
     for (out, v) in a.scalar_out.iter_mut().zip(scalars) {
         *out = *v;
     }

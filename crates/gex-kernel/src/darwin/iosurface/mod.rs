@@ -190,6 +190,15 @@ pub struct Root {
     send_rights: std::collections::BTreeMap<u32, SendRight>,
     next_send_right: u32,
     params: surface::RootParams,
+    /// `+0x250`: the displays that told the root what their layers show
+    /// (eight at most, each its framebuffer and the allocation size of
+    /// each of its four layers' surfaces), and `+0x248` the sum.
+    displayed: [Option<(u64, [u64; 4])>; 8],
+    displayed_bytes: u64,
+    /// The framebuffer's default temporary surface (its `+0x1620`), which
+    /// AppleCLCD's start makes from the root ([`Root::default_temp`]): its
+    /// id, until the framebuffer lets it go.
+    default_temp: Option<u32>,
 }
 
 /// An `IOSurfaceSendRight` (or `IOSurfaceWiredSendRight`): its surface,
@@ -225,9 +234,13 @@ fn root<R>(f: impl FnOnce(&mut Root) -> R) -> R {
             next_client: 0,
             send_rights: Default::default(),
             next_send_right: 0,
+            displayed: [None; 8],
+            displayed_bytes: 0,
+            default_temp: None,
             params: surface::RootParams { row_mask: (line - 1) | 0xf, offset_mask: (line - 1) | 0x3fff, max_alloc: super::mig::machine::MEMORY >> 2, debug: DEBUG_DEFAULT, page_size: super::mach::PAGE_MASK + 1 },
         };
         r.grow();
+        r.default_temp();
         r
     });
     f(r)
@@ -268,6 +281,33 @@ impl Root {
             }
             self.hint = end;
         }
+    }
+
+    /// The surface AppleCLCD's start (0xfffffff006793694, its slot 299)
+    /// makes at boot, before any task runs, when the panel's mode is valid
+    /// (`+0x1780`) with a width and height: `IOSurfaceRoot::createSurface`
+    /// for the kernel (0xfffffff005baaa24) with the properties
+    /// `{IOSurfaceMemoryRegion: "PurpleGfxMem"}`, which takes the first id
+    /// (1), the next trace id, its shared records (as 0xfffffff005bac7c8
+    /// makes them; no task maps them yet) and a place in the root's list.
+    /// The framebuffer then sets its memory region (the root's
+    /// "PurpleGfxMem", the device tree's `/vram`, 0xfffffff005ba93c0), its
+    /// pixel format (`+0x1700`) and its layout for the panel
+    /// (0xfffffff00678d0c0), which fits its height to the region's size.
+    /// That size is the bootloader's (`/vram`'s `reg`, zero in this device
+    /// tree), so the surface's description is not modelled: only the id,
+    /// trace id and count it holds are, and a lookup that would find it
+    /// (the kernel created it, so only a global lookup the root's debug
+    /// flags allow) is reported.
+    fn default_temp(&mut self) {
+        if super::iomfb::swap::Panel::from_tree().is_err() {
+            return;
+        }
+        let Some(id) = self.alloc_id() else { return };
+        self.next_trace += 1;
+        self.shared.alloc_unmapped(id);
+        self.count += 1;
+        self.default_temp = Some(id);
     }
 
     /// free_surface_id (0xfffffff005babe2c).
@@ -774,6 +814,9 @@ pub fn note_store(k: &mut Kernel, m: &mut GuestMem<'_>, page: u64) -> bool {
             None => false,
         }
     };
+    // The framebuffer's frame information queues are IOKit memory mapped
+    // the same way.
+    let claimed = claimed || super::iomfb::finfo::note_write(k, m, pid, page);
     if !claimed {
         let addr = page << gex_abi::PERM_PAGE_SHIFT;
         k.mem.lock().restore(addr, addr + gex_abi::PERM_PAGE, gex_abi::perm::WRITE);
@@ -892,24 +935,84 @@ impl Geometry {
 /// reference go with [`kernel_release`].
 pub fn kernel_lookup(k: &mut Kernel, id: u32) -> Option<u32> {
     let pid = k.pid;
-    root(|r| {
+    let r = root(|r| {
         if id == 0 || id >= r.table_size {
-            return None;
+            return Ok(None);
         }
         let client = r.clients.iter().find(|(_, c)| c.pid == pid && c.live).map(|(uc, _)| *uc);
         let debug = r.params.debug;
         let held = client.is_some_and(|uc| r.clients.get(&uc).and_then(|c| c.handles.get(id as usize)).is_some_and(|h| h.is_some()));
-        let s = r.surfaces.get_mut(&id)?;
+        // The framebuffer's default temporary surface, the kernel's, is
+        // found only when every lookup is allowed.
+        if r.default_temp == Some(id) && debug & 1 != 0 {
+            return Err(());
+        }
+        let Some(s) = r.surfaces.get_mut(&id) else { return Ok(None) };
         if !s.installed {
-            return None;
+            return Ok(None);
         }
         let found = s.creator == Some(pid) || held || (s.desc.flags & flag::PRIVATE == 0 && ((debug & 4 != 0 && s.desc.flags & flag::GLOBAL != 0) || debug & 1 != 0));
         if !found || s.refs == 0 {
-            return None;
+            return Ok(None);
         }
         s.refs += 1;
-        Some(id)
+        Ok(Some(id))
+    });
+    r.unwrap_or_else(|()| {
+        k.darwin_unimplemented(format!("a kext's lookup of the framebuffer's default temporary surface {id} (its description follows the bootloader's /vram region)"));
+        None
     })
+}
+
+/// The root told that `display`'s layer `layer` shows `surface` now
+/// (0xfffffff005bacfe0): the display's entry found, or the first free one
+/// of eight taken (none free: nothing is kept), the layer's size the
+/// surface's allocation size (or none), and the sum of every display's
+/// kept. When the sum changes the callback registered for it
+/// (0xfffffff005bad200) is called: IOGPU's scheduler registers one
+/// (IOGPUScheduler::init, 0xfffffff005bca870), which the accelerator here
+/// does not make, so none is.
+pub fn displayed(display: u64, layer: u32, surface: Option<u32>) {
+    root(|r| {
+        let slot = match r.displayed.iter().position(|d| d.is_some_and(|(k, _)| k == display)) {
+            Some(i) => i,
+            None => match r.displayed.iter().position(Option::is_none) {
+                Some(i) => {
+                    r.displayed[i] = Some((display, [0; 4]));
+                    i
+                }
+                None => return,
+            },
+        };
+        if layer > 3 {
+            return;
+        }
+        let size = surface.and_then(|id| r.surfaces.get(&id)).map_or(0, |s| s.desc.alloc_size);
+        let (_, sizes) = r.displayed[slot].as_mut().expect("the display's entry");
+        r.displayed_bytes = r.displayed_bytes - sizes[layer as usize] + size;
+        sizes[layer as usize] = size;
+    });
+}
+
+/// The framebuffer's default temporary surface let go (0xfffffff00679437c,
+/// "Freeing up Default Temp surface", as the first shown swap that enables
+/// layer 0 retires the layer): its last reference, so it is torn down as
+/// [`surface_release`] tears a surface down, its id free for the next.
+pub fn release_default_temp() {
+    root(|r| {
+        let Some(id) = r.default_temp.take() else { return };
+        r.count -= 1;
+        if r.count <= 0x4000 {
+            r.warned = false;
+        }
+        r.free_id(id);
+    });
+}
+
+/// Whether `id` is the framebuffer's default temporary surface, which the
+/// root holds with no description modelled.
+pub fn is_default_temp(id: u32) -> bool {
+    root(|r| r.default_temp == Some(id))
 }
 
 /// A reference [`kernel_lookup`] took let go.
