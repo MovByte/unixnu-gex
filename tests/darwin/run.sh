@@ -46,7 +46,7 @@ fi
 if [ -n "${GEX_DARWIN_BOOT:-}" ] && [ -f "$GEX_DARWIN_BOOT/DeviceTree" ]; then
     cp "$GEX_DARWIN_BOOT/DeviceTree" "$BOOT/"
 fi
-for f in sandbox_profile.bin sandbox_builtin.bin sandbox_protobox.bin os.dmg.trustcache; do
+for f in sandbox_profile.bin sandbox_builtin.bin sandbox_protobox.bin os.dmg.trustcache SystemVolume.attrs; do
     if [ -n "${GEX_DARWIN_BOOT:-}" ] && [ -f "$GEX_DARWIN_BOOT/$f" ]; then
         cp "$GEX_DARWIN_BOOT/$f" "$BOOT/"
     fi

@@ -1285,7 +1285,10 @@ fn run_program_with(
         let tc = read("TrustCache")?;
         let sandbox = gex_kernel::darwin::SandboxProfiles { platform: read("sandbox_profile.bin")?, builtin: read("sandbox_builtin.bin")?, protobox: read("sandbox_protobox.bin")? };
         let device_tree = read("DeviceTree")?;
-        gex_kernel::darwin::boot(tc.as_deref(), sandbox, device_tree.as_deref()).map_err(|e| anyhow!("the boot payload: {e}"))?;
+        // The system volume's owners, modes and flags, which an extracted
+        // root does not keep.
+        let system_attrs = read("SystemVolume.attrs")?;
+        gex_kernel::darwin::boot(tc.as_deref(), sandbox, device_tree.as_deref(), system_attrs).map_err(|e| anyhow!("the boot payload: {e}"))?;
         // The panel: the test embedder's recorder when asked for.
         if let Some(dir) = &opts.darwin_frames {
             std::fs::create_dir_all(dir).map_err(|e| anyhow!("making {}: {e}", dir.display()))?;

@@ -43,6 +43,7 @@ pub mod accel;
 pub mod iomfb;
 pub mod platform;
 pub mod pe;
+pub mod volattrs;
 pub mod guarded;
 pub mod exit;
 pub mod exception;
@@ -129,9 +130,12 @@ pub struct SandboxProfiles {
 /// the static trust cache (`load_static_trust_cache`; one that does not
 /// load is the kernel's panic), without which there are no trust caches;
 /// and the Sandbox kext's profiles. Once per system.
-pub fn boot(trust_cache: Option<&[u8]>, sandbox: SandboxProfiles, device_tree: Option<&[u8]>) -> Result<(), String> {
+pub fn boot(trust_cache: Option<&[u8]>, sandbox: SandboxProfiles, device_tree: Option<&[u8]>, system_attrs: Option<Vec<u8>>) -> Result<(), String> {
     if let Some(t) = device_tree {
         iokit::set_tree(t)?;
+    }
+    if let Some(a) = system_attrs {
+        volattrs::set_system(a)?;
     }
     let m = match trust_cache {
         Some(b) => Some(trustcache::load_bundle(b).map_err(|e| format!("failed to load static trust cache module: 0 ({e:?})"))?),

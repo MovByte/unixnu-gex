@@ -358,6 +358,7 @@ missing has effects:
 | `sandbox_protobox.bin` | the Sandbox kext's protobox profile collection (profiles named by executable path), a compiled collection blob from the kernelcache | every exec is reported and killed, since its protobox profile cannot be looked up |
 | `DeviceTree` | the flattened device tree: the payload of the IPSW's device tree image (an IM4P) for this device | the IOKit registry has no device tree, which is reported |
 | `os.dmg.trustcache` | the SystemOS cryptex's trust cache, an IM4P (in the IPSW, the `Firmware/<os cryptex>.dmg.trustcache` whose cdhashes are the shared cache's files'), which libignition loads at boot | with pid 1 standing in for launchd, the boot's shared region cannot be mapped: the cache's ad-hoc signatures are in no trust cache |
+| `SystemVolume.attrs` | the system volume's owners, modes and file flags, which an extracted root does not keep: an mtree(5)-layout specification (flags in hexadecimal) that `tools/darwin-volume-attrs.py` writes from the IPSW's root filesystem image mounted read-only with its owners honoured (`hdiutil attach -readonly -nobrowse -owners on`); read when first looked in (`volattrs::lookup`) | a lookup of a system volume file's attributes says the payload has none |
 
 A `TrustCache` that does not load stops the boot. `tools/darwin-trust-cache.py`
 makes the bundle from the IPSW's static trust cache (its IM4P-wrapped
