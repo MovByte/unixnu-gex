@@ -1,6 +1,7 @@
 #!/bin/sh
 # Run the Darwin programs under gexc and check what each prints and how it
-# exits. Builds them first when bin/ is missing; GEXC picks the runner.
+# exits. Builds them first when bin/ has none or a source of theirs is newer
+# than the last build; GEXC picks the runner.
 # With program names, only those run; without, all of them.
 #
 # A dynamic program needs a Darwin root (GEX_DARWIN_ROOT: dyld and the
@@ -21,14 +22,27 @@ set -u
 HERE=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 ROOT=$(CDPATH='' cd -- "$HERE/../.." && pwd)
 GEXC=${GEXC:-$ROOT/target/release/gexc}
-[ -d "$HERE/bin" ] || "$HERE/build.sh" >/dev/null
+# bin/.built marks the last build that succeeded (build.sh builds every
+# program): a source, the build script or WebMetal's wire header
+# (metalwire's) newer than it, as a merge or an edit leaves them, has them
+# built again. It is made before the build, so that a source changed during
+# one is newer than it.
+STAMP=$HERE/bin/.built
+if [ ! -f "$STAMP" ] || [ -n "$(find -H "$HERE/src" "$HERE/build.sh" "$ROOT/third_party/WebMetal/wire/generated" -newer "$STAMP" 2>/dev/null | head -n 1)" ]; then
+    mkdir -p "$HERE/bin" && touch "$STAMP.new" || exit 1
+    if ! "$HERE/build.sh" >/dev/null; then
+        echo "FAIL build.sh: the programs did not build" >&2
+        exit 1
+    fi
+    mv "$STAMP.new" "$STAMP"
+fi
 
 BOOT=$HERE/bin/boot
 mkdir -p "$BOOT"
-# (untrusted is the one left out. bin may be a link to where the build
-# keeps them, which find follows with -H.) launchcon's entry has launch
-# constraint category 5.
-progs=$(find -H "$HERE/bin" -maxdepth 1 -type f ! -name untrusted | sort)
+# (untrusted is the one left out, and the build's stamp is no program. bin
+# may be a link to where the build keeps them, which find follows with -H.)
+# launchcon's entry has launch constraint category 5.
+progs=$(find -H "$HERE/bin" -maxdepth 1 -type f ! -name untrusted ! -name '.built*' | sort)
 cats="--category 5:$HERE/bin/launchcon"
 
 # opaque DIR: overlayfs's mark (in its user.overlay. form) of an overlay
