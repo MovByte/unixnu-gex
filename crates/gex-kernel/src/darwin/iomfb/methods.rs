@@ -313,6 +313,29 @@ pub fn external_method(k: &mut Kernel, id: u32, c: &mut Client, a: &mut MethodAr
             a.scalar_out[0] = 1;
             ret::SUCCESS
         }
+        // s_get_color_remap_mode (0xfffffff00677a200, member
+        // 0xfffffff006777f40): the framebuffer's slot +0x670 (AppleCLCD
+        // 0xfffffff006bfb2e4). A built-in panel's mode is the pipe's
+        // runtime property 0, BlendOutputCSCMethod, through the five
+        // pairs at 0xfffffff0058a3850 (each value 0 to 4 its own mode;
+        // another is kIOReturnError, "Failed to translate CSC mode
+        // enum"); an external display's is kIOReturnUnsupported.
+        57 => match (swap::builtin(), super::rtprop::value(0)) {
+            (Ok(false), _) => ret::UNSUPPORTED,
+            (Ok(true), Some(v)) if v <= 4 => {
+                a.scalar_out[0] = u64::from(v);
+                ret::SUCCESS
+            }
+            (Ok(true), Some(_)) => ret::ERROR,
+            (Ok(true), None) => {
+                k.darwin_unimplemented("IOMobileFramebufferUserClient selector 57 (GetColorRemapMode): the pipe's runtime property 0".to_string());
+                ret::UNSUPPORTED
+            }
+            (Err(what), _) => {
+                k.darwin_unimplemented(format!("IOMobileFramebufferUserClient selector 57 (GetColorRemapMode): {what}"));
+                ret::UNSUPPORTED
+            }
+        },
         // s_swap_cancel (0xfffffff006779574): slot 217's gated cancel.
         52 => swap::cancel(k, sc(0) as u32),
         // s_notifications (0xfffffff00677a658, member 0xfffffff006778460):

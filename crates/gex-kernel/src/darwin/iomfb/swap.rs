@@ -76,6 +76,16 @@ impl Panel {
     }
 }
 
+/// Whether the panel is built in: AppleCLCD's `+0x1782`, which its
+/// 0xfffffff006bf5a30 sets at start to the inverse of `external`, read
+/// from disp0's device tree entry there. `Err` when disp0 is not in the
+/// tree.
+pub fn builtin() -> Result<bool, String> {
+    let t = super::super::iokit::tree();
+    let disp = t.iter().find(|n| n.props.iter().any(|(k, v)| k == "compatible" && v.split(|&c| c == 0).any(|c| c == b"disp0,t8011"))).ok_or("disp0 in the device tree")?;
+    Ok(!disp.props.iter().any(|(k, _)| k == "external"))
+}
+
 /// The subframes a frame takes at the start (`+0x294`).
 const SUBFRAMES: u64 = 2;
 
