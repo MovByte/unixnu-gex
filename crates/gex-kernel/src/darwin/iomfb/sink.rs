@@ -4,7 +4,9 @@
 //! their bytes, pixel format, plane geometry and rectangles, with no
 //! conversion. Showing them (on a canvas, or in a recording) is the
 //! embedder's; one that cannot show a frame as it is says why, and the
-//! kernel reports it.
+//! kernel reports it. The sink is also told when the panel goes dark and
+//! lights again (its power, [`PresentSink::panel`]): a dark panel shows
+//! nothing, whatever frame it last showed.
 //!
 //! The embedder installs the sink ([`install`]); until one does, a swap
 //! that reaches the glass is reported.
@@ -69,6 +71,11 @@ pub trait PresentSink: Send + Sync {
     /// Show `frame`. `Err` says why the embedder cannot show it as it is
     /// (a pixel format its glass cannot hold, say), which is reported.
     fn present(&self, frame: &Frame) -> Result<(), String>;
+
+    /// The panel lit (`on`) or dark, as the display's power turns it (its
+    /// backlight off as it goes dark, and the panel on again). The panel
+    /// starts lit. `Err` says why the embedder cannot, which is reported.
+    fn panel(&self, on: bool) -> Result<(), String>;
 }
 
 static SINK: OnceLock<Box<dyn PresentSink>> = OnceLock::new();

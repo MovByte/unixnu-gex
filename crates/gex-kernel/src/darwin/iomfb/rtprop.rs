@@ -370,6 +370,9 @@ const ELSEWHERE: [u8; 4] = [0x05, 0x4d, 0x78, 0x90];
 /// - 0x00 `BlendOutputCSCMethod`: 0, which the blend output CSC block
 ///   (the pipe's +0x1c78, made by its init 0xfffffff006bb540c) registers
 ///   (0xfffffff006bb1914).
+/// - 0xad `AOTEnable`: false, which the block manager's setup
+///   (0xfffffff006bd0b2c) registers in the pipe's table (`+0x1b80`) and
+///   the display's power evaluation reads (0xfffffff006bd26c8).
 /// - 0xb5 `SupportsAOTPowerSaving`: the pipe's virtual at +0x650
 ///   (0xfffffff006bbd2c0, false), which the block manager's setup
 ///   registers (`FUN_fffffff006bd0b2c`).
@@ -378,7 +381,7 @@ const ELSEWHERE: [u8; 4] = [0x05, 0x4d, 0x78, 0x90];
 /// framebuffer's slot at +0x9e8 (0xfffffff006bf4568), which only the
 /// `iomfb_RuntimeProperty_*` boot-args (none on this boot) and
 /// `AppleCLCD::setProperties` reach.
-const START: [(u8, u32); 2] = [(0x00, 0), (0xb5, 0)];
+const START: [(u8, u32); 3] = [(0x00, 0), (0xad, 0), (0xb5, 0)];
 
 /// The id of the runtime property `name`.
 pub fn id_of(name: &str) -> Option<u8> {

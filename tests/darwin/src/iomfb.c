@@ -15,6 +15,13 @@
 //   range, the dispatch counts, reserved and empty entries, unknown swaps,
 //   a source rectangle outside its surface, the debug flags a production
 //   device refuses, the notification types, and memory of no type.
+// - Power, on that connection: power notifications asked for (an option
+//   for them refused), the display turned off (selector 12), its
+//   notification (the time, and state 0), the swap waits a display that is
+//   off answers, a swap made while it is off, the display turned on again
+//   (state 3: controller and panel), and that swap gone with the queue's
+//   flush, never shown. The test embedder records the panel going dark and
+//   lighting again (frame-check.py).
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
@@ -45,6 +52,34 @@ static void fill(uint8_t *base, size_t bpr, uint32_t w, uint32_t h) {
             row[4 * x + 3] = 0xff;
         }
     }
+}
+
+// A power notification: IOUserClient's async result (kOSNotificationMessageID,
+// an OSNotificationHeader64 of kIOAsyncCompletionNotificationType with the
+// reference the enable set, the result, and the time and state).
+static int power_note(mach_port_t p, uint64_t callout, uint64_t refcon, uint64_t want_state) {
+    // The header, then at 24 the notification header's size and type, at
+    // 32 its eight-word reference, at 96 the result and at 100 the
+    // arguments (packed).
+    uint64_t buf[64];
+    memset(buf, 0, sizeof buf);
+    mach_msg_header_t *h = (mach_msg_header_t *)buf;
+    kern_return_t kr = mach_msg(h, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof buf, p, 5000, MACH_PORT_NULL);
+    if (kr != KERN_SUCCESS) return bad("receiving a power notification", kr, 0);
+    if (h->msgh_id != 53 || h->msgh_size != 120) return bad("the power notification's id and size", (long)h->msgh_id << 16 | h->msgh_size, 53 << 16 | 120);
+    const uint8_t *b = (const uint8_t *)buf;
+    uint32_t size, type;
+    uint64_t reference[8], args[2];
+    int32_t result;
+    memcpy(&size, b + 24, 4);
+    memcpy(&type, b + 28, 4);
+    memcpy(reference, b + 32, 64);
+    memcpy(&result, b + 96, 4);
+    memcpy(args, b + 100, 16);
+    if (size != 4 + 16 || type != 150) return bad("its header's size and type", (long)size << 16 | type, 20 << 16 | 150);
+    if (reference[0] != 0 || reference[1] != callout || reference[2] != refcon || reference[3] != 0) return bad("its reference", (long)reference[1], (long)callout);
+    if (result != 0 || args[0] == 0 || args[1] != want_state) return bad("its result, time and state", (long)args[1], (long)want_state);
+    return 0;
 }
 
 static CFNumberRef num(int v) {
@@ -204,6 +239,48 @@ int main(void) {
     mach_vm_size_t len = 0;
     if ((kr = IOConnectMapMemory64(c, 0, mach_task_self(), &addr, &len, kIOMapAnywhere)) != kIOReturnBadArgument) return bad("memory of type 0", kr, kIOReturnBadArgument);
     if ((kr = IOConnectMapMemory64(c, 3, mach_task_self(), &addr, &len, kIOMapAnywhere)) != kIOReturnBadArgument) return bad("memory of type 3", kr, kIOReturnBadArgument);
+
+    // Power notifications (type 1) to a port of their own: an option for
+    // them is refused, the record staying listed.
+    mach_port_t pp;
+    mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &pp);
+    mach_port_insert_right(mach_task_self(), pp, pp, MACH_MSG_TYPE_MAKE_SEND);
+    if ((kr = IOConnectSetNotificationPort(c, 1, pp, 0)) != KERN_SUCCESS) return bad("a power port", kr, 0);
+    in[0] = 0x1234;
+    in[1] = 0x5678;
+    in[2] = 1;
+    in[3] = 1;
+    if ((kr = IOConnectCallScalarMethod(c, 72, in, 4, NULL, NULL)) != kIOReturnBadArgument) return bad("power notifications with an option", kr, kIOReturnBadArgument);
+    in[3] = 0;
+    if ((kr = IOConnectCallScalarMethod(c, 72, in, 4, NULL, NULL)) != kIOReturnError) return bad("power notifications listed already", kr, kIOReturnError);
+    // Off: the request succeeds, the scheduler sets the soft state (no swap
+    // is pending), the controller and panel go off, and the client is told.
+    in[0] = 0;
+    if ((kr = IOConnectCallScalarMethod(c, 12, in, 1, NULL, NULL)) != KERN_SUCCESS) return bad("RequestPowerChange off", kr, 0);
+    if (power_note(pp, 0x1234, 0x5678, 0)) return 1;
+    // Off: option 4 is so and option 3 is not, at once or not; a wait on a
+    // swap is kIOReturnOffline.
+    if ((kr = swap_wait(fb, token, 4)) != KERN_SUCCESS) return bad("SwapWait option 4 while off", kr, 0);
+    if ((kr = swap_wait(fb, token, 3)) != kIOReturnBadArgument) return bad("SwapWait option 3 while off", kr, kIOReturnBadArgument);
+    if ((kr = swap_wait(fb, token, 0x80000004)) != KERN_SUCCESS) return bad("SwapWait option 4 while off, not blocking", kr, 0);
+    if ((kr = swap_wait(fb, token, 0x80000003)) != kIOReturnBusy) return bad("SwapWait option 3 while off, not blocking", kr, kIOReturnBusy);
+    if ((kr = swap_wait(fb, token, 1)) != (kern_return_t)0xe00002e3) return bad("SwapWait while off", kr, 0xe00002e3);
+    // A swap while off is queued, not shown.
+    int off = 0;
+    if ((kr = swap_begin(fb, &off)) != KERN_SUCCESS) return bad("SwapBegin while off", kr, 0);
+    if ((kr = swap_set_layer(fb, 0, s, whole, whole, 0)) != KERN_SUCCESS) return bad("SwapSetLayer while off", kr, 0);
+    if ((kr = swap_end(fb)) != KERN_SUCCESS) return bad("SwapEnd while off", kr, 0);
+    if ((kr = swap_wait(fb, off, 1)) != (kern_return_t)0xe00002e3) return bad("SwapWait on a swap made while off", kr, 0xe00002e3);
+    // On again: the controller's change flushes the queue (the swap is gone
+    // and never shown), the panel lights, and the client is told.
+    in[0] = 1;
+    if ((kr = IOConnectCallScalarMethod(c, 12, in, 1, NULL, NULL)) != KERN_SUCCESS) return bad("RequestPowerChange on", kr, 0);
+    if (power_note(pp, 0x1234, 0x5678, 3)) return 1;
+    if ((kr = swap_wait(fb, off, 1)) != KERN_SUCCESS) return bad("SwapWait on the flushed swap", kr, 0);
+    if ((kr = swap_wait(fb, off, 2)) != KERN_SUCCESS) return bad("SwapWait for an idle queue after the flush", kr, 0);
+    if ((kr = swap_wait(fb, off, 3)) != KERN_SUCCESS) return bad("SwapWait option 3 when on again", kr, 0);
+    in[0] = 0;
+    if ((kr = IOConnectCallScalarMethod(c, 72, in, 4, NULL, NULL)) != KERN_SUCCESS) return bad("power notifications off", kr, 0);
     IOServiceClose(c);
 
     printf("iomfb ok\n");

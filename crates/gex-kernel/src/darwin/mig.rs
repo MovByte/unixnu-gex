@@ -2294,15 +2294,6 @@ fn connect_method(k: &mut Kernel, c: &mut super::iokit::UserClient, mut a: super
             return reply;
         }
     }
-    // A method that answers later (IOMobileFramebuffer's swap wait): the
-    // reply waits with it.
-    if r == ret::SUCCESS {
-        if let Some(d) = a.deferred.take() {
-            let mut reply = Reply::ok(Vec::new());
-            reply.defer = Some((k.tid, d));
-            return reply;
-        }
-    }
     connect_method_reply(r, &a, ool_out_field)
 }
 
@@ -2319,6 +2310,15 @@ fn connect_method_reply(r: i32, a: &super::iokit::MethodArgs, ool_out_field: boo
         return Reply::err(ret::UNDERRUN);
     }
     method_reply(a, Some(a.ool_out.map_or(0, |(_, n)| n)))
+}
+
+/// The tokens of the methods that answer later, never reused.
+static NEXT_LATER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A new token for a method that answers later (set in its
+/// [`super::iokit::MethodArgs::later`]).
+pub(crate) fn later_token() -> u64 {
+    NEXT_LATER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The methods that answer later, by token: their arguments, and whether

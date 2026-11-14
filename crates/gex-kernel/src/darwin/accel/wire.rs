@@ -32,7 +32,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::super::iokit::{dispatch_check, no_method, ret, Dispatch, MethodArgs};
+use super::super::iokit::{dispatch_check, no_method, ret, Dispatch, MethodArgs, ASYNC_REF64_COUNT};
 use super::super::ipc::{ObjId, TaskLink};
 use super::host::{self, Done, Fault, FaultKind, Outcome, TaskMemory};
 use crate::syscalls::Kernel;
@@ -52,12 +52,6 @@ const METHODS: [Dispatch; 3] = [
 /// The record header's size: opcode, flags, length.
 const HEADER: u64 = 8;
 
-/// `kOSNotificationMessageID`, `kIOAsyncCompletionNotificationType`,
-/// `kMaxAsyncArgs` and `kOSAsyncRef64Count` (`OSMessageNotification.h`).
-const NOTIFICATION_MESSAGE_ID: i32 = 53;
-const ASYNC_COMPLETION_TYPE: u32 = 150;
-const MAX_ASYNC_ARGS: usize = 16;
-const ASYNC_REF64_COUNT: usize = 8;
 
 /// A registration of `register_event_port`: the queue handle, the wake
 /// port's send right (the async reference's port) and the reference, which
@@ -122,8 +116,6 @@ impl Shared {
 /// The connections' numbers, never reused.
 static NEXT_CONN: AtomicU64 = AtomicU64::new(1);
 
-/// The calls' tokens, which their deferred replies are found by.
-static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 /// The open connections, by number: what the executor's rings and reports
 /// reach.
@@ -239,7 +231,7 @@ impl Wire {
             k.darwin_unimplemented("a WebMetal call from a task that did not open the connection (the wire protocol reads the caller's memory)".to_string());
             return ret::UNSUPPORTED;
         }
-        let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+        let token = super::super::mig::later_token();
         let call = match a.selector {
             0 => Call::Control { token, request: (a.scalar_in[0], a.scalar_in[1]), reply: (a.scalar_in[2], a.scalar_in[3]) },
             _ => Call::Fetch { token, reply: (a.scalar_in[0], a.scalar_in[1]) },
@@ -448,7 +440,7 @@ impl Kernel {
                 if let Some(e) = st.events.iter().find(|e| e.queue == queue) {
                     let (wake, reference) = (e.wake, e.reference);
                     drop(st);
-                    self.darwin_async_result(wake, &reference, ret::SUCCESS, &[queue]);
+                    self.darwin_io_async_result(wake, &reference, ret::SUCCESS, &[queue], false);
                     self.darwin_ipc_settle(m);
                 }
             }
@@ -505,52 +497,5 @@ impl Kernel {
     fn darwin_accel_answer(&mut self, m: &mut GuestMem<'_>, token: u64, (r, len): (i32, u64)) {
         let Some(reply) = super::super::mig::later_reply(token, r, &[len]) else { return };
         self.darwin_answer_later(m, token, reply);
-    }
-
-    /// `IOUserClient::_sendAsyncResult64` to the wake port of a 64-bit
-    /// task's async reference: a message from the kernel with a copy of the
-    /// kernel's send right, `kOSNotificationMessageID`, an
-    /// `OSNotificationHeader64` of type `kIOAsyncCompletionNotificationType`
-    /// whose reference is the async reference with its first word zero, the
-    /// result and the arguments. Its size is the reply structure's less the
-    /// arguments not sent (the 64-bit arm of the structure is 8-aligned, so
-    /// it ends with 4 bytes of zeros after the arguments).
-    fn darwin_async_result(&mut self, wake: ObjId, reference: &[u64; ASYNC_REF64_COUNT], result: i32, args: &[u64]) {
-        use super::super::ipc::msg::{bits, Kmsg, Sender};
-        use super::super::ipc::right::msgt;
-        debug_assert!(args.len() <= MAX_ASYNC_ARGS);
-        let ipc = self.ipc();
-        if !ipc.port(wake).active {
-            return;
-        }
-        ipc.copy_send(wake);
-        // struct { OSNotificationHeader64 notifyHdr; IOAsyncCompletionContent
-        // asyncContent; io_user_reference_t args[kMaxAsyncArgs] packed; }:
-        // 72 + 4 + 128 bytes, 208 with its alignment.
-        const MSG64: usize = 208;
-        let len = MSG64 - (MAX_ASYNC_ARGS - args.len()) * 8;
-        let mut body = vec![0u8; len];
-        let size = 4 + 8 * args.len() as u32;
-        body[0..4].copy_from_slice(&size.to_le_bytes());
-        body[4..8].copy_from_slice(&ASYNC_COMPLETION_TYPE.to_le_bytes());
-        for (i, r) in reference.iter().enumerate().skip(1) {
-            body[8 + 8 * i..16 + 8 * i].copy_from_slice(&r.to_le_bytes());
-        }
-        body[72..76].copy_from_slice(&result.to_le_bytes());
-        for (i, v) in args.iter().enumerate() {
-            body[76 + 8 * i..84 + 8 * i].copy_from_slice(&v.to_le_bytes());
-        }
-        let k = Kmsg { bits: bits::set(msgt::PORT_SEND, 0, 0, 0), size: 24 + body.len() as u32, dest: wake, reply: None, voucher: None, voucher_raw: 0, id: NOTIFICATION_MESSAGE_ID, body, descs: Vec::new(), sender: Sender::KERNEL, aux: Vec::new(), keep_alive: false, ppriority: 0, qos_override: 0, imp: None };
-        self.darwin_kernel_send(Box::new(k));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn async_result_sizes_follow_the_kernel_structure() {
-        // One argument: 24 + 208 - 15 * 8 = 112 bytes, as
-        // _sendAsyncResult64 computes msgh_size.
-        assert_eq!(24 + 208 - (super::MAX_ASYNC_ARGS - 1) * 8, 112);
     }
 }

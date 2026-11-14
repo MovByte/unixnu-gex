@@ -2,7 +2,9 @@
 # it (hosts/native/src/darwin_frames.rs): one frame, of swap 1, one layer
 # (layer 0) of a BGRA surface the panel's size, its source and destination
 # the whole panel, untransformed, one plane, and every pixel the pattern
-# the program wrote (iomfb.c's fill), the rows' padding zero.
+# the program wrote (iomfb.c's fill), the rows' padding zero. Then the
+# panel going dark and lighting again, after that frame and in that order
+# (the program's power change; the swap it made while off is never shown).
 import struct
 import sys
 from pathlib import Path
@@ -55,3 +57,11 @@ for y in range(h):
     if row != want:
         x = next(i for i in range(bpr) if row[i] != want[i]) // 4
         fail(f"row {y} differs from pixel {x}")
+
+# The panel's power, numbered with the frames: dark, then lit, after the
+# frame.
+first = int(frames[0].name[len("frame-"):-len(".bin")])
+panel = sorted(Path(sys.argv[1]).glob("panel-*.txt"), key=lambda p: int(p.name[len("panel-"):-len(".txt")]))
+states = [(int(p.name[len("panel-"):-len(".txt")]), p.read_text().strip()) for p in panel]
+if [s for _, s in states] != ["off", "on"] or any(n <= first for n, _ in states):
+    fail(f"the panel's power {states} after frame {first}, want off then on")

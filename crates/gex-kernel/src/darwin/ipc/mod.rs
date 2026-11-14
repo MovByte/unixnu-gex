@@ -643,6 +643,10 @@ pub enum Remote {
     Kobject { kmsg: Box<msg::Kmsg>, options: u64, caller: TaskKey },
     /// What the host executor left for one of its WebMetal connections.
     Accel(super::accel::wire::Note),
+    /// The outcome of a user client method that answers later
+    /// ([`super::mig::later_reply`]), for the routine that waits for it in
+    /// this task: its return code and scalar outputs.
+    Later { token: u64, ret: i32, scalars: Vec<u64> },
 }
 
 /// How other tasks reach a task: its mailbox, and the bell of the thread

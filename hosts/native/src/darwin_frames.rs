@@ -1,7 +1,9 @@
 //! A presentation sink that records the frames the Darwin framebuffer
 //! presents (`gex_kernel::darwin::iomfb::sink`), for tests: each frame goes
 //! to its own file in a directory, `frame-<n>.bin` in the order presented,
-//! with nothing converted.
+//! with nothing converted. Each change of the panel's power goes to
+//! `panel-<n>.txt`, numbered in the same order as the frames, holding
+//! `on` or `off`.
 //!
 //! A file holds, all little-endian:
 //!
@@ -79,5 +81,11 @@ impl PresentSink for Recorder {
         let n = self.next.fetch_add(1, Ordering::Relaxed);
         let path = self.dir.join(format!("frame-{n}.bin"));
         std::fs::write(&path, encode(frame)).map_err(|e| format!("recording the frame to {}: {e}", path.display()))
+    }
+
+    fn panel(&self, on: bool) -> Result<(), String> {
+        let n = self.next.fetch_add(1, Ordering::Relaxed);
+        let path = self.dir.join(format!("panel-{n}.txt"));
+        std::fs::write(&path, if on { "on\n" } else { "off\n" }).map_err(|e| format!("recording the panel's power to {}: {e}", path.display()))
     }
 }

@@ -11,11 +11,13 @@
 //! - Its user client, `IOMobileFramebufferUserClient`, which
 //!   IOMobileFramebuffer.framework opens with `IOServiceOpen` for any type
 //!   (`IOMobileFramebuffer::newUserClient` checks none): its methods
-//!   ([`methods`]), its notification ports, and the swaps a client makes
-//!   ([`swap`]).
+//!   ([`methods`]), its notification ports, the swaps a client makes and
+//!   the display's power ([`swap`]).
 //! - The panel. A completed swap's surfaces go to the embedder's
 //!   presentation sink ([`sink`]) at the panel's vertical blank, which the
-//!   framebuffer counts at the panel's rate ([`swap::Panel`]).
+//!   framebuffer counts at the panel's rate ([`swap::Panel`]) while the
+//!   display's controller is on; the sink is told as the panel goes dark
+//!   and lights.
 
 pub mod methods;
 pub mod rtprop;

@@ -192,14 +192,6 @@ fn selector_name(s: u32) -> &'static str {
     }
 }
 
-/// What a method answers: its result now, or a swap wait to answer when it
-/// is done.
-pub enum Outcome {
-    Done(i32),
-    /// Selector 6 waiting: the swap and the wait's options.
-    Wait { swap: u32, options: u32 },
-}
-
 /// `IOMobileFramebufferUserClient::externalMethod` (0xfffffff006778d40):
 /// a selector past the table is 0xe0000001; the framebuffer's check
 /// (AppleCLCD slot 182, 0xfffffff006c078bc) passes; selectors 68, 78 and
@@ -208,10 +200,11 @@ pub enum Outcome {
 /// check), and 79 any scalar count and any structure output; then
 /// `IOUserClient::externalMethod`'s checks of the entry, and an entry with
 /// no method is kIOReturnNoCompletion. An asynchronous call goes the same
-/// way.
-pub fn external_method(k: &mut Kernel, id: u32, c: &mut Client, a: &mut MethodArgs) -> Outcome {
+/// way. A method that sleeps (a swap wait, a power request) answers later
+/// ([`MethodArgs::later`]).
+pub fn external_method(k: &mut Kernel, id: u32, c: &mut Client, a: &mut MethodArgs) -> i32 {
     const K_IO_RETURN_NO_COMPLETION: i32 = 0xe00002ea_u32 as i32;
-    let Some(&(mut d, has_method)) = METHODS.get(a.selector as usize) else { return Outcome::Done(0xe000_0001_u32 as i32) };
+    let Some(&(mut d, has_method)) = METHODS.get(a.selector as usize) else { return 0xe000_0001_u32 as i32 };
     match a.selector {
         68 | 78 | 85 => {
             d.scalar_in = a.scalar_in.len() as u32;
@@ -224,13 +217,13 @@ pub fn external_method(k: &mut Kernel, id: u32, c: &mut Client, a: &mut MethodAr
         _ => {}
     }
     if let Err(e) = super::super::iokit::dispatch_check(&d, a) {
-        return Outcome::Done(e);
+        return e;
     }
     if !has_method {
-        return Outcome::Done(K_IO_RETURN_NO_COMPLETION);
+        return K_IO_RETURN_NO_COMPLETION;
     }
     if RESERVED.contains(&a.selector) {
-        return Outcome::Done(ret::UNSUPPORTED);
+        return ret::UNSUPPORTED;
     }
     swap::catch_up(k);
     let sc = |i: usize| a.scalar_in[i];
@@ -264,18 +257,18 @@ pub fn external_method(k: &mut Kernel, id: u32, c: &mut Client, a: &mut MethodAr
             // is larger than the inband maximum, and so fails the size).
             let record = a.struct_in.clone();
             if swap::wants_gain_map(&record) && !k.darwin_entitled("com.apple.private.gain-map-access") {
-                return Outcome::Done(ret::NOT_PRIVILEGED);
+                return ret::NOT_PRIVILEGED;
             }
             swap::submit(k, &record)
         }
         // s_swap_wait (0xfffffff006779518): the client's swap_wait
-        // (0xfffffff006777390) and the framebuffer's (slot 176).
-        6 => match swap::wait(k, sc(0) as u32, sc(1) as u32, sc(2) as u32) {
-            Ok(Some(r)) => r,
-            Ok(None) => return Outcome::Wait { swap: sc(0) as u32, options: sc(1) as u32 },
-            Err(what) => {
-                k.darwin_unimplemented(what);
-                ret::UNSUPPORTED
+        // (0xfffffff006777390) and the framebuffer's (slot 176), with the
+        // swap id, the options and the timeout in milliseconds.
+        6 => match swap::wait(k, id, sc(0) as u32, sc(1) as u32, sc(2) as u32) {
+            Ok(r) => r,
+            Err(token) => {
+                a.later = Some(token);
+                ret::SUCCESS
             }
         },
         // s_get_id (0xfffffff006779614): the framebuffer's id (slot 175,
@@ -298,6 +291,27 @@ pub fn external_method(k: &mut Kernel, id: u32, c: &mut Client, a: &mut MethodAr
                 ret::UNSUPPORTED
             }
         },
+        // s_request_power_change (0xfffffff006779f24, member
+        // 0xfffffff0067779f8): the client made a swap client (type 2, slot
+        // 169) if it is not one. Slots 255, 256, 258, 260 and 261, the
+        // external display and clamshell checks, all answer 0 on AppleCLCD,
+        // so the request goes to slot 229 (0xfffffff006bf7900) while the
+        // display supports power changes (`+0x8c` bit 0, which AppleCLCD's
+        // display start sets, 0xfffffff006bf5170), with the state as an
+        // int.
+        12 => {
+            if c.ty != 2 {
+                c.ty = 2;
+                swap::add_swap_client();
+            }
+            match swap::request_power_change(k, sc(0) as u32) {
+                Ok(r) => r,
+                Err(token) => {
+                    a.later = Some(token);
+                    ret::SUCCESS
+                }
+            }
+        }
         // s_set_debug_flags (0xfffffff00677a014): slot 180
         // (0xfffffff006798404) is kIOReturnError without the debugger
         // (PE_i_can_has_debugger, which a production device does not
@@ -340,7 +354,7 @@ pub fn external_method(k: &mut Kernel, id: u32, c: &mut Client, a: &mut MethodAr
         52 => swap::cancel(k, sc(0) as u32),
         // s_notifications (0xfffffff00677a658, member 0xfffffff006778460):
         // scalars {callout, refcon, type, extra}.
-        72 => notifications(k, id, c, sc(0), sc(2) as u32, sc(3) as u32),
+        72 => notifications(k, id, c, sc(0), sc(1), sc(2) as u32, sc(3) as u32),
         // s_get_current_absolute_time (0xfffffff00677ad48): slot 241, the
         // pipe's time (0xfffffff006bb6550; its display counter only in
         // the hardware mode the pipe leaves off), mach_continuous_time.
@@ -357,17 +371,17 @@ pub fn external_method(k: &mut Kernel, id: u32, c: &mut Client, a: &mut MethodAr
         // (kIOReturnNotPrivileged), a layer below 4.
         83 => {
             if !k.darwin_entitled("com.apple.private.allow-explicit-graphics-priority") {
-                return Outcome::Done(ret::NOT_PRIVILEGED);
+                return ret::NOT_PRIVILEGED;
             }
             if sc(0) as u32 >= 4 {
-                return Outcome::Done(ret::BAD_ARGUMENT);
+                return ret::BAD_ARGUMENT;
             }
             // Slot 242's member (0xfffffff00678b450): the layer's displayed
             // surface (`+0x1358 + 8 * layer`), which a vertical blank sets,
             // as a send right in the task; none is kIOReturnError.
             a.scalar_out[0] = 0;
             if !swap::any_displayed() {
-                return Outcome::Done(ret::ERROR);
+                return ret::ERROR;
             }
             k.darwin_unimplemented("IOMobileFramebufferUserClient selector 83 (CopyLayerDisplayedSurface): a send right to the layer's displayed surface".to_string());
             ret::UNSUPPORTED
@@ -377,14 +391,18 @@ pub fn external_method(k: &mut Kernel, id: u32, c: &mut Client, a: &mut MethodAr
             ret::UNSUPPORTED
         }
     };
-    Outcome::Done(r)
+    r
 }
 
 /// Selector 72's member (0xfffffff006778460): a type past the slots is
-/// kIOReturnBadArgument; with a callout the record is set up and listed
-/// (slot 208, gated 0xfffffff006795ec0) and, with `extra`, slot 210 run,
-/// which is not modelled; without one it is unlisted (slot 209).
-fn notifications(k: &mut Kernel, id: u32, c: &mut Client, callout: u64, ty: u32, extra: u32) -> i32 {
+/// kIOReturnBadArgument; with a callout the record is set up with the
+/// slot's port, the callout and its reference and listed (slot 208, gated
+/// 0xfffffff006795ec0) and, with `extra`, slot 210 run (gated, AppleCLCD
+/// slot 211 to the pipe's 0xfffffff006bb672c), which takes options for
+/// frame information only and answers kIOReturnBadArgument for any other
+/// type, the record staying listed; without a callout it is unlisted
+/// (slot 209).
+fn notifications(k: &mut Kernel, id: u32, c: &mut Client, callout: u64, refcon: u64, ty: u32, extra: u32) -> i32 {
     let ty = ty as usize;
     if ty >= super::NOTIFY_TYPES {
         return ret::BAD_ARGUMENT;
@@ -396,11 +414,14 @@ fn notifications(k: &mut Kernel, id: u32, c: &mut Client, callout: u64, ty: u32,
         c.slots[ty].enabled = false;
         return ret::SUCCESS;
     }
-    match swap::enable_notifications(id, ty, c.slots[ty].enabled) {
+    match swap::enable_notifications(k, id, ty, c.slots[ty].enabled, c.slots[ty].port, callout, refcon) {
         Ok(r) if r == ret::SUCCESS => {
             c.slots[ty].enabled = true;
             if extra != 0 {
-                k.darwin_unimplemented(format!("IOMobileFramebuffer notifications of type {ty} with option {extra:#x} (the framebuffer's slot 210)"));
+                if ty != 3 {
+                    return ret::BAD_ARGUMENT;
+                }
+                k.darwin_unimplemented(format!("IOMobileFramebuffer frame information notifications with option {extra:#x} (the pipe's update_notify_clients, 0xfffffff006bb6774)"));
                 return ret::UNSUPPORTED;
             }
             ret::SUCCESS
