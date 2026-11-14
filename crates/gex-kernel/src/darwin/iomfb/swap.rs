@@ -69,7 +69,7 @@ pub mod kr {
     pub const NOT_PERMITTED: i32 = 0xe00002e2_u32 as i32;
     pub const BUSY: i32 = 0xe00002d5_u32 as i32;
     pub const ABORTED: i32 = 0xe00002eb_u32 as i32;
-    pub const OFFLINE: i32 = 0xe00002e3_u32 as i32;
+    pub const NO_POWER: i32 = 0xe00002e3_u32 as i32;
     pub const TIMEOUT: i32 = 0xe00002d6_u32 as i32;
     pub const VM_ERROR: i32 = 0xe00002c8_u32 as i32;
 }
@@ -1627,7 +1627,7 @@ impl Display {
     /// the timeout; modes 3 and 4, which ask whether the soft state is on
     /// (kIOReturnBadArgument where it is not as asked); the wait proper when
     /// the controller is on (the display's power change support, `+0x8c`,
-    /// being on), else kIOReturnOffline.
+    /// being on), else kIOReturnNoPower.
     fn wait_body(&mut self, w: &mut Waiter, no_block: bool, now: u64) -> Option<i32> {
         if w.timeout != 0 {
             w.swap_deadline = now + ms_to_abs(u64::from(w.timeout));
@@ -1638,7 +1638,7 @@ impl Display {
             _ => {}
         }
         if !self.power.controller {
-            return Some(kr::OFFLINE);
+            return Some(kr::NO_POWER);
         }
         self.wait_pass(w, no_block, now)
     }

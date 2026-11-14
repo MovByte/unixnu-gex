@@ -568,18 +568,18 @@ int main(void) {
     if ((kr = IOConnectCallScalarMethod(c, 12, in, 1, NULL, NULL)) != KERN_SUCCESS) return bad("RequestPowerChange off", kr, 0);
     if (power_note(pp, 0x1234, 0x5678, 0)) return 1;
     // Off: option 4 is so and option 3 is not, at once or not; a wait on a
-    // swap is kIOReturnOffline.
+    // swap is kIOReturnNoPower.
     if ((kr = swap_wait(fb, token, 4)) != KERN_SUCCESS) return bad("SwapWait option 4 while off", kr, 0);
     if ((kr = swap_wait(fb, token, 3)) != kIOReturnBadArgument) return bad("SwapWait option 3 while off", kr, kIOReturnBadArgument);
     if ((kr = swap_wait(fb, token, 0x80000004)) != KERN_SUCCESS) return bad("SwapWait option 4 while off, not blocking", kr, 0);
     if ((kr = swap_wait(fb, token, 0x80000003)) != kIOReturnBusy) return bad("SwapWait option 3 while off, not blocking", kr, kIOReturnBusy);
-    if ((kr = swap_wait(fb, token, 1)) != (kern_return_t)0xe00002e3) return bad("SwapWait while off", kr, 0xe00002e3);
+    if ((kr = swap_wait(fb, token, 1)) != kIOReturnNoPower) return bad("SwapWait while off", kr, kIOReturnNoPower);
     // A swap while off is queued, not shown.
     int off = 0;
     if ((kr = swap_begin(fb, &off)) != KERN_SUCCESS) return bad("SwapBegin while off", kr, 0);
     if ((kr = swap_set_layer(fb, 0, s, whole, whole, 0)) != KERN_SUCCESS) return bad("SwapSetLayer while off", kr, 0);
     if ((kr = swap_end(fb)) != KERN_SUCCESS) return bad("SwapEnd while off", kr, 0);
-    if ((kr = swap_wait(fb, off, 1)) != (kern_return_t)0xe00002e3) return bad("SwapWait on a swap made while off", kr, 0xe00002e3);
+    if ((kr = swap_wait(fb, off, 1)) != kIOReturnNoPower) return bad("SwapWait on a swap made while off", kr, kIOReturnNoPower);
     // Queued while off: a signal for the layer it enables is taken, one
     // for a layer it does not is kIOReturnBadArgument.
     in[0] = off;
