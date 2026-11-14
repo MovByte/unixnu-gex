@@ -679,6 +679,15 @@ pub fn submit(k: &mut Kernel, record: &[u8]) -> i32 {
         k.darwin_unimplemented("an IOMobileFramebuffer swap of kind 9, which shows the framebuffer's own surface on every layer".to_string());
         return give_back(k, id, req, ret::ERROR);
     }
+    // The kick has paths of its own for kinds 8 (the idle buffer
+    // IOMobileFramebufferSetIdleBuffer makes: the pipe's idle surfaces,
+    // 0xfffffff006bfbbc4, or the swap dropped by the pipe's slot 0x3e8) and
+    // 0x13 (dropped until a client's swap was shown, `+0x1787`, or taken
+    // with slot 323), which are not modelled.
+    if req.kind == 8 || req.kind == 0x13 {
+        k.darwin_unimplemented(format!("an IOMobileFramebuffer swap of kind {:#x}, which the kick (0xfffffff006bfb384) takes by a path of its own", req.kind));
+        return give_back(k, id, req, ret::ERROR);
+    }
     let mut valid = true;
     for n in 0..4usize {
         if req.enabled & (1 << n) == 0 {
@@ -1107,7 +1116,7 @@ impl Display {
     /// yet completed (`+0x318 != +0x31c`, "swap was not completed": it
     /// waits for its swap signals), status 2. The pipe's readiness check
     /// (0xfffffff006bd2f24) passes with `AOTEnable` off; the kinds with a
-    /// path of their own here (8, 0x13) are refused at submission.
+    /// path of their own here (8, 0x13) are reported at submission.
     fn kick(&mut self, pid: i32, now: u64) {
         if self.pending.is_some() || self.power.soft == 0 || !self.power.controller || !self.power.timing {
             return;
