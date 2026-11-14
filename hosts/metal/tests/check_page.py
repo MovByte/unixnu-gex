@@ -8,10 +8,11 @@ page starts the GPU Worker with the display's canvas and a process memory, and r
 stands where that process's kernel stands. Each check's result is printed; the exit status is 0 when every check
 passed, 1 when one did not, 2 when the run could not complete.
 
-Usage: check_page.py [--browser chrome|firefox|safari|PATH] [--build DIR] [--no-build] [--reference-build DIR]
+Usage: check_page.py [--browser chrome|chrome-headless|firefox|safari|PATH] [--build DIR] [--no-build] [--reference-build DIR]
                      [--out RESULTS] [--timeout SECONDS]
 
-Browsers: chrome (headless); firefox, in a window of a fresh profile (Firefox gives a headless page no WebGPU
+Browsers: chrome, in a window of a fresh profile (chrome-headless: headless, which Chrome 157 on the reference Mac
+does not keep running past about 30 s); firefox, in a window of a fresh profile (Firefox gives a headless page no WebGPU
 adapter); safari, through `open -a Safari`. --reference-build names a build of WebMetal's
 `tests/reference/build.py --platform ios`; without it the script makes one (Xcode's Metal toolchain).
 """
@@ -35,6 +36,7 @@ JS = os.path.join(ROOT, "hosts", "browser", "js")
 PAGE = os.path.join(HERE, "page")
 BROWSERS = {
     "chrome": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "chrome-headless": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "firefox": "/Applications/Firefox.app/Contents/MacOS/firefox",
     "safari": "/Applications/Safari.app",
 }
@@ -122,8 +124,15 @@ def launch(browser, url, profile):
     if "firefox" in name:
         cmd = [path, "--no-remote", "--new-instance", "--profile", profile, url]
     else:
-        cmd = [path, "--headless=new", "--no-first-run", "--no-default-browser-check", "--user-data-dir=" + profile,
+        # In a window: a headless Chrome 157 on the reference Mac receives SIGTERM about 30 s after it starts
+        # ("Handling shutdown for signal 15" in its log; a windowed one runs on), which ends a run. The window is
+        # kept running at full rate when it is in the background.
+        cmd = [path, "--no-first-run", "--no-default-browser-check", "--user-data-dir=" + profile,
+               "--disable-background-networking", "--disable-component-update", "--disable-background-timer-throttling",
+               "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows", "--window-size=640,480",
                url]
+        if browser == "chrome-headless":
+            cmd.insert(1, "--headless=new")
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
