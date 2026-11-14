@@ -145,10 +145,10 @@ record_of() {
 # What earlier runs of these programs left in the root's /private/var/tmp,
 # made before gex kept the owners of the files a program makes there:
 # with no record, nothing says whose they are, and a run that meets one
-# stops. Those ten minutes old are removed (a run in progress makes its
-# own afresh).
+# stops. Those of the names this runner and its programs use, ten minutes
+# old, are removed (a run in progress makes its own afresh).
 if [ -n "${GEX_DARWIN_ROOT:-}" ] && [ -d "$GEX_DARWIN_ROOT/private/var/tmp" ]; then
-    find "$GEX_DARWIN_ROOT/private/var/tmp" -mindepth 1 -maxdepth 1 -name 'gex-*' -mmin +10 | while read -r f; do
+    find "$GEX_DARWIN_ROOT/private/var/tmp" -mindepth 1 -maxdepth 1 \( -name 'gex-darwin-*' -o -name 'gex-exec*' -o -name 'gex-spawn-*' -o -name 'gex-kq*' -o -name 'gex-ioctl*' -o -name 'gex-codesig*' -o -name 'gex-pathrules-*' \) -mmin +10 | while read -r f; do
         record_of "$f" || rm -rf "$f"
     done
 fi
