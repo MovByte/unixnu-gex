@@ -17,9 +17,18 @@
 // device is set up (a device that cannot be set up leaves the Worker
 // refusing every request with the reason), and { failed: reason } for a
 // message it cannot take.
+//
+// A panic of the executor (a defect, such as a WebGPU error no scope caught)
+// traps the module, which WebAssembly cannot unwind: the Worker answers
+// nothing more, where gexc's thread goes on refusing every request with the
+// reason. It posts { trapped: reason } so that the page knows.
 
 let worker = null;
 const early = [];
+
+const trapped = (why) => postMessage({ trapped: String(why && why.stack ? why.stack : why) });
+self.addEventListener('error', (e) => trapped(e.error || e.message));
+self.addEventListener('unhandledrejection', (e) => trapped(e.reason));
 
 function take(m) {
   if (m.attach !== undefined) worker.attach_memory(m.attach, m.memory, m.table);
