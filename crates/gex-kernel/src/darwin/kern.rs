@@ -1126,7 +1126,10 @@ impl Kernel {
     }
 
     /// `fsgetpath(buf, size, fsid, objid)`: the path of a file named by its
-    /// filesystem and object ids. Only the shared cache is named so.
+    /// filesystem and object ids: a volume's root, the shared cache, the
+    /// task's images, and a file the root filesystem finds by number (an
+    /// overlay's, `OverlayFs`); the root's other files are looked up by
+    /// name only, and reported.
     fn darwin_fsgetpath(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
         const FSGETPATH_MAXBUFLEN: u64 = 8192;
         const ROOT_OBJID: u64 = 2;
@@ -1144,6 +1147,8 @@ impl Kernel {
         } else if (fs, a[3]) == (super::CACHE_FS_ID, super::CACHE_OBJ_ID) && self.darwin_region.0 != 0 && super::shregion::region().is_some() {
             super::CACHE_PATH.to_string()
         } else if let Some(path) = image {
+            path
+        } else if let Some(path) = self.vfs.root_path_of_ino(a[3]).filter(|p| mount_of(p).fsid as u32 == fs as u32) {
             path
         } else {
             self.darwin_unimplemented(format!("fsgetpath of object {:#x} (VFS_VGET: the filesystems here look files up by name only)", a[3]));
