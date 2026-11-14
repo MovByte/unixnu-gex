@@ -9,10 +9,11 @@
 //!   to the queue.
 //! - The kick (AppleCLCD slot 290, 0xfffffff006bfb384) takes the queue's
 //!   head as the pending swap while the display is powered, and the
-//!   vertical blank after completes it (0xfffffff00678a96c): it becomes the
-//!   displayed swap, its layers reach the glass (the embedder's
-//!   [`super::sink`]), and the swap it replaces retires, its surfaces let
-//!   go.
+//!   vertical blank after completes it (0xfffffff00678a96c): each layer it
+//!   enables goes on the glass in place of the one there, whose surface is
+//!   let go, and the layers it does not enable stay as earlier swaps left
+//!   them (0xfffffff00679534c); the glass then reaches the embedder's
+//!   [`super::sink`].
 //! - Swap waits (selector 6, `swap_wait_gated` 0xfffffff00678b960) sleep on
 //!   the queue's event, which a completed swap, a removed one and
 //!   `swap_cancel_all` wake, each for five seconds at most.
@@ -243,8 +244,11 @@ struct PowerCaller {
 pub enum Effect {
     /// A request's surfaces let go.
     Release(Request),
-    /// A swap's layers to the glass at the blank (its count and time).
-    Present(Request, u64, u64),
+    /// A surface the glass held let go.
+    ReleaseSurface(u32),
+    /// The glass after swap `.0` at the blank (its count and time): the
+    /// layers on it, by index.
+    Present(u32, u64, u64, Vec<(u32, LayerReq)>),
     /// A method that answered later answered, in its task.
     Answer { link: Arc<TaskLink>, token: u64, ret: i32 },
     /// An async result to a notification record's port
@@ -262,12 +266,15 @@ struct Display {
     /// `+0x16b8`: the last swap id given.
     next_id: u32,
     /// `+0x1578`: begun requests; `+0x1568`: the queue; `+0x1560`: the
-    /// pending swap; the displayed swap and its id (`+0x16bc`).
+    /// pending swap; the display's swap id (`+0x16bc`).
     begun: Vec<Request>,
     queue: VecDeque<Request>,
     pending: Option<Request>,
-    displayed: Option<Request>,
     display_swap_id: u32,
+    /// The layers on the glass (`+0x1358 + 8 * n` their surfaces, with the
+    /// rectangles and transform their swaps gave), each holding a reference
+    /// on its surface.
+    glass: [Option<LayerReq>; 4],
     /// The last vertical blank reached (its index since boot), the count
     /// (`+0x100`), its time (`+0x108`) and the time since the one before
     /// (`+0x110`).
@@ -305,7 +312,7 @@ fn display<R>(f: impl FnOnce(&mut Display) -> R) -> R {
         begun: Vec::new(),
         queue: VecDeque::new(),
         pending: None,
-        displayed: None,
+        glass: [None; 4],
         display_swap_id: 0,
         vbl_index: 0,
         vbl_count: 0,
@@ -345,7 +352,8 @@ fn perform(k: &mut Kernel, effects: Vec<Effect>) {
     for e in effects {
         match e {
             Effect::Release(r) => release_request(k, r),
-            Effect::Present(r, vbl, time) => present(k, &r, vbl, time),
+            Effect::ReleaseSurface(id) => super::super::iosurface::kernel_release(k, id),
+            Effect::Present(swap, vbl, time, layers) => present(k, swap, vbl, time, &layers),
             Effect::Answer { link, token, ret } => {
                 link.mailbox.lock().unwrap_or_else(|e| e.into_inner()).push(super::super::ipc::Remote::Later { token, ret, scalars: Vec::new() });
                 link.bell.ring();
@@ -953,8 +961,10 @@ impl Display {
     }
 
     /// The pending swap completed (0xfffffff00678a96c): `shown` at a
-    /// vertical blank (its layers to the glass, the swap it replaces
-    /// retired), or not (a flush: each enabled layer dropped, status 7).
+    /// vertical blank (0xfffffff00679534c: each layer it enables on the
+    /// glass, the surface there let go (0xfffffff00679437c), and the glass
+    /// to the sink), or not (a flush: each enabled layer dropped, status
+    /// 7).
     /// Either way a swap of kind 0 or 15 is the display's swap id, the swap
     /// queue's waiters are woken, the swap timer's count of removals starts
     /// again, and with the soft state off and the controller on the power
@@ -965,14 +975,23 @@ impl Display {
         match shown {
             Some((count, time)) => {
                 req.status = 4;
-                self.effects.push(Effect::Present(req.clone(), count, time));
-                if let Some(old) = self.displayed.take() {
-                    self.effects.push(Effect::Release(old));
+                for n in 0..4 {
+                    if req.enabled & (1 << n) == 0 {
+                        continue;
+                    }
+                    if let Some(old) = self.glass[n].take().and_then(|l| l.surface) {
+                        self.effects.push(Effect::ReleaseSurface(old));
+                    }
+                    // The request's reference goes to the glass.
+                    let l = std::mem::take(&mut req.layers[n]);
+                    self.glass[n] = l.surface.is_some().then_some(l);
                 }
+                let layers = (0..4u32).filter_map(|n| self.glass[n as usize].map(|l| (n, l))).collect();
+                self.effects.push(Effect::Present(req.id, count, time, layers));
                 if req.kind == 0 || req.kind == 0xf {
                     self.display_swap_id = req.id;
                 }
-                self.displayed = Some(req);
+                self.effects.push(Effect::Release(req));
             }
             None => {
                 if req.enabled & 0xf != 0 {
@@ -1396,15 +1415,12 @@ pub fn catch_up(k: &mut Kernel) {
     with_display(k, |d| d.advance(pid, super::super::mach::absolute_time()));
 }
 
-/// Swap `s`'s layers to the glass.
-fn present(k: &mut Kernel, s: &Request, vbl: u64, time: u64) {
+/// The glass after swap `swap`, its `layers`, to the sink.
+fn present(k: &mut Kernel, swap: u32, vbl: u64, time: u64, layers: &[(u32, LayerReq)]) {
     let Ok(panel) = panel() else { return };
-    let mut frame = sink::Frame { swap_id: s.id, vbl, time, panel: (panel.width, panel.height), layers: Vec::new() };
-    for (n, l) in s.layers.iter().enumerate() {
+    let mut frame = sink::Frame { swap_id: swap, vbl, time, panel: (panel.width, panel.height), layers: Vec::new() };
+    for &(n, l) in layers {
         let Some(id) = l.surface else { continue };
-        if s.enabled & (1 << n) == 0 {
-            continue;
-        }
         let Some(g) = super::super::iosurface::geometry(id) else { continue };
         let count = if g.plane_count == 0 { 1 } else { g.plane_count };
         let planes = (0..count)
@@ -1414,7 +1430,7 @@ fn present(k: &mut Kernel, s: &Request, vbl: u64, time: u64) {
         let size = g.alloc_size as usize;
         let bytes = super::super::iosurface::with_bytes(k, id, |b| b[..size.min(b.len())].to_vec()).unwrap_or_default();
         let rect = |r: [i32; 4]| sink::Rect { x: r[0], y: r[1], w: r[2], h: r[3] };
-        frame.layers.push(sink::Layer { index: n as u32, surface: id, pixel_format: g.pixel_format, width: g.width, height: g.height, planes, bytes, src: rect(l.src), dst: rect(l.dst), transform: l.transform });
+        frame.layers.push(sink::Layer { index: n, surface: id, pixel_format: g.pixel_format, width: g.width, height: g.height, planes, bytes, src: rect(l.src), dst: rect(l.dst), transform: l.transform });
     }
     match sink::sink() {
         Some(s) => {
@@ -1426,9 +1442,10 @@ fn present(k: &mut Kernel, s: &Request, vbl: u64, time: u64) {
     }
 }
 
-/// Whether a swap was ever displayed.
-pub fn any_displayed() -> bool {
-    display(|d| d.displayed.is_some())
+/// The surface on the glass in layer `layer` (`+0x1358 + 8 * layer`), if
+/// any.
+pub fn glass_surface(layer: u32) -> Option<u32> {
+    display(|d| d.glass.get(layer as usize).copied().flatten().and_then(|l| l.surface))
 }
 
 /// When task `pid` wants the display's thread call: the next vertical

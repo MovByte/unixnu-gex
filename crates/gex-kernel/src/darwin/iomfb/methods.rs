@@ -378,15 +378,20 @@ pub fn external_method(k: &mut Kernel, id: u32, c: &mut Client, a: &mut MethodAr
             if sc(0) as u32 >= 4 {
                 return ret::BAD_ARGUMENT;
             }
-            // Slot 242's member (0xfffffff00678b450): the layer's displayed
-            // surface (`+0x1358 + 8 * layer`), which a vertical blank sets,
-            // as a send right in the task; none is kIOReturnError.
+            // Slot 242's member (0xfffffff00678b450): the layer's surface on
+            // the glass (`+0x1358 + 8 * layer`), which a vertical blank sets,
+            // as a send right in the client's task by IOSurface's
+            // 0xfffffff005baa90c (selector 35's maker with no options);
+            // none is kIOReturnError.
             a.scalar_out[0] = 0;
-            if !swap::any_displayed() {
-                return ret::ERROR;
+            let Some(surface) = swap::glass_surface(sc(0) as u32) else { return ret::ERROR };
+            match super::super::iosurface::send_right_in_task(k, surface, 0) {
+                Ok(name) => {
+                    a.scalar_out[0] = u64::from(name);
+                    ret::SUCCESS
+                }
+                Err(e) => e,
             }
-            k.darwin_unimplemented("IOMobileFramebufferUserClient selector 83 (CopyLayerDisplayedSurface): a send right to the layer's displayed surface".to_string());
-            ret::UNSUPPORTED
         }
         s => {
             k.darwin_unimplemented(format!("IOMobileFramebufferUserClient selector {s} ({})", selector_name(s)));

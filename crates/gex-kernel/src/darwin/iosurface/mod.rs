@@ -17,6 +17,8 @@ mod methods;
 pub mod shared;
 pub mod surface;
 
+pub use methods::send_right_in_task;
+
 use super::iokit::{ret, MethodArgs, Node, Prop, VARIABLE};
 use super::osserialize::{self as os, Graph, Id, Obj};
 use crate::syscalls::Kernel;

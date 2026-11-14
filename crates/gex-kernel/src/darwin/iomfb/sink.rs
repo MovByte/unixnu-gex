@@ -63,8 +63,10 @@ pub struct Layer {
 }
 
 /// A frame on the glass: its swap, the vertical blank that showed it (its
-/// count and absolute time), the panel's size, and its layers in index
-/// order. A swap with no layer enabled shows nothing.
+/// count and absolute time), the panel's size, and the layers on the glass
+/// in index order: those the swap set and those earlier swaps left (a swap
+/// sets only the layers it enables, and one it enables with no surface
+/// leaves that layer empty).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Frame {
     pub swap_id: u32,

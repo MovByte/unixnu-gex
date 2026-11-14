@@ -128,10 +128,11 @@ codesign -s - -f -i com.apple.splashboardd --entitlements "$HERE/src/splashboard
 codesign -s - -f -i com.apple.PreBoard --entitlements "$HERE/src/preboard.entitlements" "$OUT/iosurfacexpreboard" 2>/dev/null
 # iomfb and iomfbmain open the framebuffer as splashboardd, whose
 # iokit-user-client-class entitlement names IOMobileFramebufferUserClient
-# too.
-for p in iomfb iomfbmain; do
-    codesign -s - -f -i com.apple.splashboardd --entitlements "$HERE/src/splashboardd.entitlements" "$OUT/$p" 2>/dev/null
-done
+# too; iomfb also holds backboardd's
+# com.apple.private.allow-explicit-graphics-priority, which the
+# framebuffer's selector 83 asks for.
+codesign -s - -f -i com.apple.splashboardd --entitlements "$HERE/src/iomfb.entitlements" "$OUT/iomfb" 2>/dev/null
+codesign -s - -f -i com.apple.splashboardd --entitlements "$HERE/src/splashboardd.entitlements" "$OUT/iomfbmain" 2>/dev/null
 # accelr's IOGPU device client is restricted by its entitlement.
 codesign -s - -f --entitlements "$HERE/src/gpurestricted.entitlements" "$OUT/accelr" 2>/dev/null
 # atmflag sets the ATM diagnostic flag, which its entitlement allows.

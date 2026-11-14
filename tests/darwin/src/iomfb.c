@@ -15,6 +15,10 @@
 //   range, the dispatch counts, reserved and empty entries, unknown swaps,
 //   a source rectangle outside its surface, the debug flags a production
 //   device refuses, the notification types, and memory of no type.
+// - The glass, on that connection (selector 83, with backboardd's graphics
+//   priority entitlement): layer 0 holds the swapped surface and layer 1
+//   nothing; a second swap that sets only layer 1 leaves layer 0 as it
+//   was, and the test embedder records both layers (frame-check.py).
 // - Power, on that connection: power notifications asked for (an option
 //   for them refused), the display turned off (selector 12), its
 //   notification (the time, and state 0), the swap waits a display that is
@@ -239,6 +243,47 @@ int main(void) {
     mach_vm_size_t len = 0;
     if ((kr = IOConnectMapMemory64(c, 0, mach_task_self(), &addr, &len, kIOMapAnywhere)) != kIOReturnBadArgument) return bad("memory of type 0", kr, kIOReturnBadArgument);
     if ((kr = IOConnectMapMemory64(c, 3, mach_task_self(), &addr, &len, kIOMapAnywhere)) != kIOReturnBadArgument) return bad("memory of type 3", kr, kIOReturnBadArgument);
+
+    // The glass: layer 0's surface is the swapped one, as a send right;
+    // layer 1 has none (kIOReturnError); there is no layer 4.
+    in[0] = 0;
+    outn = 1;
+    if ((kr = IOConnectCallScalarMethod(c, 83, in, 1, out, &outn)) != KERN_SUCCESS) return bad("CopyLayerDisplayedSurface of layer 0", kr, 0);
+    IOSurfaceRef shown = IOSurfaceLookupFromMachPort((mach_port_t)out[0]);
+    if (shown == NULL || IOSurfaceGetID(shown) != IOSurfaceGetID(s)) return bad("layer 0's surface", shown ? IOSurfaceGetID(shown) : 0, IOSurfaceGetID(s));
+    CFRelease(shown);
+    mach_port_deallocate(mach_task_self(), (mach_port_t)out[0]);
+    in[0] = 1;
+    outn = 1;
+    if ((kr = IOConnectCallScalarMethod(c, 83, in, 1, out, &outn)) != kIOReturnError) return bad("CopyLayerDisplayedSurface of an empty layer", kr, kIOReturnError);
+    in[0] = 4;
+    outn = 1;
+    if ((kr = IOConnectCallScalarMethod(c, 83, in, 1, out, &outn)) != kIOReturnBadArgument) return bad("CopyLayerDisplayedSurface of layer 4", kr, kIOReturnBadArgument);
+    // A swap that sets only layer 1, a small surface of its own: layer 0
+    // stays as the first swap left it.
+    const void *vals2[] = {num(64), num(64), num(bpe), num(fmt)};
+    CFDictionaryRef props2 = CFDictionaryCreate(NULL, keys, vals2, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    IOSurfaceRef s2 = IOSurfaceCreate(props2);
+    if (s2 == NULL) return bad("IOSurfaceCreate of the small surface", 0, 1);
+    if (IOSurfaceLock(s2, 0, NULL) != KERN_SUCCESS) return bad("locking the small surface", 0, 1);
+    memset(IOSurfaceGetBaseAddress(s2), 0x40, IOSurfaceGetAllocSize(s2));
+    if (IOSurfaceUnlock(s2, 0, NULL) != KERN_SUCCESS) return bad("unlocking the small surface", 0, 1);
+    int second = 0;
+    if ((kr = swap_begin(fb, &second)) != KERN_SUCCESS) return bad("SwapBegin of layer 1", kr, 0);
+    FbRect small = {0, 0, 64, 64};
+    if ((kr = swap_set_layer(fb, 1, s2, small, small, 0)) != KERN_SUCCESS) return bad("SwapSetLayer of layer 1", kr, 0);
+    if ((kr = swap_end(fb)) != KERN_SUCCESS) return bad("SwapEnd of layer 1", kr, 0);
+    if ((kr = swap_wait(fb, second, 1)) != KERN_SUCCESS) return bad("SwapWait until layer 1 is displayed", kr, 0);
+    for (int layer = 0; layer < 2; layer++) {
+        in[0] = layer;
+        outn = 1;
+        if ((kr = IOConnectCallScalarMethod(c, 83, in, 1, out, &outn)) != KERN_SUCCESS) return bad("CopyLayerDisplayedSurface after layer 1's swap", kr, 0);
+        IOSurfaceRef on = IOSurfaceLookupFromMachPort((mach_port_t)out[0]);
+        IOSurfaceRef want = layer == 0 ? s : s2;
+        if (on == NULL || IOSurfaceGetID(on) != IOSurfaceGetID(want)) return bad("a layer's surface after layer 1's swap", on ? IOSurfaceGetID(on) : 0, IOSurfaceGetID(want));
+        CFRelease(on);
+        mach_port_deallocate(mach_task_self(), (mach_port_t)out[0]);
+    }
 
     // Power notifications (type 1) to a port of their own: an option for
     // them is refused, the record staying listed.
