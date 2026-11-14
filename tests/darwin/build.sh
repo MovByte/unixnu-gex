@@ -21,7 +21,7 @@ for p in hello-static bsd-carry commpage exclusive-pair aes; do
         -Wl,-e,_start -o "$OUT/$p" "$HERE/src/$p.c"
 done
 
-for p in hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit xpc-anon sbxinit sbxexec sbxkill hostspecial sbxmask sbxnet sbxpriv sbxfile layout launchcon shregion; do
+for p in hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname taskreg excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit xpc-anon sbxinit sbxexec sbxkill hostspecial sbxmask sbxnet sbxpriv sbxfile layout launchcon shregion; do
     cc -O2 -o "$OUT/$p" "$HERE/src/$p.c"
 done
 cc -O2 -framework CoreFoundation -o "$OUT/cfrunloop" "$HERE/src/cfrunloop.c"
@@ -50,6 +50,19 @@ cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/accel" "$HERE/src/acc
 cc -O2 -framework IOKit -framework IOSurface -framework CoreFoundation -o "$OUT/iosurface" "$HERE/src/iosurface.c"
 cc -O2 -framework IOSurface -framework CoreFoundation -o "$OUT/iosurfacex" "$HERE/src/iosurfacex.c"
 cc -O2 -framework IOKit -framework IOSurface -framework CoreFoundation -o "$OUT/iogpudev" "$HERE/src/iogpudev.c"
+cc -O2 -framework IOKit -framework IOSurface -framework CoreFoundation -o "$OUT/iomfb" "$HERE/src/iomfb.c"
+# metalwire: WebMetal's wire records, from its generated header (the pinned
+# submodule's).
+xcrun -sdk iphoneos clang++ -target "$TARGET" -std=c++17 -O2 -I "$HERE/../../third_party/WebMetal/wire/generated" \
+    -framework IOKit -framework CoreFoundation -o "$OUT/metalwire" "$HERE/src/metalwire.cpp"
+# metal: Metal through the root's Metal.framework, with its kernel compiled
+# by Xcode's Metal toolchain into a metallib linked in as a section (made
+# in a directory of its own: the runner trusts every file of bin/).
+mkdir -p "$OUT/metallib"
+xcrun -sdk iphoneos metal -std=ios-metal2.4 -c -o "$OUT/metallib/metal.air" "$HERE/src/metal.metal"
+xcrun -sdk iphoneos metallib -o "$OUT/metallib/metal.metallib" "$OUT/metallib/metal.air"
+cc -O2 -fobjc-arc -framework Foundation -framework IOSurface -framework Metal -Wl,-sectcreate,__DATA,__metallib,"$OUT/metallib/metal.metallib" \
+    -o "$OUT/metal" "$HERE/src/metal.m"
 # iosurfacesplash and iosurfacexpreboard: iosurface as splashboardd and
 # iosurfacex as PreBoard, outside the container.
 cc -O2 -framework IOKit -framework IOSurface -framework CoreFoundation -o "$OUT/iosurfacesplash" "$HERE/src/iosurface.c"
@@ -112,6 +125,9 @@ codesign -s - -f --entitlements "$HERE/src/workinterval.entitlements" "$OUT/work
 # no-sandbox.
 codesign -s - -f -i com.apple.splashboardd --entitlements "$HERE/src/splashboardd.entitlements" "$OUT/iosurfacesplash" 2>/dev/null
 codesign -s - -f -i com.apple.PreBoard --entitlements "$HERE/src/preboard.entitlements" "$OUT/iosurfacexpreboard" 2>/dev/null
+# iomfb opens the framebuffer as splashboardd, whose iokit-user-client-class
+# entitlement names IOMobileFramebufferUserClient too.
+codesign -s - -f -i com.apple.splashboardd --entitlements "$HERE/src/splashboardd.entitlements" "$OUT/iomfb" 2>/dev/null
 # accelr's IOGPU device client is restricted by its entitlement.
 codesign -s - -f --entitlements "$HERE/src/gpurestricted.entitlements" "$OUT/accelr" 2>/dev/null
 # atmflag sets the ATM diagnostic flag, which its entitlement allows.

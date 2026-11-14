@@ -62,6 +62,9 @@ pub fn run(mut ra: RunArgs, bytes: &[u8]) -> Result<ExitCode> {
     // profile the system boots with.
     ra.opts.darwin_boot = std::env::var_os("GEX_DARWIN_BOOT").map(PathBuf::from);
     ra.opts.darwin_strict = std::env::var("GEX_DARWIN_STRICT").is_ok_and(|v| v == "1");
+    // The test embedder's panel: the frames the framebuffer presents,
+    // recorded into this directory.
+    ra.opts.darwin_frames = std::env::var_os("GEX_DARWIN_FRAMES").map(PathBuf::from);
     // Its commpage is folded to its alias at the top of the memory in
     // everything translated for it, which needs the addresses its code
     // builds in registers seen as the constants they are; and its tables

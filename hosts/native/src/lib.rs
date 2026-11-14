@@ -18,6 +18,7 @@ pub mod aot_only;
 pub mod libprov;
 pub(crate) mod elfprov;
 pub mod aot_share;
+pub mod darwin_frames;
 pub mod darwin_image;
 pub mod gl;
 pub mod profile;
@@ -248,6 +249,10 @@ pub struct RunOptions {
     /// collection (`sandbox_builtin.bin`) and protobox collection
     /// (`sandbox_protobox.bin`).
     pub darwin_boot: Option<std::path::PathBuf>,
+    /// Record the frames the Darwin framebuffer presents into this
+    /// directory (`GEX_DARWIN_FRAMES`, [`darwin_frames`]): the test
+    /// embedder's panel.
+    pub darwin_frames: Option<std::path::PathBuf>,
     /// Run ahead-of-time code only (`aot_only`): an ejected Windows
     /// program's runtime, with no tier-1 module and no run-time translator.
     pub aot_only: bool,
@@ -269,6 +274,7 @@ impl Default for RunOptions {
             darwin_thread_stack: 0,
             darwin_dylinker: None,
             darwin_boot: None,
+            darwin_frames: None,
             args: Vec::new(),
             env: Vec::new(),
             trace: false,
@@ -1280,6 +1286,11 @@ fn run_program_with(
         let sandbox = gex_kernel::darwin::SandboxProfiles { platform: read("sandbox_profile.bin")?, builtin: read("sandbox_builtin.bin")?, protobox: read("sandbox_protobox.bin")? };
         let device_tree = read("DeviceTree")?;
         gex_kernel::darwin::boot(tc.as_deref(), sandbox, device_tree.as_deref()).map_err(|e| anyhow!("the boot payload: {e}"))?;
+        // The panel: the test embedder's recorder when asked for.
+        if let Some(dir) = &opts.darwin_frames {
+            std::fs::create_dir_all(dir).map_err(|e| anyhow!("making {}: {e}", dir.display()))?;
+            gex_kernel::darwin::iomfb::sink::install(Box::new(darwin_frames::Recorder::new(dir.clone()))).map_err(|_| anyhow!("the framebuffer's presentation sink is installed already"))?;
+        }
         // The run's first process: of the user it runs as.
         kernel.dtask.cred = gex_kernel::darwin::cred::Cred::of(kernel_uid, kernel_gid);
         kernel.dtask.uniqueid = gex_kernel::darwin::next_uniqueid();
@@ -1295,8 +1306,10 @@ fn run_program_with(
     kernel.darwin_dyld_final = false;
     kernel.dtask.strict = opts.darwin_strict;
     kernel.dtask.platform = opts.darwin_platform;
-    // An exec takes the next pidversion (`proc_setpidversion`).
-    if opts.darwin {
+    // The run's first program is exec'd as XNU execs its first process: it
+    // takes the next pidversion (`proc_setpidversion`). An exec's and a
+    // spawn's came with their switch to the image.
+    if opts.darwin && fresh {
         kernel.dtask.pidversion = gex_kernel::darwin::next_pidversion();
     }
     // A Darwin program other than launchd is not pid 1: dyld treats pid 1
@@ -3272,9 +3285,19 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         provider_stacks: Mutex::new(cx.provider_stacks.lock().unwrap_or_else(|e| e.into_inner()).clone()),
     });
     note_live_process(&child_cx);
-    // A Darwin child's thread calls (its timers, its knotes' and its
-    // workqueue's) are its own, as a new image's are.
-    if child_cx.kernel.lock().unwrap_or_else(|e| e.into_inner()).darwin {
+    // A Darwin child's task is enabled before its parent's fork returns
+    // (fork's ipc_task_enable): its pid finds it, and its ports are made,
+    // whether or not it has run yet. Its thread calls (its timers, its
+    // knotes' and its workqueue's, other tasks' requests to its ports) are
+    // its own, as a new image's are.
+    let darwin = {
+        let mut k = child_cx.kernel.lock().unwrap_or_else(|e| e.into_inner());
+        if k.darwin {
+            k.darwin_task_enable();
+        }
+        k.darwin
+    };
+    if darwin {
         start_darwin_thread_calls(Arc::downgrade(&child_cx.kernel), child_cx.memory.clone());
     }
     let status = {
@@ -3325,10 +3348,11 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
                         stop_other_threads(&cx, false);
                     }
                     gex_kernel::syscalls::outgrow_ending(pid, 127 << 8, &procs);
-                    kernel
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .close_all_fds();
+                    {
+                        let mut k = kernel.lock().unwrap_or_else(|e| e.into_inner());
+                        k.darwin_task_terminate();
+                        k.close_all_fds();
+                    }
                     (127, 127 << 8)
                 }
             };
@@ -3355,10 +3379,14 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
             // (one that exec'd was looked at as its program ended,
             // `report_first_end`).
             gex_kernel::syscalls::outgrow_ending(pid, wstatus, &procs);
-            // Its descriptors close before its parent can see it gone, as on
-            // Linux: a listening socket's port is free once `wait4` returns.
+            // Its task ends (a Darwin child's: its ports die and its pid no
+            // longer finds it), and its descriptors close, before its parent
+            // can see it gone, as on Linux: a listening socket's port is
+            // free once `wait4` returns. (One that exec'd ended its task as
+            // its image did.)
             {
                 let mut k = kernel.lock().unwrap_or_else(|e| e.into_inner());
+                k.darwin_task_terminate();
                 k.close_all_fds();
             }
             procs.exit(pid, wstatus);
@@ -4013,7 +4041,12 @@ fn exec_darwin(
 ) -> Result<(Exit, Stats)> {
     let loaded = match load_darwin_image(&kernel, &img) {
         Ok(l) => l,
-        Err(why) => return darwin_killed(why),
+        Err(why) => {
+            // The process ends, its task with it, as one SIGKILL ended.
+            kernel.darwin_task_terminate();
+            kernel.close_all_fds();
+            return darwin_killed(why);
+        }
     };
     note_exec(kernel.pid, &img.path, &req.argv);
     switch_to_darwin_image(&mut kernel, &img);
@@ -4105,14 +4138,19 @@ fn run_darwin_image(
 /// A Darwin `posix_spawn`'s child (`Kernel::darwin_spawned`), started:
 /// its image loaded here, in its parent's call, so that a load that fails
 /// is that call's error (EBADMACHO, EBADEXEC for a bad signature, EIO for
-/// a file that cannot be read) and the child goes unseen; then run on a
-/// thread of its own, its end recorded for its parent's `wait4`.
+/// a file that cannot be read) and the child goes unseen; then switched
+/// over to it, the image activated and its task enabled, before the call
+/// returns; then run on a thread of its own, its end recorded for its
+/// parent's `wait4`.
 fn start_darwin_spawn(cx: &SpawnContext, mut child: Kernel) -> std::result::Result<i32, gex_kernel::errno::Errno> {
     use gex_kernel::errno::Errno;
     let pid = child.pid;
     let procs = Arc::clone(&child.procs);
     let img = child.darwin_exec.take().expect("a spawned child's image");
+    // A child that does not start goes unseen, its task ended (what it
+    // inherited let go) and its descriptors closed.
     let fail = |child: &mut Kernel, e: Errno| {
+        child.darwin_task_terminate();
         child.close_all_fds();
         procs.reap(pid);
         Err(e)
@@ -4140,9 +4178,12 @@ fn start_darwin_spawn(cx: &SpawnContext, mut child: Kernel) -> std::result::Resu
     switch_to_darwin_image(&mut child, &img);
     child.dtask.platform = loaded.platform;
     child.darwin_activate(&darwin_loaded(&img, &loaded));
-    // exec_mach_imgact's P_EXEC and posix_spawn's NOTE_EXEC for the child,
-    // before the call returns.
+    // exec_mach_imgact's P_EXEC; then, the image in (exec_resettextvp),
+    // posix_spawn's ipc_task_enable of the child and its NOTE_EXEC, before
+    // the call returns: its pid finds its task, and its ports are made,
+    // before it has run (whether or not a policy's refusal is to kill it).
     procs.set_execed(pid);
+    child.darwin_task_enable();
     gex_kernel::procnote::post(pid, gex_kernel::procnote::note::EXEC);
     let child_proc = Arc::new(ProcCell::default());
     child.vfs.mount("/proc", Arc::new(ProcFs::new(Arc::new(KernelProcSource(Arc::clone(&child_proc))))));
@@ -4156,28 +4197,38 @@ fn start_darwin_spawn(cx: &SpawnContext, mut child: Kernel) -> std::result::Resu
     note_exec(pid, &img.path, &argv);
     let (opts, xlate, wayland) = (cx.opts.clone(), cx.xlate.clone(), cx.wayland.clone());
     let creds = Arc::clone(&child.creds);
+    // The child goes to its thread through a slot, so that one that cannot
+    // be made leaves it here to end.
+    let slot = Arc::new(Mutex::new(Some(child)));
     let started = std::thread::Builder::new()
         .name(format!("gex-pid-{pid}"))
         .stack_size(guest_thread_stack())
-        .spawn(move || {
-            let wstatus = match run_darwin_image(img, loaded, argv, envp, &opts, &xlate, child, child_proc, wayland) {
-                Ok((exit, _)) => {
-                    say_killed(pid, &exit);
-                    exit.wait_status()
-                }
-                Err(e) => {
-                    eprintln!("gexc: child {pid} failed: {e:#}");
-                    127 << 8
-                }
-            };
-            procs.set_uid(pid, creds.uid());
-            procs.exit(pid, wstatus);
-            *status.lock().unwrap_or_else(|e| e.into_inner()) = Some(wstatus);
-            done.notify_all();
+        .spawn({
+            let (slot, procs) = (Arc::clone(&slot), Arc::clone(&procs));
+            move || {
+                let child = slot.lock().unwrap_or_else(|e| e.into_inner()).take().expect("the spawned child's kernel");
+                let wstatus = match run_darwin_image(img, loaded, argv, envp, &opts, &xlate, child, child_proc, wayland) {
+                    Ok((exit, _)) => {
+                        say_killed(pid, &exit);
+                        exit.wait_status()
+                    }
+                    Err(e) => {
+                        eprintln!("gexc: child {pid} failed: {e:#}");
+                        127 << 8
+                    }
+                };
+                procs.set_uid(pid, creds.uid());
+                procs.exit(pid, wstatus);
+                *status.lock().unwrap_or_else(|e| e.into_inner()) = Some(wstatus);
+                done.notify_all();
+            }
         });
     match started {
         Ok(_) => Ok(pid),
-        Err(_) => Err(Errno::EAGAIN),
+        Err(_) => match slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            Some(mut child) => fail(&mut child, Errno::EAGAIN),
+            None => Err(Errno::EAGAIN),
+        },
     }
 }
 
@@ -5088,7 +5139,14 @@ fn place_image(
                     signature: exec.as_ref().map(|i| i.load.clone()),
                     nano: exec.as_ref().and_then(|i| i.spawn.as_ref()).is_some_and(|sp| sp.flags & gex_kernel::darwin::spawn::flag::NANO_ALLOCATOR != 0),
                 };
-                k.darwin_start(exec.map(|i| i.strings), &loaded, opts.darwin_user_stack)
+                let st = k.darwin_start(exec.map(|i| i.strings), &loaded, opts.darwin_user_stack);
+                // An image that cannot start ends its process (`badtoolate`),
+                // its task with it.
+                if st.is_err() {
+                    k.darwin_task_terminate();
+                    k.close_all_fds();
+                }
+                st
             })
             .map_err(|e| anyhow::Error::new(DarwinStartFailed(format!("starting {path}: errno {}", e.0))))?;
         let layout = gex_ld::stack::StackLayout { sp: st.sp, low: st.sp, bytes: st.bytes };

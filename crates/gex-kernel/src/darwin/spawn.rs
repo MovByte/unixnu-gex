@@ -740,7 +740,7 @@ impl Kernel {
             }
         }
         // Its watch ports, bound to its task (an adaptive daemon's for
-        // importance) once the task is the IPC table's.
+        // importance) when its spawn enables the task.
         if !held.watch.is_empty() {
             let adaptive = apptype == super::taskpolicy::apptype::DAEMON_ADAPTIVE;
             child.dtask.pending_watchports = Some((std::mem::take(&mut held.watch), adaptive));

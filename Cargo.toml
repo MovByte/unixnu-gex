@@ -33,6 +33,9 @@ members = [
     "hosts/hostwl",
     "hosts/native",
 ]
+# WebMetal and AirWgsl are pinned submodules with workspaces (and manifests)
+# of their own; gexc builds them as dependencies (its `webmetal` feature).
+exclude = ["third_party/WebMetal", "third_party/AirWgsl"]
 
 [workspace.package]
 version = "0.0.1"
@@ -81,3 +84,8 @@ debug = 1
 # host instead of reaching the guest as SIGSEGV / an access violation.
 [patch.crates-io]
 wasmtime = { path = "third_party/wasmtime-49.0.2" }
+
+# WebMetal's executor takes AirWgsl at a commit of its public repository;
+# the submodule is that commit.
+[patch."https://github.com/MovByte/AirWgsl"]
+airwgsl = { path = "third_party/AirWgsl" }

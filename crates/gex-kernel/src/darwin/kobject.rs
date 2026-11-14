@@ -299,18 +299,17 @@ impl Kernel {
     /// semaphores destroyed (`semaphore_destroy_all`), its threads' sends
     /// still waiting for room abandoned, its threads' and its own ports
     /// dead (`ipc_thread_terminate`, `ipc_task_terminate`), the send
-    /// rights it held (special, registered) released, and its space
-    /// ended (`ipc_space_terminate`), every right in it with the
-    /// notifications that owes; then its space leaves the system's table.
+    /// rights it held (special, registered, a spawn's watch ports not yet
+    /// bound) released, and its space ended (`ipc_space_terminate`), every
+    /// right in it with the notifications that owes; then its space and
+    /// its link leave the system's table, and its pid no longer finds it.
+    /// Once for a task: a spawn's child that never ran is ended so too.
     pub fn darwin_task_terminate(&mut self) {
-        if !self.darwin {
+        if !self.darwin || self.dtask.ipc_raw.ended {
             return;
         }
         // coalitions_remove_task, launchd told of those it emptied.
         self.darwin_coalitions_task_end();
-        if self.dtask.ipc_raw.task == 0 {
-            return;
-        }
         // Its threads' vouchers, its importance (ipc_importance_disconnect_task)
         // and its bank context (task_bank_reset).
         self.darwin_threads_vouchers_release();
@@ -339,7 +338,8 @@ impl Kernel {
         let k = std::mem::take(&mut self.dtask.kports);
         let name = self.ipc().task_name_port_take();
         let task_ports: Vec<ObjId> = k.task.map(|(a, b)| vec![a, b]).unwrap_or_default().into_iter().chain(name).chain(k.resume).chain(flavored).collect();
-        let sends: Vec<ObjId> = k.special.values().copied().chain(k.registered.into_iter().flatten()).collect();
+        let watch = self.dtask.pending_watchports.take().map(|(w, _)| w).unwrap_or_default();
+        let sends: Vec<ObjId> = k.special.values().copied().chain(k.registered.into_iter().flatten()).chain(watch.into_iter().flatten()).collect();
         let ipc = self.ipc();
         for p in task_ports {
             ipc.port_mut(p).kobject = None;
@@ -392,8 +392,13 @@ impl Kernel {
         if let Some((target, op)) = reply.defer {
             match req.reply {
                 Some(Carried::Port(rport)) => {
+                    let blank = matches!(op, Deferred::IomfbSwapWait { .. });
                     let pending = PendingReply { id: req.id, rport, rtype: bits::local(req.bits), target, op };
                     self.dtask.pending_replies.push(pending);
+                    // A swap wait is answered at a vertical blank.
+                    if blank {
+                        self.darwin_iomfb_arm();
+                    }
                 }
                 Some(r) => self.ipc().object_destroy(r, bits::local(req.bits)),
                 None => {}
@@ -505,6 +510,14 @@ pub enum Deferred {
     /// (`held`: a stop hold was put on it for this.)
     GetState { flavor: i32, count: u32, held: bool },
     SetState { flavor: i32, state: Vec<u32>, held: bool },
+    /// IOMobileFramebuffer's blocking swap wait (selector 6): io_connect_method's
+    /// reply once the swap is where the wait's options ask, or the client
+    /// that waits is stopped (kIOReturnAborted).
+    IomfbSwapWait { client: u32, swap: u32, options: u32 },
+    /// A user client's method that answers later, by its token
+    /// ([`super::mig::later_reply`]); answered by
+    /// [`Kernel::darwin_answer_later`], not by a thread stopping.
+    Later(u64),
 }
 
 /// A request answered once a thread is off its CPU.
@@ -554,7 +567,9 @@ impl Kernel {
     /// every other thread.
     fn pending_is_ready(&self, p: &PendingReply) -> bool {
         match p.op {
+            Deferred::Later(_) => false,
             Deferred::TaskWait { .. } => self.thread_signals.tids_in_order().into_iter().filter(|&t| t != p.target).all(|t| self.darwin_offcpu(t)),
+            Deferred::IomfbSwapWait { client, swap, options } => super::iokit::iomfb_wait_outcome(client, swap, options).is_some(),
             _ => p.target == self.tid || !self.darwin_thread_alive(p.target) || self.darwin_offcpu(p.target),
         }
     }
@@ -575,6 +590,14 @@ impl Kernel {
                 Deferred::TaskWait { token: Some(port) } => Reply { ret: 0, defer: None, out: Vec::new(), ports: vec![PortOut::Right(Carried::Port(port), msgt::PORT_SEND_ONCE)], unimplemented: None },
                 Deferred::GetState { flavor, count, .. } => self.darwin_thread_state_now(m, tid, flavor, count, None),
                 Deferred::SetState { flavor, ref state, .. } => self.darwin_thread_state_now(m, tid, flavor, 0, Some(state.clone())),
+                // io_connect_method's reply with no output: the inband and
+                // scalar counts and the out-of-line size, all zero.
+                Deferred::IomfbSwapWait { client, swap, options } => match super::iokit::iomfb_wait_outcome(client, swap, options) {
+                    Some(0) => Reply::ok(vec![0; 16]),
+                    Some(r) => Reply::err(r),
+                    None => unreachable!("a swap wait answered before it is done"),
+                },
+                Deferred::Later(_) => unreachable!("a method's later reply is never ready by itself"),
             };
             if matches!(p.op, Deferred::GetState { held: true, .. } | Deferred::SetState { held: true, .. }) {
                 // thread_unstop, thread_release.
@@ -591,6 +614,17 @@ impl Kernel {
         }
         self.darwin_ipc_settle(m);
         true
+    }
+
+    /// Answer the routine whose method answers later with `token`: `reply`
+    /// sent to its reply port. Nothing when no routine waits for it (it
+    /// had no reply port).
+    pub(crate) fn darwin_answer_later(&mut self, m: &mut crate::GuestMem<'_>, token: u64, reply: Reply) {
+        let Some(i) = self.dtask.pending_replies.iter().position(|p| p.op == Deferred::Later(token)) else { return };
+        let p = self.dtask.pending_replies.remove(i);
+        let k = reply.message(p.id, p.rport, p.rtype);
+        self.darwin_kernel_send(Box::new(k));
+        self.darwin_ipc_settle(m);
     }
 
     /// The replies whose thread is off its CPU now, or is the caller: what

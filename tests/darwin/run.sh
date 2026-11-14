@@ -25,6 +25,17 @@ mkdir -p "$BOOT"
 # constraint category 5.
 progs=$(find -H "$HERE/bin" -maxdepth 1 -type f ! -name untrusted | sort)
 cats="--category 5:$HERE/bin/launchcon"
+# The web device's system volume carries WebMetal's bundle, which
+# Metal.framework loads for the accelerator's MetalPluginName from
+# /System/Library/Extensions; its code is the system's, in the static trust
+# cache with the rest of it, with the entry the device's trust cache gives
+# its own plugin bundles on the system volume (SHA-256, flags 0, launch
+# constraint category 2, as AppleUVDMLib.plugin's and IOUSBLib.bundle's).
+WEBMETAL=${GEX_DARWIN_ROOT:+$GEX_DARWIN_ROOT/System/Library/Extensions/WebMetal.bundle/WebMetal}
+if [ -n "$WEBMETAL" ] && [ -f "$WEBMETAL" ]; then
+    progs="$progs $WEBMETAL"
+    cats="$cats --category 2:$WEBMETAL"
+fi
 if [ -n "${GEX_DARWIN_BOOT:-}" ]; then
     # shellcheck disable=SC2086
     python3 -I "$ROOT/tools/darwin-trust-cache.py" -o "$BOOT/TrustCache" --bundle "$GEX_DARWIN_BOOT/TrustCache" $cats $progs || exit 1
@@ -81,6 +92,40 @@ check_root() {
     # shellcheck disable=SC2086
     out=$("$GEXC" run --sysroot "$GEX_DARWIN_ROOT" ${as:+--uid "$as"} "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$name" "$@" 2>/dev/null)
     report "$name" "$out" $? "$want_out" "$want_status"
+}
+
+# check_webmetal NAME WANT_OUT WANT_STATUS: a dynamic program that uses the
+# accelerator's GPU, which a gexc built without WebMetal's executor does
+# not have (`gexc webmetal-info` says so): skipped, or failed when it was
+# asked for by name.
+check_webmetal() {
+    if ! "$GEXC" webmetal-info >/dev/null 2>&1; then
+        if [ "$named" -gt 0 ]; then
+            echo "FAIL $1: this gexc has no WebMetal executor (build it with --features webmetal)"
+            fail=1
+        else
+            echo "SKIP $1 (gexc built without WebMetal's executor)"
+        fi
+        return
+    fi
+    check_root "$@"
+}
+
+# check_metal NAME WANT_OUT WANT_STATUS: a program that uses Metal through
+# the root's Metal.framework, which needs WebMetal's executor in gexc and
+# WebMetal's bundle in the root's system volume: skipped without them, or
+# failed when it was asked for by name.
+check_metal() {
+    if [ -n "${GEX_DARWIN_ROOT:-}" ] && [ ! -f "$WEBMETAL" ]; then
+        if [ "$named" -gt 0 ]; then
+            echo "FAIL $1: the root's system volume has no WebMetal.bundle in /System/Library/Extensions"
+            fail=1
+        else
+            echo "SKIP $1 (the root has no /System/Library/Extensions/WebMetal.bundle)"
+        fi
+        return
+    fi
+    check_webmetal "$@"
 }
 
 # check_root_as UID:GID NAME WANT_OUT WANT_STATUS [ARGS...]: check_root, the
@@ -149,6 +194,7 @@ hello from /var/tmp/gex-exec-fat with 1 argument" 0
     crosstask) check_root crosstask "crosstask ok" 0 ;;
     spawnports) check_root spawnports "spawnports ok" 0 ;;
     taskname) check_root taskname "taskname ok" 0 ;;
+    taskreg) check_root taskreg "taskreg ok" 0 ;;
     excports) check_root excports "excports ok" 0 ;;
     pages) check_root pages "pages ok" 0 ;;
     mmapflags) check_root mmapflags "mmapflags ok" 0 ;;
@@ -216,12 +262,32 @@ hello from /var/tmp/gex-exec-fat with 1 argument" 0
     ioreg) check_root ioreg "ioreg ok" 0 ;;
     accel) check_root accel "accel ok" 0 ;;
     accelr) check_root accelr "accel ok" 0 restricted ;;
+    metalwire) check_webmetal metalwire "metalwire ok" 0 ;;
+    # The digest WebMetal's macOS test shim prints for the same program
+    # (and the Mac's own Metal device: every output is exact).
+    metal) check_metal metal "metal WebMetalDevice 8dd26b24238872f1" 0 ;;
     iosurface) check_root iosurface "iosurface ok" 0 container ;;
     iosurfacex) check_root iosurfacex "iosurfacex ok" 0 container ;;
     # splashboardd and PreBoard run as mobile.
     iosurfacesplash) check_root_as 501:501 iosurfacesplash "iosurface ok" 0 ;;
     iosurfacexpreboard) check_root_as 501:501 iosurfacexpreboard "iosurfacex ok" 0 ;;
     iogpudev) check_root iogpudev "iogpudev ok" 0 ;;
+    iomfb)
+        # The test embedder's panel records the frames, beside the boot
+        # payload in bin; frame-check.py checks the one the program swapped.
+        # The program is signed as splashboardd, which runs as mobile.
+        frames=$HERE/bin/frames
+        rm -rf "$frames"
+        mkdir -p "$frames"
+        export GEX_DARWIN_FRAMES="$frames"
+        check_root_as 501:501 iomfb "iomfb ok" 0
+        unset GEX_DARWIN_FRAMES
+        if [ -n "${GEX_DARWIN_ROOT:-}" ] && ! python3 -I "$HERE/frame-check.py" "$frames"; then
+            echo "FAIL iomfb: the recorded frame"
+            fail=1
+        fi
+        rm -rf "$frames"
+        ;;
     xattr) check_root xattr "xattr ok" 0 ;;
     fileport) check_root fileport "fileport ok" 0 ;;
     guarded) check_root guarded "guarded ok" 0 ;;
@@ -314,7 +380,7 @@ if [ "$named" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl iokit ioreg accel accelr iosurface iosurfacex iosurfacesplash iosurfacexpreboard iogpudev xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit sbxinit sbxexec sbxkill hostspecial sbxmask sbxnet sbxiokit sbxpriv sbxfile sbxscrub cfrunloop xpc-anon layout stackfb launchcon shregion; do
+    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate tasksuspend portrefs crosstask spawnports taskname taskreg excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl iokit ioreg accel accelr metalwire metal iosurface iosurfacex iosurfacesplash iosurfacexpreboard iogpudev iomfb xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit sbxinit sbxexec sbxkill hostspecial sbxmask sbxnet sbxiokit sbxpriv sbxfile sbxscrub cfrunloop xpc-anon layout stackfb launchcon shregion; do
         run "$p"
     done
 fi

@@ -790,20 +790,51 @@ pub fn describe(id: u32) -> Option<executor::SurfaceDesc> {
             .iter()
             .map(|p| executor::PlaneDesc { offset: p.offset, width: p.width, height: p.height, bytes_per_row: p.bytes_per_row, bytes_per_element: u32::from(p.bytes_per_element), element_width: u32::from(p.element_width), element_height: u32::from(p.element_height), size: p.size })
             .collect();
-        Some(executor::SurfaceDesc { id, pixel_format: d.pixel_format, alloc_size: d.alloc_size, planes, seed: ro_u32(r, id, ro::SEED) })
+        Some(executor::SurfaceDesc {
+            id,
+            width: d.width,
+            height: d.height,
+            bytes_per_row: d.bytes_per_row,
+            bytes_per_element: u32::from(d.bytes_per_element),
+            element_width: u32::from(d.element_width),
+            element_height: u32::from(d.element_height),
+            offset: d.offset,
+            pixel_format: d.pixel_format,
+            alloc_size: d.alloc_size,
+            planes,
+            seed: ro_u32(r, id, ro::SEED),
+        })
     })
 }
 
 /// Surface `id` handed to the GPU (a GPU client's use of it: a texture or
-/// buffer over its bytes) through the executor's surface table; from then
-/// on its locks read the GPU's writes back and its unlocks hand over the
-/// CPU's. `Err` says what is missing: no such surface, or no executor.
-pub fn bind_gpu(id: u32) -> Result<(), String> {
-    let desc = describe(id).ok_or_else(|| format!("binding IOSurface {id:#x} to the GPU: no such surface"))?;
+/// buffer over its bytes) through the executor's surface table, with its
+/// bytes as every task has left them; from then on its locks read the
+/// GPU's writes back and the tasks' changes the kernel gathers are handed
+/// over. A surface the GPU has already is left as it is, and an id no
+/// surface has binds nothing (the executor finds no surface by it). `Err`
+/// says what is missing: no executor. A surface whose bytes do
+/// not start at its memory's first byte (`IOSurfaceOffset`) is refused:
+/// where its planes start relative to its base address, as the executor
+/// addresses them, is not checked against IOSurface.framework.
+pub fn bind_gpu(k: &mut Kernel, id: u32) -> Result<(), String> {
+    let Some(desc) = describe(id) else { return Ok(()) };
+    if root(|r| r.surfaces.get(&id).is_some_and(|s| s.gpu)) {
+        return Ok(());
+    }
+    if desc.offset != 0 {
+        return Err(format!("binding IOSurface {id:#x} to the GPU: its IOSurfaceOffset {:#x} (where its planes start relative to its base address is not checked against IOSurface.framework)", desc.offset));
+    }
     executor::bind(&desc)?;
+    let t = executor::table().expect("bound through the table");
     root(|r| {
-        if let Some(s) = r.surfaces.get_mut(&id) {
-            s.gpu = true;
+        let Some(s) = r.surfaces.get_mut(&id) else { return };
+        s.gpu = true;
+        if let Some(mem) = s.memory.as_mut() {
+            let _ = k.darwin_own_memory(|k, m| mem.gather(k, m));
+            mem.take_changed();
+            let len = mem.backing.len() as u64;
+            t.cpu_wrote(id, &mem.backing, &[(0, len)]);
         }
     });
     Ok(())
@@ -816,6 +847,85 @@ pub fn with_bytes<R>(k: &mut Kernel, id: u32, f: impl FnOnce(&mut [u8]) -> R) ->
         let mem = r.surfaces.get_mut(&id)?.memory.as_mut()?;
         k.darwin_own_memory(|k, m| mem.gather(k, m)).ok()?;
         Some(f(&mut mem.backing))
+    })
+}
+
+/// A surface's geometry as a kext reads it through IOSurface's accessors
+/// (0xfffffff005b9ebac and on): its flags (`+0x3b0`), pixel format
+/// (`+0x80`), width and height (`+0x58`, `+0x60`), and its planes, a
+/// surface with none being one plane of its own width, height, offset
+/// (`+0x78`), bytes per row (`+0x68`), size (`+0x90`) and bytes per element
+/// (`+0x70`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Geometry {
+    pub id: u32,
+    pub flags: u32,
+    pub pixel_format: u32,
+    pub width: u64,
+    pub height: u64,
+    pub alloc_size: u64,
+    pub planes: Vec<surface::Plane>,
+    pub plane_count: u32,
+}
+
+impl Geometry {
+    /// The plane accessors (0xfffffff005b9eeb8 and the others): plane `i`
+    /// of a planar surface, or the surface itself as plane 0 of one with
+    /// none; none past them.
+    pub fn plane(&self, i: u32) -> Option<surface::Plane> {
+        if self.plane_count == 0 {
+            return (i == 0).then(|| self.planes[0]);
+        }
+        self.planes.get(i as usize).copied()
+    }
+}
+
+/// `IOSurfaceRoot::lookupSurface(id, task)` as a kext calls it
+/// (0xfffffff005baa72c): the calling task's user client found
+/// (0xfffffff005baa7cc), then the surface in the root's table
+/// (0xfffffff005baa438) if the task created it, or that client holds it
+/// (0xfffffff005bb2220), or a global lookup is allowed for it (the debug
+/// flags; never for a private surface); and a reference taken unless its
+/// count is already zero (0xfffffff005b9c9a0). The kext lets the
+/// reference go with [`kernel_release`].
+pub fn kernel_lookup(k: &mut Kernel, id: u32) -> Option<u32> {
+    let pid = k.pid;
+    root(|r| {
+        if id == 0 || id >= r.table_size {
+            return None;
+        }
+        let client = r.clients.iter().find(|(_, c)| c.pid == pid && c.live).map(|(uc, _)| *uc);
+        let debug = r.params.debug;
+        let held = client.is_some_and(|uc| r.clients.get(&uc).and_then(|c| c.handles.get(id as usize)).is_some_and(|h| h.is_some()));
+        let s = r.surfaces.get_mut(&id)?;
+        if !s.installed {
+            return None;
+        }
+        let found = s.creator == Some(pid) || held || (s.desc.flags & flag::PRIVATE == 0 && ((debug & 4 != 0 && s.desc.flags & flag::GLOBAL != 0) || debug & 1 != 0));
+        if !found || s.refs == 0 {
+            return None;
+        }
+        s.refs += 1;
+        Some(id)
+    })
+}
+
+/// A reference [`kernel_lookup`] took let go.
+pub fn kernel_release(k: &mut Kernel, id: u32) {
+    root(|r| surface_release(k, r, id));
+}
+
+/// Surface `id`'s geometry; none for an id no surface has.
+pub fn geometry(id: u32) -> Option<Geometry> {
+    root(|r| {
+        let s = r.surfaces.get(&id)?;
+        let d = &s.desc;
+        let planes = if d.planes.is_empty() {
+            vec![surface::Plane { width: d.width, height: d.height, base: 0, offset: d.offset, bytes_per_row: d.bytes_per_row, size: d.alloc_size, bytes_per_element: d.bytes_per_element, element_width: d.element_width, element_height: d.element_height, address_format: 0 }]
+        } else {
+            d.planes.clone()
+        };
+        Some(Geometry { id, flags: d.flags, pixel_format: d.pixel_format, width: d.width, height: d.height, alloc_size: d.alloc_size, plane_count: d.planes.len() as u32, planes })
     })
 }
 
