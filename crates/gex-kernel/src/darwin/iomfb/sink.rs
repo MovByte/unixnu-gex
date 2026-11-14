@@ -10,6 +10,14 @@
 //!
 //! The embedder installs the sink ([`install`]); until one does, a swap
 //! that reaches the glass is reported.
+//!
+//! A layer's pixel format is one the pipe shows unscaled (its RGB formats:
+//! `BGRA`, `ARGB`, `RGBA`, `L565`, `w40a`, `w10p`, `w30r`, `l10r`, `w18p`,
+//! `b3a8` and `f3a8`), its bytes as the surface holds them. The browser's
+//! sink presents the 10-bit `b3a8` frames on an `rgba16float` canvas; the
+//! test sink records every frame as it is. A sink that converts a frame
+//! for its glass converts every value exactly (each 10-bit value to its
+//! half float), or says it cannot.
 
 use std::sync::OnceLock;
 
