@@ -1326,6 +1326,13 @@ impl Kernel {
         let cred = self.dtask.cred.clone();
         let node = self.darwin_vnode_node(&f.path, &f.md, None);
         self.darwin_authorize(&cred, &node, None, action)?;
+        // APFS takes the set-user-id and set-group-id bits off a file a
+        // user other than root writes to (measured on a Mac's APFS), which
+        // the writes here do not do.
+        if action & (kauth::WRITE_DATA | kauth::APPEND_DATA) != 0 && cred.uid != 0 && node.attrs.as_ref().is_ok_and(|o| o.mode & (super::vattr::S_ISUID | super::vattr::S_ISGID) != 0) {
+            self.darwin_unimplemented(format!("{} opened for writing by a user other than root: APFS clears a set-id file's set-id bits as it is written", f.path));
+            return Err(Errno::EIO);
+        }
         Ok(None)
     }
 }
