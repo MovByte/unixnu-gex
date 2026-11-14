@@ -131,7 +131,11 @@ subsystem, most naming in their header the XNU source they port:
 - **Terminals.** `struct tty`, its character lists and the termios line
   discipline (`tty.rs`, `clist.rs`); `/dev/ptmx` and its replicas, the BSD
   ptys and `/dev/tty` (`ptmx.rs`, `ttydev.rs`); sessions and controlling
-  terminals (`ctty.rs`).
+  terminals (`ctty.rs`); `/dev/console`, which goes to the terminal
+  `TIOCCONS` made the console's or to the kernel's console terminal `km`,
+  whose output is the console's (`km.rs`). The host's standard error shows
+  that output as the device's serial port carries it with the `serial`
+  boot-arg's output on; the device boots with no boot-args (`pe.rs`).
 - **Sockets.** Darwin's address structures, flags and option numbers
   (`sockaddr.rs`); socket-level options (`sockopt.rs`); the socket layer's
   refusals (`sockerr.rs`); Unix-domain stream sockets' sends and receives
@@ -522,7 +526,7 @@ dyld and libSystem from the device's shared cache.
 | memory | `layout`, `shregion`, `stackfb`, `mmapflags`, `madvise`, `msync`, `mlock`, `vmregion`, `vmcopy`, `vmwx`, `jit` |
 | files | `fsops`, `pathrules`, `pathconf`, `statino`, `statfsino`, `dirino`, `setattr`, `xattr`, `clone`, `renameswap`, `lockf`, `lastclose`, `guarded`, `fileport`, `filesec`, `openmode`, `vectored`, `aio`, `fixedcalls`, `ioctl`, `realdev` |
 | kqueue, poll and pipes | `kq-pipe`, `vnode`, `vnextend`, `select`, `poll`, `pipe`, `timeouts` |
-| terminals and `/dev` | `pty`, `ptyjob`, `ptyclose`, `bsdpty`, `ttyinfo`, `ttydead`, `ttydrain`, `fcntltty`, `revoke`, `devfs`, `devattr` |
+| terminals and `/dev` | `pty`, `ptyjob`, `ptyclose`, `bsdpty`, `ttyinfo`, `ttydead`, `ttydrain`, `fcntltty`, `revoke`, `devfs`, `devattr`, `console` |
 | sockets | `sockerr`, `sockevent`, `sockname`, `sockopts`, `halfclose`, `nosigpipe`, `dgrambuf`, `streambuf` |
 | code signing and IOKit | `codesig`, `amfi`, `launchcon`, `policy`, `iokit`, `ioreg`, `iosurface`, `iosurfacex`, `iogpudev`, `accel`, `accelr`, `iomfb` |
 | the GPU (WebMetal) | `metalwire`, `metal` |
@@ -663,7 +667,9 @@ is the reference (search `crates/gex-kernel/src/` for
   which pages are a task's, `phys_footprint` is.
 - **Terminals.** Terminal `ioctl`s not handled, an `fcntl` that would sleep
   in the driver, calls that would wait for a revoke to finish, and parts of
-  `revoke` itself.
+  `revoke` itself. The console's window size (`km`'s, from the boot video
+  console's size, which iBoot's boot arguments give), and a `TIOCCONS` that
+  reaches `km` (XNU locks its terminal twice and panics).
 - **Other.** `EVFILT_FS`, `NOTE_WL_SYNC_IPC` on a workloop, writes to the
   `sysctl` nodes that only have a fixed value here, the nodes this kernel
   has no value for, and some `proc_info` flavors and `iopolicysys` types.

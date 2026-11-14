@@ -12,7 +12,7 @@
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::tty::{self, cc, cmd, iflag, lflag, ts, Caller, Chan, Env, Io, IoctlState, ReadState, SleepReq, Tty, TtyCell, Uio, Woke, WriteState, FREAD, FWRITE, IO_NDELAY, TTYHOG, VDISABLE};
+use super::tty::{self, cc, cmd, iflag, lflag, ts, Caller, Oproc, Chan, Env, Io, IoctlState, ReadState, SleepReq, Tty, TtyCell, Uio, Woke, WriteState, FREAD, FWRITE, IO_NDELAY, TTYHOG, VDISABLE};
 use crate::errno::Errno;
 
 /// The majors `cdevsw_add(-15, ...)` gives `/dev/ptmx` and the replicas:
@@ -468,7 +468,7 @@ pub fn ptsopen(dev: u32, flag: i32, p: &Caller, env: &mut dyn Env, st: &mut PtsO
             drop(tp);
             return fail(Errno::EBUSY);
         }
-        if tp.oproc {
+        if tp.oproc != Oproc::None {
             // The primary is still there.
             tp.ttymodem(true, env);
         }
@@ -554,7 +554,7 @@ fn ptsd_revoke_knotes(tp: &mut Tty, env: &mut dyn Env) {
 #[allow(clippy::too_many_arguments)]
 pub fn ptsread(tp: &mut Tty, uio: &mut dyn Uio, flag: i32, p: &Caller, env: &mut dyn Env, st: &mut ReadState, resumed: Option<(SleepReq, Woke)>) -> Io<Result<(), Errno>> {
     let mut r = Ok(());
-    if tp.oproc || resumed.is_some() {
+    if tp.oproc != Oproc::None || resumed.is_some() {
         match tp.ttread(uio, flag, p, env, st, resumed) {
             Io::Sleep(s) => return Io::Sleep(s),
             Io::Done(e) => r = e,
@@ -567,7 +567,7 @@ pub fn ptsread(tp: &mut Tty, uio: &mut dyn Uio, flag: i32, p: &Caller, env: &mut
 /// `ptswrite`: the line discipline's write; EIO with no primary.
 #[allow(clippy::too_many_arguments)]
 pub fn ptswrite(tp: &mut Tty, uio: &mut dyn Uio, flag: i32, p: &Caller, env: &mut dyn Env, st: &mut WriteState, resumed: Option<(SleepReq, Woke)>) -> Io<Result<(), Errno>> {
-    if !tp.oproc && resumed.is_none() {
+    if tp.oproc == Oproc::None && resumed.is_none() {
         return Io::Done(Err(Errno::EIO));
     }
     tp.ttwrite(uio, flag, p, env, st, resumed)
@@ -584,15 +584,15 @@ pub fn ptcopen(dev: u32, env: &mut dyn Env) -> Result<Arc<TtyCell>, Errno> {
     };
     let mut tp = cell.lock();
     // A primary open, or a replica still draining: busy.
-    if tp.oproc || tp.state & ts::ISOPEN != 0 {
+    if tp.oproc != Oproc::None || tp.state & ts::ISOPEN != 0 {
         let oproc = tp.oproc;
         drop(tp);
-        if !oproc {
+        if oproc == Oproc::None {
             free_ioctl(dev, pf::OPEN_M);
         }
         return Err(Errno::EBUSY);
     }
-    tp.oproc = true;
+    tp.oproc = Oproc::Ptsstart;
     tp.state &= !ts::ZOMBIE;
     tp.state |= ts::IOCTL_NOT_OK;
     tp.ttymodem(true, env);
@@ -637,7 +637,7 @@ pub fn ptcclose(cell: &Arc<TtyCell>, dev: u32, env: &mut dyn Env) {
         tp.ttyflush(FREAD | FWRITE, env);
     }
     // No more starting the replica's output.
-    tp.oproc = false;
+    tp.oproc = Oproc::None;
     let p = pti(&mut tp);
     p.selr_revokes += 1;
     p.selr.notify();
@@ -801,7 +801,7 @@ pub fn ptcwrite(tp: &mut Tty, uio: &mut dyn Uio, flag: i32, env: &mut dyn Env, s
 /// driver's.
 #[derive(Clone, Debug, Default)]
 pub struct PtyIoctl {
-    tt: Option<IoctlState>,
+    pub tt: Option<IoctlState>,
 }
 
 /// `ptyioctl`: both sides' ioctls, of device `dev`.

@@ -253,7 +253,8 @@ fn devfs_vnode(pio: &PathIo<'_>, mnt: &Mount, path: &str, md: &Metadata, name: O
         acctime: t(st.atime, st.atime_ns),
         data_size: md.size,
         data_alloc: roundup(md.size, 512),
-        rdev: if is_chr { darwin_dev(st.rdev) } else { 0 },
+        // The node's device, makedev(0, 0) (the console's) included.
+        rdev: if is_chr { darwin_dev(md.rdev) } else { 0 },
         iosize: if is_chr { super::devfs::MAXPHYSIO as u32 } else { 512 },
         // `perms` as vnode_authorize grants them: the attribute call's.
         user_access: user_access(md.mode, md.file_type == FileType::Directory, pio.creds.uid() == 0, false),

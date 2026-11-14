@@ -4110,16 +4110,17 @@ impl PathIo<'_> {
     /// `fstat` said root, so only 32-bit programs (whose libc stats through
     /// `statx`) passed.
     fn stat_owned(&self, md: &crate::vfs::Metadata) -> Stat {
-        // A Darwin terminal node's owner is devfs's: its own.
+        // A Darwin terminal node's owner is devfs's: its own. Its device is
+        // the node's, makedev(0, 0) (the console's) included.
         if self.darwin {
             if let Some((uid, gid)) = crate::darwin::ttydev::node_owner(md) {
-                return Stat { uid, gid, ..Kernel::stat_from(md) };
+                return Stat { uid, gid, rdev: md.rdev, ..Kernel::stat_from(md) };
             }
             if let Some(n) = crate::darwin::devfs::node_of(md) {
                 if n.major.is_none() {
                     crate::darwin::note_unimplemented(format!("st_rdev of /dev/{}: its major is the one cdevsw_add(-1) gave it at the device's boot", n.name));
                 }
-                return Stat { uid: n.uid, gid: n.gid, ..Kernel::stat_from(md) };
+                return Stat { uid: n.uid, gid: n.gid, rdev: md.rdev, ..Kernel::stat_from(md) };
             }
         }
         Stat { uid: self.creds.uid(), gid: self.creds.gid(), ..Kernel::stat_from(md) }

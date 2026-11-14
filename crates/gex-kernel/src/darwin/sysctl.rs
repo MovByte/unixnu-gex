@@ -105,7 +105,7 @@ pub fn value(path: &str) -> Option<Value> {
         "kern.usrstack" => UserStack32,
         "kern.usrstack64" => UserStack64,
         "kern.osversion" => Str("21H461"),
-        "kern.bootargs" => Str(""),
+        "kern.bootargs" => Str(super::pe::BOOT_ARGS),
         "kern.osproductversion" => Str("17.7.11"),
         "kern.osvariant_status" => I64(0),
         "kern.secure_kernel" => I32(0),
