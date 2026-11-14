@@ -319,9 +319,8 @@ struct PowerCaller {
 /// keeps it off the surface (`+0x1899`), whether `IOMFBPreserveContents`
 /// keeps the glass when the last swap client goes (`+0x1897`), the layers
 /// whose surface it mapped for the console (`+0x1438 + 8 * n`), and the
-/// service's `SystemConsoleMode` once set. The setters of `+0x1897` to
-/// `+0x1899` are the framebuffer's setProperties, not modelled, so they
-/// stay as start leaves them (clear).
+/// service's `SystemConsoleMode` once set. `+0x1897` to `+0x1899` start
+/// clear; the framebuffer's setProperties sets them ([`set_console_keys`]).
 #[derive(Debug, Default)]
 struct Console {
     on: bool,
@@ -1831,6 +1830,8 @@ enum Gate {
     Completion,
     /// The last swap client's going (0xfffffff00678b544).
     LastClient,
+    /// `IOMFBSetConsoleMode` set (setProperties' gated 0xfffffff006789314).
+    SetProperties,
 }
 
 /// IOSurface's pixel formats the console takes (0xfffffff00678c44c), with
@@ -2081,6 +2082,34 @@ pub fn catch_up(k: &mut Kernel) {
     if let Some(what) = super::super::vconsole::due(now) {
         k.darwin_unimplemented(what);
     }
+}
+
+/// The family's setProperties keys for the console (0xfffffff006792404):
+/// `IOMFBPreserveContents` (`+0x1897`, the glass kept when the last swap
+/// client goes), `IOMFBSkipSpinner` (`+0x1899`), and `IOMFBSetConsoleMode`:
+/// off clears the hold (`+0x1898`) before the gated console mode change
+/// (0xfffffff00678c44c through 0xfffffff006789314), on sets it after.
+pub fn set_console_keys(k: &mut Kernel, preserve: Option<bool>, console: Option<bool>, skip_spinner: Option<bool>) {
+    let pid = k.pid;
+    with_display(k, |d| {
+        let now = super::super::mach::absolute_time();
+        if let Some(v) = preserve {
+            d.console.preserve = v;
+        }
+        if let Some(on) = console {
+            if !on {
+                d.console.forced = false;
+            }
+            d.console_mode(on, Gate::SetProperties, pid, now);
+            if on {
+                d.console.forced = true;
+            }
+        }
+        if let Some(v) = skip_spinner {
+            d.console.skip_spinner = v;
+        }
+    });
+    k.darwin_iomfb_arm();
 }
 
 /// `SystemConsoleMode` on the service, once the console mode was set

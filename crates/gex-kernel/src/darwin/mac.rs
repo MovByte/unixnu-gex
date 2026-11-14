@@ -56,6 +56,7 @@ pub mod op {
     pub const IOKIT_GET_PROPERTIES: usize = 60;
     pub const IOKIT_OPEN_USER_CLIENT: usize = 63;
     pub const IOKIT_OPEN_SERVICE: usize = 64;
+    pub const IOKIT_SET_PROPERTIES: usize = 65;
     pub const FILE_CLONE: usize = 12;
     pub const FILE_IOCTL: usize = 13;
     pub const FILE_LINK: usize = 15;
@@ -1053,6 +1054,24 @@ impl Kernel {
         }
         let a = SbArgs { kind: sandbox::kind::IOKIT, iokit: Some(sandbox::IoKitObject { property: Some(name.to_vec()), ..entry }), ..Default::default() };
         self.darwin_sb_evaluate(op::IOKIT_GET_PROPERTIES, &a)
+    }
+
+    /// `mac_iokit_check_set_properties` (slot 310, Sandbox's
+    /// 0xfffffff0069ff5cc) for an entry that is not the NVRAM one: when the
+    /// properties are a dictionary, iokit-set-properties of the entry and
+    /// each key in the dictionary's order (0xfffffff0069f272c's
+    /// `iterateObjects`), the first refusal ending it; anything else is not
+    /// looked at. The NVRAM entry's keys go to nvram-set instead
+    /// (0xfffffff006a00724), which the caller does not reach here.
+    pub(crate) fn darwin_mac_check_iokit_set_properties(&mut self, entry: sandbox::IoKitObject, keys: &[Vec<u8>]) -> u32 {
+        for key in keys {
+            let a = SbArgs { kind: sandbox::kind::IOKIT, iokit: Some(sandbox::IoKitObject { property: Some(key.clone()), ..entry.clone() }), ..Default::default() };
+            let r = self.darwin_sb_evaluate(op::IOKIT_SET_PROPERTIES, &a);
+            if r != 0 {
+                return r;
+            }
+        }
+        0
     }
 
     /// The socket of descriptor `fd`, as its operations' filters read it

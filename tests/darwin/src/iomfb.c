@@ -59,6 +59,10 @@
 //   one, interrupted by a signal, is kIOReturnAborted and clears the swaps.
 // - The last swap client's close waits for the kernel's swap that blanks
 //   the glass, a frame with no layers.
+// - Properties set on the service (io_registry_entry_set_properties, to
+//   AppleCLCD's setProperties): the console keys it takes as booleans;
+//   none of them, or a value that is no dictionary, is
+//   kIOReturnBadArgument.
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
@@ -243,6 +247,18 @@ int main(void) {
     if (kr != KERN_SUCCESS || fb == NULL) return bad("IOMobileFramebufferOpen", kr, 0);
     // No swap client yet: no console mode set.
     if (console_mode(clcd, -1)) return 1;
+    // setProperties: IOMFBSkipSpinner and IOMFBPreserveContents as they are
+    // (off), taken; an unknown key alone, or a number, refused.
+    // (The iOS SDK declares these unavailable; IOKit has them.)
+    kern_return_t (*set_prop)(io_registry_entry_t, CFStringRef, CFTypeRef) = dlsym(RTLD_DEFAULT, "IORegistryEntrySetCFProperty");
+    kern_return_t (*set_props)(io_registry_entry_t, CFTypeRef) = dlsym(RTLD_DEFAULT, "IORegistryEntrySetCFProperties");
+    if (!set_prop || !set_props) return bad("IORegistryEntrySetCFProperty", 0, 1);
+    if ((kr = set_prop(clcd, CFSTR("IOMFBSkipSpinner"), kCFBooleanFalse)) != KERN_SUCCESS) return bad("setting IOMFBSkipSpinner", kr, 0);
+    if ((kr = set_prop(clcd, CFSTR("IOMFBPreserveContents"), kCFBooleanFalse)) != KERN_SUCCESS) return bad("setting IOMFBPreserveContents", kr, 0);
+    if ((kr = set_prop(clcd, CFSTR("IOMFBNoSuchKey"), kCFBooleanTrue)) != kIOReturnBadArgument) return bad("setting an unknown key", kr, kIOReturnBadArgument);
+    CFNumberRef seven = num(7);
+    if ((kr = set_props(clcd, seven)) != kIOReturnBadArgument) return bad("setting a number", kr, kIOReturnBadArgument);
+    CFRelease(seven);
     FbSize size = {0, 0};
     kr = display_size(fb, &size);
     if (kr != KERN_SUCCESS || size.w != pw || size.h != ph) return bad("the display size", (long)size.w << 16 | (long)size.h, (long)pw << 16 | ph);

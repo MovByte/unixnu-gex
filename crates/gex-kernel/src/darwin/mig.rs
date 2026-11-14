@@ -344,6 +344,16 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             o.resize((o.len() + 3) & !3, 0);
             Reply::ok(o)
         }
+        // io_registry_entry_set_properties(entry, properties) -> result
+        // (is_io_registry_entry_set_properties): the properties, physically
+        // copied out of line, no larger than 1024 inband structures
+        // (kIOReturnMessageTooLarge, as the routine's own return);
+        // unserialized (OSUnserializeXML), none being kIOReturnBadArgument;
+        // the MAC check (kIOReturnNotPermitted); the entry's
+        // IORegistryEntryAllowableSetProperties, which no entry here has, nor
+        // IORegistryEntryDefaultLockingSetProperties; then its class's
+        // setProperties, as `result`.
+        (Kobject::IoEntry(i), 2828) => entry_set_properties(k, req, *i),
         // io_registry_entry_get_property_bin_buf(entry, plane, name, options,
         // buf, bufsize) -> properties, bufsize: the property serialized in
         // OSSerializeBinary, into `buf` when it fits, else out of line.
@@ -1958,6 +1968,47 @@ fn is_own_task(k: &mut Kernel, right: Option<Carried>) -> bool {
     let Some(Carried::Port(p)) = right else { return false };
     let (task, me) = (k.darwin_task_port(), k.darwin_task_self_port());
     p == task || p == me
+}
+
+/// [`Kobject::IoEntry`]'s io_registry_entry_set_properties: see the
+/// routine's arm. The result goes in the reply's `result`.
+fn entry_set_properties(k: &mut Kernel, req: &Kmsg, i: u32) -> Reply {
+    use super::iokit::ret;
+    const K_IO_RETURN_MESSAGE_TOO_LARGE: i32 = 0xe00002e1_u32 as i32;
+    const IO_STRUCT_INBAND_MAX: usize = 4096;
+    let Some(Desc::Ool { data, .. }) = req.descs.first() else { return Reply::err(MIG_BAD_ARGUMENTS) };
+    if data.len() > IO_STRUCT_INBAND_MAX * 1024 {
+        return Reply::err(K_IO_RETURN_MESSAGE_TOO_LARGE);
+    }
+    let result = |r: i32| Reply::ok(r.to_le_bytes().to_vec());
+    let (g, obj) = match super::osserialize::unserialize(data) {
+        super::osserialize::Parsed::Binary(Some(p)) => p,
+        super::osserialize::Parsed::Binary(None) | super::osserialize::Parsed::Invalid => return result(ret::BAD_ARGUMENT),
+        super::osserialize::Parsed::Xml => {
+            let mut r = result(ret::UNSUPPORTED);
+            r.unimplemented = Some(format!("io_registry_entry_set_properties on {}: OSUnserializeXML of XML text", super::iokit::name(super::iokit::tree(), i)));
+            return r;
+        }
+    };
+    if super::iokit::is_nvram(i) {
+        let mut r = result(ret::UNSUPPORTED);
+        r.unimplemented = Some("io_registry_entry_set_properties on the NVRAM entry (Sandbox's nvram-set of each key, and IODTNVRAM::setProperties)".to_string());
+        return r;
+    }
+    let keys: Vec<Vec<u8>> = match g.get(obj) {
+        super::osserialize::Obj::Dict(e) => e.iter().map(|(key, _)| key.clone()).collect(),
+        _ => Vec::new(),
+    };
+    if k.darwin_mac_check_iokit_set_properties(super::iokit::sb_entry(i), &keys) != 0 {
+        return result(ret::NOT_PERMITTED);
+    }
+    let class = super::iokit::tree().get(i as usize).map(|n| n.class).unwrap_or("");
+    if class == super::iomfb::CLASS {
+        return result(super::iomfb::set_properties(k, &g, obj));
+    }
+    let mut r = result(ret::UNSUPPORTED);
+    r.unimplemented = Some(format!("setProperties of {} (class {class:?})", super::iokit::name(super::iokit::tree(), i)));
+    r
 }
 
 /// `is_io_service_open_extended`: the caller's own task must own the

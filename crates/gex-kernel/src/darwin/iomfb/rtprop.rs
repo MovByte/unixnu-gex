@@ -450,6 +450,11 @@ const START: [(u8, u32); 38] = [
 /// published, and read are answered missing.
 const NOT_MADE: [u8; 4] = [0x2c, 0x2d, 0x2f, 0xac];
 
+/// The runtime properties' names in id order.
+pub fn names() -> impl Iterator<Item = &'static str> {
+    NAMES.iter().map(|&(_, n)| n)
+}
+
 /// The id of the runtime property `name`.
 pub fn id_of(name: &str) -> Option<u8> {
     NAMES.iter().find(|(_, n)| *n == name).map(|&(id, _)| id)
