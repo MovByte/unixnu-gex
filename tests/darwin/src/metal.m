@@ -9,6 +9,10 @@
 // device (phase 4 of the WebMetal plan) over the same WebGPU
 // implementation.
 //
+// In the guest the device's class must come from the plugin's executable,
+// AGXMetalA10.bundle/WebMetal, with the shared cache's AGXMetalA10, the A10X
+// driver at the bundle's driver path, not loaded.
+//
 // In the guest it runs as an app does, in the container profile's sandbox
 // (the platform profile admits a GPU user client to no unsandboxed program
 // but those it names by signing identifier).
@@ -19,7 +23,9 @@
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurfaceRef.h>
 #import <Metal/Metal.h>
+#include <objc/runtime.h>
 #include <dlfcn.h>
+#include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
 #include <mach-o/ldsyms.h>
 #include <stdio.h>
@@ -63,6 +69,29 @@ static id<MTLDevice> device_for(int argc, char **argv) {
 #endif
 }
 
+#if !TARGET_OS_OSX
+// The device's class is the plugin's, from the executable its bundle's
+// Info.plist names (WebMetal), and the A10X driver's own executable, which
+// the shared cache holds at the bundle's driver path, is not loaded.
+static int plugin_image(id<MTLDevice> device) {
+    static const char plugin[] = "/System/Library/Extensions/AGXMetalA10.bundle/WebMetal";
+    static const char driver[] = "/System/Library/Extensions/AGXMetalA10.bundle/AGXMetalA10";
+    const char *image = class_getImageName([(id)device class]);
+    if (!image || strcmp(image, plugin) != 0) {
+        printf("metal: the device's class is from %s, not %s\n", image ? image : "no image", plugin);
+        return 1;
+    }
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name && strcmp(name, driver) == 0) {
+            printf("metal: the shared cache's %s is loaded\n", driver);
+            return 1;
+        }
+    }
+    return 0;
+}
+#endif
+
 // A completed command buffer, or the reason it is not.
 static int run(id<MTLCommandBuffer> cb, const char *what) {
     [cb commit];
@@ -78,6 +107,9 @@ int main(int argc, char **argv) {
     @autoreleasepool {
         id<MTLDevice> device = device_for(argc, argv);
         if (!device) return bad("the system default device", 0, 1);
+#if !TARGET_OS_OSX
+        if (plugin_image(device)) return 1;
+#endif
         id<MTLCommandQueue> queue = [device newCommandQueue];
         if (!queue) return bad("a command queue", 0, 1);
 
