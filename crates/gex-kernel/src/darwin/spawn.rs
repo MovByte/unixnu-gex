@@ -624,6 +624,7 @@ impl Kernel {
         crate::procnote::post(self.pid, crate::procnote::note::FORK | pid as u32);
         child.pid = pid;
         child.tid = pid;
+        child.darwin_inherit_region(self.darwin_shared_region.as_ref());
         // Its thread is in its task's list before it first runs.
         child.thread_sig(pid);
         child.forget_own_pidfds();

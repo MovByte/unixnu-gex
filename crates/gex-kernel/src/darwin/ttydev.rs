@@ -1,7 +1,8 @@
 //! The terminal devices' vnodes and the calls on them: devfs's nodes for
 //! `/dev/ptmx`, `/dev/ttysNNN` and `/dev/tty` (`bsd/miscfs/devfs`),
 //! specfs's open and last close of a device (`spec_open`, `spec_close`),
-//! `/dev/tty`'s indirection to the session's terminal (`tty_tty.c`), and
+//! `/dev/tty`'s indirection to the session's terminal (`tty_tty.c`),
+//! `/dev/console`'s to the console's terminal ([`super::km`]), and
 //! `read`, `write`, `ioctl` on them (`sys_generic.c`, `vfs_vnops.c`), with
 //! the line discipline's sleeps as the thread's waits.
 
@@ -11,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::ctty::{self, Pgrp, Session, TtyVnode};
+use super::km::{self, CONSOLE_MAJOR};
 use super::ptmx::{self, makedev, PTC_MAJOR, PTMX_MAJOR, PTSD_MAJOR, PTS_MAJOR};
 use super::thread::Finish;
 use super::tty::{self, Caller, Env, FgInfo, Io, SleepReq, TtyCell, Uio, Woke};
@@ -45,6 +47,24 @@ pub enum Node {
     Ptyp(u32),
     /// `/dev/tty`.
     Ctty,
+    /// `/dev/console`.
+    Console,
+}
+
+/// The driver a call on a terminal's vnode reaches (its cdevsw entry's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Drv {
+    /// A pty's primary (`ptcopen` and the rest).
+    Ptc,
+    /// A pty's replica (`ptsopen` and the rest).
+    Pts,
+    /// The kernel's console terminal (`kmopen` and the rest).
+    Km,
+}
+
+/// devfs's `/dev/console` node ([`super::devfs`]'s, made in `devfs_init`).
+fn console_node() -> &'static super::devfs::Node {
+    super::devfs::lookup("console").expect("devfs_init's console node")
 }
 
 /// What devfs and specfs keep of a device: its vnodes' use count
@@ -67,6 +87,7 @@ fn made(dev: u32) -> (u64, super::devfs::DnTimes) {
     let name = match dev >> 24 {
         PTMX_MAJOR => Some("ptmx".to_string()),
         CTTY_MAJOR => Some("tty".to_string()),
+        CONSOLE_MAJOR => Some("console".to_string()),
         PTS_MAJOR => Some(bsd_name("tty", minor)),
         PTC_MAJOR => Some(bsd_name("pty", minor)),
         _ => None,
@@ -141,6 +162,10 @@ fn pts_node_made(minor: u32) {
 
 /// devfs's attributes of a terminal node (`devfs_getattr`).
 pub fn node_metadata(node: Node, dev: u32) -> Metadata {
+    if node == Node::Console {
+        // devfs keeps the console node's times with the boot's others.
+        return super::devfs::metadata(console_node());
+    }
     let mode = node_attrs(node).2;
     let ndev = match node {
         Node::Ptmx => node_dev(dev),
@@ -163,7 +188,7 @@ pub fn node_metadata(node: Node, dev: u32) -> Metadata {
 /// A terminal node's owner, group and mode: `ptmx` root's, group tty,
 /// 0666; `tty` root's, group wheel, 0666; a ptmx replica's and a BSD
 /// pty's `ttypN` as made and as a grant changed them; `ptypN` root's,
-/// group wheel, 0666.
+/// group wheel, 0666; `console` as `devfs_init` made it.
 pub fn node_attrs(node: Node) -> (u32, u32, u32) {
     match node {
         Node::Ptmx => (0, ptmx::GID_TTY, 0o666),
@@ -171,6 +196,10 @@ pub fn node_attrs(node: Node) -> (u32, u32, u32) {
         Node::Pts(m) => ptmx::pts_node(m).map_or((0, ptmx::GID_TTY, 0o620), |n| (n.uid, n.gid, n.mode)),
         Node::Ttyp(m) => ptmx::bsd_node(m).map_or((0, 0, 0o666), |n| (n.uid, n.gid, n.mode)),
         Node::Ptyp(_) => (0, 0, 0o666),
+        Node::Console => {
+            let n = console_node();
+            (n.uid, n.gid, n.mode)
+        }
     }
 }
 
@@ -202,24 +231,13 @@ fn dev_node(dev: u32) -> Option<Node> {
         PTS_MAJOR if minor < ptmx::NPTY => Node::Ttyp(minor),
         PTC_MAJOR if minor < ptmx::NPTY => Node::Ptyp(minor),
         CTTY_MAJOR if minor == 0 => Node::Ctty,
+        CONSOLE_MAJOR if minor == 0 => Node::Console,
         _ => return None,
     })
 }
 
 pub fn node_owner(md: &Metadata) -> Option<(u32, u32)> {
-    if md.file_type != FileType::CharDevice {
-        return None;
-    }
-    let major = (((md.rdev >> 8) & 0xfff) | ((md.rdev >> 32) & !0xfff)) as u32;
-    let minor = ((md.rdev & 0xff) | ((md.rdev >> 12) & !0xff)) as u32;
-    let node = match major {
-        PTMX_MAJOR => Node::Ptmx,
-        PTSD_MAJOR => Node::Pts(minor),
-        PTS_MAJOR if minor < ptmx::NPTY => Node::Ttyp(minor),
-        PTC_MAJOR if minor < ptmx::NPTY => Node::Ptyp(minor),
-        CTTY_MAJOR if minor == 0 => Node::Ctty,
-        _ => return None,
-    };
+    let node = dev_node(tty_dev_of(md)?)?;
     let (uid, gid, _) = node_attrs(node);
     Some((uid, gid))
 }
@@ -235,6 +253,7 @@ pub fn lookup(name: &str) -> Option<Node> {
     match name {
         "ptmx" => Some(Node::Ptmx),
         "tty" => Some(Node::Ctty),
+        "console" => Some(Node::Console),
         _ if name.len() == 5 && (name.starts_with("ttyp") || name.starts_with("ptyp")) => {
             let minor = u32::from_str_radix(&name[4..], 16).ok()?;
             if minor >= ptmx::NPTY || bsd_name(&name[..3], minor) != name {
@@ -266,6 +285,7 @@ pub fn lookup_dev(node: Node) -> u32 {
         Node::Ttyp(minor) => makedev(PTS_MAJOR, minor),
         Node::Ptyp(minor) => makedev(PTC_MAJOR, minor),
         Node::Ctty => makedev(CTTY_MAJOR, 0),
+        Node::Console => makedev(CONSOLE_MAJOR, 0),
     }
 }
 
@@ -375,7 +395,12 @@ impl TtyDev {
     /// modification, of the node.
     fn mark(&self, write: bool) {
         use super::devfs::{UPDATE_ACCESS, UPDATE_CHANGE, UPDATE_MOD};
-        with_dev(node_dev(self.dev()), |d| d.times.consider(if write { UPDATE_CHANGE | UPDATE_MOD } else { UPDATE_ACCESS }));
+        let flags = if write { UPDATE_CHANGE | UPDATE_MOD } else { UPDATE_ACCESS };
+        if self.node == Node::Console {
+            super::devfs::touch(console_node(), flags);
+            return;
+        }
+        with_dev(node_dev(self.dev()), |d| d.times.consider(flags));
     }
 
     /// What `select` sees of it (the device's `d_select`): readable,
@@ -401,6 +426,31 @@ impl TtyDev {
         };
         let procs = self.procs.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let mut env = KEnv::new(procs, super::pipe::caller());
+        if self.node == Node::Console {
+            // cnselect: the select of the device the console's calls go
+            // to now.
+            let r = match km::cn_dev() {
+                Ok((km::Cn::Km, _, cell)) => {
+                    let mut tp = cell.lock();
+                    // ttselect.
+                    let r = tp.ttyselect(tty::FREAD, &mut env) > 0;
+                    let w = tp.ttyselect(tty::FWRITE, &mut env) > 0;
+                    (r, w, tp.ttyselect(0, &mut env) > 0)
+                }
+                Ok((km::Cn::Pts, _, cell)) => {
+                    let mut tp = cell.lock();
+                    let r = ptmx::ptsselect(&mut tp, tty::FREAD, &mut env) > 0;
+                    let w = ptmx::ptsselect(&mut tp, tty::FWRITE, &mut env) > 0;
+                    (r, w, tp.state & tty::ts::ZOMBIE != 0)
+                }
+                Err(why) => {
+                    super::note_unimplemented(why);
+                    (true, true, true)
+                }
+            };
+            env.finish();
+            return r;
+        }
         let r = {
             let mut tp = o.cell.lock();
             if self.primary() {
@@ -436,6 +486,11 @@ impl TtyDev {
             };
         }
         let Some(o) = self.opened() else { return (true, 0, true, u64::MAX) };
+        if self.node == Node::Console {
+            // A console knote is filt_spec's, through cnselect.
+            let (r, w, eof) = self.ready();
+            return (if read { r } else { w }, 0, eof, 0);
+        }
         let procs = self.procs.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let mut env = KEnv::new(procs, super::pipe::caller());
         let r = {
@@ -505,20 +560,34 @@ impl TtyDev {
 /// timeout.
 fn d_close(cell: &Arc<TtyCell>, dev: u32, fflag: i32, revoke: bool, procs: Option<Arc<ProcTable>>, caller: i32) {
     let mut env = KEnv::new(procs, caller);
-    if ptmx::is_ptc(dev) {
+    let flag = if revoke { fflag | tty::FNONBLOCK } else { fflag };
+    if dev >> 24 == CONSOLE_MAJOR {
+        // cnclose: the close of the device the console's calls go to now.
+        match km::cn_dev() {
+            Ok((km::Cn::Km, _, k)) => {
+                let mut resumed = None;
+                while let Io::Sleep(req) = km::kmclose(&k, flag, &mut env, resumed.take()) {
+                    resumed = Some((req, sync_sleep(&k, &req)));
+                }
+            }
+            Ok((km::Cn::Pts, pdev, c)) => pts_close_now(&c, pdev, flag, revoke, &mut env),
+            Err(why) => super::note_unimplemented(why),
+        }
+    } else if ptmx::is_ptc(dev) {
         ptmx::ptcclose(cell, dev, &mut env);
     } else {
-        let flag = if revoke { fflag | tty::FNONBLOCK } else { fflag };
-        let mut st = ptmx::PtsClose::default();
-        let mut resumed = None;
-        loop {
-            match ptmx::ptsclose(cell, dev, flag, revoke, &mut env, &mut st, resumed.take()) {
-                Io::Done(_) => break,
-                Io::Sleep(req) => resumed = Some((req, sync_sleep(cell, &req))),
-            }
-        }
+        pts_close_now(cell, dev, flag, revoke, &mut env);
     }
     env.finish();
+}
+
+/// `ptsclose`, its drain's sleeps taken here and now.
+fn pts_close_now(cell: &Arc<TtyCell>, dev: u32, flag: i32, revoke: bool, env: &mut KEnv) {
+    let mut st = ptmx::PtsClose::default();
+    let mut resumed = None;
+    while let Io::Sleep(req) = ptmx::ptsclose(cell, dev, flag, revoke, env, &mut st, resumed.take()) {
+        resumed = Some((req, sync_sleep(cell, &req)));
+    }
 }
 
 /// A sleep on the terminal's channel taken here and now: woken, or out of
@@ -584,6 +653,9 @@ impl FileHandle for TtyDev {
             return self.ctty_target().map_or(0, |t| t.wait_queue());
         }
         let Some(o) = self.opened() else { return 0 };
+        if self.node == Node::Console {
+            return km::cn_dev().map_or(0, |(_, _, cell)| cell.lock().rsel.id());
+        }
         let tp = o.cell.lock();
         if self.primary() {
             tp.pti.as_ref().map_or(0, |p| p.selr.id())
@@ -597,6 +669,11 @@ impl FileHandle for TtyDev {
             return self.ctty_target().and_then(|t| t.wakes());
         }
         let o = self.opened()?;
+        if self.node == Node::Console {
+            let (_, _, cell) = km::cn_dev().ok()?;
+            let tp = cell.lock();
+            return Some(tp.rsel.wakes() + tp.wsel.wakes());
+        }
         let tp = o.cell.lock();
         if self.primary() {
             tp.pti.as_ref().map(|p| p.selr.wakes() + p.selw.wakes())
@@ -617,25 +694,27 @@ impl FileHandle for TtyDev {
 /// The vnode of the session terminal `v`, as `/dev/tty` reaches it: a new
 /// vnode of the device, opened as that one was.
 fn ttyvp_handle(v: &TtyVnode) -> Option<Arc<TtyDev>> {
-    let minor = v.dev & 0x00ff_ffff;
-    let node = match v.dev >> 24 {
-        PTSD_MAJOR => Node::Pts(minor),
-        PTMX_MAJOR => Node::Ptmx,
-        PTS_MAJOR => Node::Ttyp(minor),
-        PTC_MAJOR => Node::Ptyp(minor),
-        _ => return None,
-    };
+    let node = dev_node(v.dev).filter(|n| *n != Node::Ctty)?;
     if with_dev(v.dev, |d| d.vid) != v.vid {
         // Revoked: vnode_getwithvid fails.
         return None;
     }
-    let slot_tty = match ptmx::get_ioctl(v.dev, 0) {
-        ptmx::Got::Tty(t) => t,
-        _ => return None,
-    };
+    let slot_tty = dev_tty(v.dev)?;
     let h = Arc::new(TtyDev { node, dev: Mutex::new(v.dev), opened: Mutex::new(None), procs: Mutex::new(None), defer: Default::default(), deferred: Mutex::new(None) });
     *h.opened.lock().unwrap_or_else(|e| e.into_inner()) = Some(Opened { cell: slot_tty, vid: v.vid, fflag: tty::FREAD | tty::FWRITE });
     Some(h)
+}
+
+/// The terminal a call on device `dev`'s vnode reaches: its pty's, or for
+/// the console the one its calls go to now.
+fn dev_tty(dev: u32) -> Option<Arc<TtyCell>> {
+    if dev >> 24 == CONSOLE_MAJOR {
+        return km::cn_dev().ok().map(|(_, _, cell)| cell);
+    }
+    match ptmx::get_ioctl(dev, 0) {
+        ptmx::Got::Tty(t) => Some(t),
+        _ => None,
+    }
 }
 
 /// The line discipline's view of the kernel: the process table, the
@@ -1015,9 +1094,37 @@ impl Kernel {
                 let pdev = dev.dev();
                 return Some(self.darwin_pts_open(m, fd, dflags, dev, pdev, ptmx::PtsOpen::default(), None));
             }
+            Node::Console => match self.darwin_cn_dev() {
+                // cnopen: the d_open of the console's terminal, a pty
+                // replica's (which may wait for its carrier).
+                Ok((Drv::Pts, pdev, _)) => return Some(self.darwin_pts_open(m, fd, dflags, dev, pdev, ptmx::PtsOpen::default(), None)),
+                Ok((_, kdev, _)) => self.darwin_kmopen(&dev, kdev, ff),
+                Err(e) => Err(e),
+            },
             _ => self.darwin_tty_open_primary(&dev, ff),
         };
         Some(self.darwin_tty_open_end(m, fd, dflags, r))
+    }
+
+    /// The device `/dev/console`'s calls go to now (`cn_dev`), reported
+    /// when it is one the console cannot reach.
+    fn darwin_cn_dev(&mut self) -> Result<(Drv, u32, Arc<TtyCell>), Errno> {
+        match km::cn_dev() {
+            Ok((km::Cn::Km, d, c)) => Ok((Drv::Km, d, c)),
+            Ok((km::Cn::Pts, d, c)) => Ok((Drv::Pts, d, c)),
+            Err(why) => {
+                self.darwin_unimplemented(why);
+                Err(Errno::ENXIO)
+            }
+        }
+    }
+
+    /// cnopen's `kmopen` of km's device `kdev` for the console's vnode.
+    fn darwin_kmopen(&mut self, dev: &Arc<TtyDev>, kdev: u32, ff: i32) -> Result<(), Errno> {
+        let mut env = self.darwin_tty_env();
+        let r = km::kmopen(kdev, &mut env).map(|cell| dev.set_opened(cell, ff, Arc::clone(&self.procs)));
+        self.darwin_tty_env_done(env);
+        r
     }
 
     /// The open of a node that never sleeps in it: a primary (ptmx's, made
@@ -1042,7 +1149,7 @@ impl Kernel {
                 r
             }
             Node::Ctty => self.darwin_cttyopen(dev, ff),
-            Node::Pts(_) | Node::Ptyp(_) => unreachable!("a replica's open is ptsopen's"),
+            Node::Pts(_) | Node::Ptyp(_) | Node::Console => unreachable!("a replica's open is ptsopen's, the console's cnopen's"),
         }
     }
 
@@ -1056,9 +1163,16 @@ impl Kernel {
         }
         let ff = fflag(&file);
         self.darwin_node_access(node_attrs(dev.node), file.readable, file.writable)?;
-        match dev.node {
-            Node::Pts(_) | Node::Ptyp(_) => {
-                let pdev = dev.dev();
+        let pdev = match dev.node {
+            Node::Pts(_) | Node::Ptyp(_) => Some(dev.dev()),
+            Node::Console => match self.darwin_cn_dev()? {
+                (Drv::Pts, pdev, _) => Some(pdev),
+                (_, kdev, _) => return self.darwin_kmopen(&dev, kdev, ff),
+            },
+            _ => None,
+        };
+        match pdev {
+            Some(pdev) => {
                 let p = self.darwin_tty_caller();
                 let mut env = self.darwin_tty_env();
                 let mut st = ptmx::PtsOpen::default();
@@ -1077,7 +1191,7 @@ impl Kernel {
                     }
                 }
             }
-            _ => self.darwin_tty_open_primary(&dev, ff),
+            None => self.darwin_tty_open_primary(&dev, ff),
         }
     }
 
@@ -1191,18 +1305,33 @@ impl Kernel {
             // VNOP_OPEN of the terminal's vnode, and the vnode_ref that
             // keeps it open until the session leader's exit revokes it.
             let o = tv.opened().ok_or(Errno::ENXIO)?;
+            let pdev = match tv.node {
+                // cnopen: kmopen, or the console's pty's ptsopen.
+                Node::Console => match self.darwin_cn_dev()? {
+                    (Drv::Pts, pdev, _) => Some(pdev),
+                    (_, kdev, _) => {
+                        let mut env = self.darwin_tty_env();
+                        let r = km::kmopen(kdev, &mut env);
+                        self.darwin_tty_env_done(env);
+                        r?;
+                        None
+                    }
+                },
+                _ if tv.primary() => None,
+                _ => Some(tv.dev()),
+            };
             if tv.primary() {
                 let tp = o.cell.lock();
-                if tp.oproc || tp.state & tty::ts::ISOPEN != 0 {
+                if tp.oproc != tty::Oproc::None || tp.state & tty::ts::ISOPEN != 0 {
                     // ptcopen of an open primary: EBUSY.
                     return Err(Errno::EBUSY);
                 }
                 drop(tp);
-            } else {
+            } else if let Some(pdev) = pdev {
                 let p = self.darwin_tty_caller();
                 let mut env = self.darwin_tty_env();
                 let mut st = ptmx::PtsOpen::default();
-                let r = ptmx::ptsopen(tv.dev(), ff | tty::FNONBLOCK, &p, &mut env, &mut st, None);
+                let r = ptmx::ptsopen(pdev, ff | tty::FNONBLOCK, &p, &mut env, &mut st, None);
                 self.darwin_tty_env_done(env);
                 match r {
                     Io::Done(Ok(_)) => {}
@@ -1254,18 +1383,18 @@ impl Kernel {
         };
         let resumed = Some((req, woke));
         Some(match op {
-            Op::Read { fd, iov, st } => self.darwin_tty_read_step(m, fd, dev, iov, st, resumed),
-            Op::Write { fd, iov, st, ptc } => self.darwin_tty_write_step(m, fd, dev, iov, st, ptc, resumed),
-            Op::Ioctl { fd, com, data, udata, st } => self.darwin_tty_ioctl_step(m, fd, dev, com, data, udata, st, resumed),
+            Op::Read { fd, iov, st } => self.darwin_tty_read_step(m, fd, dev, iov, st, resumed, Some(cell)),
+            Op::Write { fd, iov, st, ptc } => self.darwin_tty_write_step(m, fd, dev, iov, st, ptc, resumed, Some(cell)),
+            Op::Ioctl { fd, com, data, udata, st } => self.darwin_tty_ioctl_step(m, fd, dev, com, data, udata, st, resumed, Some(cell)),
             Op::Open { fd, dflags, pdev, st } => self.darwin_pts_open(m, fd, dflags, dev, pdev, st, resumed),
             Op::Close { pdev, fflag, st } => self.darwin_pts_close_step(m, dev, cell, pdev, fflag, st, resumed),
             Op::Revoke { r } => self.darwin_revoke_step(m, dev, cell, r),
         })
     }
 
-    /// `close` of a replica's descriptor: the descriptor goes, and if that
-    /// was the device's last open file, its `ptsclose` runs as this call,
-    /// draining the output as long as it may (`ttylclose`).
+    /// `close` of a replica's or the console's descriptor: the descriptor
+    /// goes, and if that was the device's last open file, its close runs
+    /// as this call, draining the output as long as it may (`ttylclose`).
     pub(crate) fn darwin_tty_close(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> SyscallOutcome {
         let Some((_, dev)) = self.darwin_tty_of(a[0]) else { return self.darwin_tty_result(m, Err(Errno::EBADF)) };
         if self.dtask.ladvlock {
@@ -1279,18 +1408,26 @@ impl Kernel {
             return self.darwin_tty_result(m, Err(e));
         }
         let job = dev.deferred.lock().unwrap_or_else(|e| e.into_inner()).take();
-        match job {
-            Some(j) => self.darwin_pts_close_step(m, dev, j.cell, j.dev, j.fflag, ptmx::PtsClose::default(), None),
-            None => self.darwin_tty_result(m, Ok(0)),
-        }
+        let Some(j) = job else { return self.darwin_tty_result(m, Ok(0)) };
+        // cnclose: the close of the device the console's calls go to now.
+        let (cell, pdev) = if j.dev >> 24 == CONSOLE_MAJOR {
+            match self.darwin_cn_dev() {
+                Ok((_, pdev, cell)) => (cell, pdev),
+                Err(_) => return self.darwin_tty_result(m, Ok(0)),
+            }
+        } else {
+            (j.cell, j.dev)
+        };
+        self.darwin_pts_close_step(m, dev, cell, pdev, j.fflag, ptmx::PtsClose::default(), None)
     }
 
-    /// `ptsclose` as a close(2), until it ends or sleeps; the call's
-    /// result is 0 (`ttylclose`'s).
+    /// A device's last close as a close(2) (`ptsclose`, or the console's
+    /// `kmclose`), until it ends or sleeps; the call's result is 0
+    /// (`ttylclose`'s).
     #[allow(clippy::too_many_arguments)]
     fn darwin_pts_close_step(&mut self, m: &mut GuestMem<'_>, dev: Arc<TtyDev>, cell: Arc<TtyCell>, pdev: u32, fflag: i32, mut st: ptmx::PtsClose, resumed: Option<(SleepReq, Woke)>) -> SyscallOutcome {
         let mut env = self.darwin_tty_env();
-        let r = ptmx::ptsclose(&cell, pdev, fflag, false, &mut env, &mut st, resumed);
+        let r = if km::is_km(&cell) { km::kmclose(&cell, fflag, &mut env, resumed) } else { ptmx::ptsclose(&cell, pdev, fflag, false, &mut env, &mut st, resumed) };
         self.darwin_tty_env_done(env);
         match r {
             Io::Done(_) => self.darwin_tty_result(m, Ok(0)),
@@ -1353,9 +1490,9 @@ impl Kernel {
             Err(e) => self.darwin_tty_result(m, Err(e)),
             Ok((fd, dev, iov)) => {
                 if write {
-                    self.darwin_tty_write_step(m, fd, dev, iov, tty::WriteState::default(), ptmx::PtcWrite::default(), None)
+                    self.darwin_tty_write_step(m, fd, dev, iov, tty::WriteState::default(), ptmx::PtcWrite::default(), None, None)
                 } else {
-                    self.darwin_tty_read_step(m, fd, dev, iov, tty::ReadState::default(), None)
+                    self.darwin_tty_read_step(m, fd, dev, iov, tty::ReadState::default(), None, None)
                 }
             }
         }
@@ -1370,9 +1507,31 @@ impl Kernel {
         Ok(Arc::clone(dev))
     }
 
+    /// The driver a call on vnode `target` reaches, the device it is
+    /// called with, and its terminal: the pty's own; for the console, the
+    /// device its calls go to now, or for a call back from a sleep, the
+    /// terminal it slept in (`slept_in`).
+    fn darwin_tty_driver(&mut self, target: &TtyDev, o: &Opened, slept_in: Option<&Arc<TtyCell>>) -> Result<(Drv, u32, Arc<TtyCell>), Errno> {
+        if target.node != Node::Console {
+            let drv = if target.primary() { Drv::Ptc } else { Drv::Pts };
+            return Ok((drv, target.dev(), Arc::clone(&o.cell)));
+        }
+        let Some(cell) = slept_in else { return self.darwin_cn_dev() };
+        let dev = cell.lock().dev;
+        match km::cn_of(cell, dev) {
+            Ok(km::Cn::Km) => Ok((Drv::Km, dev, Arc::clone(cell))),
+            Ok(km::Cn::Pts) => Ok((Drv::Pts, dev, Arc::clone(cell))),
+            Err(why) => {
+                self.darwin_unimplemented(why);
+                Err(Errno::ENXIO)
+            }
+        }
+    }
+
     /// `fo_read` of a terminal (`vn_read`, `spec_read`, then the driver's
     /// `d_read`), until it ends or sleeps.
-    fn darwin_tty_read_step(&mut self, m: &mut GuestMem<'_>, fd: i32, dev: Arc<TtyDev>, mut iov: Iov, mut st: tty::ReadState, resumed: Option<(SleepReq, Woke)>) -> SyscallOutcome {
+    #[allow(clippy::too_many_arguments)]
+    fn darwin_tty_read_step(&mut self, m: &mut GuestMem<'_>, fd: i32, dev: Arc<TtyDev>, mut iov: Iov, mut st: tty::ReadState, resumed: Option<(SleepReq, Woke)>, slept_in: Option<Arc<TtyCell>>) -> SyscallOutcome {
         let file = match self.fds.get(fd) {
             Ok(f) => f,
             Err(e) => return self.darwin_tty_result(m, Err(e)),
@@ -1385,15 +1544,19 @@ impl Kernel {
         let Some(o) = target.opened() else { return self.darwin_tty_result(m, Ok(0)) };
         // A call that comes to a vnode being revoked waits for its reclaim
         // (vnode_getiocount), then finds it dead.
-        let resumed = match resumed {
-            Some((r, _)) if r.chan == tty::Chan::Reclaim => None,
-            r => r,
+        let (resumed, slept_in) = match resumed {
+            Some((r, _)) if r.chan == tty::Chan::Reclaim => (None, None),
+            r => (r, slept_in),
+        };
+        let (drv, _, cell) = match self.darwin_tty_driver(&target, &o, slept_in.as_ref()) {
+            Ok(d) => d,
+            Err(e) => return self.darwin_tty_result(m, Err(e)),
         };
         if resumed.is_none() && target.terminating() {
-            let req = reclaim_wait(&o.cell);
-            return self.darwin_tty_sleep(m, Op::Read { fd, iov, st }, dev, o.cell, req);
+            let req = reclaim_wait(&cell);
+            return self.darwin_tty_sleep(m, Op::Read { fd, iov, st }, dev, cell, req);
         }
-        let _io = IoRef::enter(&o.cell, (target.dev(), o.vid));
+        let _io = IoRef::enter(&cell, (target.dev(), o.vid));
         let count = iov.total;
         if count == 0 {
             // spec_read: nothing asked, nothing done.
@@ -1403,13 +1566,18 @@ impl Kernel {
         let p = self.darwin_tty_caller();
         let mut env = self.darwin_tty_env();
         let r = {
-            let mut tp = o.cell.lock();
+            let mut tp = cell.lock();
             let mut u = GuestUio { m: &mut *m, c: &mut iov };
-            let r = if target.primary() { ptmx::ptcread(&mut tp, &mut u, flag, resumed) } else { ptmx::ptsread(&mut tp, &mut u, flag, &p, &mut env, &mut st, resumed) };
+            let r = match drv {
+                Drv::Ptc => ptmx::ptcread(&mut tp, &mut u, flag, resumed),
+                Drv::Pts => ptmx::ptsread(&mut tp, &mut u, flag, &p, &mut env, &mut st, resumed),
+                // kmread: l_read.
+                Drv::Km => tp.ttread(&mut u, flag, &p, &mut env, &mut st, resumed),
+            };
             if let Io::Sleep(req) = r {
                 drop(tp);
                 self.darwin_tty_env_done(env);
-                return self.darwin_tty_sleep(m, Op::Read { fd, iov, st }, dev, o.cell, req);
+                return self.darwin_tty_sleep(m, Op::Read { fd, iov, st }, dev, cell, req);
             }
             r
         };
@@ -1421,7 +1589,7 @@ impl Kernel {
 
     /// `fo_write` of a terminal, until it ends or sleeps.
     #[allow(clippy::too_many_arguments)]
-    fn darwin_tty_write_step(&mut self, m: &mut GuestMem<'_>, fd: i32, dev: Arc<TtyDev>, mut iov: Iov, mut st: tty::WriteState, mut ptc: ptmx::PtcWrite, resumed: Option<(SleepReq, Woke)>) -> SyscallOutcome {
+    fn darwin_tty_write_step(&mut self, m: &mut GuestMem<'_>, fd: i32, dev: Arc<TtyDev>, mut iov: Iov, mut st: tty::WriteState, mut ptc: ptmx::PtcWrite, resumed: Option<(SleepReq, Woke)>, slept_in: Option<Arc<TtyCell>>) -> SyscallOutcome {
         let file = match self.fds.get(fd) {
             Ok(f) => f,
             Err(e) => return self.darwin_tty_result(m, Err(e)),
@@ -1432,27 +1600,36 @@ impl Kernel {
         };
         // deadfs: EIO.
         let Some(o) = target.opened() else { return self.darwin_tty_result(m, Err(Errno::EIO)) };
-        let resumed = match resumed {
-            Some((r, _)) if r.chan == tty::Chan::Reclaim => None,
-            r => r,
+        let (resumed, slept_in) = match resumed {
+            Some((r, _)) if r.chan == tty::Chan::Reclaim => (None, None),
+            r => (r, slept_in),
+        };
+        let (drv, _, cell) = match self.darwin_tty_driver(&target, &o, slept_in.as_ref()) {
+            Ok(d) => d,
+            Err(e) => return self.darwin_tty_result(m, Err(e)),
         };
         if resumed.is_none() && target.terminating() {
-            let req = reclaim_wait(&o.cell);
-            return self.darwin_tty_sleep(m, Op::Write { fd, iov, st, ptc }, dev, o.cell, req);
+            let req = reclaim_wait(&cell);
+            return self.darwin_tty_sleep(m, Op::Write { fd, iov, st, ptc }, dev, cell, req);
         }
-        let _io = IoRef::enter(&o.cell, (target.dev(), o.vid));
+        let _io = IoRef::enter(&cell, (target.dev(), o.vid));
         let count = iov.total;
         let flag = if file.flags() & crate::fs::oflags::O_NONBLOCK != 0 { tty::IO_NDELAY } else { 0 };
         let p = self.darwin_tty_caller();
         let mut env = self.darwin_tty_env();
         let r = {
-            let mut tp = o.cell.lock();
+            let mut tp = cell.lock();
             let mut u = GuestUio { m: &mut *m, c: &mut iov };
-            let r = if target.primary() { ptmx::ptcwrite(&mut tp, &mut u, flag, &mut env, &mut ptc, resumed) } else { ptmx::ptswrite(&mut tp, &mut u, flag, &p, &mut env, &mut st, resumed) };
+            let r = match drv {
+                Drv::Ptc => ptmx::ptcwrite(&mut tp, &mut u, flag, &mut env, &mut ptc, resumed),
+                Drv::Pts => ptmx::ptswrite(&mut tp, &mut u, flag, &p, &mut env, &mut st, resumed),
+                // kmwrite: l_write.
+                Drv::Km => tp.ttwrite(&mut u, flag, &p, &mut env, &mut st, resumed),
+            };
             if let Io::Sleep(req) = r {
                 drop(tp);
                 self.darwin_tty_env_done(env);
-                return self.darwin_tty_sleep(m, Op::Write { fd, iov, st, ptc }, dev, o.cell, req);
+                return self.darwin_tty_sleep(m, Op::Write { fd, iov, st, ptc }, dev, cell, req);
             }
             r
         };
@@ -1491,7 +1668,7 @@ impl Kernel {
             data[..8].copy_from_slice(&udata.to_le_bytes());
         }
         let _ = IOC_OUT;
-        Some(self.darwin_tty_ioctl_step(m, a[0] as i32, dev, com, data, udata, ptmx::PtyIoctl::default(), None))
+        Some(self.darwin_tty_ioctl_step(m, a[0] as i32, dev, com, data, udata, ptmx::PtyIoctl::default(), None, None))
     }
 
     /// `VNOP_IOCTL` of a terminal's vnode with command `com`, which has no
@@ -1514,13 +1691,17 @@ impl Kernel {
             return Some(Err(Errno::EINVAL));
         }
         let Some(o) = target.opened() else { return Some(Err(Errno::ENOTTY)) };
+        let (drv, ddev, cell) = match self.darwin_tty_driver(&target, &o, None) {
+            Ok(d) => d,
+            Err(e) => return Some(Err(e)),
+        };
         let p = self.darwin_tty_caller();
         let mut env = self.darwin_tty_env();
         let mut data = vec![0u8; 8];
         let mut st = ptmx::PtyIoctl::default();
         let r = {
-            let mut tp = o.cell.lock();
-            ptmx::ptyioctl(&o.cell, &mut tp, target.dev(), u64::from(com), &mut data, 0, &p, &mut env, &mut st, None)
+            let mut tp = cell.lock();
+            d_ioctl(drv, &cell, &mut tp, ddev, u64::from(com), &mut data, 0, &p, &mut env, &mut st, None)
         };
         self.darwin_tty_env_done(env);
         Some(match r {
@@ -1605,7 +1786,7 @@ impl Kernel {
 
     /// `vn_ioctl` and `ptyioctl` of a terminal, until they end or sleep.
     #[allow(clippy::too_many_arguments)]
-    fn darwin_tty_ioctl_step(&mut self, m: &mut GuestMem<'_>, fd: i32, dev: Arc<TtyDev>, com: u64, mut data: Vec<u8>, udata: u64, mut st: ptmx::PtyIoctl, resumed: Option<(SleepReq, Woke)>) -> SyscallOutcome {
+    fn darwin_tty_ioctl_step(&mut self, m: &mut GuestMem<'_>, fd: i32, dev: Arc<TtyDev>, com: u64, mut data: Vec<u8>, udata: u64, mut st: ptmx::PtyIoctl, resumed: Option<(SleepReq, Woke)>, slept_in: Option<Arc<TtyCell>>) -> SyscallOutcome {
         const IOCPARM_MASK: u64 = 0x1fff;
         const IOC_OUT: u64 = 0x4000_0000;
         const D_TTY: i32 = 3;
@@ -1618,15 +1799,19 @@ impl Kernel {
         if !file.readable && !file.writable {
             return self.darwin_tty_result(m, Err(Errno::EBADF));
         }
-        let resumed = match resumed {
-            Some((r, _)) if r.chan == tty::Chan::Reclaim => None,
-            r => r,
+        let (resumed, slept_in) = match resumed {
+            Some((r, _)) if r.chan == tty::Chan::Reclaim => (None, None),
+            r => (r, slept_in),
         };
         if resumed.is_none() {
             if let Some(t) = self.darwin_tty_target(&dev).ok().filter(|t| t.terminating()) {
                 if let Some(o) = t.opened() {
-                    let req = reclaim_wait(&o.cell);
-                    return self.darwin_tty_sleep(m, Op::Ioctl { fd, com, data, udata, st }, dev, o.cell, req);
+                    let cell = match self.darwin_tty_driver(&t, &o, None) {
+                        Ok((_, _, c)) => c,
+                        Err(e) => return self.darwin_tty_result(m, Err(e)),
+                    };
+                    let req = reclaim_wait(&cell);
+                    return self.darwin_tty_sleep(m, Op::Ioctl { fd, com, data, udata, st }, dev, cell, req);
                 }
             }
         }
@@ -1674,8 +1859,16 @@ impl Kernel {
             match target.opened() {
                 // Revoked since: VBAD's ENOTTY.
                 None => Err(Errno::ENOTTY),
+                // cnioctl: TIOCCONS while the console has a terminal of
+                // its own takes the console's output back, for the
+                // superuser.
+                Some(_) if resumed.is_none() && target.node == Node::Console && com == tty::cmd::TIOCCONS && tty::copy_constty().is_some() => self.darwin_suser().map(|()| tty::set_constty(None)),
                 Some(o) => {
-                    let _io = IoRef::enter(&o.cell, (target.dev(), o.vid));
+                    let (drv, ddev, cell) = match self.darwin_tty_driver(&target, &o, slept_in.as_ref()) {
+                        Ok(d) => d,
+                        Err(e) => return self.darwin_tty_result(m, Err(e)),
+                    };
+                    let _io = IoRef::enter(&cell, (target.dev(), o.vid));
                     let p = self.darwin_tty_caller();
                     let mut env = self.darwin_tty_env();
                     if com == tty::cmd::TIOCPTYGRANT {
@@ -1683,17 +1876,18 @@ impl Kernel {
                     }
                     let ff = fflag(&file);
                     let r = {
-                        let mut tp = o.cell.lock();
-                        let r = ptmx::ptyioctl(&o.cell, &mut tp, target.dev(), com, &mut data, ff, &p, &mut env, &mut st, resumed);
+                        let mut tp = cell.lock();
+                        let r = d_ioctl(drv, &cell, &mut tp, ddev, com, &mut data, ff, &p, &mut env, &mut st, resumed);
                         if let Io::Sleep(req) = r {
                             drop(tp);
                             self.darwin_tty_env_done(env);
-                            return self.darwin_tty_sleep(m, Op::Ioctl { fd, com, data, udata, st }, dev, o.cell, req);
+                            return self.darwin_tty_sleep(m, Op::Ioctl { fd, com, data, udata, st }, dev, cell, req);
                         }
                         r
                     };
                     self.darwin_tty_env_done(env);
                     let Io::Done(r) = r else { unreachable!("handled above") };
+                    self.darwin_constty_check(com, &r);
                     // vn_ioctl: a TIOCSCTTY's session has this vnode.
                     if r.is_ok() && com == tty::cmd::TIOCSCTTY {
                         let sid = self.procs.sid(self.pid, self.pid).unwrap_or(self.pid);
@@ -1714,6 +1908,19 @@ impl Kernel {
                 self.darwin_tty_result(m, Ok(0))
             }
             Err(e) => self.darwin_tty_result(m, Err(e)),
+        }
+    }
+
+    /// After a `TIOCCONS` made a terminal the console's: one whose `t_dev`
+    /// the console's calls cannot go to is reported now (on the device
+    /// the console's next call recurses).
+    fn darwin_constty_check(&mut self, com: u64, r: &Result<(), Errno>) {
+        use tty::cmd::{OTIOCCONS, TIOCCONS, TIOCSCONS};
+        if r.is_err() || !matches!(com, TIOCCONS | TIOCSCONS | OTIOCCONS) {
+            return;
+        }
+        if let Err(why) = km::cn_dev() {
+            self.darwin_unimplemented(why);
         }
     }
 
@@ -1740,12 +1947,13 @@ impl Kernel {
             return Err(Errno::EINVAL);
         }
         let o = target.opened().ok_or(Errno::ENOTTY)?;
+        let (drv, ddev, cell) = self.darwin_tty_driver(&target, &o, None)?;
         let p = self.darwin_tty_caller();
         let mut env = self.darwin_tty_env();
         let mut st = ptmx::PtyIoctl::default();
         let r = {
-            let mut tp = o.cell.lock();
-            ptmx::ptyioctl(&o.cell, &mut tp, target.dev(), com, data, fflag(file), &p, &mut env, &mut st, None)
+            let mut tp = cell.lock();
+            d_ioctl(drv, &cell, &mut tp, ddev, com, data, fflag(file), &p, &mut env, &mut st, None)
         };
         self.darwin_tty_env_done(env);
         let r = match r {
@@ -1811,6 +2019,38 @@ impl Kernel {
     }
 }
 
+/// A device's `d_ioctl` for a call on its vnode: `ptyioctl`, or
+/// `kmioctl`. What km meets that is not modelled is reported.
+#[allow(clippy::too_many_arguments)]
+fn d_ioctl(drv: Drv, cell: &Arc<TtyCell>, tp: &mut tty::Tty, dev: u32, com: u64, data: &mut [u8], flag: i32, p: &Caller, env: &mut KEnv, st: &mut ptmx::PtyIoctl, resumed: Option<(SleepReq, Woke)>) -> Io<Result<(), Errno>> {
+    if drv != Drv::Km {
+        return ptmx::ptyioctl(cell, tp, dev, com, data, flag, p, env, st, resumed);
+    }
+    if resumed.is_none() {
+        use tty::cmd::{OTIOCCONS, TIOCCONS, TIOCGWINSZ, TIOCSCONS};
+        let on = com != TIOCCONS || i32::from_le_bytes(data[..4].try_into().unwrap()) != 0;
+        if matches!(com, TIOCCONS | TIOCSCONS | OTIOCCONS) && !(on && !p.suser) {
+            // ttioctl sends KMIOCDISABLCONS to km (constty is none when
+            // a console ioctl reaches km), whose kmioctl takes the lock
+            // ttioctl holds: XNU panics (a mutex unexpectedly owned).
+            env.unimplemented.push("TIOCCONS on the console's own terminal (KMIOCDISABLCONS to km under km's lock: a kernel panic)".into());
+            return Io::Done(Err(Errno::ENXIO));
+        }
+        if matches!(com, km::KMIOCSIZE | TIOCGWINSZ) {
+            if let Some(why) = km::size_unknown() {
+                env.unimplemented.push(format!("the console's window size (kmopen's): {why}"));
+                return Io::Done(Err(Errno::ENXIO));
+            }
+        }
+    }
+    let mut tst = st.tt.take().unwrap_or_default();
+    let r = km::kmioctl(cell, tp, com, data, flag, p, env, &mut tst, resumed);
+    if let Io::Sleep(_) = r {
+        st.tt = Some(tst);
+    }
+    r
+}
+
 /// A revoke of a terminal device's vnode under way
 /// (`vnode_reclaim_internal` with REVOKEALL): the vnode, and whether
 /// TIOCREVOKE was sent to the terminal.
@@ -1829,12 +2069,9 @@ fn revoke_begin(dev: u32) -> Option<(Arc<TtyCell>, Revoking)> {
     if opens == 0 || terminating {
         return None;
     }
-    let cell = match ptmx::get_ioctl(dev, 0) {
-        ptmx::Got::Tty(t) => t,
-        _ => {
-            reclaim(dev, None);
-            return None;
-        }
+    let Some(cell) = dev_tty(dev) else {
+        reclaim(dev, None);
+        return None;
     };
     with_dev(dev, |d| d.terminating = true);
     let v = (dev, vid);

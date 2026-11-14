@@ -171,16 +171,6 @@ fn sb_lookup(dir: &Found, name: &str) -> SbVnode {
     v
 }
 
-/// Whether `path` is a file of the dyld shared cache the shared region
-/// maps (VSHARED_DYLD): the cache, or one of its subcaches.
-fn shared_cache_file(path: &str) -> bool {
-    match path.strip_prefix(super::CACHE_PATH) {
-        Some("") => true,
-        Some(rest) => rest.strip_prefix('.').is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit())),
-        None => false,
-    }
-}
-
 impl Kernel {
     fn darwin_sb_vnode_eval(&mut self, op: usize, v: SbVnode, quiet: bool) -> (u32, u32) {
         let sb = self.darwin_sandbox();
@@ -812,10 +802,10 @@ impl Kernel {
 
     /// `mpo_file_check_mmap` of a vnode with protection `prot`: an
     /// executable mapping is file-map-executable, but of a file of the dyld
-    /// shared cache (VSHARED_DYLD).
-    pub(crate) fn darwin_mac_check_file_mmap(&mut self, v: SbVnode, prot: u64) -> u32 {
+    /// shared cache, one the shared region has mapped (VSHARED_DYLD).
+    pub(crate) fn darwin_mac_check_file_mmap(&mut self, v: SbVnode, prot: u64, shared_dyld: bool) -> u32 {
         const PROT_EXEC: u64 = 4;
-        if prot & PROT_EXEC == 0 || shared_cache_file(&String::from_utf8_lossy(&v.path)) {
+        if prot & PROT_EXEC == 0 || shared_dyld {
             return 0;
         }
         self.darwin_sb_vnode_check(op::FILE_MAP_EXECUTABLE, v)
@@ -1147,7 +1137,8 @@ impl Kernel {
     pub(crate) fn darwin_sb_mmap(&mut self, file: &std::sync::Arc<crate::file::OpenFile>, prot: u64) -> Result<(), Errno> {
         let md = file.handle.metadata()?;
         let v = sb_vnode(&self.vfs.canonical(&file.path), &md);
-        refused(self.darwin_mac_check_file_mmap(v, prot))
+        let shared_dyld = self.darwin_vnode_of(file).is_some_and(super::shregion::shared_dyld);
+        refused(self.darwin_mac_check_file_mmap(v, prot, shared_dyld))
     }
 }
 

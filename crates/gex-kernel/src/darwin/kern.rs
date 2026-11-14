@@ -172,6 +172,15 @@ pub const MOUNTS: &[Mount] = &[
     Mount { on: "/System/Cryptexes/OS", from: "/dev/disk3s1", fsid: super::CACHE_FS_ID, flags: MNT_RDONLY | MNT_DONTBROWSE, fs: Fs::Apfs },
 ];
 
+/// The volume the preboot cryptexes are on: what `vnode_lookup` of
+/// `/private/preboot/Cryptexes` finds the mount of, for the shared region's
+/// check of where a cache is (devices without SIP). This root has the OS
+/// cryptex at `/System/Cryptexes/OS`, the mount above standing for the
+/// Preboot volume's graft of it, and no `/private/preboot/Cryptexes`.
+pub fn preboot_cryptex_volume() -> Option<&'static str> {
+    MOUNTS.iter().find(|m| m.on == "/System/Cryptexes/OS").map(|m| m.on)
+}
+
 /// A mount's `vfsstatfs` counts and type: `f_bsize`, `f_iosize`,
 /// `f_blocks`, `f_bfree`, `f_bavail`, `f_files`, `f_ffree`, its
 /// `vfs_typenum`, its name.
@@ -453,28 +462,8 @@ impl Kernel {
             }
         }
         Some(match raw {
-            // dyld asks where the shared cache is mapped; the kernel mapped
-            // it before the process started.
-            // DYLD_VM_END_MWL ends map_with_linking_np for the process; a
-            // null address takes the shared region out of the task.
-            sys::SHARED_REGION_CHECK_NP if a[0] == super::mwl::DYLD_VM_END_MWL => {
-                self.dtask.disallow_mwl = true;
-                0
-            }
-            // The task's region (none once removed: EINVAL); its first
-            // mapping, or ENOMEM while nothing has mapped it.
-            sys::SHARED_REGION_CHECK_NP => match self.darwin_region {
-                (0, _) => neg(Errno::EINVAL),
-                (start, size) if a[0] == 0 => {
-                    self.darwin_shared_region_remove(m, start, size);
-                    self.darwin_region = (0, 0);
-                    0
-                }
-                _ => match super::shregion::region().and_then(|r| r.start()) {
-                    Some(start) => res(m.write_u64(a[0], start).map(|_| 0)),
-                    None => neg(Errno::ENOMEM),
-                },
-            },
+            sys::SHARED_REGION_CHECK_NP => res(self.darwin_shared_region_check_np(m, a[0])),
+            sys::SHARED_REGION_MAP_AND_SLIDE_2_NP => res(self.darwin_shared_region_map_and_slide_2_np(m, a)),
             sys::MAP_WITH_LINKING_NP => res(self.darwin_map_with_linking(m, a)),
             sys::GETENTROPY => res(self.canonical(m, nr::GETRANDOM, [a[0], a[1], 0, 0, 0, 0]).map(|_| 0)),
             sys::FCNTL | sys::FCNTL_NOCANCEL => self.darwin_fcntl(m, a),
@@ -1144,8 +1133,8 @@ impl Kernel {
         let image = self.dtask.image_files.iter().find(|f| (f.0, f.1) == (fs, a[3])).map(|f| f.2.clone());
         let path = if a[3] == ROOT_OBJID {
             mnt.on.to_string()
-        } else if (fs, a[3]) == (super::CACHE_FS_ID, super::CACHE_OBJ_ID) && self.darwin_region.0 != 0 && super::shregion::region().is_some() {
-            super::CACHE_PATH.to_string()
+        } else if let Some(path) = super::shregion::file_path(fs as u32, a[3]) {
+            path
         } else if let Some(path) = image {
             path
         } else if let Some(path) = self.vfs.root_path_of_ino(a[3]).filter(|p| mount_of(p).fsid as u32 == fs as u32) {
@@ -1800,8 +1789,10 @@ impl Kernel {
                 };
                 m.write_u64(out, p).map_err(fault)
             }
-            // {cdhash, ..., result at 0x18}: in the static trust cache (1),
-            // in a loaded one (2); for an entitled caller.
+            // {cdhash, ..., result at 0x18} (0xfffffff005ab73a8): the
+            // result zeroed, then bit 0 if the static trust cache has the
+            // cdhash (query type 1) and bit 1 if a loaded one has it (type
+            // 2); for an entitled caller.
             amfi_call::CHECK_TRUST_CACHE => {
                 if !self.darwin_task_entitled("com.apple.private.amfi.can-check-trust-cache") {
                     return Err(13);
@@ -1809,7 +1800,8 @@ impl Kernel {
                 let mut q = [0u8; 0x20];
                 q.copy_from_slice(m.read(arg, 0x20).map_err(fault)?);
                 let cdhash: [u8; 20] = q[..20].try_into().unwrap();
-                let found = u64::from(super::trustcache::platform(&cdhash).is_some());
+                use super::trustcache::{query, Query};
+                let found = u64::from(query(Query::Static, &cdhash).is_some()) | u64::from(query(Query::Loadable, &cdhash).is_some()) << 1;
                 q[0x18..0x20].copy_from_slice(&found.to_le_bytes());
                 m.write(arg, &q).map_err(fault)
             }

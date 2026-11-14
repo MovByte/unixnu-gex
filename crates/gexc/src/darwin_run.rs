@@ -54,7 +54,9 @@ pub fn run(mut ra: RunArgs, bytes: &[u8]) -> Result<ExitCode> {
     argv.append(&mut ra.guest_args);
     ra.opts.args = argv;
     ra.opts.exe.get_or_insert(guest_path);
-    if ra.opts.env.is_empty() {
+    // launchd boots as the kernel's first process (load_init_program_at_path),
+    // whose environment is none (envp NULL); another program gets a shell's.
+    if ra.opts.env.is_empty() && ra.opts.exe.as_deref() != Some("/sbin/launchd") {
         ra.opts.env = vec!["PATH=/usr/bin:/bin".into(), "HOME=/var/mobile".into()];
     }
     ra.opts.darwin = true;

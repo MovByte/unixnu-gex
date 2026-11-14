@@ -56,6 +56,18 @@ pub mod category {
 /// not enabled it.
 pub const DEVELOPER_MODE: bool = false;
 
+// AMFI's `developer_mode_status` also needs Developer Mode latched
+// (0xfffffff007ae6204, which its boot sets as it logs "AMFI: finished"),
+// which is not modelled: Developer Mode on does not build until it is.
+const _: () = assert!(!DEVELOPER_MODE, "security.mac.amfi.developer_mode_status needs AMFI's latch of Developer Mode");
+
+/// `security.mac.amfi.developer_mode_status` (0xfffffff005aae7e8, which
+/// refuses a new value with EPERM): Developer Mode's state, and'ed with
+/// AMFI's latch of it.
+pub fn developer_mode_status() -> i32 {
+    i32::from(DEVELOPER_MODE)
+}
+
 /// What AMFI made of a signature: its flags (`csb_flags`), whether it is a
 /// platform binary, its validation category and its entitlements.
 #[derive(Clone, Debug, PartialEq, Eq)]

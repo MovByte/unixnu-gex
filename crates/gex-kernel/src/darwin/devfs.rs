@@ -30,6 +30,9 @@ pub enum Kind {
     Zero,
     /// `/dev/random` and `/dev/urandom`.
     Random,
+    /// A terminal, whose node the terminal layer opens
+    /// ([`super::ttydev`]).
+    Terminal,
     /// A driver whose device is not modelled: its open is reported.
     Unmodelled(&'static str),
 }
@@ -67,7 +70,7 @@ const fn node(name: &'static str, major: Option<u32>, minor: u32, uid: u32, gid:
 /// `devfs_init`'s (in `vfsinit`; `tty`, the second, is the terminal
 /// code's), then pf's (`pfinit`, in `dlil_init`).
 const EARLY: &[Node] = &[
-    node("console", Some(0), 0, ROOT, WHEEL, 0o622, Kind::Unmodelled("the console (cnopen, the console's terminal)")),
+    node("console", Some(0), 0, ROOT, WHEEL, 0o622, Kind::Terminal),
     node("null", Some(3), 2, ROOT, WHEEL, 0o666, Kind::Null),
     node("zero", Some(3), 3, ROOT, WHEEL, 0o666, Kind::Zero),
     node("klog", Some(6), 0, ROOT, WHEEL, 0o600, Kind::Unmodelled("the kernel message log (klog, logopen)")),

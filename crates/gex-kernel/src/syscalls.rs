@@ -741,9 +741,10 @@ pub struct Kernel {
     /// is in x16, and its errors come back with the carry flag set (see
     /// `crate::darwin`). Set at exec, inherited across fork.
     pub darwin: bool,
-    /// A Darwin process's shared region, `(start, size)`, which the host
-    /// mapped the shared cache into: `(0, 0)` when there is none.
-    pub darwin_region: (u64, u64),
+    /// A Darwin process's shared region (`task->shared_region`): its
+    /// environment's, entered at exec, or its parent's; none once dyld took
+    /// it out.
+    pub darwin_shared_region: Option<crate::darwin::shregion::RegionRef>,
     /// Where a Darwin process's dyld keeps its image list
     /// (`dyld_all_image_infos`), once it has said: 0 before.
     pub darwin_dyld_infos: u64,
@@ -4109,16 +4110,17 @@ impl PathIo<'_> {
     /// `fstat` said root, so only 32-bit programs (whose libc stats through
     /// `statx`) passed.
     fn stat_owned(&self, md: &crate::vfs::Metadata) -> Stat {
-        // A Darwin terminal node's owner is devfs's: its own.
+        // A Darwin terminal node's owner is devfs's: its own. Its device is
+        // the node's, makedev(0, 0) (the console's) included.
         if self.darwin {
             if let Some((uid, gid)) = crate::darwin::ttydev::node_owner(md) {
-                return Stat { uid, gid, ..Kernel::stat_from(md) };
+                return Stat { uid, gid, rdev: md.rdev, ..Kernel::stat_from(md) };
             }
             if let Some(n) = crate::darwin::devfs::node_of(md) {
                 if n.major.is_none() {
                     crate::darwin::note_unimplemented(format!("st_rdev of /dev/{}: its major is the one cdevsw_add(-1) gave it at the device's boot", n.name));
                 }
-                return Stat { uid: n.uid, gid: n.gid, ..Kernel::stat_from(md) };
+                return Stat { uid: n.uid, gid: n.gid, rdev: md.rdev, ..Kernel::stat_from(md) };
             }
         }
         Stat { uid: self.creds.uid(), gid: self.creds.gid(), ..Kernel::stat_from(md) }
@@ -10606,7 +10608,7 @@ impl Kernel {
             sig_tid: 0,
             compat: false,
             darwin: false,
-            darwin_region: (0, 0),
+            darwin_shared_region: None,
             darwin_dyld_infos: 0,
             darwin_dyld_infos_size: 0,
             darwin_dyld_final: false,
@@ -11102,7 +11104,9 @@ impl Kernel {
             sig_tid: 0,
             compat: self.compat,
             darwin: self.darwin,
-            darwin_region: self.darwin_region,
+            // The parent's region, once the child has its pid
+            // (`Kernel::darwin_inherit_region`).
+            darwin_shared_region: None,
             // task_create_internal: a fork's task has its parent's dyld
             // image info range (an exec's replaces it).
             darwin_dyld_infos: self.darwin_dyld_infos,

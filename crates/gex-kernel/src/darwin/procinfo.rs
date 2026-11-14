@@ -73,7 +73,8 @@ impl Public {
             threads: None,
             pcaction: Default::default(),
             persona: None,
-            csflags: Default::default(),
+            // bsd_init's kernproc_ro_data: CS_VALID.
+            csflags: Arc::new(std::sync::atomic::AtomicU32::new(super::amfi::cs::VALID)),
             codesign: None,
             p_name: Default::default(),
             live: Default::default(),
