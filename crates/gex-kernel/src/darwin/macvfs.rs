@@ -1087,9 +1087,10 @@ impl Kernel {
     /// A file about to take another name (a link, a rename): its attributes
     /// recorded on it where they are not yet, as what its old name gave it
     /// (the image's for a Data volume file of its own), for its new name
-    /// to keep.
+    /// to keep; none on a read-only volume.
     pub(crate) fn darwin_keep_attrs(&mut self, f: &Found) {
-        if super::kern::mount_of(&f.path).fs == super::kern::Fs::Devfs {
+        // (a read-only volume's file takes no other name: the call fails)
+        if super::kern::mount_of(&f.path).fs == super::kern::Fs::Devfs || super::vattr::device_mnt_flags(&f.path) & super::vauth::mnt::RDONLY != 0 {
             return;
         }
         if let Ok(None) = super::vattr::recorded(&self.vfs, &f.path, None) {
