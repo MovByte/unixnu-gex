@@ -44,6 +44,10 @@ pub struct Public {
     pub csflags: Arc<std::sync::atomic::AtomicU32>,
     /// The signature on its executable (`p_textvp`'s blob at `p_textoff`).
     pub codesign: Option<Arc<super::codesign::CodeSign>>,
+    /// `p_textoff`.
+    pub textoff: i64,
+    /// Its credential's Sandbox label.
+    pub sandbox: super::sandboxes::Label,
     /// `p_name`, all of it.
     pub p_name: super::reason::PName,
     /// Its signal dispositions, real timer and accounting flags.
@@ -73,11 +77,30 @@ impl Public {
             threads: None,
             pcaction: Default::default(),
             persona: None,
-            csflags: Default::default(),
+            // bsd_init's kernproc: CS_VALID.
+            csflags: Arc::new(super::amfi::cs::VALID.into()),
             codesign: None,
+            textoff: 0,
+            sandbox: Default::default(),
             p_name: Default::default(),
             live: Default::default(),
         }
+    }
+}
+
+/// `struct proc_ident` (`proc_ident(p)`): a process as found, by pid, unique
+/// id and identity version, for a later lookup that must find the same one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProcIdent {
+    pub pid: i32,
+    pub uniqueid: u64,
+    pub pidversion: i32,
+}
+
+impl Public {
+    /// `proc_ident(p)` of process `pid`, this record.
+    pub(crate) fn ident(&self, pid: i32) -> ProcIdent {
+        ProcIdent { pid, uniqueid: self.uniqueid, pidversion: self.pidversion }
     }
 }
 
@@ -293,6 +316,8 @@ impl Kernel {
             persona: self.dtask.persona.clone(),
             csflags: Arc::clone(&self.dtask.csflags),
             codesign: self.dtask.codesign.clone().map(Arc::new),
+            textoff: self.dtask.textoff,
+            sandbox: Arc::clone(&self.dtask.sandbox),
             p_name: self.dtask.p_name,
             live: Arc::clone(&self.dtask.live),
         }
@@ -307,13 +332,36 @@ impl Kernel {
     }
 
     /// Process `pid`'s record (this process's as it is now) and whether it
-    /// is a zombie; none for no Darwin process of that pid.
+    /// has exited (`proc_list_exited`: past `proc_prepareexit`, or a
+    /// zombie); none for no Darwin process of that pid, or one its fork or
+    /// spawn has not made yet.
     pub(crate) fn darwin_public(&self, pid: i32) -> Option<(Public, bool)> {
         if pid == self.pid {
             return Some((self.darwin_public_now(), false));
         }
-        let (r, zombie) = self.procs.darwin(pid)?;
-        r.downcast::<Public>().ok().map(|p| ((*p).clone(), zombie))
+        let (r, exited) = self.procs.darwin(pid)?;
+        r.downcast::<Public>().ok().map(|p| ((*p).clone(), exited))
+    }
+
+    /// `proc_find(pid)`: the process's record, unless it is being made
+    /// (`P_REF_NEW`) or has exited (`P_REF_DEAD`, a zombie) or is gone;
+    /// pid 0 is the kernel's own process, and the caller's own pid is its
+    /// record as it is now.
+    pub(crate) fn darwin_proc_find(&self, pid: i32) -> Option<Public> {
+        if pid == 0 {
+            return Some(Public::kernel());
+        }
+        match self.darwin_public(pid) {
+            Some((p, false)) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// `proc_find_ident`: [`Self::darwin_proc_find`] of the process
+    /// `ident` names, while it is still the one (its unique id and
+    /// identity version both match).
+    pub(crate) fn darwin_proc_find_ident(&self, ident: ProcIdent) -> Option<Public> {
+        self.darwin_proc_find(ident.pid).filter(|p| p.uniqueid == ident.uniqueid && p.pidversion == ident.pidversion)
     }
 
     /// `proc_info(callnum, pid, flavor, arg, buffer, buffersize)`.
@@ -756,18 +804,6 @@ impl Kernel {
         Ok(())
     }
 
-    /// The process `proc_find(pid)` finds: none for one that has exited
-    /// (`P_REF_DEAD`), and `kernproc` for 0.
-    fn darwin_proc_find(&self, pid: i32) -> Option<Public> {
-        if pid == 0 {
-            return Some(Public::kernel());
-        }
-        match self.darwin_public(pid) {
-            Some((p, false)) => Some(p),
-            _ => None,
-        }
-    }
-
     /// `proc_pidfdinfo(pid, flavor, fd, buffer, buffersize)`.
     fn darwin_proc_pidfdinfo(&mut self, m: &mut GuestMem<'_>, pid: i32, fl: u32, fd: i32, buf: u64, bufsize: u32) -> Result<u64, i32> {
         let (kind, size) = match fl {
@@ -1037,13 +1073,16 @@ impl Kernel {
         Ok(data)
     }
 
-    /// `p_stat` and `p_xstat`: SRUN, SSTOP for a stopped process, SZOMB.
-    pub(crate) fn darwin_pstat(&self, pid: i32, zombie: bool) -> (u32, u32) {
+    /// `p_stat` and `p_xstat`: SRUN, SSTOP for a stopped process, SZOMB
+    /// for one that has exited (`exited`, past `proc_prepareexit`) and
+    /// ended; one past `proc_prepareexit` that has not ended yet is SRUN
+    /// still, as `proc_exit` makes it SZOMB only at its end.
+    pub(crate) fn darwin_pstat(&self, pid: i32, exited: bool) -> (u32, u32) {
         const SRUN: u32 = 2;
         const SSTOP: u32 = 4;
         const SZOMB: u32 = 5;
-        if zombie {
-            return (SZOMB, self.procs.xstat(pid).unwrap_or(0));
+        if let Some(x) = exited.then(|| self.procs.xstat(pid)).flatten() {
+            return (SZOMB, x);
         }
         match self.procs.job(pid).map(|j| *j.lock().unwrap_or_else(|e| e.into_inner())) {
             Some(j) if j.stopped => (SSTOP, j.xstat),

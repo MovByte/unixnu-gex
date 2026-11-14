@@ -598,13 +598,17 @@ impl Kernel {
 
     /// `task_name_for_pid(target_tport, pid, t)` (vm_unix.c): a send right
     /// to process `pid`'s task name port, for a caller holding some task's
-    /// control port, when the process is live and is the caller, or the
-    /// caller is root, or both have the same uid (and real uid: a process
-    /// has one uid here), or the caller has the
+    /// control port, when `proc_find` finds the process (one being made,
+    /// one that has exited, a zombie are not) and it is the caller, or the
+    /// caller is root, or both have the same effective uid and the same
+    /// real uid, or the caller has the
     /// com.apple.system-task-ports.name.safe entitlement; else null and
-    /// KERN_FAILURE. A live process whose task's IPC is not active (an
-    /// exec's new task before its image is in, a task that has ended)
-    /// gives null and KERN_SUCCESS.
+    /// KERN_FAILURE. A found process has its task, and the policies are
+    /// asked about it (`mac_proc_check_get_task` of its `proc_ident`):
+    /// their refusal is null and KERN_FAILURE too. Its name port is null,
+    /// with KERN_SUCCESS, while its task's IPC is not active (a spawn's
+    /// child before its image is in, an exec's new task before its image
+    /// is in).
     fn task_name_for_pid(&mut self, m: &mut GuestMem<'_>, target: u32, pid: i32, at: u64) -> u64 {
         let ipc = self.ipc();
         // port_name_to_task: any task's control port.
@@ -618,21 +622,26 @@ impl Kernel {
             return kr::FAILURE;
         }
         let me = self.pid;
-        let uid = self.creds.uid();
-        let allowed = self.procs.live_nice(pid).is_some_and(|(tuid, _)| pid == me || uid == 0 || tuid == uid || self.darwin_task_entitled("com.apple.system-task-ports.name.safe"));
-        if !allowed {
+        let mine = (self.dtask.cred.uid, self.dtask.cred.ruid);
+        let found = self.darwin_proc_find(pid);
+        let allowed = found.as_ref().is_some_and(|p| pid == me || mine.0 == 0 || (p.cred.uid == mine.0 && p.cred.ruid == mine.1) || self.darwin_task_entitled("com.apple.system-task-ports.name.safe"));
+        let (true, Some(p)) = (allowed, found) else {
+            let _ = m.write_u32(at, 0);
+            return kr::FAILURE;
+        };
+        // proc_task: the found process's task; the policies' say on its
+        // name port.
+        if self.darwin_mac_check_get_task(p.ident(pid), super::amfi::flavor::NAME) != 0 {
             let _ = m.write_u32(at, 0);
             return kr::FAILURE;
         }
-        // proc_task: the process's task, if it has one here; the policies'
-        // say on its name port.
+        if pid == 0 {
+            self.darwin_unimplemented("task_name_for_pid of the kernel's process (kernel_task's name port)".into());
+            let _ = m.write_u32(at, 0);
+            return kr::FAILURE;
+        }
         let ipc = self.ipc();
         let task = if pid == me { Some(ipc.task) } else { ipc.task_of_pid(pid) };
-        if task.is_some() && self.darwin_mac_check_get_task(pid, super::amfi::flavor::NAME) != 0 {
-            let _ = m.write_u32(at, 0);
-            return kr::FAILURE;
-        }
-        let ipc = self.ipc();
         let port = task.and_then(|t| ipc.task_name_port(t));
         // convert_task_name_to_port (null for a task whose IPC is not
         // active), ipc_port_copyout_send.
@@ -685,23 +694,23 @@ impl Kernel {
     }
 
     /// `proc_is_third_party_debuggable_driver` (iOS): a driver task, not a
-    /// platform binary, entitled to DriverKit and allowed get-task.
+    /// platform binary, entitled to DriverKit and allowed get-task (of the
+    /// process `proc_find` finds by `pid`).
     pub(crate) fn darwin_third_party_debuggable_driver(&mut self, pid: i32) -> bool {
         let driver = self.procs.task_policy(pid).is_some_and(|c| c.lock().unwrap_or_else(|e| e.into_inner()).requested.apptype == super::taskpolicy::apptype::DRIVER);
-        let Some(link) = self.ipc().links.values().find(|l| l.pid == pid).cloned() else { return false };
-        let csflags = link.csflags.load(std::sync::atomic::Ordering::Acquire);
-        let sig = link.codesign.as_ref();
+        let Some(p) = self.darwin_proc_find(pid) else { return false };
+        let csflags = p.csflags.load(std::sync::atomic::Ordering::Acquire);
+        let sig = p.codesign.as_ref();
         driver && !sig.is_some_and(|c| c.platform_binary) && sig.is_some_and(|c| c.entitled("com.apple.developer.driverkit")) && csflags & super::amfi::cs::GET_TASK_ALLOW != 0
     }
 
     /// `task_for_pid(target_tport, pid, t)` (vm_unix.c): process `pid`'s
     /// task control port, for a caller holding some task's control port,
-    /// that passes the POSIX check, whose task's IPC is active (not an
-    /// exec's new task before its image is in, nor a task that has ended),
-    /// and that passes the policies' check (AMFI allows it only with
-    /// Developer Mode); the caller's own is its pinned self port, another's
-    /// is dead without Developer Mode (task_conversion_eval). The name, or
-    /// null, is copied out either way.
+    /// when `proc_find` finds the process, it passes the POSIX check, its
+    /// task's IPC is active (not a spawn's child or an exec's new task
+    /// before its image is in), and the policies allow it (AMFI allows
+    /// another's only with Developer Mode); the caller's own is its pinned
+    /// self port. The name, or null, is copied out either way.
     fn task_for_pid(&mut self, m: &mut GuestMem<'_>, target: u32, pid: i32, at: u64) -> u64 {
         let fail = |m: &mut GuestMem<'_>, r: u64| {
             let _ = m.write_u32(at, 0);
@@ -710,7 +719,8 @@ impl Kernel {
         if pid == 0 || !self.darwin_name_is_some_task(target) {
             return fail(m, kr::FAILURE);
         }
-        if self.procs.live_nice(pid).is_none() || !self.darwin_tfp_posix_check(pid) {
+        let Some(p) = self.darwin_proc_find(pid) else { return fail(m, kr::FAILURE) };
+        if !self.darwin_tfp_posix_check(pid) {
             return fail(m, kr::FAILURE);
         }
         // proc_task, and task_is_ipc_active: before the policies are asked.
@@ -718,17 +728,17 @@ impl Kernel {
         if !task.is_some_and(|t| self.ipc().task_ipc_active(t)) {
             return fail(m, kr::FAILURE);
         }
-        if self.darwin_mac_check_get_task(pid, super::amfi::flavor::CONTROL) != 0 {
+        if self.darwin_mac_check_get_task(p.ident(pid), super::amfi::flavor::CONTROL) != 0 {
             return fail(m, kr::FAILURE);
         }
+        // Another process's control port is reached only past AMFI's
+        // check, which allows it only with Developer Mode.
         let name = if pid == self.pid {
             let p = self.darwin_task_self_port();
             self.ipc().make_send(p);
             self.darwin_copyout_send(p)
-        } else if !super::amfi::DEVELOPER_MODE {
-            super::ipc::PORT_DEAD
         } else {
-            self.darwin_unimplemented("task_for_pid of another process (its task access port and control port)".into());
+            self.darwin_unimplemented("task_for_pid of another process under Developer Mode (its task access port's check and its control port)".into());
             return fail(m, kr::FAILURE);
         };
         let _ = m.write_u32(at, name);
@@ -749,11 +759,11 @@ impl Kernel {
             out(m, 0)?;
             return Err(Errno::EINVAL);
         }
-        if self.procs.live_nice(pid).is_none() {
+        let Some(p) = self.darwin_proc_find(pid) else {
             out(m, 0)?;
             return Err(Errno::ESRCH);
-        }
-        if !self.darwin_tfp_posix_check(pid) || self.darwin_mac_check_get_task(pid, f) != 0 {
+        };
+        if !self.darwin_tfp_posix_check(pid) || self.darwin_mac_check_get_task(p.ident(pid), f) != 0 {
             out(m, 0)?;
             return Err(Errno::EPERM);
         }
@@ -1547,20 +1557,25 @@ mod tests {
         k.dtask.said.iter().any(|s| s.contains(NO_PROFILE))
     }
 
-    /// A child's pid finds its task once its creation has enabled it, and
-    /// not before, while the process is being made (null, KERN_SUCCESS,
-    /// the policies not asked): its name port names it. Once its task has
-    /// ended the port names no task, and its pid gives null with
-    /// KERN_SUCCESS while the process is still live, then KERN_FAILURE for
-    /// its zombie, for its reaped pid, and for a pid that never was.
+    /// A child's pid finds nothing while fork1 is making it (`P_REF_NEW`:
+    /// null, KERN_FAILURE, the policies not asked); once it is made,
+    /// `proc_find` finds it and the policies are asked about its task
+    /// (here, with no Sandbox profile, they refuse). Its task's name port
+    /// is none until its creation enables it, then names it. Once its process is past `proc_prepareexit`
+    /// and its task has ended the port names no task, and its pid gives
+    /// null with KERN_FAILURE: as it ends, for its zombie, for its reaped
+    /// pid, and for a pid that never was.
     #[test]
     fn a_new_task_is_found_by_its_pid_once_enabled() {
         let (mut buf, mut k, me) = parent();
         let mut c = child(&k);
         let pid = c.pid;
-        assert_eq!(name_for_pid(&mut k, &mut buf, me, pid), (kr::SUCCESS, 0));
-        assert_eq!(task_of(&mut k, pid), None);
+        assert_eq!(name_for_pid(&mut k, &mut buf, me, pid), (kr::FAILURE, 0), "a process being made");
         assert!(!policies_asked(&k));
+        c.darwin_publish();
+        assert_eq!(name_for_pid(&mut k, &mut buf, me, pid), (kr::FAILURE, 0));
+        assert!(policies_asked(&k));
+        assert_eq!(task_of(&mut k, pid), None);
         c.darwin_task_enable();
         let key = c.dtask.ipc_raw.task;
         assert_eq!(task_of(&mut k, pid), Some((key, true)));
@@ -1571,13 +1586,36 @@ mod tests {
         c.darwin_task_terminate();
         assert_eq!(task_of(&mut k, pid), None);
         assert_eq!(pid_for(&mut k, &mut buf, n), (kr::FAILURE, -1));
-        assert_eq!(name_for_pid(&mut k, &mut buf, me, pid), (kr::SUCCESS, 0), "a dying task");
+        assert_eq!(name_for_pid(&mut k, &mut buf, me, pid), (kr::FAILURE, 0), "an ending process");
         k.procs.exit(pid, 0);
         assert_eq!(name_for_pid(&mut k, &mut buf, me, pid), (kr::FAILURE, 0), "a zombie");
         k.procs.reap(pid);
         assert_eq!(name_for_pid(&mut k, &mut buf, me, pid), (kr::FAILURE, 0), "a reaped pid");
         assert_eq!(name_for_pid(&mut k, &mut buf, me, 9999), (kr::FAILURE, 0), "a pid that never was");
+    }
+
+    /// `proc_prepareexit` (`P_REF_DEAD`) comes before the task ends: from
+    /// it the pid finds nothing, though the task's link and name port are
+    /// still there, and the policies are not asked.
+    #[test]
+    fn an_exiting_process_is_not_found_before_its_task_ends() {
+        let (mut buf, mut k, me) = parent();
+        let mut c = child(&k);
+        let pid = c.pid;
+        c.darwin_publish();
+        c.darwin_task_enable();
+        let key = c.dtask.ipc_raw.task;
+        let n = name_port(&mut k, key).unwrap();
+        k.procs.set_exited(pid);
+        assert_eq!(task_of(&mut k, pid), Some((key, true)));
+        assert_eq!(pid_for(&mut k, &mut buf, n), (kr::SUCCESS, pid), "its task is still there");
+        assert_eq!(name_for_pid(&mut k, &mut buf, me, pid), (kr::FAILURE, 0));
+        assert_eq!(task_for(&mut k, &mut buf, me, pid), (kr::FAILURE, 0));
         assert!(!policies_asked(&k));
+        assert!(k.darwin_proc_find(pid).is_none());
+        assert!(matches!(k.darwin_public(pid), Some((_, true))), "proc_find_zombref finds it");
+        c.darwin_task_terminate();
+        assert_eq!(pid_for(&mut k, &mut buf, n), (kr::FAILURE, -1));
     }
 
     /// task_for_pid of a live process whose task's IPC is not active fails
@@ -1661,7 +1699,7 @@ mod tests {
         c.darwin_task_terminate();
         assert_eq!(k.ipc().port(port).srights, 1);
         k.darwin_ipc_leave();
-        assert_eq!(name_for_pid(&mut k, &mut buf, me, pid), (kr::SUCCESS, 0));
+        assert_eq!(name_for_pid(&mut k, &mut buf, me, pid), (kr::FAILURE, 0));
         c.darwin_task_terminate();
         assert_eq!(k.ipc().port(port).srights, 1, "once");
         k.darwin_ipc_leave();

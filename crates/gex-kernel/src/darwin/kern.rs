@@ -1569,13 +1569,13 @@ impl Kernel {
         if !reads && !forself && self.creds.uid() != 0 {
             return Err(Errno::EPERM);
         }
-        // proc_find: this process, or another's task's link.
+        // proc_find: this process, or another that has not exited (one
+        // being spawned is found, with what its spawn has made of it).
         let (sig, flags, pidversion, textoff) = if forself {
-            (self.dtask.codesign.clone(), std::sync::Arc::clone(&self.dtask.csflags), self.dtask.pidversion, self.dtask.textoff)
+            (self.dtask.codesign.clone().map(std::sync::Arc::new), std::sync::Arc::clone(&self.dtask.csflags), self.dtask.pidversion, self.dtask.textoff)
         } else {
-            let ipc = self.ipc();
-            let Some(l) = ipc.links.values().find(|l| l.pid == pid).cloned() else { return Err(Errno::ESRCH) };
-            (l.codesign.clone(), std::sync::Arc::clone(&l.csflags), l.pidversion, l.textoff)
+            let Some(p) = self.darwin_proc_find(pid) else { return Err(Errno::ESRCH) };
+            (p.codesign, p.csflags, p.pidversion, p.textoff)
         };
         if let Some(t) = token {
             let tok = m.read(t, 32)?;
@@ -1786,12 +1786,10 @@ impl Kernel {
                 let p = if pid == self.pid {
                     self.darwin_dyld_policy()
                 } else {
-                    // proc_find: its task's link, while it lives.
-                    let ipc = self.ipc();
-                    let Some(l) = ipc.links.values().find(|l| l.pid == pid).cloned() else { return Err(3) };
-                    let ents = l.codesign.as_ref().map(|c| c.ents.clone()).unwrap_or_default();
-                    let sugid = self.darwin_public(pid).is_some_and(|(p, _)| p.sugid);
-                    super::amfi::dyld_policy(sugid, l.csflags.load(std::sync::atomic::Ordering::Acquire), &ents)
+                    // proc_find: one that has not exited.
+                    let Some(t) = self.darwin_proc_find(pid) else { return Err(3) };
+                    let ents = t.codesign.as_ref().map(|c| c.ents.clone()).unwrap_or_default();
+                    super::amfi::dyld_policy(t.sugid, t.csflags.load(std::sync::atomic::Ordering::Acquire), &ents)
                 };
                 m.write_u64(out, p).map_err(fault)
             }
@@ -1854,8 +1852,8 @@ impl Kernel {
             let (v, u, sb) = if pid == k.pid {
                 (k.dtask.pidversion, k.dtask.uniqueid, k.darwin_sandbox())
             } else {
-                let ipc = k.ipc();
-                ipc.links.values().find(|l| l.pid == pid).map(|l| (l.pidversion, l.uniqueid, super::sandboxes::of(&l.sandbox)))?
+                let p = k.darwin_proc_find(pid)?;
+                (p.pidversion, p.uniqueid, super::sandboxes::of(&p.sandbox))
             };
             (version.is_none_or(|w| i64::from(v) == w as i64) && unique.is_none_or(|w| u == w)).then_some(sb)
         };
@@ -2000,6 +1998,40 @@ impl Kernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// csops finds a process as `proc_find` does: not while its fork makes
+    /// it, then (with what that made of it) until it has exited; ESRCH
+    /// before the policies are asked, which here, with no Sandbox profile,
+    /// refuse what it finds.
+    #[test]
+    fn csops_finds_what_proc_find_finds() {
+        const STATUS: u32 = 0;
+        let mut buf = vec![0u8; 0x10000];
+        let mut k = Kernel::new(0x1000, 0x10000, "/prog".into());
+        k.darwin = true;
+        k.darwin_task_enable();
+        let mut c = k.fork_kernel();
+        c.pid = k.procs.spawn(k.pid);
+        c.tid = c.pid;
+        let pid = c.pid;
+        let mut csops = |k: &mut Kernel, pid: i32| {
+            let mut m = GuestMem::new(&mut buf);
+            let r = k.darwin_csops(&mut m, pid, STATUS, 0x8000, 4, None);
+            k.darwin_ipc_leave();
+            r
+        };
+        assert_eq!(csops(&mut k, pid), Err(Errno::ESRCH), "being made");
+        c.darwin_publish();
+        let found = csops(&mut k, pid);
+        assert!(found.is_err_and(|e| e != Errno::ESRCH), "found, then judged: {found:?}");
+        assert_eq!(csops(&mut k, 0), csops(&mut k, 1), "pid 0 is the caller");
+        k.procs.set_exited(pid);
+        assert_eq!(csops(&mut k, pid), Err(Errno::ESRCH), "exited");
+        k.procs.exit(pid, 0);
+        assert_eq!(csops(&mut k, pid), Err(Errno::ESRCH), "a zombie");
+        k.procs.reap(pid);
+        assert_eq!(csops(&mut k, pid), Err(Errno::ESRCH), "reaped");
+    }
 
     #[test]
     fn signal_masks_round_trip() {

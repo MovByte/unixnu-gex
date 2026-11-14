@@ -11455,8 +11455,10 @@ impl Kernel {
             };
             if raw == crate::darwin::sysno::EXIT {
                 self.darwin_workq_mark_exiting();
-                // exit(): the value, for `p_xstat` and the parent's record.
+                // exit(): the value, for `p_xstat` and the parent's record;
+                // then exit1's proc_prepareexit (P_REF_DEAD).
                 self.procs.set_end(self.pid, a[0] as u32, self.creds.uid());
+                self.procs.set_exited(self.pid);
             }
             if crate::darwin::thread::CANCEL_POINTS.contains(&raw) && self.darwin_testcancel(true) {
                 let _ = crate::darwin::set_result(m, self.ctx_addr, Errno::EINTR.as_return());

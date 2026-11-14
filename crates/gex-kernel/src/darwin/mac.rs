@@ -336,12 +336,7 @@ impl KernelFacts<'_> {
             4 => self.k.procs.ppid(t) == me,
             // The target's credential's sandbox is the very one.
             5 => {
-                let theirs = if t == me {
-                    self.k.darwin_sandbox()
-                } else {
-                    let ipc = self.k.ipc();
-                    ipc.links.values().find(|l| l.pid == t).and_then(|l| super::sandboxes::of(&l.sandbox))
-                };
+                let theirs = if t == me { self.k.darwin_sandbox() } else { self.k.darwin_proc_find(t).and_then(|p| super::sandboxes::of(&p.sandbox)) };
                 match (theirs, self.sb) {
                     (Some(a), Some(b)) => std::ptr::eq(Arc::as_ptr(&a), b),
                     (None, None) => true,
@@ -353,13 +348,13 @@ impl KernelFacts<'_> {
         }
     }
 
-    /// Another process's signature, by its pid (its task's link).
-    fn sig_of(&mut self, pid: i32) -> Option<Option<super::codesign::CodeSign>> {
+    /// Another process's signature, by its pid (`proc_find`: none for one
+    /// that has exited).
+    fn sig_of(&mut self, pid: i32) -> Option<Option<Arc<super::codesign::CodeSign>>> {
         if pid == self.k.pid {
-            return Some(self.k.dtask.codesign.clone());
+            return Some(self.k.dtask.codesign.clone().map(Arc::new));
         }
-        let ipc = self.k.ipc();
-        ipc.links.values().find(|l| l.pid == pid).map(|l| l.codesign.clone())
+        self.k.darwin_proc_find(pid).map(|p| p.codesign)
     }
 }
 
@@ -464,7 +459,7 @@ impl Facts for KernelFacts<'_> {
             if uniqueid == 0 {
                 return Ok(false);
             }
-            let theirs = if pid == self.k.pid { Some(self.k.dtask.uniqueid) } else { self.k.ipc().links.values().find(|l| l.pid == pid).map(|l| l.uniqueid) };
+            let theirs = if pid == self.k.pid { Some(self.k.dtask.uniqueid) } else { self.k.darwin_proc_find(pid).map(|p| p.uniqueid) };
             if theirs != Some(uniqueid) {
                 return Ok(false);
             }
@@ -646,7 +641,7 @@ impl Facts for KernelFacts<'_> {
         let mut out = Vec::new();
         let mut pid = self.k.pid;
         loop {
-            if let Some(id) = self.sig_of(pid).flatten().and_then(|c| c.identity) {
+            if let Some(id) = self.sig_of(pid).flatten().and_then(|c| c.identity.clone()) {
                 out.push(id);
             }
             let ppid = self.k.procs.ppid(pid);
@@ -658,7 +653,7 @@ impl Facts for KernelFacts<'_> {
     }
     fn target_signing_identifier(&mut self) -> Result<Option<Vec<u8>>, Stop> {
         let t = self.a.target.unwrap_or(0);
-        Ok(self.sig_of(t).flatten().and_then(|c| c.identity))
+        Ok(self.sig_of(t).flatten().and_then(|c| c.identity.clone()))
     }
     fn process_path(&mut self) -> Result<Option<Vec<u8>>, Stop> {
         Ok(Some(self.k.exe_path.clone().into_bytes()))
@@ -1318,19 +1313,21 @@ impl Kernel {
         error_select(amfi, sb)
     }
 
-    /// `mac_proc_check_get_task` for process `pid`'s task port of flavor
-    /// `f`: AMFI's (the caller's entitlements, the target's), then
-    /// Sandbox's operation for the flavor. ESRCH when the target is gone.
-    pub(crate) fn darwin_mac_check_get_task(&mut self, pid: i32, f: u32) -> u32 {
+    /// `mac_proc_check_get_task` for the task port of flavor `f` of the
+    /// process `ident` names (`proc_ident` of the one the caller found):
+    /// AMFI's (the caller's entitlements, the target's), then Sandbox's
+    /// operation for the flavor. ESRCH when `proc_find_ident` no longer
+    /// finds it (it has exited, or its pid is another's).
+    pub(crate) fn darwin_mac_check_get_task(&mut self, ident: super::procinfo::ProcIdent, f: u32) -> u32 {
+        let pid = ident.pid;
         let caller = self.dtask.codesign.as_ref().map(|c| c.ents.clone()).unwrap_or_default();
         let target = if pid == self.pid {
-            Some(self.dtask.codesign.clone())
+            Some(self.dtask.codesign.as_ref().map(|c| c.ents.clone()))
         } else {
-            let ipc = self.ipc();
-            ipc.links.values().find(|l| l.pid == pid).map(|l| l.codesign.clone())
+            self.darwin_proc_find_ident(ident).map(|p| p.codesign.map(|c| c.ents.clone()))
         };
         let Some(target) = target else { return e::ESRCH };
-        let target = target.map(|c| c.ents).unwrap_or_default();
+        let target = target.unwrap_or_default();
         let amfi = super::amfi::get_task_with_flavor(&caller, &target, f).err().unwrap_or(0);
         let op = [op::MACH_PRIV_TASK_PORT, op::MACH_TASK_READ, op::MACH_TASK_INSPECT, op::MACH_TASK_NAME][f as usize & 3];
         let a = SbArgs { kind: sandbox::kind::PROCESS, target: Some(pid), ..Default::default() };

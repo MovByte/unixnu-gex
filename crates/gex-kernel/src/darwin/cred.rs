@@ -213,15 +213,12 @@ impl Kernel {
                 } else if pid == 0 {
                     Err(Errno::ESRCH)
                 } else {
-                    let found = pid == self.pid || {
-                        let ipc = self.ipc();
-                        ipc.links.values().any(|l| l.pid == pid)
-                    };
-                    if !found {
-                        return Some(Err(Errno::ESRCH));
-                    }
-                    // Another process's identity on this thread.
-                    self.darwin_settid(0)
+                    // kauth_cred_proc_ref_for_pid: the credential of the
+                    // process in the pid hash (proc_find_noref_smr), one
+                    // that has exited or is a zombie too; its uid and gid
+                    // are this thread's to take.
+                    let Some((target, _)) = self.darwin_public(pid) else { return Some(Err(Errno::ESRCH)) };
+                    self.darwin_settid(target.cred.uid)
                 }
             }
             sys::GETLOGIN => self.darwin_getlogin(m, a[0], a[1] as u32),

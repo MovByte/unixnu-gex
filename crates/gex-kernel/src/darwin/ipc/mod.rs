@@ -661,16 +661,10 @@ pub struct TaskLink {
     pub ipc_active: std::sync::atomic::AtomicBool,
     /// Its name port (`itk_task_ports[TASK_FLAVOR_NAME]`), once made.
     pub name_port: Mutex<Option<ObjId>>,
-    /// Its code signature, for its entitlements.
+    /// Its code signature, for the entitlements its requests to other
+    /// tasks' kernel objects are judged by (what another process is, by
+    /// its pid, is its record in the process table: `proc_find`).
     pub codesign: Option<super::codesign::CodeSign>,
-    /// Its credential's Sandbox label.
-    pub sandbox: super::sandboxes::Label,
-    /// Its process's `p_csflags`, `p_idversion` and `p_textoff`.
-    pub csflags: Arc<std::sync::atomic::AtomicU32>,
-    pub pidversion: i32,
-    pub textoff: i64,
-    /// Its process's `p_uniqueid`.
-    pub uniqueid: u64,
     /// Its task policy, with its importance marks.
     pub policy: Option<super::importance::Policy>,
 }
