@@ -9,7 +9,8 @@
 // - events: register_event_port's async completion (the message
 //   IOUserClient::sendAsyncResult64 sends for a 64-bit task, with the queue
 //   handle its argument), then FetchEvents' records: the command buffer
-//   scheduled and completed, and the GPU's write in this task's memory.
+//   scheduled, its one encoder completed, the command buffer completed,
+//   and the GPU's write in this task's memory.
 // It runs as an app does, in the container profile's sandbox: the platform
 // profile admits a GPU user client to no unsandboxed program but those it
 // names by signing identifier.
@@ -145,7 +146,7 @@ int main(void) {
 
     // The doorbell rings, and the queue's events are collected, until the
     // command buffer has completed.
-    bool scheduled = false, completed = false;
+    bool scheduled = false, encoded = false, completed = false;
     for (int rings = 0; !completed; rings++) {
         // The message: its header, then OSNotificationHeader64 (size, type,
         // the reference), the result and the one argument at 4-byte
@@ -182,10 +183,17 @@ int main(void) {
             if (auto *x = std::get_if<wire::CommandBufferScheduled>(&e)) {
                 if (x->commandBuffer != cb || x->failure.status != 0) return bad("the scheduled event", x->failure.status, 0);
                 scheduled = true;
+            } else if (auto *x = std::get_if<wire::EncoderCompleted>(&e)) {
+                // The one encoder's work, once, before its command buffer's
+                // completion (the wire's EncoderCompleted).
+                if (x->commandBuffer != cb || x->encoder != encoder) return bad("the encoder's completed event", x->encoder, encoder);
+                if (encoded || completed) return bad("the encoder's completed event's order", completed, 0);
+                encoded = true;
             } else if (auto *x = std::get_if<wire::CommandBufferCompleted>(&e)) {
                 // MTLCommandBufferStatusCompleted.
                 if (x->commandBuffer != cb || x->status != 4 || x->failure.status != 0) return bad("the completed event", x->status, 4);
                 if (!scheduled) return bad("completed before scheduled", 0, 1);
+                if (!encoded) return bad("completed before its encoder", 0, 1);
                 completed = true;
             } else {
                 return bad("an unexpected event", e.index(), 0);
