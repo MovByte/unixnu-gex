@@ -65,6 +65,11 @@ pub struct Memory {
     /// The tasks' mappings (`IOMemoryMap`s): each a view, how it was asked
     /// for, and the references to it.
     maps: Vec<Map>,
+    /// The ranges of the backing store (offset, length) the tasks' and the
+    /// kernel's writes changed since they were last taken
+    /// ([`Memory::take_changed`]): disjoint, in order, none touching the
+    /// next.
+    changed: Vec<(u64, u64)>,
 }
 
 /// An `IOMemoryMap` of the memory in a task: its address, whether it is
@@ -128,7 +133,31 @@ impl Memory {
     /// A surface's memory of `len` bytes (a whole number of pages), zeroed,
     /// as a new surface's is.
     pub fn new(len: u64) -> Memory {
-        Memory { backing: vec![0; len as usize], views: Vec::new(), maps: Vec::new() }
+        Memory { backing: vec![0; len as usize], views: Vec::new(), maps: Vec::new(), changed: Vec::new() }
+    }
+
+    /// Note that `[at, at + len)` of the backing store changed: merged
+    /// with the ranges it overlaps or touches.
+    fn note_changed(&mut self, at: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        let (mut start, mut end) = (at, at + len);
+        let first = self.changed.partition_point(|&(s, n)| s + n < start);
+        let mut last = first;
+        while last < self.changed.len() && self.changed[last].0 <= end {
+            let (s, n) = self.changed[last];
+            start = start.min(s);
+            end = end.max(s + n);
+            last += 1;
+        }
+        self.changed.splice(first..last, [(start, end - start)]);
+    }
+
+    /// The ranges of the backing store that changed since this was last
+    /// asked, in order.
+    pub fn take_changed(&mut self) -> Vec<(u64, u64)> {
+        std::mem::take(&mut self.changed)
     }
 
     /// Whether `pid`'s view at `addr` is still in its address space.
@@ -161,6 +190,7 @@ impl Memory {
             }
         });
         let v = &mut self.views[i];
+        let mut runs: Vec<(u64, u64)> = Vec::new();
         for (p, bytes) in cur {
             let o = p * PAGE as usize;
             let base = &mut v.base[o..o + PAGE as usize];
@@ -168,10 +198,18 @@ impl Memory {
                 if now != *was {
                     if let Some(b) = self.backing.get_mut(o + j) {
                         *b = now;
+                        let at = (o + j) as u64;
+                        match runs.last_mut() {
+                            Some((s, n)) if *s + *n == at => *n += 1,
+                            _ => runs.push((at, 1)),
+                        }
                     }
                     *was = now;
                 }
             }
+        }
+        for (at, n) in runs {
+            self.note_changed(at, n);
         }
         let v = &mut self.views[i];
         if v.write_locks == 0 {
@@ -318,6 +356,7 @@ impl Memory {
         }
         let o = off as usize;
         self.backing[o..o + bytes.len()].copy_from_slice(bytes);
+        self.note_changed(off, bytes.len() as u64);
         for i in 0..self.views.len() {
             if !self.live(k, i) {
                 continue;
@@ -412,6 +451,23 @@ impl Memory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changed_ranges_merge() {
+        let mut m = Memory::new(PAGE);
+        m.note_changed(10, 5);
+        m.note_changed(30, 2);
+        m.note_changed(15, 3);
+        m.note_changed(0, 0);
+        m.note_changed(29, 10);
+        m.note_changed(12, 2);
+        assert_eq!(m.take_changed(), vec![(10, 8), (29, 10)]);
+        assert!(m.take_changed().is_empty());
+        m.note_changed(5, 1);
+        m.note_changed(1, 3);
+        m.note_changed(4, 1);
+        assert_eq!(m.take_changed(), vec![(1, 5)]);
+    }
 
     #[test]
     fn views_find_their_pages() {

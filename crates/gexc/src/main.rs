@@ -24,6 +24,8 @@ mod host_thread_time;
 mod host_walk;
 mod darwin_run;
 mod dsc_info;
+#[cfg(feature = "webmetal")]
+mod host_webmetal;
 
 /// Where the dynamic linker is placed, well above a PIE executable so their
 /// mappings cannot overlap. A closure module for `ld.so` is only correct at the
@@ -54,6 +56,8 @@ fn real_main() -> Result<ExitCode> {
     host_vm::install();
     host_walk::install();
     host_thread_time::install();
+    #[cfg(feature = "webmetal")]
+    host_webmetal::install();
     let argv: Vec<String> = std::env::args().collect();
     if argv.len() < 2 {
         usage();
@@ -94,6 +98,7 @@ fn real_main() -> Result<ExitCode> {
         "closure" => cmd_closure(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "pe-info" => pe_info::cmd_pe_info(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "dsc-info" => dsc_info::cmd(&argv[2..]),
+        "webmetal-info" => cmd_webmetal_info(),
         "units" => units::cmd_units(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "profile" => cmd_profile(&argv[2..]).map(|_| ExitCode::SUCCESS),
         // `eject run` runs the guest, as `run` does: on a thread with a
@@ -207,6 +212,9 @@ usage:
                                    different programs add up (--split DIR:
                                    one file per object instead of -o)
   gexc profile show [--top N] IN   summarise a profile
+  gexc webmetal-info               the WebGPU implementation the Darwin
+                                   personality's GPU runs on (the `webmetal`
+                                   build), or why there is none
   gexc units profile OUT LOG...     instrumented runs' [gex-prof] lines (and
                                    *.prof files) added up into a unit profile
   gexc units select PROFILE CACHE OUT [--link-mbit N ...]
@@ -2032,6 +2040,18 @@ fn cmd_funcs(args: &[String]) -> Result<ExitCode> {
 }
 
 /// `gexc profile merge|show`: work with profiles `gexc run --record` wrote.
+/// `gexc webmetal-info`: the WebGPU implementation WebMetal's executor runs
+/// on in this build; an error for a build without the executor.
+fn cmd_webmetal_info() -> Result<ExitCode> {
+    #[cfg(feature = "webmetal")]
+    {
+        println!("webmetal: {}", host_webmetal::implementation());
+        Ok(ExitCode::SUCCESS)
+    }
+    #[cfg(not(feature = "webmetal"))]
+    bail!("this gexc is built without WebMetal's executor (cargo feature `webmetal`)")
+}
+
 fn cmd_profile(args: &[String]) -> Result<()> {
     use gex_xlate::profile::Profile;
     gex_native::profile::use_kernel_syscall_names();

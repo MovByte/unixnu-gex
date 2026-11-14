@@ -790,20 +790,51 @@ pub fn describe(id: u32) -> Option<executor::SurfaceDesc> {
             .iter()
             .map(|p| executor::PlaneDesc { offset: p.offset, width: p.width, height: p.height, bytes_per_row: p.bytes_per_row, bytes_per_element: u32::from(p.bytes_per_element), element_width: u32::from(p.element_width), element_height: u32::from(p.element_height), size: p.size })
             .collect();
-        Some(executor::SurfaceDesc { id, pixel_format: d.pixel_format, alloc_size: d.alloc_size, planes, seed: ro_u32(r, id, ro::SEED) })
+        Some(executor::SurfaceDesc {
+            id,
+            width: d.width,
+            height: d.height,
+            bytes_per_row: d.bytes_per_row,
+            bytes_per_element: u32::from(d.bytes_per_element),
+            element_width: u32::from(d.element_width),
+            element_height: u32::from(d.element_height),
+            offset: d.offset,
+            pixel_format: d.pixel_format,
+            alloc_size: d.alloc_size,
+            planes,
+            seed: ro_u32(r, id, ro::SEED),
+        })
     })
 }
 
 /// Surface `id` handed to the GPU (a GPU client's use of it: a texture or
-/// buffer over its bytes) through the executor's surface table; from then
-/// on its locks read the GPU's writes back and its unlocks hand over the
-/// CPU's. `Err` says what is missing: no such surface, or no executor.
-pub fn bind_gpu(id: u32) -> Result<(), String> {
-    let desc = describe(id).ok_or_else(|| format!("binding IOSurface {id:#x} to the GPU: no such surface"))?;
+/// buffer over its bytes) through the executor's surface table, with its
+/// bytes as every task has left them; from then on its locks read the
+/// GPU's writes back and the tasks' changes the kernel gathers are handed
+/// over. A surface the GPU has already is left as it is, and an id no
+/// surface has binds nothing (the executor finds no surface by it). `Err`
+/// says what is missing: no executor. A surface whose bytes do
+/// not start at its memory's first byte (`IOSurfaceOffset`) is refused:
+/// where its planes start relative to its base address, as the executor
+/// addresses them, is not checked against IOSurface.framework.
+pub fn bind_gpu(k: &mut Kernel, id: u32) -> Result<(), String> {
+    let Some(desc) = describe(id) else { return Ok(()) };
+    if root(|r| r.surfaces.get(&id).is_some_and(|s| s.gpu)) {
+        return Ok(());
+    }
+    if desc.offset != 0 {
+        return Err(format!("binding IOSurface {id:#x} to the GPU: its IOSurfaceOffset {:#x} (where its planes start relative to its base address is not checked against IOSurface.framework)", desc.offset));
+    }
     executor::bind(&desc)?;
+    let t = executor::table().expect("bound through the table");
     root(|r| {
-        if let Some(s) = r.surfaces.get_mut(&id) {
-            s.gpu = true;
+        let Some(s) = r.surfaces.get_mut(&id) else { return };
+        s.gpu = true;
+        if let Some(mem) = s.memory.as_mut() {
+            let _ = k.darwin_own_memory(|k, m| mem.gather(k, m));
+            mem.take_changed();
+            let len = mem.backing.len() as u64;
+            t.cpu_wrote(id, &mem.backing, &[(0, len)]);
         }
     });
     Ok(())

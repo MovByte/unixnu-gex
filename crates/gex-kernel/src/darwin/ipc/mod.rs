@@ -543,8 +543,11 @@ pub struct Ipc {
     pub space: Space,
     /// The other tasks' spaces, by task, while this task holds the table.
     pub others: HashMap<TaskKey, Space>,
-    /// This task's key among the spaces (0: none taken yet).
+    /// This task's key among the spaces (0: none taken yet, or the task
+    /// has ended).
     pub task: TaskKey,
+    /// The task has ended ([`Ipc::space_leave`]).
+    pub ended: bool,
     /// The task is the system's first (`initproc`).
     pub initproc: bool,
     /// The system's table, once this task has taken it.
@@ -638,16 +641,24 @@ pub enum Remote {
     PsetKnote(ObjId, ObjId),
     /// A request to one of its kernel objects, from task `caller`.
     Kobject { kmsg: Box<msg::Kmsg>, options: u64, caller: TaskKey },
+    /// What the host executor left for one of its WebMetal connections.
+    Accel(super::accel::wire::Note),
 }
 
 /// How other tasks reach a task: its mailbox, and the bell of the thread
-/// that empties it.
+/// that empties it. A task has one from its creation (`fork`, `posix_spawn`,
+/// the system's first process) to its end; an exec's new task takes over
+/// its old task's.
 #[derive(Debug)]
 pub struct TaskLink {
     pub mailbox: Mutex<Vec<Remote>>,
     pub bell: Arc<super::timer::Bell>,
     /// The task's process.
     pub pid: i32,
+    /// `ipc_active`: the task's ports may be made and converted to. An
+    /// exec's old task's are not from its switch of tasks, and its new
+    /// task's are once its image is in (`ipc_task_enable`).
+    pub ipc_active: std::sync::atomic::AtomicBool,
     /// Its name port (`itk_task_ports[TASK_FLAVOR_NAME]`), once made.
     pub name_port: Mutex<Option<ObjId>>,
     /// Its code signature, for its entitlements.
@@ -789,6 +800,7 @@ impl Ipc {
         self.link = None;
         self.space = Space::new();
         self.task = 0;
+        self.ended = true;
         let cell = self.cell.take();
         self.held = false;
         if let Some(cell) = cell {
@@ -812,10 +824,56 @@ impl Ipc {
         true
     }
 
-    /// Task `task`'s name port, made (as that task's object) if it has
-    /// none yet.
+    /// `ipc_task_enable`: `link`, this task's, goes in the table under its
+    /// key in place of the one it had (an exec's old task's, or its own as
+    /// its creation left it), and its ports may be made. What other tasks
+    /// left in the old one's mailbox goes on to it, and so does the name
+    /// port made for the old one (none for an exec's old task: its name
+    /// port died with it).
+    pub fn task_enable(&mut self, mut link: TaskLink) {
+        debug_assert!(self.held && self.task != 0);
+        if let Some(old) = self.link.take() {
+            let pending = std::mem::take(&mut *old.mailbox.lock().unwrap_or_else(|e| e.into_inner()));
+            link.mailbox.get_mut().unwrap_or_else(|e| e.into_inner()).extend(pending);
+            *link.name_port.get_mut().unwrap_or_else(|e| e.into_inner()) = old.name_port.lock().unwrap_or_else(|e| e.into_inner()).take();
+        }
+        *link.ipc_active.get_mut() = true;
+        let ring = !link.mailbox.get_mut().unwrap_or_else(|e| e.into_inner()).is_empty();
+        let link = Arc::new(link);
+        self.links.insert(self.task, Arc::clone(&link));
+        if ring {
+            link.bell.ring();
+        }
+        self.link = Some(link);
+    }
+
+    /// `ipc_task_disable` of an exec's old task: no port of it is made or
+    /// converted to from here on. Its link stays (its process is still
+    /// found by its pid) until the new task's takes its place.
+    pub fn task_disable(&mut self) {
+        if let Some(l) = &self.link {
+            l.ipc_active.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// `task_is_ipc_active` for task `task`: false for one with no link.
+    pub fn task_ipc_active(&self, task: TaskKey) -> bool {
+        self.links.get(&task).is_some_and(|l| l.ipc_active.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// `proc_task` of process `pid`: its task's key, while it has one in
+    /// the table (from its creation to its end).
+    pub fn task_of_pid(&self, pid: i32) -> Option<TaskKey> {
+        self.links.iter().find(|(_, l)| l.pid == pid).map(|(&k, _)| k)
+    }
+
+    /// Task `task`'s name port (`convert_task_name_to_port`), made (as that
+    /// task's object) if it has none yet; none while its IPC is not active.
     pub fn task_name_port(&mut self, task: TaskKey) -> Option<ObjId> {
         let link = Arc::clone(self.links.get(&task)?);
+        if !link.ipc_active.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
         let mut slot = link.name_port.lock().unwrap_or_else(|e| e.into_inner());
         Some(*slot.get_or_insert_with(|| {
             let p = self.kobject_port(Kobject::TaskName);
